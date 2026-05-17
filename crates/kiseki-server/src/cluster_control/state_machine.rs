@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use futures::TryStreamExt;
 use kiseki_common::ids::{NodeId, OrgId, ShardId};
-use kiseki_control::shard_topology::{NamespaceCreationState, NamespaceShardMap, ShardRange};
+use kiseki_control::shard_topology::{
+    NamespaceCreationState, NamespaceShardMap, NamespaceShardMapStore, ShardRange,
+};
 use openraft::alias::{LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf};
 use openraft::storage::{EntryResponder, RaftStateMachine};
 use openraft::{EntryPayload, OptionalSend, RaftSnapshotBuilder};
@@ -288,6 +290,18 @@ pub struct ControlStateMachine {
     /// Optional metrics: per-replica apply counts, namespace
     /// gauge, apply-hook duration. `None` for unit tests.
     metrics: Option<Arc<super::ClusterControlMetrics>>,
+    /// Gateway-readable `NamespaceShardMapStore` kept in lockstep with
+    /// the state machine's `namespaces` map. Hydrated on every node's
+    /// apply path so the gateway's `shard_map` lookup
+    /// (`mem_gateway::route_to_shard`) routes by `hashed_key` range
+    /// rather than the namespace's primary `comp.shard_id`.
+    ///
+    /// Without this wiring the gateway's `shard_map` is `None` in
+    /// production and ADR-033 §5 routing is dead code — every write
+    /// goes to the single shard `comps.add_namespace` registered.
+    /// `None` for unit tests and single-node setups that don't
+    /// engage the control plane.
+    shard_map: Option<Arc<NamespaceShardMapStore>>,
 }
 
 impl ControlStateMachine {
@@ -298,6 +312,7 @@ impl ControlStateMachine {
             inner: Arc::new(futures::lock::Mutex::new(StateMachineInner::new())),
             apply_hook: None,
             metrics: None,
+            shard_map: None,
         }
     }
 
@@ -310,6 +325,7 @@ impl ControlStateMachine {
             inner: Arc::new(futures::lock::Mutex::new(StateMachineInner::new())),
             apply_hook: Some(hook),
             metrics: None,
+            shard_map: None,
         }
     }
 
@@ -319,6 +335,88 @@ impl ControlStateMachine {
     pub fn with_apply_metrics(mut self, metrics: Arc<super::ClusterControlMetrics>) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+
+    /// Builder: attach the gateway-readable `NamespaceShardMapStore`
+    /// so every `CreateNamespace` apply populates it on every node.
+    /// This is what makes ADR-033 §5 routing (`route_to_shard` over
+    /// `hashed_key` ranges) actually engage in production — without
+    /// this wiring the gateway's `shard_map` is `None` and writes
+    /// route to the namespace's single primary `comp.shard_id`.
+    #[must_use]
+    pub fn with_shard_map(mut self, shard_map: Arc<NamespaceShardMapStore>) -> Self {
+        self.shard_map = Some(shard_map);
+        self
+    }
+
+    /// Mirror one `ControlCommand` into the gateway-readable
+    /// `NamespaceShardMapStore`. Called from `apply` on every node
+    /// after the inner state mutation commits, and from
+    /// `install_snapshot` on snapshot-driven catch-up.
+    ///
+    /// Errors are downgraded to `tracing::debug` — by the time we
+    /// reach here the consensus log already records the canonical
+    /// state, and the local store is a derived projection. Re-apply
+    /// on snapshot install repopulates it.
+    pub(crate) fn hydrate_shard_map(shard_map: &NamespaceShardMapStore, cmd: &ControlCommand) {
+        match cmd {
+            ControlCommand::CreateNamespace {
+                namespace_id,
+                tenant_id,
+                shards,
+            } => {
+                // Use the caller-supplied shards verbatim. The earlier
+                // implementation called `create_namespace(...,
+                // Some(N))` which invented FRESH shard UUIDs via
+                // `compute_shard_ranges` — the shard_map then routed
+                // writes to shards that didn't exist locally because
+                // the apply hook had registered the per-shard Raft
+                // groups under the COMMAND's shard IDs, not the
+                // store's freshly-generated ones. Observed on the
+                // 2026-05-17 dev compose: every PUT against the new
+                // multi-shard "default" namespace returned `shard
+                // not found`.
+                let ranges: Vec<kiseki_control::shard_topology::ShardRange> = shards
+                    .iter()
+                    .map(|s| kiseki_control::shard_topology::ShardRange {
+                        shard_id: s.shard_id,
+                        range_start: s.range_start,
+                        range_end: s.range_end,
+                        leader_node: s.leader_node,
+                    })
+                    .collect();
+                match shard_map.register_namespace_with_shards(namespace_id, *tenant_id, ranges) {
+                    Ok(_) => {
+                        tracing::debug!(
+                            namespace_id = %namespace_id,
+                            shards = shards.len(),
+                            "control-plane apply: shard_map hydrated",
+                        );
+                    }
+                    Err(e) => {
+                        // `AlreadyExists` is the expected idempotent
+                        // path on replay; anything else means the
+                        // local store and state machine have drifted
+                        // (impossible without a bug).
+                        tracing::debug!(
+                            namespace_id = %namespace_id,
+                            error = %e,
+                            "control-plane apply: shard_map create skipped (already present?)",
+                        );
+                    }
+                }
+            }
+            // Split / Merge / Retire mutate existing shards. The
+            // current `NamespaceShardMapStore` API doesn't expose
+            // per-shard mutation helpers — the production read path
+            // tolerates a slightly-stale local store via the in-memory
+            // state-machine snapshot. Follow-up: thread split/merge
+            // updates through too (tracked alongside the split/merge
+            // BDD scenarios).
+            ControlCommand::RecordSplit { .. }
+            | ControlCommand::RecordMerge { .. }
+            | ControlCommand::RetireShard { .. } => {}
+        }
     }
 
     /// Snapshot of the full state — for tests and read-side admin RPCs.
@@ -450,6 +548,16 @@ impl RaftStateMachine<C> for ControlStateMachine {
                 }
             }
         }
+        // ADR-033 §5: keep the gateway-readable shard map in lockstep
+        // with the state machine. Runs on every node so the gateway's
+        // `route_to_shard` lookup hits a populated map regardless of
+        // which node fields the request. Idempotent against replay
+        // (already-existing → `AlreadyExists` is swallowed below).
+        if let Some(shard_map) = self.shard_map.as_ref() {
+            for cmd in &hook_dispatch {
+                Self::hydrate_shard_map(shard_map.as_ref(), cmd);
+            }
+        }
         Ok(())
     }
 
@@ -467,6 +575,33 @@ impl RaftStateMachine<C> for ControlStateMachine {
         let data = snapshot.into_inner();
         let snap: ControlSnapshot = serde_json::from_slice(&data)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // Replay snapshot namespaces into the gateway-readable shard
+        // map. A restarting node receives the snapshot from the leader
+        // and would otherwise have an empty shard_map until the next
+        // CreateNamespace lands — wrong: existing namespaces should
+        // be routable immediately.
+        if let Some(shard_map) = self.shard_map.as_ref() {
+            for (ns_id, ns_snap) in &snap.namespaces {
+                let shards: Vec<ShardRecord> = ns_snap
+                    .shards
+                    .iter()
+                    .map(|s| ShardRecord {
+                        shard_id: s.shard_id,
+                        range_start: s.range_start,
+                        range_end: s.range_end,
+                        leader_node: s.leader_node,
+                    })
+                    .collect();
+                Self::hydrate_shard_map(
+                    shard_map.as_ref(),
+                    &ControlCommand::CreateNamespace {
+                        namespace_id: ns_id.clone(),
+                        tenant_id: ns_snap.tenant_id,
+                        shards,
+                    },
+                );
+            }
+        }
         let mut inner = self.inner.lock().await;
         inner.namespaces = snap.namespaces;
         inner.last_applied_log = meta.last_log_id;

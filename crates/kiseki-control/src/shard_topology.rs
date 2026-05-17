@@ -364,6 +364,51 @@ impl NamespaceShardMapStore {
         Ok(map)
     }
 
+    /// Register a namespace with caller-supplied shard ranges.
+    ///
+    /// Unlike [`Self::create_namespace`] this does NOT generate fresh
+    /// shard IDs — the caller provides exact `ShardRange` entries.
+    /// Used by the control-plane state-machine apply hook so the
+    /// gateway-readable `NamespaceShardMapStore` reflects the SAME
+    /// shard IDs that the per-shard Raft groups were registered
+    /// under. `create_namespace`'s `compute_shard_ranges` call would
+    /// invent new UUIDs and the resulting routing would point at
+    /// shards that don't exist locally — fail mode observed on the
+    /// 2026-05-17 dev compose with the first-touch provisioner.
+    ///
+    /// Idempotent on `AlreadyExists` (returns `Err` with that
+    /// variant so callers can downgrade it to a debug message).
+    /// Replay through snapshot install is safe.
+    pub fn register_namespace_with_shards(
+        &self,
+        namespace_id: &str,
+        tenant_id: OrgId,
+        shards: Vec<ShardRange>,
+    ) -> Result<NamespaceShardMap, ControlError> {
+        let mut maps = self.maps.write().lock_or_die("shard_topology.unknown");
+        if let Some(existing) = maps.get(namespace_id) {
+            if existing.state == NamespaceCreationState::Creating {
+                return Err(ControlError::Rejected(
+                    "namespace creation in progress".into(),
+                ));
+            }
+            return Err(ControlError::AlreadyExists(format!(
+                "namespace {namespace_id}"
+            )));
+        }
+        let mut shards_sorted = shards;
+        shards_sorted.sort_by_key(|s| s.range_start);
+        let map = NamespaceShardMap {
+            namespace_id: namespace_id.to_owned(),
+            tenant_id,
+            version: 1,
+            shards: shards_sorted,
+            state: NamespaceCreationState::Active,
+        };
+        maps.insert(namespace_id.to_owned(), map.clone());
+        Ok(map)
+    }
+
     /// Get the shard map for a namespace, validating tenant authorization (ADV-033-9).
     pub fn get(
         &self,

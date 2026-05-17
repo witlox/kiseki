@@ -262,6 +262,7 @@ impl OpenRaftControlStore {
     /// * `bootstrap` — true on the seed node. Must be `true` on
     ///   exactly one node at first cluster boot; false on every
     ///   subsequent restart and on every other node.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         node_id: u64,
         peers: &BTreeMap<u64, String>,
@@ -270,6 +271,7 @@ impl OpenRaftControlStore {
         apply_hook: Arc<dyn ApplyHook>,
         bootstrap: bool,
         metrics: Option<Arc<super::ClusterControlMetrics>>,
+        shard_map: Option<Arc<kiseki_control::shard_topology::NamespaceShardMapStore>>,
     ) -> Result<Self, std::io::Error> {
         let config = KisekiRaftConfig::default_config();
         // State machine owns the apply hook — fires from inside
@@ -282,6 +284,13 @@ impl OpenRaftControlStore {
         let mut state_machine = ControlStateMachine::with_apply_hook(apply_hook);
         if let Some(m) = metrics.as_ref() {
             state_machine = state_machine.with_apply_metrics(Arc::clone(m));
+        }
+        // ADR-033 §5: hydrate the gateway-readable shard map on every
+        // apply. Without this binding the gateway falls back to the
+        // namespace's single primary `comp.shard_id` for every write,
+        // and multi-shard fanout is dead code.
+        if let Some(sm) = shard_map.as_ref() {
+            state_machine = state_machine.with_shard_map(Arc::clone(sm));
         }
 
         let members: BTreeMap<u64, KisekiNode> = peers
@@ -464,6 +473,7 @@ mod tests {
             &registry,
             Arc::new(NoopApplyHook),
             true,
+            None,
             None,
         )
         .await
