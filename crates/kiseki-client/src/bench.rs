@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kiseki_common::ids::CompositionId;
+use kiseki_common::ids::{CompositionId, NamespaceId};
 
 /// Workload shape — what mix of operations to drive. Mirrors
 /// `kiseki-profile::Shape` so the output tables align.
@@ -67,6 +67,15 @@ pub struct BenchConfig {
     pub warmup_objects: usize,
     /// Emit machine-readable JSON instead of the human table.
     pub json: bool,
+    /// Round-robin PUTs / GETs across this many namespaces (native:
+    /// distinct `NamespaceId`s; s3: distinct buckets). `1` = single
+    /// namespace, matching pre-fanout behaviour. Larger values let the
+    /// gateway proxy fan PUTs across multiple shard leaders — see
+    /// issue #66 fix 2. Concretely, with 3 shards aligned to 3 storage
+    /// nodes, `namespace_fanout: 3` spreads the Raft commit load
+    /// across 3 leaders instead of bottlenecking on the bootstrap
+    /// leader.
+    pub namespace_fanout: usize,
 }
 
 /// Final benchmark report.
@@ -109,26 +118,36 @@ struct Key {
     /// only s3 reads this field, and the s3 module is feature-gated.
     #[allow(dead_code)]
     name: Option<String>,
+    /// Fanout slot the PUT landed on. Native: indexes into the
+    /// driver's `namespace_ids` vec; S3: indexes into `buckets`. The
+    /// GET path uses the same slot so cross-namespace lookups never
+    /// happen.
+    #[allow(dead_code)]
+    slot: usize,
 }
 
 #[async_trait::async_trait]
 trait Driver: Send + Sync {
-    async fn put(&self, payload: &[u8]) -> Result<Key, String>;
+    async fn put(&self, payload: &[u8], slot: usize) -> Result<Key, String>;
     async fn get(&self, key: &Key) -> Result<usize, String>;
     fn label(&self) -> &'static str;
+    /// Number of distinct namespaces / buckets this driver was built
+    /// with. The bench loop modulo-indexes against this.
+    fn fanout(&self) -> usize;
 }
 
 /// Build the right driver from the endpoint URL and binding selector.
 async fn build_driver(cfg: &BenchConfig) -> Result<Arc<dyn Driver>, String> {
+    let fanout = cfg.namespace_fanout.max(1);
     if let Some(addr) = cfg.endpoint.strip_prefix("kiseki://") {
         #[cfg(feature = "native")]
         match cfg.binding {
-            NativeBinding::Tcp => return native::build_tcp(addr, cfg.concurrency).await,
-            NativeBinding::Grpc => return native::build_grpc(addr, cfg.concurrency).await,
+            NativeBinding::Tcp => return native::build_tcp(addr, cfg.concurrency, fanout).await,
+            NativeBinding::Grpc => return native::build_grpc(addr, cfg.concurrency, fanout).await,
         }
         #[cfg(not(feature = "native"))]
         {
-            let _ = addr;
+            let _ = (addr, fanout);
             return Err(
                 "kiseki:// endpoint requires the `native` feature; rebuild kiseki-client with `--features native`"
                     .to_string(),
@@ -137,7 +156,7 @@ async fn build_driver(cfg: &BenchConfig) -> Result<Arc<dyn Driver>, String> {
     }
     if cfg.endpoint.starts_with("http://") || cfg.endpoint.starts_with("https://") {
         #[cfg(feature = "remote-http")]
-        return Ok(Arc::new(s3::S3Driver::new(&cfg.endpoint).await?));
+        return Ok(Arc::new(s3::S3Driver::new(&cfg.endpoint, fanout).await?));
         #[cfg(not(feature = "remote-http"))]
         return Err(
             "http(s):// endpoint requires the `remote-http` feature; rebuild kiseki-client with `--features remote-http`"
@@ -150,6 +169,25 @@ async fn build_driver(cfg: &BenchConfig) -> Result<Arc<dyn Driver>, String> {
     ))
 }
 
+/// Generate `fanout` deterministic namespace IDs from the seed name
+/// `"bench-ns-<i>"`. `UUIDv5` keeps the cluster's `namespace_ids`
+/// stable across bench invocations, so a follow-up
+/// `kiseki-admin split-shard` or readback hits the same set the
+/// previous PUT landed in.
+#[allow(dead_code)] // used only when `native` is on; `remote-http`-only builds skip it
+fn bench_namespace_ids(fanout: usize) -> Vec<NamespaceId> {
+    let n = fanout.max(1);
+    (0..n)
+        .map(|i| {
+            let seed = format!("bench-ns-{i}");
+            NamespaceId(uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_DNS,
+                seed.as_bytes(),
+            ))
+        })
+        .collect()
+}
+
 /// Run the benchmark and emit a report on stdout. Returns the report
 /// so callers can inspect it programmatically.
 ///
@@ -160,13 +198,16 @@ async fn build_driver(cfg: &BenchConfig) -> Result<Arc<dyn Driver>, String> {
 pub async fn run(cfg: BenchConfig) -> Result<BenchReport, String> {
     let driver = build_driver(&cfg).await?;
     let payload = vec![0xa5u8; cfg.object_size];
+    let fanout = driver.fanout().max(1);
 
-    // Warmup keys for GetHeavy / Mixed.
+    // Warmup keys for GetHeavy / Mixed. Each warmup PUT lands on a
+    // round-robined slot so the GET phase also fans out across the
+    // configured namespaces.
     let warmup_keys: Vec<Key> = if matches!(cfg.shape, Shape::GetHeavy | Shape::Mixed) {
         let n = cfg.warmup_objects.max(1);
         let mut keys = Vec::with_capacity(n);
-        for _ in 0..n {
-            keys.push(driver.put(&payload).await?);
+        for i in 0..n {
+            keys.push(driver.put(&payload, i % fanout).await?);
         }
         keys
     } else {
@@ -211,7 +252,8 @@ pub async fn run(cfg: BenchConfig) -> Result<BenchReport, String> {
                 };
                 let t0 = Instant::now();
                 let res = if is_put {
-                    driver.put(&payload).await.map(|_| 0)
+                    let slot = (worker_id + n_usize) % fanout;
+                    driver.put(&payload, slot).await.map(|_| 0)
                 } else {
                     let idx = (worker_id + n_usize) % warmup_keys.len();
                     driver.get(&warmup_keys[idx]).await
@@ -339,7 +381,11 @@ mod native {
 
     // -- TCP-framed -----------------------------------------------------------
 
-    pub(super) async fn build_tcp(addr: &str, pool_size: usize) -> Result<Arc<dyn Driver>, String> {
+    pub(super) async fn build_tcp(
+        addr: &str,
+        pool_size: usize,
+        fanout: usize,
+    ) -> Result<Arc<dyn Driver>, String> {
         let pool_size = pool_size.max(1);
         let mut clients = Vec::with_capacity(pool_size);
         for _ in 0..pool_size {
@@ -349,12 +395,13 @@ mod native {
                     .map_err(|e| format!("tcp-framed connect: {e}"))?;
             clients.push(client);
         }
-        let (tenant_id, namespace_id) = default_ids();
+        let (tenant_id, _) = default_ids();
+        let namespace_ids = super::bench_namespace_ids(fanout);
         Ok(Arc::new(TcpFramedDriver {
             clients,
             next: AtomicUsize::new(0),
             tenant_id,
-            namespace_id,
+            namespace_ids,
         }))
     }
 
@@ -362,7 +409,7 @@ mod native {
         clients: Vec<Arc<crate::native::tcp_framed::client::TcpFramedClient>>,
         next: AtomicUsize,
         tenant_id: OrgId,
-        namespace_id: NamespaceId,
+        namespace_ids: Vec<NamespaceId>,
     }
 
     impl TcpFramedDriver {
@@ -374,14 +421,15 @@ mod native {
 
     #[async_trait::async_trait]
     impl Driver for TcpFramedDriver {
-        async fn put(&self, payload: &[u8]) -> Result<Key, String> {
+        async fn put(&self, payload: &[u8], slot: usize) -> Result<Key, String> {
             // V3: meta = postcard(PutObjectRequest with empty .data),
             // bulk = the actual payload bytes. The server attaches bulk
             // onto req.data before calling the handler.
+            let ns = &self.namespace_ids[slot % self.namespace_ids.len()];
             let req = kiseki_proto::v1::native::PutObjectRequest {
                 control: Some(ctrl(self.tenant_id)),
                 namespace_id: Some(kiseki_proto::v1::NamespaceId {
-                    value: self.namespace_id.0.to_string(),
+                    value: ns.0.to_string(),
                 }),
                 name: format!("bench-{}", uuid::Uuid::new_v4().simple()),
                 data: Vec::new(),
@@ -404,14 +452,16 @@ mod native {
             Ok(Key {
                 composition_id: CompositionId(uuid),
                 name: None,
+                slot: slot % self.namespace_ids.len(),
             })
         }
 
         async fn get(&self, key: &Key) -> Result<usize, String> {
+            let ns = &self.namespace_ids[key.slot % self.namespace_ids.len()];
             let req = kiseki_proto::v1::native::GetObjectRequest {
                 control: Some(ctrl(self.tenant_id)),
                 namespace_id: Some(kiseki_proto::v1::NamespaceId {
-                    value: self.namespace_id.0.to_string(),
+                    value: ns.0.to_string(),
                 }),
                 range_start: 0,
                 range_end: 0,
@@ -436,6 +486,10 @@ mod native {
         fn label(&self) -> &'static str {
             "native-tcp"
         }
+
+        fn fanout(&self) -> usize {
+            self.namespace_ids.len()
+        }
     }
 
     // -- gRPC ----------------------------------------------------------------
@@ -443,6 +497,7 @@ mod native {
     pub(super) async fn build_grpc(
         addr: &str,
         pool_size: usize,
+        fanout: usize,
     ) -> Result<Arc<dyn Driver>, String> {
         let pool_size = pool_size.max(1);
         let mut clients = Vec::with_capacity(pool_size);
@@ -463,12 +518,13 @@ mod native {
                     .max_encoding_message_size(64 * 1024 * 1024);
             clients.push(client);
         }
-        let (tenant_id, namespace_id) = default_ids();
+        let (tenant_id, _) = default_ids();
+        let namespace_ids = super::bench_namespace_ids(fanout);
         Ok(Arc::new(GrpcDriver {
             clients,
             next: AtomicUsize::new(0),
             tenant_id,
-            namespace_id,
+            namespace_ids,
         }))
     }
 
@@ -480,7 +536,7 @@ mod native {
         >,
         next: AtomicUsize,
         tenant_id: OrgId,
-        namespace_id: NamespaceId,
+        namespace_ids: Vec<NamespaceId>,
     }
 
     impl GrpcDriver {
@@ -496,11 +552,12 @@ mod native {
 
     #[async_trait::async_trait]
     impl Driver for GrpcDriver {
-        async fn put(&self, payload: &[u8]) -> Result<Key, String> {
+        async fn put(&self, payload: &[u8], slot: usize) -> Result<Key, String> {
+            let ns = &self.namespace_ids[slot % self.namespace_ids.len()];
             let req = tonic::Request::new(kiseki_proto::v1::native::PutObjectRequest {
                 control: Some(ctrl(self.tenant_id)),
                 namespace_id: Some(kiseki_proto::v1::NamespaceId {
-                    value: self.namespace_id.0.to_string(),
+                    value: ns.0.to_string(),
                 }),
                 name: format!("bench-{}", uuid::Uuid::new_v4().simple()),
                 data: payload.to_vec(),
@@ -519,14 +576,16 @@ mod native {
             Ok(Key {
                 composition_id: CompositionId(uuid),
                 name: None,
+                slot: slot % self.namespace_ids.len(),
             })
         }
 
         async fn get(&self, key: &Key) -> Result<usize, String> {
+            let ns = &self.namespace_ids[key.slot % self.namespace_ids.len()];
             let req = tonic::Request::new(kiseki_proto::v1::native::GetObjectRequest {
                 control: Some(ctrl(self.tenant_id)),
                 namespace_id: Some(kiseki_proto::v1::NamespaceId {
-                    value: self.namespace_id.0.to_string(),
+                    value: ns.0.to_string(),
                 }),
                 range_start: 0,
                 range_end: 0,
@@ -550,6 +609,10 @@ mod native {
         fn label(&self) -> &'static str {
             "native-grpc"
         }
+
+        fn fanout(&self) -> usize {
+            self.namespace_ids.len()
+        }
     }
 }
 
@@ -568,32 +631,43 @@ mod s3 {
     pub(super) struct S3Driver {
         base: String,
         client: reqwest::Client,
-        bucket: String,
+        /// One bucket per fanout slot — `bench-0`, `bench-1`, …
+        /// kiseki's S3 surface maps each distinct bucket name to a
+        /// distinct namespace via `UUIDv5(NAMESPACE_DNS, bucket)`, so
+        /// N buckets = N namespaces = up to N shard leaders under
+        /// the cluster's namespace→shard routing.
+        buckets: Vec<String>,
     }
 
     impl S3Driver {
-        pub async fn new(base: &str) -> Result<Self, String> {
+        pub async fn new(base: &str, fanout: usize) -> Result<Self, String> {
             let client = reqwest::Client::builder()
                 .pool_max_idle_per_host(64)
                 .build()
                 .map_err(|e| format!("reqwest client: {e}"))?;
             let base = base.trim_end_matches('/').to_string();
-            // Best-effort bucket create — ignore failure (may already
-            // exist from a prior run).
-            let _ = client.put(format!("{base}/bench")).send().await;
+            let n = fanout.max(1);
+            let buckets: Vec<String> = (0..n).map(|i| format!("bench-{i}")).collect();
+            // Best-effort bucket creates — ignore failure (may
+            // already exist from a prior run).
+            for b in &buckets {
+                let _ = client.put(format!("{base}/{b}")).send().await;
+            }
             Ok(Self {
                 base,
                 client,
-                bucket: "bench".to_string(),
+                buckets,
             })
         }
     }
 
     #[async_trait::async_trait]
     impl Driver for S3Driver {
-        async fn put(&self, payload: &[u8]) -> Result<Key, String> {
+        async fn put(&self, payload: &[u8], slot: usize) -> Result<Key, String> {
+            let slot = slot % self.buckets.len();
+            let bucket = &self.buckets[slot];
             let name = format!("obj-{}", uuid::Uuid::new_v4().simple());
-            let url = format!("{}/{}/{}", self.base, self.bucket, name);
+            let url = format!("{}/{}/{}", self.base, bucket, name);
             let resp = self
                 .client
                 .put(&url)
@@ -610,15 +684,17 @@ mod s3 {
                 // for GETs (we keyed by name).
                 composition_id: CompositionId(uuid::Uuid::nil()),
                 name: Some(name),
+                slot,
             })
         }
 
         async fn get(&self, key: &Key) -> Result<usize, String> {
+            let bucket = &self.buckets[key.slot % self.buckets.len()];
             let name = key
                 .name
                 .as_deref()
                 .ok_or_else(|| "s3 get: key has no name".to_string())?;
-            let url = format!("{}/{}/{}", self.base, self.bucket, name);
+            let url = format!("{}/{}/{}", self.base, bucket, name);
             let resp = self
                 .client
                 .get(&url)
@@ -638,6 +714,10 @@ mod s3 {
         fn label(&self) -> &'static str {
             "s3"
         }
+
+        fn fanout(&self) -> usize {
+            self.buckets.len()
+        }
     }
 }
 
@@ -656,6 +736,7 @@ mod tests {
             duration: Duration::from_secs(1),
             warmup_objects: 0,
             json: false,
+            namespace_fanout: 1,
         };
         let Err(err) = build_driver(&cfg).await else {
             panic!("ftp:// must be rejected");
@@ -681,6 +762,7 @@ mod tests {
             duration: Duration::from_secs(1),
             warmup_objects: 0,
             json: false,
+            namespace_fanout: 1,
         };
         let Err(err) = build_driver(&cfg).await else {
             panic!("port 1 is reserved — no listener can answer");

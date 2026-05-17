@@ -14,6 +14,11 @@
 #   KISEKI_BENCH_CONCURRENCY     (default: 16)   per-client concurrency
 #   KISEKI_BENCH_OBJECT_SIZE     (default: 65536)
 #   KISEKI_BENCH_PARALLEL_CLIENTS (default: 2 local / count of CLIENT_ARRAY on gcp)
+#   KISEKI_BENCH_NAMESPACE_FANOUT (default: storage_count) — issue #66 fix 2.
+#     `kiseki-client bench --namespace-fanout N` round-robins PUTs across
+#     N namespaces; with N = storage_count and shards split out, each
+#     namespace can land on its own shard leader (the perf-harness
+#     consumer of the multi-shard architecture).
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -30,8 +35,14 @@ OBJSZ="${KISEKI_BENCH_OBJECT_SIZE:-65536}"
 MODE=$(bench_mode)
 if [ "$MODE" = "gcp" ]; then
   N_CLIENTS="${KISEKI_BENCH_PARALLEL_CLIENTS:-${#CLIENT_ARRAY[@]}}"
+  # Default fanout = storage_count, so each bench-ns-<i> aims for
+  # its own shard once splits are wired. Defaults to 1 when
+  # STORAGE_IPS_ARRAY is empty (local single-node debug runs).
+  N_STORAGE="${#STORAGE_IPS_ARRAY[@]}"
+  FANOUT="${KISEKI_BENCH_NAMESPACE_FANOUT:-${N_STORAGE:-1}}"
 else
   N_CLIENTS="${KISEKI_BENCH_PARALLEL_CLIENTS:-2}"
+  FANOUT="${KISEKI_BENCH_NAMESPACE_FANOUT:-1}"
 fi
 
 OUT="$RESULTS/11-native-parallel.txt"
@@ -39,6 +50,7 @@ OUT="$RESULTS/11-native-parallel.txt"
   echo "=== Phase 11: parallel native put-heavy ==="
   echo "mode=$MODE n_clients=$N_CLIENTS endpoint=$LEADER_NATIVE_URL"
   echo "per-client: duration=${DURATION}s concurrency=$CONC object_size=$OBJSZ"
+  echo "namespace_fanout=$FANOUT"
   echo ""
 } | tee "$OUT"
 
@@ -75,14 +87,14 @@ for i in $(seq 0 $((N_CLIENTS - 1))); do
       client_run "$idx" > "$CLIENT_OUT" 2>&1 <<EOF
 $CLIENT_BIN bench --endpoint $LEADER_NATIVE_URL --shape put-heavy \
   --concurrency $CONC --object-size $OBJSZ \
-  --duration-secs $DURATION --json
+  --duration-secs $DURATION --namespace-fanout $FANOUT --json
 EOF
     ) &
   else
     (
       "$CLIENT_BIN" bench --endpoint "$LEADER_NATIVE_URL" --shape put-heavy \
         --concurrency "$CONC" --object-size "$OBJSZ" \
-        --duration-secs "$DURATION" --json > "$CLIENT_OUT" 2>&1
+        --duration-secs "$DURATION" --namespace-fanout "$FANOUT" --json > "$CLIENT_OUT" 2>&1
     ) &
   fi
   PIDS+=($!)
