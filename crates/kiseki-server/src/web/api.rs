@@ -38,6 +38,11 @@ pub struct UiState {
     /// per-namespace shard maps the `/cluster/info` `shards` field
     /// (ADR-008 rev 2) projects. `None` on single-node deployments.
     pub cluster_control: Option<Arc<crate::cluster_control::ControlStateMachine>>,
+    /// Writable handle to the control-plane Raft store. Lets admin
+    /// HTTP routes submit `ControlCommand`s (e.g. `CreateNamespace`
+    /// for #68's multi-shard namespace endpoint). `None` on single-
+    /// node deployments — paired with `cluster_control` above.
+    pub cluster_control_store: Option<Arc<crate::cluster_control::OpenRaftControlStore>>,
     /// In-process audit log. The Audit dashboard tab + `kiseki-admin
     /// audit query` read from here.
     pub audit: Option<super::admin_extra::AuditHandle>,
@@ -1037,6 +1042,7 @@ mod cluster_info_rev2_tests {
             compositions: None,
             local_chunk_store: None,
             cluster_control: Some(Arc::new(state)),
+            cluster_control_store: None,
             audit: None,
             key_manager: None,
             tenants: None,
@@ -1124,6 +1130,7 @@ mod cluster_info_rev2_tests {
             compositions: None,
             local_chunk_store: None,
             cluster_control: None,
+            cluster_control_store: None,
             audit: None,
             key_manager: None,
             tenants: None,
@@ -1209,6 +1216,7 @@ mod ui_router_auth_tests {
             compositions: None,
             local_chunk_store: None,
             cluster_control: None,
+            cluster_control_store: None,
             audit: None,
             key_manager: None,
             tenants: None,

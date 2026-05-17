@@ -567,6 +567,19 @@ enum Command {
         left_shard_id: String,
         right_shard_id: String,
     },
+    /// `topology namespace-create <namespace-id> --tenant <uuid> [--shards N]` —
+    /// create a namespace with `N` shards from inception (#68). Posts
+    /// to `/admin/topology/namespaces`; per-shard Raft groups spin up
+    /// on apply across every node via `ShardStoreApplyHook`.
+    ///
+    /// `--shards` defaults to `compute_initial_shards(default, active_nodes)`
+    /// (typically `3 × node_count` capped at 64). Pass an explicit
+    /// value to align with `kiseki-client bench --namespace-fanout N`.
+    TopologyCreateNamespace {
+        namespace_id: String,
+        tenant_id: String,
+        shards: Option<u32>,
+    },
     /// `forwarding` — proxy + stale-leader counters per node.
     Forwarding,
     /// `audit query [--tenant T] [--type X] [--limit N] [--from S] [--local-only]`
@@ -782,6 +795,7 @@ fn parse_subcommand(args: &[String], start: usize) -> Result<Command, String> {
         "scrub" => Ok(Command::Scrub),
         "shards" => Ok(Command::Shards),
         "shard" => parse_shard(&args[i..]),
+        "topology" => parse_topology(&args[i..]),
         "forwarding" => Ok(Command::Forwarding),
         "audit" => parse_audit(&args[i..]),
         "tenant" => parse_tenant(&args[i..]),
@@ -844,6 +858,56 @@ fn parse_shard(rest: &[String]) -> Result<Command, String> {
         }
         other => Err(format!(
             "unknown shard subcommand: {other} (try: shard split | shard merge)"
+        )),
+    }
+}
+
+/// `topology namespace-create <namespace-id> --tenant <uuid> [--shards N]`
+fn parse_topology(rest: &[String]) -> Result<Command, String> {
+    let sub = rest
+        .first()
+        .ok_or("topology requires a subcommand (namespace-create)")?;
+    match sub.as_str() {
+        "namespace-create" => {
+            let namespace_id = rest
+                .get(1)
+                .cloned()
+                .ok_or("topology namespace-create requires <namespace-id>")?;
+            let mut tenant_id: Option<String> = None;
+            let mut shards: Option<u32> = None;
+            let mut i = 2;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--tenant" | "--tenant-id" => {
+                        i += 1;
+                        tenant_id = rest.get(i).cloned();
+                        i += 1;
+                    }
+                    "--shards" => {
+                        i += 1;
+                        let raw = rest.get(i).ok_or("--shards requires a positive u32")?;
+                        let n: u32 = raw.parse().map_err(|e| format!("--shards: {raw}: {e}"))?;
+                        if n == 0 {
+                            return Err("--shards must be > 0".into());
+                        }
+                        shards = Some(n);
+                        i += 1;
+                    }
+                    other => {
+                        return Err(format!("unknown topology namespace-create flag: {other}"));
+                    }
+                }
+            }
+            let tenant_id =
+                tenant_id.ok_or("topology namespace-create requires --tenant <uuid>")?;
+            Ok(Command::TopologyCreateNamespace {
+                namespace_id,
+                tenant_id,
+                shards,
+            })
+        }
+        other => Err(format!(
+            "unknown topology subcommand: {other} (try: topology namespace-create)"
         )),
     }
 }
@@ -1244,6 +1308,29 @@ fn main() {
                 format_forwarding(&b)
             }
         }),
+        Command::TopologyCreateNamespace {
+            namespace_id,
+            tenant_id,
+            shards,
+        } => {
+            let shards_field = match shards {
+                Some(n) => format!(",\"shards\":{n}"),
+                None => String::new(),
+            };
+            let body = format!(
+                "{{\"namespace_id\":\"{}\",\"tenant_id\":\"{}\"{}}}",
+                json_escape(&namespace_id),
+                json_escape(&tenant_id),
+                shards_field
+            );
+            http_post(&args.endpoint, "/admin/topology/namespaces", &body).map(|b| {
+                if json {
+                    b
+                } else {
+                    format_topology_create_namespace(&b)
+                }
+            })
+        }
         Command::AuditQuery {
             tenant,
             event_type,
@@ -1549,6 +1636,22 @@ fn format_shard_split(body: &str) -> String {
     }
     format!(
         "Shard split:\n  source: {source}\n  left:   {left}\n  right:  {right}\n  log_index: {idx}\n"
+    )
+}
+
+fn format_topology_create_namespace(body: &str) -> String {
+    if let Some(err) = json_str(body, "error") {
+        let existing = json_u64(body, "existing_shard_count");
+        if let Some(n) = existing {
+            return format!("Namespace already exists: {err} (existing_shard_count={n})\n");
+        }
+        return format!("Namespace create failed: {err}\n");
+    }
+    let ns = json_str(body, "namespace_id").unwrap_or("?");
+    let tenant = json_str(body, "tenant_id").unwrap_or("?");
+    let count = json_u64(body, "shard_count").unwrap_or(0);
+    format!(
+        "Namespace created:\n  namespace_id: {ns}\n  tenant_id:    {tenant}\n  shard_count:  {count}\n"
     )
 }
 
@@ -2000,6 +2103,97 @@ mod tests {
         assert!(parse(&["shard", "merge", "left-uuid", "right-uuid", "extra"]).is_err());
         // Unknown shard subcommand
         assert!(parse(&["shard", "rebalance", "x"]).is_err());
+    }
+
+    /// #68 — `topology namespace-create <id> --tenant <uuid> [--shards N]`
+    #[test]
+    fn topology_namespace_create_parses_required_and_optional_flags() {
+        // Required-only: namespace-id + --tenant. shards omitted →
+        // server-side computes from active_node_count.
+        let cmd = parse(&[
+            "topology",
+            "namespace-create",
+            "bench-ns-0",
+            "--tenant",
+            "00000000-0000-0000-0000-000000000001",
+        ])
+        .expect("namespace-create bench-ns-0 --tenant <uuid>");
+        match cmd {
+            Command::TopologyCreateNamespace {
+                namespace_id,
+                tenant_id,
+                shards,
+            } => {
+                assert_eq!(namespace_id, "bench-ns-0");
+                assert_eq!(tenant_id, "00000000-0000-0000-0000-000000000001");
+                assert!(
+                    shards.is_none(),
+                    "shards omitted → None so server picks the default"
+                );
+            }
+            _ => panic!("expected TopologyCreateNamespace"),
+        }
+
+        // With explicit --shards 3
+        let cmd = parse(&[
+            "topology",
+            "namespace-create",
+            "bench-ns-0",
+            "--tenant",
+            "00000000-0000-0000-0000-000000000001",
+            "--shards",
+            "3",
+        ])
+        .expect("with --shards");
+        match cmd {
+            Command::TopologyCreateNamespace { shards, .. } => {
+                assert_eq!(shards, Some(3));
+            }
+            _ => panic!("expected TopologyCreateNamespace"),
+        }
+
+        // Missing --tenant
+        assert!(parse(&["topology", "namespace-create", "bench-ns-0"]).is_err());
+        // Missing namespace-id
+        assert!(parse(&["topology", "namespace-create"]).is_err());
+        // --shards 0
+        assert!(parse(&[
+            "topology",
+            "namespace-create",
+            "bench-ns-0",
+            "--tenant",
+            "00000000-0000-0000-0000-000000000001",
+            "--shards",
+            "0"
+        ])
+        .is_err());
+        // Unknown topology subcommand
+        assert!(parse(&["topology", "shard-merge", "x"]).is_err());
+    }
+
+    #[test]
+    fn format_topology_create_namespace_renders_success_and_conflict() {
+        // Success body
+        let body = r#"{"namespace_id":"bench-ns-0","tenant_id":"00000000-0000-0000-0000-000000000001","shard_count":3}"#;
+        let out = format_topology_create_namespace(body);
+        assert!(out.contains("Namespace created"), "headline missing");
+        assert!(out.contains("bench-ns-0"), "namespace_id missing");
+        assert!(out.contains("shard_count:  3"), "shard count missing");
+
+        // Idempotent re-invocation body (409)
+        let body = r#"{"error":"namespace already exists","namespace_id":"bench-ns-0","existing_shard_count":3}"#;
+        let out = format_topology_create_namespace(body);
+        assert!(out.contains("already exists"), "echo error message");
+        assert!(
+            out.contains("existing_shard_count=3"),
+            "include existing count so caller can no-op without re-parsing"
+        );
+
+        // Generic error
+        let body = r#"{"error":"forward request to: NodeId(2)"}"#;
+        let out = format_topology_create_namespace(body);
+        assert!(out.contains("Namespace create failed"));
+        assert!(out.contains("forward request to"));
     }
 
     #[test]

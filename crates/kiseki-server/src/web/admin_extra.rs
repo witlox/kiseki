@@ -55,6 +55,10 @@ pub fn admin_extra_routes() -> Router<UiState> {
         .route("/admin/topology/shards", get(api_topology_shards))
         .route("/admin/topology/shards/split", post(api_split_shard))
         .route("/admin/topology/shards/merge", post(api_merge_shards))
+        .route(
+            "/admin/topology/namespaces",
+            post(api_create_sharded_namespace),
+        )
         .route("/admin/topology/forwarding", get(api_topology_forwarding))
         .route(
             "/ui/fragment/topology-shards",
@@ -340,6 +344,232 @@ async fn api_merge_shards(
             })),
         ),
     }
+}
+
+/// `POST /admin/topology/namespaces` — create a namespace whose
+/// `NamespaceShardMap` already covers N shards at inception (#68,
+/// blocks #66 fix 2). The internal API `compute_shard_ranges` +
+/// `ControlCommand::CreateNamespace` already exists; this route is
+/// the thin admin-HTTP surface that lets `kiseki-admin` (and
+/// `infra/gcp/scripts/setup-shards.sh`) drive it.
+///
+/// Body: `{"namespace_id": "<utf-8 id>", "tenant_id": "<uuid>",
+/// "shards": <u32>?}`. `shards` defaults to
+/// `compute_initial_shards(default_config, active_node_count)` —
+/// typically `3 × node_count` capped at 64.
+///
+/// Response: `{"namespace_id": ..., "shard_count": N,
+/// "shards": [{"shard_id", "range_start", "range_end",
+/// "leader_node"}, ...]}` — the full topology the apply hooks
+/// will install across the cluster.
+///
+/// Idempotent: a repeat call with the same `namespace_id` returns
+/// 409 with `existing_shard_count` so callers can no-op without
+/// parsing the error message. Mirrors the convention `api_create_org`
+/// uses for orgs.
+#[allow(clippy::too_many_lines)] // single linear flow: parse → validate → build → submit → format
+async fn api_create_sharded_namespace(
+    State(state): State<UiState>,
+    body: String,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+    use kiseki_common::ids::{NodeId, OrgId};
+    use kiseki_control::shard_topology::{
+        compute_initial_shards, compute_shard_ranges, ShardTopologyConfig,
+    };
+
+    let (Some(cluster_control), Some(cluster_control_store)) = (
+        state.cluster_control.as_ref(),
+        state.cluster_control_store.as_ref(),
+    ) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": "cluster control not wired (single-node deploy?)"
+            })),
+        );
+    };
+
+    let parsed: serde_json::Value = if body.trim().is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "error": format!("invalid JSON body: {e}"),
+                    })),
+                );
+            }
+        }
+    };
+
+    let namespace_id = parsed
+        .get("namespace_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if namespace_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "namespace_id is required",
+            })),
+        );
+    }
+    let tenant_id_str = parsed
+        .get("tenant_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let tenant_id = match uuid::Uuid::parse_str(&tenant_id_str) {
+        Ok(u) => OrgId(u),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": format!("tenant_id must be a UUID: {e}"),
+                })),
+            );
+        }
+    };
+    let requested_shards = parsed.get("shards").and_then(serde_json::Value::as_u64);
+
+    // Idempotent re-invocation: if the namespace already exists, echo
+    // the current shard count back with 409 so the caller can no-op
+    // without parsing an error string.
+    if let Some(existing) = cluster_control.namespace(&namespace_id).await {
+        let n = existing.shards.len();
+        return (
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "error": "namespace already exists",
+                "namespace_id": namespace_id,
+                "existing_shard_count": n,
+            })),
+        );
+    }
+
+    // Active node list from the raft_peers field (always populated on
+    // a multi-node cluster). Single-node deployments degrade to
+    // [NodeId(self)] so the apply hook still fires.
+    let mut active_nodes: Vec<NodeId> = state
+        .node_info
+        .raft_peers
+        .iter()
+        .map(|(id, _)| NodeId(*id))
+        .collect();
+    if active_nodes.is_empty() {
+        active_nodes.push(NodeId(state.node_info.node_id));
+    }
+
+    let config = ShardTopologyConfig::default();
+    let shard_count = match requested_shards {
+        Some(n) if n > 0 => match u32::try_from(n) {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "error": "shards exceeds u32::MAX",
+                    })),
+                );
+            }
+        },
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": "shards must be a positive u32",
+                })),
+            );
+        }
+        None => compute_initial_shards(
+            &config,
+            u32::try_from(active_nodes.len()).unwrap_or(u32::MAX),
+        ),
+    };
+
+    let ranges = compute_shard_ranges(shard_count, &active_nodes);
+    let shards: Vec<crate::cluster_control::commands::ShardRecord> = ranges
+        .iter()
+        .map(|r| crate::cluster_control::commands::ShardRecord {
+            shard_id: r.shard_id,
+            range_start: r.range_start,
+            range_end: r.range_end,
+            leader_node: r.leader_node,
+        })
+        .collect();
+
+    let cmd = crate::cluster_control::ControlCommand::CreateNamespace {
+        namespace_id: namespace_id.clone(),
+        tenant_id,
+        shards: shards.clone(),
+    };
+
+    match cluster_control_store.submit(cmd).await {
+        Ok(resp) => {
+            let n = match resp {
+                crate::cluster_control::ControlResponse::NamespaceCreated { shard_count } => {
+                    shard_count
+                }
+                _ => shard_count,
+            };
+            let shard_json: Vec<serde_json::Value> = shards
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "shard_id": s.shard_id.0.to_string(),
+                        "range_start": encode_range_hex(&s.range_start),
+                        "range_end": encode_range_hex(&s.range_end),
+                        "leader_node": s.leader_node.0,
+                    })
+                })
+                .collect();
+            (
+                StatusCode::CREATED,
+                axum::Json(serde_json::json!({
+                    "namespace_id": namespace_id,
+                    "tenant_id": tenant_id.0.to_string(),
+                    "shard_count": n,
+                    "shards": shard_json,
+                })),
+            )
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            // openraft returns `forward request to: NodeId(X)` when
+            // this node isn't the leader. Translate so callers know
+            // to retry against the leader.
+            let code = if msg.contains("forward request to") {
+                StatusCode::MISDIRECTED_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (
+                code,
+                axum::Json(serde_json::json!({
+                    "error": msg,
+                })),
+            )
+        }
+    }
+}
+
+/// Encode a 32-byte hashed-key bound as a `0x`-prefixed lowercase
+/// hex string. Mirrors `api::encode_hex_prefixed` (kept inline here
+/// because that helper is private to api.rs and the contract — wire
+/// shape per ADR-008 rev 2 — must stay aligned across both routes).
+fn encode_range_hex(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(2 + 64);
+    s.push_str("0x");
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 async fn api_topology_forwarding(State(state): State<UiState>) -> impl IntoResponse {
