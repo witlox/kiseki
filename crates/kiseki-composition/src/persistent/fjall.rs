@@ -44,7 +44,7 @@
 use std::path::Path;
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
-use kiseki_common::ids::{CompositionId, NamespaceId, SequenceNumber};
+use kiseki_common::ids::{CompositionId, NamespaceId, SequenceNumber, ShardId};
 
 use super::error::PersistentStoreError;
 use super::storage::{CompositionStorage, HydrationBatch};
@@ -64,10 +64,30 @@ const KS_NAMES_REV: &str = "names_rev";
 const KS_META: &str = "meta";
 
 mod meta_keys {
+    use kiseki_common::ids::ShardId;
+
     pub const SCHEMA_VERSION: &[u8] = b"schema_version";
-    pub const LAST_APPLIED_SEQ: &[u8] = b"last_applied_seq";
-    pub const STUCK_STATE: &[u8] = b"stuck_state";
+    /// Halt is global (any shard's hydrator can set it; reads on the
+    /// node fail safe across shards).
     pub const HALTED: &[u8] = b"halted";
+
+    /// Per-shard `last_applied_seq` key: `b"last_applied_seq:" || shard_uuid_bytes`.
+    pub fn last_applied_seq(shard_id: ShardId) -> Vec<u8> {
+        let prefix = b"last_applied_seq:";
+        let mut out = Vec::with_capacity(prefix.len() + 16);
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(shard_id.0.as_bytes());
+        out
+    }
+
+    /// Per-shard `stuck_state` key: `b"stuck_state:" || shard_uuid_bytes`.
+    pub fn stuck_state(shard_id: ShardId) -> Vec<u8> {
+        let prefix = b"stuck_state:";
+        let mut out = Vec::with_capacity(prefix.len() + 16);
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(shard_id.0.as_bytes());
+        out
+    }
 }
 
 /// Fjall-backed implementation of [`CompositionStorage`].
@@ -394,8 +414,8 @@ impl CompositionStorage for FjallStorage {
         Ok(out)
     }
 
-    fn last_applied_seq(&self) -> Result<SequenceNumber, PersistentStoreError> {
-        match self.meta.get(meta_keys::LAST_APPLIED_SEQ)? {
+    fn last_applied_seq(&self, shard_id: ShardId) -> Result<SequenceNumber, PersistentStoreError> {
+        match self.meta.get(meta_keys::last_applied_seq(shard_id))? {
             None => Ok(SequenceNumber(0)),
             Some(slice) => {
                 let bytes = slice.as_ref();
@@ -412,8 +432,11 @@ impl CompositionStorage for FjallStorage {
         }
     }
 
-    fn stuck_state(&self) -> Result<Option<(SequenceNumber, u32)>, PersistentStoreError> {
-        match self.meta.get(meta_keys::STUCK_STATE)? {
+    fn stuck_state(
+        &self,
+        shard_id: ShardId,
+    ) -> Result<Option<(SequenceNumber, u32)>, PersistentStoreError> {
+        match self.meta.get(meta_keys::stuck_state(shard_id))? {
             None => Ok(None),
             Some(slice) => decode_stuck_state(slice.as_ref()),
         }
@@ -476,13 +499,13 @@ impl CompositionStorage for FjallStorage {
         // wrt the rest of the hydration writes (I-CP1).
         wb.insert(
             &self.meta,
-            meta_keys::LAST_APPLIED_SEQ.to_vec(),
+            meta_keys::last_applied_seq(batch.shard_id),
             batch.new_last_applied_seq.0.to_le_bytes().to_vec(),
         );
         if let Some(stuck) = batch.stuck_state {
             wb.insert(
                 &self.meta,
-                meta_keys::STUCK_STATE.to_vec(),
+                meta_keys::stuck_state(batch.shard_id),
                 encode_stuck_state(stuck),
             );
         }

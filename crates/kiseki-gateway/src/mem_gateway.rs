@@ -2591,6 +2591,7 @@ mod halt_mode_tests {
         let storage = MemoryStorage::new();
         storage
             .apply_hydration_batch(HydrationBatch {
+                shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
                 puts: Vec::new(),
                 removes: Vec::new(),
                 name_inserts: Vec::new(),

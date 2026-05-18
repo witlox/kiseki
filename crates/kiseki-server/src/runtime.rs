@@ -546,6 +546,14 @@ pub async fn run_main(
     let mut shard_map_store_for_gateway: Option<
         Arc<kiseki_control::shard_topology::NamespaceShardMapStore>,
     > = None;
+    // Holds the concrete `ShardStoreApplyHook` Arc so the
+    // composition-hydrator registry can be attached after the
+    // gateway's `CompositionStore` is built. Multi-shard hydration
+    // depends on this attachment: every shard the apply hook
+    // registers also gets a hydrator task. None on single-node /
+    // persistent / in-memory paths where there's no control plane.
+    let mut apply_hook_for_registry: Option<Arc<crate::cluster_control::ShardStoreApplyHook>> =
+        None;
     let log_store: Arc<dyn kiseki_log::LogOps + Send + Sync> = if cfg.node_id > 0
         && cfg.raft_peers.len() > 1
     {
@@ -610,9 +618,17 @@ pub async fn run_main(
         // per-shard Raft group locally — closes the cluster-wide
         // split gap surfaced by the @shard-mgmt BDD scenarios.
         let raft_rt = store_arc.raft_runtime_handle();
-        let apply_hook: Arc<dyn crate::cluster_control::ApplyHook> = Arc::new(
-            crate::cluster_control::ShardStoreApplyHook::new(Arc::clone(&store_arc), cfg.node_id),
-        );
+        // Hold the concrete `ShardStoreApplyHook` Arc so the
+        // composition-hydrator registry can be attached later (after
+        // the gateway's `CompositionStore` is built). The hook is
+        // also passed into `OpenRaftControlStore::new` via the
+        // `ApplyHook` trait object — same `Arc`, two references.
+        let apply_hook_concrete = Arc::new(crate::cluster_control::ShardStoreApplyHook::new(
+            Arc::clone(&store_arc),
+            cfg.node_id,
+        ));
+        apply_hook_for_registry = Some(Arc::clone(&apply_hook_concrete));
+        let apply_hook: Arc<dyn crate::cluster_control::ApplyHook> = apply_hook_concrete;
         // ADR-033 §5: shared shard map between (a) the control-plane
         // state machine's apply path (populates it on every node) and
         // (b) the gateway's `shard_map` field (consults it for
@@ -1811,26 +1827,40 @@ pub async fn run_main(
         }
     });
 
-    // Phase 16f: composition hydrator — followers reconstruct their
-    // CompositionStore from the Raft-replicated delta log so cross-node
-    // GETs resolve. Sibling of the view stream processor above; both
-    // consume the same delta stream with non-overlapping responsibilities
-    // (views: watermarks, compositions: id→metadata).
+    // Phase 16f + multi-shard hydrator (2026-05-18): followers
+    // reconstruct their CompositionStore from each per-shard Raft
+    // log. A single bootstrap-shard hydrator was wrong for the ADR-033
+    // §4 / §1 multi-shard topology — every tenant namespace lives on
+    // its own shard, so Create deltas on those shards never made it
+    // into followers' local CompositionStore. The `HydratorRegistry`
+    // owns one hydrator task per known shard; the control-plane
+    // `ShardStoreApplyHook` calls `register(shard_id)` on every
+    // `CreateNamespace` / `RecordSplit` commit, so a fresh tenant
+    // shard is hydrated immediately after the apply hook installs the
+    // local Raft group. Sibling of the view stream processor above;
+    // both consume the same delta stream with non-overlapping
+    // responsibilities (views: watermarks, compositions: id→metadata).
     if multi_node {
         let hyd_log = Arc::clone(&log_store);
         let hyd_compositions = gw.compositions_handle();
-        let hyd_shard = bootstrap_shard;
         let hyd_metrics = composition_metrics_for_hydrator;
-        tokio::spawn(async move {
-            let mut hydrator = kiseki_composition::CompositionHydrator::new(hyd_compositions)
-                .with_metrics(hyd_metrics);
-            loop {
-                let _applied = hydrator.poll(hyd_log.as_ref(), hyd_shard).await;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        });
+        let registry = Arc::new(kiseki_composition::HydratorRegistry::new(
+            hyd_compositions,
+            hyd_log,
+            Some(hyd_metrics),
+        ));
+        // Pre-register the bootstrap shard so its hydrator starts
+        // immediately, before any control-plane CreateNamespace
+        // commits land.
+        registry.register(bootstrap_shard);
+        // Hand the registry to the cluster-control apply hook so
+        // every subsequent shard creation also registers a hydrator.
+        if let Some(hook) = apply_hook_for_registry.as_ref() {
+            hook.attach_hydrator_registry(Arc::clone(&registry));
+        }
         tracing::info!(
-            "composition hydrator spawned (Phase 16f — followers consume create-deltas)",
+            "composition hydrator registry spawned (bootstrap shard pre-registered; \
+             apply hook will register per-namespace shards)",
         );
     }
 

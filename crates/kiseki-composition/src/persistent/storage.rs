@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 
-use kiseki_common::ids::{CompositionId, NamespaceId, SequenceNumber};
+use kiseki_common::ids::{CompositionId, NamespaceId, SequenceNumber, ShardId};
 
 use super::error::PersistentStoreError;
 use crate::composition::Composition;
@@ -161,26 +161,36 @@ pub trait CompositionStorage: Send + Sync {
     // -- Hydrator meta state (ADR-040 §D5, §D5.1, §D6.3, I-CP1, I-CP6) --
 
     /// Highest delta sequence whose state has been durably applied
-    /// to this store. The hydrator polls
-    /// `read_deltas(from = last_applied_seq + 1, ...)`.
-    fn last_applied_seq(&self) -> Result<SequenceNumber, PersistentStoreError>;
+    /// for the given shard. The hydrator for that shard polls
+    /// `read_deltas(from = last_applied_seq(shard) + 1, ...)`.
+    ///
+    /// Per-shard: each Raft shard has its own sequence space, so the
+    /// "high water mark" must be keyed by shard. A new shard returns
+    /// `SequenceNumber(0)` until its first hydration batch commits.
+    fn last_applied_seq(&self, shard_id: ShardId) -> Result<SequenceNumber, PersistentStoreError>;
 
-    /// Per-stuck-delta retry counter (I-1 / N-1 closure). Returns
-    /// `(stuck_at_seq, retries)` if a delta is currently being
-    /// retried; `None` once it succeeds or is promoted to a permanent
-    /// skip. Persisted in the same backend batch as
-    /// `last_applied_seq` so a crash-loop accumulates retries
-    /// reliably across restarts.
-    fn stuck_state(&self) -> Result<Option<(SequenceNumber, u32)>, PersistentStoreError>;
+    /// Per-stuck-delta retry counter (I-1 / N-1 closure), keyed by
+    /// shard. Returns `(stuck_at_seq, retries)` if a delta is
+    /// currently being retried on that shard; `None` once it
+    /// succeeds or is promoted to a permanent skip. Persisted in
+    /// the same backend batch as `last_applied_seq` so a crash-loop
+    /// accumulates retries reliably across restarts.
+    fn stuck_state(
+        &self,
+        shard_id: ShardId,
+    ) -> Result<Option<(SequenceNumber, u32)>, PersistentStoreError>;
 
     /// Halt-mode flag. When `true`, the gateway returns 503 for
-    /// composition-not-found lookups instead of 404 (I-2). The
-    /// hydrator sets this when §D6.3's gap-detection rule fires.
+    /// composition-not-found lookups instead of 404 (I-2). Any
+    /// shard's hydrator can set this when §D6.3's gap-detection
+    /// rule fires; reads on this node fail safe until operator
+    /// intervention.
     fn halted(&self) -> Result<bool, PersistentStoreError>;
 
     /// Apply a hydrator batch atomically. The persistent backend
     /// commits all inserts + removes + meta updates in a single
-    /// atomic batch (I-CP1).
+    /// atomic batch (I-CP1). `batch.shard_id` scopes the
+    /// `last_applied_seq` / `stuck_state` meta updates.
     fn apply_hydration_batch(&self, batch: HydrationBatch) -> Result<(), PersistentStoreError>;
 }
 
@@ -188,6 +198,11 @@ pub trait CompositionStorage: Send + Sync {
 /// `apply_hydration_batch`.
 #[derive(Debug)]
 pub struct HydrationBatch {
+    /// Which shard's hydrator produced this batch. Scopes the
+    /// `new_last_applied_seq` + `stuck_state` meta updates so
+    /// per-shard hydrators don't stomp on each other's high-water
+    /// marks (ADR-040, multi-shard hydrator extension).
+    pub shard_id: ShardId,
     /// Compositions to insert (Create deltas) or replace (Update
     /// deltas — Update applies as a `put` since the new
     /// `Composition` already has the bumped `version` and updated
@@ -217,11 +232,13 @@ pub struct HydrationBatch {
 }
 
 impl HydrationBatch {
-    /// Empty batch advancing to the given seq, clearing stuck state.
-    /// Used when every delta in the poll applied cleanly.
+    /// Empty batch advancing the named shard's `last_applied_seq` to
+    /// the given value, clearing stuck state. Used when every delta
+    /// in the poll applied cleanly.
     #[must_use]
-    pub fn advance(new_last_applied_seq: SequenceNumber) -> Self {
+    pub fn advance(shard_id: ShardId, new_last_applied_seq: SequenceNumber) -> Self {
         Self {
+            shard_id,
             puts: Vec::new(),
             removes: Vec::new(),
             name_inserts: Vec::new(),
@@ -266,8 +283,13 @@ pub struct MemoryStorage {
     /// by Delete deltas to find what to unbind. A composition without
     /// a name (NFS path, internal use) has no entry here.
     names_reverse: parking_lot::Mutex<HashMap<CompositionId, (NamespaceId, String)>>,
-    last_applied_seq: parking_lot::Mutex<SequenceNumber>,
-    stuck_state: parking_lot::Mutex<Option<(SequenceNumber, u32)>>,
+    /// Per-shard last-applied sequence. Multi-shard hydrators write
+    /// disjoint keys.
+    last_applied_seq: parking_lot::Mutex<HashMap<ShardId, SequenceNumber>>,
+    /// Per-shard stuck-delta retry counter.
+    stuck_state: parking_lot::Mutex<HashMap<ShardId, Option<(SequenceNumber, u32)>>>,
+    /// Halt flag is node-global: any shard's hydrator halting takes
+    /// the node's read path to 503 fail-safe.
     halted: parking_lot::Mutex<bool>,
 }
 
@@ -288,8 +310,8 @@ impl MemoryStorage {
             compositions: parking_lot::Mutex::new(HashMap::new()),
             names: parking_lot::Mutex::new(HashMap::new()),
             names_reverse: parking_lot::Mutex::new(HashMap::new()),
-            last_applied_seq: parking_lot::Mutex::new(SequenceNumber(0)),
-            stuck_state: parking_lot::Mutex::new(None),
+            last_applied_seq: parking_lot::Mutex::new(HashMap::new()),
+            stuck_state: parking_lot::Mutex::new(HashMap::new()),
             halted: parking_lot::Mutex::new(false),
         }
     }
@@ -406,12 +428,25 @@ impl CompositionStorage for MemoryStorage {
         Ok(out)
     }
 
-    fn last_applied_seq(&self) -> Result<SequenceNumber, PersistentStoreError> {
-        Ok(*self.last_applied_seq.lock())
+    fn last_applied_seq(&self, shard_id: ShardId) -> Result<SequenceNumber, PersistentStoreError> {
+        Ok(self
+            .last_applied_seq
+            .lock()
+            .get(&shard_id)
+            .copied()
+            .unwrap_or(SequenceNumber(0)))
     }
 
-    fn stuck_state(&self) -> Result<Option<(SequenceNumber, u32)>, PersistentStoreError> {
-        Ok(*self.stuck_state.lock())
+    fn stuck_state(
+        &self,
+        shard_id: ShardId,
+    ) -> Result<Option<(SequenceNumber, u32)>, PersistentStoreError> {
+        Ok(self
+            .stuck_state
+            .lock()
+            .get(&shard_id)
+            .copied()
+            .unwrap_or(None))
     }
 
     fn halted(&self) -> Result<bool, PersistentStoreError> {
@@ -456,9 +491,11 @@ impl CompositionStorage for MemoryStorage {
                 names_reverse.remove(&id);
             }
         }
-        *self.last_applied_seq.lock() = batch.new_last_applied_seq;
+        self.last_applied_seq
+            .lock()
+            .insert(batch.shard_id, batch.new_last_applied_seq);
         if let Some(stuck) = batch.stuck_state {
-            *self.stuck_state.lock() = stuck;
+            self.stuck_state.lock().insert(batch.shard_id, stuck);
         }
         if let Some(halted) = batch.halted {
             *self.halted.lock() = halted;
