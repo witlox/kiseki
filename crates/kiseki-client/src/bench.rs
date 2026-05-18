@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kiseki_common::ids::CompositionId;
+use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
 
 /// Workload shape — what mix of operations to drive. Mirrors
 /// `kiseki-profile::Shape` so the output tables align.
@@ -67,6 +67,38 @@ pub struct BenchConfig {
     pub warmup_objects: usize,
     /// Emit machine-readable JSON instead of the human table.
     pub json: bool,
+    /// Override the `tenant_id` used by the bench. `None` → the
+    /// deterministic perf-tenant from `bench_default_ids` so bench
+    /// writes never land on the system bootstrap tenant.
+    pub tenant_id: Option<OrgId>,
+    /// Override the `namespace_id` used by the bench. `None` → the
+    /// deterministic perf-namespace from `bench_default_ids`.
+    /// Per ADR-033 §1, multi-shard fanout is a property of the
+    /// namespace's `NamespaceShardMap`: operators bring it up via
+    /// `POST /admin/topology/namespaces` (see
+    /// `infra/gcp/benchmarks/setup-shards.sh`) BEFORE the bench run;
+    /// first-touch from this client would create a single-shard
+    /// namespace which defeats the perf measurement.
+    pub namespace_id: Option<NamespaceId>,
+}
+
+/// Deterministic bench tenant + namespace. Distinct from the system
+/// bootstrap tenant (`OrgId(Uuid::from_u128(1))`) and the system
+/// "default" namespace (`UUIDv5(NAMESPACE_DNS, "default")`) so the
+/// bench's high-concurrency workload doesn't compete with casual S3
+/// traffic and isn't auto-created at boot with the wrong shard count.
+#[must_use]
+pub fn bench_default_ids() -> (OrgId, NamespaceId) {
+    (
+        OrgId(uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_DNS,
+            b"kiseki-bench-tenant",
+        )),
+        NamespaceId(uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_DNS,
+            b"kiseki-bench",
+        )),
+    )
 }
 
 /// Final benchmark report.
@@ -118,13 +150,32 @@ trait Driver: Send + Sync {
     fn label(&self) -> &'static str;
 }
 
+/// Resolve the (`tenant_id`, `namespace_id`) the bench should use.
+/// CLI / config overrides win; otherwise falls back to
+/// `bench_default_ids()` (the deterministic perf-tenant + perf-ns
+/// separate from the system bootstrap tenant + "default" namespace).
+fn resolve_bench_ids(cfg: &BenchConfig) -> (OrgId, NamespaceId) {
+    let (tenant_default, namespace_default) = bench_default_ids();
+    (
+        cfg.tenant_id.unwrap_or(tenant_default),
+        cfg.namespace_id.unwrap_or(namespace_default),
+    )
+}
+
 /// Build the right driver from the endpoint URL and binding selector.
 async fn build_driver(cfg: &BenchConfig) -> Result<Arc<dyn Driver>, String> {
     if let Some(addr) = cfg.endpoint.strip_prefix("kiseki://") {
         #[cfg(feature = "native")]
-        match cfg.binding {
-            NativeBinding::Tcp => return native::build_tcp(addr, cfg.concurrency).await,
-            NativeBinding::Grpc => return native::build_grpc(addr, cfg.concurrency).await,
+        {
+            let (tenant_id, namespace_id) = resolve_bench_ids(cfg);
+            match cfg.binding {
+                NativeBinding::Tcp => {
+                    return native::build_tcp(addr, cfg.concurrency, tenant_id, namespace_id).await
+                }
+                NativeBinding::Grpc => {
+                    return native::build_grpc(addr, cfg.concurrency, tenant_id, namespace_id).await
+                }
+            }
         }
         #[cfg(not(feature = "native"))]
         {
@@ -330,16 +381,14 @@ mod native {
         }
     }
 
-    fn default_ids() -> (OrgId, NamespaceId) {
-        (
-            OrgId(uuid::Uuid::from_u128(1)),
-            NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default")),
-        )
-    }
-
     // -- TCP-framed -----------------------------------------------------------
 
-    pub(super) async fn build_tcp(addr: &str, pool_size: usize) -> Result<Arc<dyn Driver>, String> {
+    pub(super) async fn build_tcp(
+        addr: &str,
+        pool_size: usize,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+    ) -> Result<Arc<dyn Driver>, String> {
         let pool_size = pool_size.max(1);
         let mut clients = Vec::with_capacity(pool_size);
         for _ in 0..pool_size {
@@ -349,7 +398,6 @@ mod native {
                     .map_err(|e| format!("tcp-framed connect: {e}"))?;
             clients.push(client);
         }
-        let (tenant_id, namespace_id) = default_ids();
         Ok(Arc::new(TcpFramedDriver {
             clients,
             next: AtomicUsize::new(0),
@@ -443,6 +491,8 @@ mod native {
     pub(super) async fn build_grpc(
         addr: &str,
         pool_size: usize,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
     ) -> Result<Arc<dyn Driver>, String> {
         let pool_size = pool_size.max(1);
         let mut clients = Vec::with_capacity(pool_size);
@@ -463,7 +513,6 @@ mod native {
                     .max_encoding_message_size(64 * 1024 * 1024);
             clients.push(client);
         }
-        let (tenant_id, namespace_id) = default_ids();
         Ok(Arc::new(GrpcDriver {
             clients,
             next: AtomicUsize::new(0),
@@ -656,6 +705,8 @@ mod tests {
             duration: Duration::from_secs(1),
             warmup_objects: 0,
             json: false,
+            tenant_id: None,
+            namespace_id: None,
         };
         let Err(err) = build_driver(&cfg).await else {
             panic!("ftp:// must be rejected");
@@ -681,6 +732,8 @@ mod tests {
             duration: Duration::from_secs(1),
             warmup_objects: 0,
             json: false,
+            tenant_id: None,
+            namespace_id: None,
         };
         let Err(err) = build_driver(&cfg).await else {
             panic!("port 1 is reserved — no listener can answer");

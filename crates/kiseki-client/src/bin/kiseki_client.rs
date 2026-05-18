@@ -917,6 +917,8 @@ fn handle_bench(args: &[String]) {
     let mut duration_secs: u64 = 30;
     let mut warmup_objects: usize = 256;
     let mut json = false;
+    let mut tenant_id_override: Option<kiseki_common::ids::OrgId> = None;
+    let mut namespace_id_override: Option<kiseki_common::ids::NamespaceId> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -980,6 +982,28 @@ fn handle_bench(args: &[String]) {
                 json = true;
                 i += 1;
             }
+            "--tenant" => {
+                let val = args.get(i + 1).cloned().unwrap_or_default();
+                match uuid::Uuid::parse_str(&val) {
+                    Ok(u) => tenant_id_override = Some(kiseki_common::ids::OrgId(u)),
+                    Err(e) => {
+                        eprintln!("--tenant expects a UUID (got {val:?}): {e}");
+                        std::process::exit(1);
+                    }
+                }
+                i += 2;
+            }
+            "--namespace" => {
+                let val = args.get(i + 1).cloned().unwrap_or_default();
+                match uuid::Uuid::parse_str(&val) {
+                    Ok(u) => namespace_id_override = Some(kiseki_common::ids::NamespaceId(u)),
+                    Err(e) => {
+                        eprintln!("--namespace expects a UUID (got {val:?}): {e}");
+                        std::process::exit(1);
+                    }
+                }
+                i += 2;
+            }
             "--help" | "-h" => {
                 println!(
                     "\
@@ -996,6 +1020,25 @@ OPTIONS:
     --duration-secs <N>       wall-clock cap   (default: 30)
     --warmup-objects <N>      pre-populate for GET shapes (default: 256)
     --json                    machine-readable single-line JSON
+    --tenant <uuid>           override the bench tenant_id
+                              (default: UUIDv5(NAMESPACE_DNS, \"kiseki-bench-tenant\"))
+    --namespace <uuid>        override the bench namespace_id
+                              (default: UUIDv5(NAMESPACE_DNS, \"kiseki-bench\"))
+
+NAMESPACE PROVISIONING:
+    Per ADR-033 §1, multi-shard fanout is a property of the namespace's
+    NamespaceShardMap, set when the namespace is created. The bench
+    targets a dedicated perf-tenant + perf-namespace (NOT the system
+    \"default\" bucket) so it doesn't compete with casual S3 traffic.
+    The operator must create the perf-namespace with the desired shard
+    count BEFORE running bench, e.g.:
+
+        kiseki-admin --endpoint http://leader:9090 \\
+            namespace-create-sharded \\
+            --namespace-id <uuid> --tenant-id <uuid> --shards <N>
+
+    First-touch creates the namespace with N=1 (sequential-safe);
+    that's fine for correctness but defeats fan-out measurement.
 "
                 );
                 return;
@@ -1021,6 +1064,8 @@ OPTIONS:
         duration: std::time::Duration::from_secs(duration_secs),
         warmup_objects,
         json,
+        tenant_id: tenant_id_override,
+        namespace_id: namespace_id_override,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
