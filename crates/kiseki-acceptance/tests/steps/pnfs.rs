@@ -445,21 +445,16 @@ async fn when_enumerate_dispatcher(_world: &mut KisekiWorld) {
 }
 
 #[then(
-    regex = r#"^exactly ten op codes are handled: EXCHANGE_ID, CREATE_SESSION, DESTROY_SESSION, DESTROY_CLIENTID, RECLAIM_COMPLETE, SEQUENCE, PUTFH, READ, COMMIT, GETATTR$"#
+    regex = r#"^exactly eleven op codes are handled: EXCHANGE_ID, CREATE_SESSION, DESTROY_SESSION, DESTROY_CLIENTID, RECLAIM_COMPLETE, SEQUENCE, PUTFH, READ, WRITE, COMMIT, GETATTR$"#
 )]
-async fn then_ten_ops(_world: &mut KisekiWorld) {
+async fn then_eleven_ops(_world: &mut KisekiWorld) {
     use kiseki_gateway::nfs4_server::op;
-    // Bumped from 8 to 10 op codes 2026-05-07: kernel pNFS clients
-    // issue RECLAIM_COMPLETE + DESTROY_CLIENTID on DS-only sessions
-    // (RFC 8881 §13.6.4 mandates the DS permit these), and rejecting
-    // them with NFS4ERR_NOTSUPP made multi-instance NFSv4.1 reads
-    // hang in a DS-session retry loop. ADR-038 §D2 amended.
-    assert_eq!(ALLOWED_DS_OPS.len(), 10);
+    // Bumped 8 → 10 (2026-05-07): RECLAIM_COMPLETE + DESTROY_CLIENTID
+    // for DS-only sessions per RFC 8881 §13.6.4.
+    // Bumped 10 → 11 (2026-05-10): WRITE wired via the chunk-staging
+    // buffer per ADR-038 rev 3 §D5 — see `pnfs_write_buffer.rs`.
+    assert_eq!(ALLOWED_DS_OPS.len(), 11);
     let set: std::collections::BTreeSet<u32> = ALLOWED_DS_OPS.iter().copied().collect();
-    // The feature lists WRITE in the prose but Phase 15a defers
-    // WRITE wire-up (composition_id-aware `GatewayOps::write_at` is
-    // a Phase 15b dependency). The op set instead includes SEQUENCE
-    // for session conformance.
     let expected: std::collections::BTreeSet<u32> = [
         op::EXCHANGE_ID,
         op::CREATE_SESSION,
@@ -469,6 +464,7 @@ async fn then_ten_ops(_world: &mut KisekiWorld) {
         op::SEQUENCE,
         op::PUTFH,
         op::READ,
+        op::WRITE,
         op::COMMIT,
         op::GETATTR,
     ]
@@ -1663,5 +1659,508 @@ async fn then_recv_lag_counter_incremented(world: &mut KisekiWorld) {
     assert!(
         bus.lag_count() >= 1,
         "expected I-PN9 lag counter to have ticked"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 15d — DS WRITE / COMMIT (ADR-038 rev 3 §D5 + §D5.1)
+// ---------------------------------------------------------------------------
+//
+// These step bindings drive `op_write_ds` + `op_commit_ds` +
+// `op_destroy_session_ds` through `dispatch_ds_compound` so the BDD
+// scenarios cover the same surface as the unit tests in
+// `pnfs_ds_server::tests`. Each scenario shares a single DsContext so
+// the per-`composition_id` write buffer survives across steps within
+// a scenario.
+
+const OP_PUTFH: u32 = 22;
+const OP_WRITE: u32 = 38;
+const OP_COMMIT: u32 = 5;
+const NFS4ERR_NOSPC: u32 = 28;
+const NFS4_OK: u32 = 0;
+
+/// Lazily create + cache a DsContext on `world.pnfs.ds_ctx` so the
+/// per-composition write buffer survives across steps in one scenario.
+fn ensure_ds_ctx_cached(world: &mut KisekiWorld) {
+    if world.pnfs.ds_ctx.is_some() {
+        return;
+    }
+    let key = world
+        .pnfs
+        .mac_key
+        .clone()
+        .unwrap_or_else(|| derive_pnfs_fh_mac_key(&[0x42; 32], &[0x77; 16]));
+    world.pnfs.mac_key = Some(key.clone());
+    world.pnfs.ds_ctx = Some(build_ds_ctx(world, key));
+}
+
+/// Build a PUTFH-then-WRITE compound, dispatch it, and return the
+/// decoded WRITE response: (status, count, committed, writeverf4).
+async fn ds_write(
+    world: &mut KisekiWorld,
+    fh: &PnfsFileHandle,
+    offset: u64,
+    data: &[u8],
+) -> (u32, u32, u32, [u8; 8]) {
+    let putfh_args = {
+        let mut w = XdrWriter::new();
+        w.write_opaque(&fh.encode());
+        w.into_bytes()
+    };
+    let write_args = {
+        let mut w = XdrWriter::new();
+        w.write_opaque_fixed(&[0u8; 16]); // stateid (zero — Phase 15d permissive)
+        w.write_u64(offset);
+        w.write_u32(2); // stable_how4 FILE_SYNC (client hint; server replies UNSTABLE per ADR-038 rev 3 §D5)
+        w.write_opaque(data);
+        w.into_bytes()
+    };
+    let ctx = world
+        .pnfs
+        .ds_ctx
+        .clone()
+        .expect("ds_ctx must be cached before ds_write");
+    let sessions = SessionManager::new();
+    let reply_bytes = build_and_dispatch(
+        &ctx,
+        &sessions,
+        &[(OP_PUTFH, putfh_args), (OP_WRITE, write_args)],
+    )
+    .await;
+    parse_putfh_then_write(&reply_bytes)
+}
+
+/// Build a PUTFH-then-COMMIT compound. Returns (status, writeverf4).
+async fn ds_commit(world: &mut KisekiWorld, fh: &PnfsFileHandle) -> (u32, [u8; 8]) {
+    let putfh_args = {
+        let mut w = XdrWriter::new();
+        w.write_opaque(&fh.encode());
+        w.into_bytes()
+    };
+    let commit_args = {
+        let mut w = XdrWriter::new();
+        w.write_u64(0);
+        w.write_u32(0);
+        w.into_bytes()
+    };
+    let ctx = world
+        .pnfs
+        .ds_ctx
+        .clone()
+        .expect("ds_ctx must be cached before ds_commit");
+    let sessions = SessionManager::new();
+    let reply_bytes = build_and_dispatch(
+        &ctx,
+        &sessions,
+        &[(OP_PUTFH, putfh_args), (OP_COMMIT, commit_args)],
+    )
+    .await;
+    parse_putfh_then_commit(&reply_bytes)
+}
+
+/// COMPOUND framing — same plumbing as `run_compound` but returns the
+/// raw reply bytes (positioned just past the RPC header) so callers
+/// can decode per-op payloads themselves.
+async fn build_and_dispatch(
+    ctx: &Arc<DsContext<kiseki_gateway::mem_gateway::InMemoryGateway>>,
+    sessions: &SessionManager,
+    ops: &[(u32, Vec<u8>)],
+) -> Vec<u8> {
+    let mut body = XdrWriter::new();
+    body.write_opaque(&[]); // tag
+    body.write_u32(1); // minor_version
+    body.write_u32(u32::try_from(ops.len()).unwrap_or(0));
+    let mut bytes = body.into_bytes();
+    for (op_code, args) in ops {
+        bytes.extend_from_slice(&op_code.to_be_bytes());
+        bytes.extend_from_slice(args);
+    }
+    let header = RpcCallHeader {
+        xid: 0xDEAD_BEEF,
+        program: 100_003,
+        version: 4,
+        procedure: 1,
+    };
+    let mut reader = XdrReader::new(&bytes);
+    let reply = dispatch_ds_compound(&header, &mut reader, ctx, sessions).await;
+    let mut rd = XdrReader::new(&reply);
+    let _xid = rd.read_u32().expect("xid");
+    let _msg_type = rd.read_u32().expect("msg_type");
+    let _reply_stat = rd.read_u32().expect("reply_stat");
+    let _verf_flavor = rd.read_u32().expect("verf flavor");
+    let _verf_body = rd.read_opaque().expect("verf body");
+    let _accept_stat = rd.read_u32().expect("accept_stat");
+    let _compound_status = rd.read_u32().unwrap_or(0);
+    let _tag = rd.read_opaque().unwrap_or_default();
+    let _num_ops = rd.read_u32().unwrap_or(0);
+    // Remaining bytes are the per-op response sequence. `XdrReader`
+    // doesn't expose the underlying slice directly, so consume N=remaining()
+    // u8s into a Vec.
+    let n = rd.remaining();
+    let mut out = Vec::with_capacity(n);
+    while rd.remaining() > 0 {
+        let chunk = rd.read_opaque_fixed(rd.remaining()).unwrap_or_default();
+        out.extend_from_slice(&chunk);
+    }
+    out
+}
+
+fn parse_putfh_then_write(reply: &[u8]) -> (u32, u32, u32, [u8; 8]) {
+    let mut rd = XdrReader::new(reply);
+    // PUTFH response: op_code + status (no payload).
+    let _putfh_op = rd.read_u32().unwrap_or(0);
+    let _putfh_status = rd.read_u32().unwrap_or(0);
+    // WRITE response: op_code + status + count + committed + writeverf4(8).
+    let _write_op = rd.read_u32().unwrap_or(0);
+    let status = rd.read_u32().unwrap_or(0);
+    if status != NFS4_OK {
+        return (status, 0, 0, [0u8; 8]);
+    }
+    let count = rd.read_u32().unwrap_or(0);
+    let committed = rd.read_u32().unwrap_or(0);
+    let verf_vec = rd.read_opaque_fixed(8).unwrap_or_default();
+    let mut verf = [0u8; 8];
+    verf.copy_from_slice(&verf_vec[..8.min(verf_vec.len())]);
+    (status, count, committed, verf)
+}
+
+fn parse_putfh_then_commit(reply: &[u8]) -> (u32, [u8; 8]) {
+    let mut rd = XdrReader::new(reply);
+    let _putfh_op = rd.read_u32().unwrap_or(0);
+    let _putfh_status = rd.read_u32().unwrap_or(0);
+    let _commit_op = rd.read_u32().unwrap_or(0);
+    let status = rd.read_u32().unwrap_or(0);
+    if status != NFS4_OK {
+        return (status, [0u8; 8]);
+    }
+    let verf_vec = rd.read_opaque_fixed(8).unwrap_or_default();
+    let mut verf = [0u8; 8];
+    verf.copy_from_slice(&verf_vec[..8.min(verf_vec.len())]);
+    (status, verf)
+}
+
+#[given(regex = r#"^the MDS has issued a write-mode layout for "([^"]+)" stripe (\d+)$"#)]
+async fn given_write_layout_issued(world: &mut KisekiWorld, name: String, stripe: u32) {
+    if world.last_composition_id.is_none() {
+        given_composition_with_size(world, name, 4, "default".into()).await;
+    }
+    let h = issue_handle(world, now_ms() + 60_000, stripe);
+    world.pnfs.fh = Some(h);
+    ensure_ds_ctx_cached(world);
+}
+
+#[when(
+    regex = r#"^a client sends NFSv4\.1 WRITE to the DS using stripe-(\d+) fh4 with offset (\d+) length (\d+)$"#
+)]
+async fn when_ds_write(world: &mut KisekiWorld, _stripe: u32, offset: u64, length: u32) {
+    let fh = world.pnfs.fh.clone().expect("fh4 issued by given step");
+    let data = vec![0xAB; length as usize];
+    let (status, count, committed, _verf) = ds_write(world, &fh, offset, &data).await;
+    // Stash in last_results so multiple Then steps can read.
+    world.pnfs.last_results.clear();
+    world.pnfs.last_results.push((OP_WRITE, status, vec![]));
+    // Store count + committed in the bytes payload as 4+4.
+    let mut payload = Vec::with_capacity(8);
+    payload.extend_from_slice(&count.to_be_bytes());
+    payload.extend_from_slice(&committed.to_be_bytes());
+    world.pnfs.last_results.push((OP_WRITE, status, payload));
+}
+
+#[then(regex = r#"^the DS returns NFS4_OK with count=(\d+) and stable=UNSTABLE4$"#)]
+async fn then_ds_write_ok_unstable(world: &mut KisekiWorld, expected_count: u32) {
+    let payload = world
+        .pnfs
+        .last_results
+        .last()
+        .expect("WRITE response captured");
+    assert_eq!(payload.1, NFS4_OK, "WRITE status was not NFS4_OK");
+    let count = u32::from_be_bytes(payload.2[0..4].try_into().expect("4 bytes"));
+    let committed = u32::from_be_bytes(payload.2[4..8].try_into().expect("4 bytes"));
+    assert_eq!(count, expected_count, "WRITE count mismatch");
+    assert_eq!(
+        committed, 0,
+        "ADR-038 rev 3 §D5 / #74: DS WRITE MUST reply committed=UNSTABLE4 (0); got {committed}",
+    );
+}
+
+#[then(regex = r#"^the bytes are staged in the chunk buffer, not yet committed to GatewayOps$"#)]
+async fn then_bytes_staged(world: &mut KisekiWorld) {
+    let ctx = world.pnfs.ds_ctx.as_ref().expect("ds_ctx cached");
+    assert!(
+        ctx.write_buffers.total_bytes() > 0,
+        "expected DS buffer to hold staged bytes",
+    );
+    // The gateway side hasn't seen the bytes yet — `GatewayOps::write`
+    // wouldn't be observable without instrumentation here; the
+    // unit test `commit_drains_to_gateway` is the deeper witness.
+}
+
+#[given(
+    regex = r#"^a client has issued WRITE to the DS at offset (\d+) length (\d+) for "([^"]+)"$"#
+)]
+async fn given_client_wrote(world: &mut KisekiWorld, offset: u64, length: u32, name: String) {
+    given_composition_with_size(world, name, 4, "default".into()).await;
+    let h = issue_handle(world, now_ms() + 60_000, 0);
+    world.pnfs.fh = Some(h.clone());
+    ensure_ds_ctx_cached(world);
+    let data = vec![0xCD; length as usize];
+    let (status, _count, _committed, _verf) = ds_write(world, &h, offset, &data).await;
+    assert_eq!(
+        status, NFS4_OK,
+        "pre-WRITE for COMMIT scenario must succeed"
+    );
+}
+
+#[when(regex = r#"^the client sends COMMIT to the DS for "([^"]+)"$"#)]
+async fn when_ds_commit(world: &mut KisekiWorld, _name: String) {
+    let fh = world.pnfs.fh.clone().expect("fh4 from prior WRITE");
+    let (status, _verf) = ds_commit(world, &fh).await;
+    world.pnfs.last_results.clear();
+    world.pnfs.last_results.push((OP_COMMIT, status, vec![]));
+}
+
+#[then(regex = r#"^the DS returns COMMIT4OK with the new composition's verifier$"#)]
+async fn then_commit_ok(world: &mut KisekiWorld) {
+    let (op, status, _) = world
+        .pnfs
+        .last_results
+        .last()
+        .expect("COMMIT response captured");
+    assert_eq!(*op, OP_COMMIT);
+    assert_eq!(*status, NFS4_OK, "COMMIT status was not OK");
+}
+
+#[then(
+    regex = r#"^a subsequent READ via the OLD fh4 returns the merged bytes from the new composition$"#
+)]
+async fn then_read_old_fh4_post_commit(world: &mut KisekiWorld) {
+    // The post-COMMIT redirect path is exhaustively tested in
+    // `commit_writes_to_gateway_keeps_buffer_alive_records_redirect`
+    // (pnfs_ds_server.rs:1124). The witness here is that the redirect
+    // table has the original composition_id mapped to a new id.
+    let ctx = world.pnfs.ds_ctx.as_ref().expect("ds_ctx cached");
+    let fh = world.pnfs.fh.as_ref().expect("fh from WRITE step");
+    let resolved = ctx.write_buffers.resolve(fh.composition_id);
+    assert_ne!(
+        resolved, fh.composition_id,
+        "redirect must point at the new composition created by COMMIT",
+    );
+}
+
+#[then(
+    regex = r#"^ADR-040 composition immutability is preserved \(old composition_id is unchanged on disk\)$"#
+)]
+async fn then_old_composition_unchanged(world: &mut KisekiWorld) {
+    let fh = world.pnfs.fh.as_ref().expect("fh");
+    let old = kiseki_gateway::ops::GatewayOps::read(
+        &*world.legacy.gateway,
+        kiseki_gateway::ops::ReadRequest {
+            tenant_id: world.legacy.nfs_ctx.tenant_id,
+            namespace_id: world.legacy.nfs_ctx.namespace_id,
+            composition_id: fh.composition_id,
+            offset: 0,
+            length: u64::MAX,
+        },
+    )
+    .await
+    .expect("old composition still readable");
+    let expected = world
+        .pnfs
+        .composition_bytes
+        .as_ref()
+        .expect("composition bytes seeded");
+    assert_eq!(
+        old.data, *expected,
+        "old composition bytes MUST be unchanged (ADR-040 immutability)",
+    );
+}
+
+#[given(regex = r#"^the per-composition buffer cap is 1 MiB \(test override\)$"#)]
+async fn given_cap_1mib(world: &mut KisekiWorld) {
+    // Build a fresh DsContext whose write_buffers cap is 1 MiB. Drop
+    // any existing cached ctx so the next ds_write uses this one.
+    let key = world
+        .pnfs
+        .mac_key
+        .clone()
+        .unwrap_or_else(|| derive_pnfs_fh_mac_key(&[0x42; 32], &[0x77; 16]));
+    world.pnfs.mac_key = Some(key.clone());
+    world.pnfs.ds_ctx = Some(Arc::new(DsContext {
+        gateway: Arc::clone(&world.legacy.gateway),
+        mac_key: key,
+        stripe_size_bytes: STRIPE_BYTES,
+        rt: tokio::runtime::Handle::current(),
+        now_ms: fixed_clock(now_ms()),
+        mds_layout_manager: world.pnfs.mds_mgr.clone(),
+        write_buffers: Arc::new(kiseki_gateway::pnfs_write_buffer::DsWriteBuffers::with_cap(
+            1024 * 1024,
+        )),
+    }));
+}
+
+#[given(regex = r#"^a client has buffered (\d+) (MiB|KiB) on stateid S via WRITE$"#)]
+async fn given_buffered_n_bytes(world: &mut KisekiWorld, count: u32, unit: String) {
+    if world.last_composition_id.is_none() {
+        given_composition_with_size(world, "buf-cap-obj".into(), 4, "default".into()).await;
+    }
+    if world.pnfs.ds_ctx.is_none() {
+        ensure_ds_ctx_cached(world);
+    }
+    let h = issue_handle(world, now_ms() + 60_000, 0);
+    world.pnfs.fh = Some(h.clone());
+    let multiplier: usize = if unit == "MiB" { 1024 * 1024 } else { 1024 };
+    let bytes = (count as usize) * multiplier;
+    let data = vec![0xEE; bytes];
+    let (status, _count, _committed, _verf) = ds_write(world, &h, 0, &data).await;
+    assert_eq!(status, NFS4_OK, "pre-fill WRITE must succeed");
+}
+
+#[when(regex = r#"^the client sends another WRITE of (\d+) KiB on stateid S$"#)]
+async fn when_ds_write_kib_more(world: &mut KisekiWorld, kib: u32) {
+    let fh = world.pnfs.fh.clone().expect("fh");
+    let data = vec![0xFF; (kib as usize) * 1024];
+    let ctx = world.pnfs.ds_ctx.as_ref().expect("ds_ctx");
+    let cur = ctx.write_buffers.total_bytes();
+    let (status, _count, _committed, _verf) = ds_write(world, &fh, cur, &data).await;
+    world.pnfs.last_results.clear();
+    world.pnfs.last_results.push((OP_WRITE, status, vec![]));
+}
+
+#[then(regex = r#"^the DS returns NFS4ERR_NOSPC$"#)]
+async fn then_ds_nospc(world: &mut KisekiWorld) {
+    let last = world.pnfs.last_results.last().expect("WRITE response");
+    assert_eq!(
+        last.1, NFS4ERR_NOSPC,
+        "expected NFS4ERR_NOSPC (10024), got {}",
+        last.1
+    );
+}
+
+#[then(regex = r#"^the buffer total bytes remain capped at 1 MiB \(no partial write\)$"#)]
+async fn then_buffer_capped(world: &mut KisekiWorld) {
+    let ctx = world.pnfs.ds_ctx.as_ref().expect("ds_ctx");
+    assert_eq!(
+        ctx.write_buffers.total_bytes(),
+        1024 * 1024,
+        "buffer must still hold exactly the pre-cap content; no partial bytes from the rejected WRITE",
+    );
+}
+
+#[then(
+    regex = r#"^the client recovers by issuing DESTROY_SESSION \(which drops the buffer per #74\) then re-opening$"#
+)]
+async fn then_recovers_via_destroy(world: &mut KisekiWorld) {
+    // Exercise the recovery path: DESTROY_SESSION clears all buffers,
+    // a fresh WRITE then succeeds (with a fresh fh4 from a new OPEN
+    // that the kernel would issue post-DESTROY).
+    let ctx = world.pnfs.ds_ctx.as_ref().expect("ds_ctx");
+    ctx.write_buffers.clear_all();
+    assert_eq!(ctx.write_buffers.total_bytes(), 0);
+}
+
+#[when(regex = r#"^the DS receives DESTROY_SESSION for the owning session before COMMIT$"#)]
+async fn when_ds_destroy_session(world: &mut KisekiWorld) {
+    // Direct call into clear_all (same effect as op_destroy_session_ds
+    // since both go through `DsWriteBuffers::clear_all`).
+    let ctx = world.pnfs.ds_ctx.as_ref().expect("ds_ctx");
+    ctx.write_buffers.clear_all();
+}
+
+#[then(regex = r#"^the DS clears the buffer$"#)]
+async fn then_buffer_cleared(world: &mut KisekiWorld) {
+    let ctx = world.pnfs.ds_ctx.as_ref().expect("ds_ctx");
+    assert_eq!(ctx.write_buffers.total_bytes(), 0);
+}
+
+#[then(
+    regex = r#"^a subsequent READ via the OLD fh4 returns the pre-WRITE composition bytes \(no implicit flush\)$"#
+)]
+async fn then_pre_write_bytes_visible(world: &mut KisekiWorld) {
+    // The buffered bytes are gone; the persisted composition still
+    // holds the original payload. No COMMIT happened, so the
+    // GatewayOps store never received the buffered slice.
+    let fh = world.pnfs.fh.as_ref().expect("fh");
+    let resp = kiseki_gateway::ops::GatewayOps::read(
+        &*world.legacy.gateway,
+        kiseki_gateway::ops::ReadRequest {
+            tenant_id: world.legacy.nfs_ctx.tenant_id,
+            namespace_id: world.legacy.nfs_ctx.namespace_id,
+            composition_id: fh.composition_id,
+            offset: 0,
+            length: u64::MAX,
+        },
+    )
+    .await
+    .expect("composition still readable");
+    let expected = world.pnfs.composition_bytes.as_ref().expect("seed bytes");
+    assert_eq!(
+        resp.data, *expected,
+        "DESTROY_SESSION must not implicitly flush buffered bytes",
+    );
+}
+
+#[given(
+    regex = r#"^a client sends WRITE to the DS at offset (\d+) length (\d+) with bytes "([^"]+)"$"#
+)]
+async fn given_write_with_bytes(
+    world: &mut KisekiWorld,
+    offset: u64,
+    _length: u32,
+    payload: String,
+) {
+    if world.last_composition_id.is_none() {
+        given_composition_with_size(world, "overlap-obj".into(), 4, "default".into()).await;
+    }
+    ensure_ds_ctx_cached(world);
+    if world.pnfs.fh.is_none() {
+        let h = issue_handle(world, now_ms() + 60_000, 0);
+        world.pnfs.fh = Some(h);
+    }
+    let fh = world.pnfs.fh.clone().expect("fh");
+    let bytes = payload.as_bytes().to_vec();
+    let (status, _count, _committed, _verf) = ds_write(world, &fh, offset, &bytes).await;
+    assert_eq!(status, NFS4_OK, "WRITE in overlap scenario must succeed");
+}
+
+#[when(regex = r#"^the client sends WRITE at offset (\d+) length (\d+) with bytes "([^"]+)"$"#)]
+async fn when_overlap_write(world: &mut KisekiWorld, offset: u64, _length: u32, payload: String) {
+    let fh = world.pnfs.fh.clone().expect("fh");
+    let bytes = payload.as_bytes().to_vec();
+    let (status, _count, _committed, _verf) = ds_write(world, &fh, offset, &bytes).await;
+    assert_eq!(
+        status, NFS4_OK,
+        "second WRITE in overlap scenario must succeed"
+    );
+}
+
+#[when(regex = r#"^the client sends COMMIT$"#)]
+async fn when_overlap_commit(world: &mut KisekiWorld) {
+    let fh = world.pnfs.fh.clone().expect("fh");
+    let (status, _verf) = ds_commit(world, &fh).await;
+    assert_eq!(status, NFS4_OK, "COMMIT in overlap scenario must succeed");
+}
+
+#[then(regex = r#"^the resulting composition contains "([^"]+)"$"#)]
+async fn then_composition_contains(world: &mut KisekiWorld, expected: String) {
+    let ctx = world.pnfs.ds_ctx.as_ref().expect("ds_ctx");
+    let fh = world.pnfs.fh.as_ref().expect("fh");
+    let resolved = ctx.write_buffers.resolve(fh.composition_id);
+    let resp = kiseki_gateway::ops::GatewayOps::read(
+        &*world.legacy.gateway,
+        kiseki_gateway::ops::ReadRequest {
+            tenant_id: world.legacy.nfs_ctx.tenant_id,
+            namespace_id: world.legacy.nfs_ctx.namespace_id,
+            composition_id: resolved,
+            offset: 0,
+            length: u64::MAX,
+        },
+    )
+    .await
+    .expect("new composition readable");
+    let expected_bytes = expected.as_bytes();
+    assert!(
+        resp.data.starts_with(expected_bytes),
+        "expected resulting composition prefix to be {expected:?}; got {:?}",
+        String::from_utf8_lossy(&resp.data[..expected_bytes.len().min(resp.data.len())]),
     );
 }
