@@ -163,6 +163,9 @@ def _run_in_client(
     *,
     timeout: int = 120,
 ) -> subprocess.CompletedProcess[str]:
+    # `kiseki-pnfs-client` has `ENTRYPOINT []` + a no-op CMD (#57);
+    # wrap with `bash -c` so the script is shell-interpreted rather
+    # than exec'd as a binary path.
     return subprocess.run(
         [
             "docker",
@@ -176,6 +179,8 @@ def _run_in_client(
             "--cap-add",
             "DAC_READ_SEARCH",
             image,
+            "bash",
+            "-c",
             script,
         ],
         check=False,
@@ -621,6 +626,10 @@ fio --name=load --rw=write --direct=0 --bs=1M --size=512M --numjobs=2 \
             "--cap-add",
             "DAC_READ_SEARCH",
             perf_client_image,
+            # `kiseki-pnfs-client` has empty ENTRYPOINT + no-op CMD (#57)
+            # — wrap so runc doesn't try to `exec(script_as_binary)`.
+            "bash",
+            "-c",
             nfs_load_script,
         ],
         stdout=subprocess.PIPE,
