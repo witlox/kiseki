@@ -278,7 +278,7 @@ Feature: pNFS Flexible Files Layout (ADR-038, RFC 8435)
     Given a composition "obj-w1" of size 64 KiB exists in "default"
     And the MDS has issued a write-mode layout for "obj-w1" stripe 0
     When a client sends NFSv4.1 WRITE to the DS using stripe-0 fh4 with offset 0 length 4096
-    Then the DS returns NFS4_OK with count=4096 and stable=FILE_SYNC
+    Then the DS returns NFS4_OK with count=4096 and stable=UNSTABLE4
     And the bytes are staged in the chunk buffer, not yet committed to GatewayOps
 
   @library @pnfs-15d @ds-write
@@ -295,8 +295,8 @@ Feature: pNFS Flexible Files Layout (ADR-038, RFC 8435)
     And a client has buffered 1 MiB on stateid S via WRITE
     When the client sends another WRITE of 4 KiB on stateid S
     Then the DS returns NFS4ERR_NOSPC
-    And a subsequent COMMIT clears the buffer
-    And a subsequent WRITE of 4 KiB on stateid S succeeds
+    And the buffer total bytes remain capped at 1 MiB (no partial write)
+    And the client recovers by issuing DESTROY_SESSION (which drops the buffer per #74) then re-opening
 
   @library @pnfs-15d @ds-write
   Scenario: DESTROY_SESSION drops pending buffers without implicit flush
