@@ -139,11 +139,15 @@ fn read_transient_retry_threshold() -> u32 {
 /// delete records to a follower's local persistent store.
 pub struct CompositionHydrator {
     compositions: Arc<CompositionStore>,
-    /// Cache of the durable `last_applied_seq` so most polls don't
-    /// pay a backend read for the meta key. Refreshed on apply.
+    /// Shard this hydrator is bound to. One hydrator instance polls
+    /// exactly one shard; the registry spawns N instances for N shards.
+    shard_id: ShardId,
+    /// Cache of the durable `last_applied_seq` for `shard_id` so most
+    /// polls don't pay a backend read for the meta key. Refreshed on
+    /// apply.
     last_applied_cache: SequenceNumber,
-    /// Cache of the durable halt flag so a halted hydrator skips the
-    /// poll without acquiring the storage lock.
+    /// Cache of the durable (node-global) halt flag so a halted
+    /// hydrator skips the poll without acquiring the storage lock.
     halted_cache: bool,
     transient_retry_threshold: u32,
     /// §D10 metrics surface. Optional so unit tests get no-op behavior.
@@ -151,23 +155,24 @@ pub struct CompositionHydrator {
 }
 
 impl CompositionHydrator {
-    /// Create a new hydrator.
+    /// Create a new hydrator bound to one shard.
     ///
     /// The store is shared with the gateway (same `Arc`), so
     /// installations performed here are immediately visible to
-    /// subsequent gateway reads. Reads `last_applied_seq` and `halted`
-    /// from the durable store synchronously to seed the in-memory
-    /// caches.
+    /// subsequent gateway reads. Reads `last_applied_seq(shard_id)`
+    /// and `halted` from the durable store synchronously to seed the
+    /// in-memory caches.
     #[must_use]
-    pub fn new(compositions: Arc<CompositionStore>) -> Self {
+    pub fn new(compositions: Arc<CompositionStore>, shard_id: ShardId) -> Self {
         let (last_applied_cache, halted_cache) = compositions.with_storage_locked(|s| {
             (
-                s.last_applied_seq().unwrap_or(SequenceNumber(0)),
+                s.last_applied_seq(shard_id).unwrap_or(SequenceNumber(0)),
                 s.halted().unwrap_or(false),
             )
         });
         Self {
             compositions,
+            shard_id,
             last_applied_cache,
             halted_cache,
             transient_retry_threshold: read_transient_retry_threshold(),
@@ -209,17 +214,18 @@ impl CompositionHydrator {
         self.halted_cache
     }
 
-    /// Poll one shard's log for new deltas and apply them. Returns
-    /// the number of state changes that committed in this poll.
-    /// Errors are swallowed and logged at debug — hydration is best-
-    /// effort, the next poll retries.
+    /// Poll this hydrator's bound shard for new deltas and apply
+    /// them. Returns the number of state changes that committed in
+    /// this poll. Errors are swallowed and logged at debug —
+    /// hydration is best-effort, the next poll retries.
     ///
     /// The function is one logical sequence (read deltas → gap-detect
     /// → stage each delta → apply atomic batch → refresh caches) and
     /// doesn't decompose cleanly. Splitting would obscure the data
     /// flow more than it would help.
     #[allow(clippy::too_many_lines)]
-    pub async fn poll<L: LogOps + ?Sized>(&mut self, log: &L, shard_id: ShardId) -> u64 {
+    pub async fn poll<L: LogOps + ?Sized>(&mut self, log: &L) -> u64 {
+        let shard_id = self.shard_id;
         // Cheap cache check; the durable flag was read into halted_cache
         // either at boot or by the prior poll's commit.
         if self.halted_cache {
@@ -276,7 +282,8 @@ impl CompositionHydrator {
 
         let store: &CompositionStore = self.compositions.as_ref();
 
-        let prior_stuck_state = store.with_storage_locked(|s| s.stuck_state().ok().flatten());
+        let prior_stuck_state =
+            store.with_storage_locked(|s| s.stuck_state(shard_id).ok().flatten());
 
         let mut staging = Staging::default();
         let mut last_applied_in_batch = self.last_applied_cache;
@@ -388,6 +395,7 @@ impl CompositionHydrator {
             .chain(removes.iter().copied())
             .collect();
         let batch = HydrationBatch {
+            shard_id,
             puts,
             removes,
             name_inserts: staging.name_inserts,
@@ -466,6 +474,7 @@ impl CompositionHydrator {
         );
         // Persist halt flag so subsequent restarts also short-circuit.
         let batch = HydrationBatch {
+            shard_id,
             puts: Vec::new(),
             removes: Vec::new(),
             name_inserts: Vec::new(),
@@ -743,12 +752,12 @@ mod tests {
             append_create(&log, shard_id, payload, vec![ChunkId([0u8; 32])]).await;
         }
 
-        let mut hydrator = CompositionHydrator::new(Arc::clone(&store));
+        let mut hydrator = CompositionHydrator::new(Arc::clone(&store), shard_id);
         let started = std::time::Instant::now();
         let mut applied_total: u64 = 0;
         let deadline = started + std::time::Duration::from_secs(5);
         while applied_total < N && std::time::Instant::now() < deadline {
-            applied_total += hydrator.poll(&log, shard_id).await;
+            applied_total += hydrator.poll(&log).await;
         }
         let elapsed = started.elapsed();
         assert!(
@@ -775,8 +784,8 @@ mod tests {
         let payload = encode_composition_create_payload(comp_id, ns_id, 1024);
         append_create(&log, shard_id, payload, vec![chunk_id]).await;
 
-        let mut hydrator = CompositionHydrator::new(Arc::clone(&store));
-        assert_eq!(hydrator.poll(&log, shard_id).await, 1);
+        let mut hydrator = CompositionHydrator::new(Arc::clone(&store), shard_id);
+        assert_eq!(hydrator.poll(&log).await, 1);
 
         let s = store.as_ref();
         let got = s.get(comp_id).unwrap();
@@ -794,10 +803,10 @@ mod tests {
         let payload = encode_composition_create_payload(comp_id, ns_id, 42);
         append_create(&log, shard_id, payload, vec![]).await;
 
-        let mut hydrator = CompositionHydrator::new(Arc::clone(&store));
-        assert_eq!(hydrator.poll(&log, shard_id).await, 1);
-        assert_eq!(hydrator.poll(&log, shard_id).await, 0);
-        assert_eq!(hydrator.poll(&log, shard_id).await, 0);
+        let mut hydrator = CompositionHydrator::new(Arc::clone(&store), shard_id);
+        assert_eq!(hydrator.poll(&log).await, 1);
+        assert_eq!(hydrator.poll(&log).await, 0);
+        assert_eq!(hydrator.poll(&log).await, 0);
         assert_eq!(store.count().unwrap(), 1);
     }
 
@@ -812,8 +821,8 @@ mod tests {
         // None.
         append_create(&log, shard_id, vec![0u8; 5], vec![]).await;
 
-        let mut hydrator = CompositionHydrator::new(Arc::clone(&store));
-        assert_eq!(hydrator.poll(&log, shard_id).await, 0);
+        let mut hydrator = CompositionHydrator::new(Arc::clone(&store), shard_id);
+        assert_eq!(hydrator.poll(&log).await, 0);
         assert_eq!(hydrator.last_applied().0, 1);
     }
 
@@ -846,8 +855,8 @@ mod tests {
         )
         .await;
 
-        let mut hydrator = CompositionHydrator::new(Arc::clone(&store));
-        assert_eq!(hydrator.poll(&log, shard_id).await, 2);
+        let mut hydrator = CompositionHydrator::new(Arc::clone(&store), shard_id);
+        assert_eq!(hydrator.poll(&log).await, 2);
 
         let s = store.as_ref();
         let got = s.get(comp_id).unwrap();
@@ -879,8 +888,8 @@ mod tests {
         )
         .await;
 
-        let mut hydrator = CompositionHydrator::new(Arc::clone(&store));
-        assert_eq!(hydrator.poll(&log, shard_id).await, 2);
+        let mut hydrator = CompositionHydrator::new(Arc::clone(&store), shard_id);
+        assert_eq!(hydrator.poll(&log).await, 2);
 
         let s = store.as_ref();
         assert!(s.get(comp_id).is_err(), "Delete should remove composition");
@@ -891,8 +900,8 @@ mod tests {
         // `last_applied_seq` is now 2; h2 polls from 3 and finds nothing.
         // (`s` was a shared borrow of the store; the prior `drop(&s)`
         // was a no-op caught by `clippy::dropping_references`.)
-        let mut h2 = CompositionHydrator::new(Arc::clone(&store));
-        assert_eq!(h2.poll(&log, shard_id).await, 0);
+        let mut h2 = CompositionHydrator::new(Arc::clone(&store), shard_id);
+        assert_eq!(h2.poll(&log).await, 0);
     }
 
     #[tokio::test]
@@ -919,25 +928,25 @@ mod tests {
         )
         .await;
 
-        let mut hydrator = CompositionHydrator::new(Arc::clone(&store));
+        let mut hydrator = CompositionHydrator::new(Arc::clone(&store), shard_id);
         // First two polls: transient — last_applied stays at 0, retry
         // counter accumulates.
         for expected in 1..=2 {
-            assert_eq!(hydrator.poll(&log, shard_id).await, 0);
+            assert_eq!(hydrator.poll(&log).await, 0);
             store.with_storage_locked(|s| {
-                assert_eq!(s.last_applied_seq().unwrap().0, 0);
+                assert_eq!(s.last_applied_seq(shard_id).unwrap().0, 0);
                 assert_eq!(
-                    s.stuck_state().unwrap(),
+                    s.stuck_state(shard_id).unwrap(),
                     Some((SequenceNumber(1), expected))
                 );
             });
         }
         // Third poll: hits threshold (3) → promote to permanent skip,
         // advance past, clear stuck.
-        assert_eq!(hydrator.poll(&log, shard_id).await, 0);
+        assert_eq!(hydrator.poll(&log).await, 0);
         store.with_storage_locked(|s| {
-            assert_eq!(s.last_applied_seq().unwrap().0, 1);
-            assert_eq!(s.stuck_state().unwrap(), None);
+            assert_eq!(s.last_applied_seq(shard_id).unwrap().0, 1);
+            assert_eq!(s.stuck_state(shard_id).unwrap(), None);
         });
 
         // Cleanup the env var so other tests aren't affected.
@@ -1112,10 +1121,11 @@ mod tests {
             tenant_id: OrgId(uuid::Uuid::from_u128(1)),
         };
 
-        let mut hydrator = CompositionHydrator::new(Arc::clone(&store));
+        let mut hydrator =
+            CompositionHydrator::new(Arc::clone(&store), ShardId(uuid::Uuid::from_u128(1)));
         assert!(!hydrator.halted(), "fresh hydrator must not be halted");
 
-        let applied = hydrator.poll(&log, ShardId(uuid::Uuid::from_u128(1))).await;
+        let applied = hydrator.poll(&log).await;
         assert_eq!(applied, 0, "halt mode must not apply anything");
         assert!(hydrator.halted(), "hydrator must enter halt mode");
 
@@ -1138,8 +1148,9 @@ mod tests {
             tenant_id: OrgId(uuid::Uuid::from_u128(1)),
         };
 
-        let mut hydrator = CompositionHydrator::new(Arc::clone(&store));
-        let applied = hydrator.poll(&log, ShardId(uuid::Uuid::from_u128(1))).await;
+        let mut hydrator =
+            CompositionHydrator::new(Arc::clone(&store), ShardId(uuid::Uuid::from_u128(1)));
+        let applied = hydrator.poll(&log).await;
         assert_eq!(applied, 0);
         assert!(hydrator.halted(), "empty + advanced tip must halt");
     }
@@ -1154,6 +1165,7 @@ mod tests {
             store
                 .with_storage_locked(|s| {
                     s.apply_hydration_batch(HydrationBatch {
+                        shard_id: ShardId(uuid::Uuid::from_u128(1)),
                         puts: Vec::new(),
                         removes: Vec::new(),
                         name_inserts: Vec::new(),
@@ -1171,8 +1183,9 @@ mod tests {
             shard_id: ShardId(uuid::Uuid::from_u128(1)),
             tenant_id: OrgId(uuid::Uuid::from_u128(1)),
         };
-        let mut hydrator = CompositionHydrator::new(Arc::clone(&store));
-        let applied = hydrator.poll(&log, ShardId(uuid::Uuid::from_u128(1))).await;
+        let mut hydrator =
+            CompositionHydrator::new(Arc::clone(&store), ShardId(uuid::Uuid::from_u128(1)));
+        let applied = hydrator.poll(&log).await;
         assert_eq!(applied, 0);
         assert!(!hydrator.halted(), "caught-up steady state must not halt");
     }
@@ -1216,8 +1229,8 @@ mod tests {
         )
         .await;
 
-        let mut hydrator = CompositionHydrator::new(Arc::clone(&store));
-        hydrator.poll(&log, shard_id).await;
+        let mut hydrator = CompositionHydrator::new(Arc::clone(&store), shard_id);
+        hydrator.poll(&log).await;
         let v = store.get(comp_id).unwrap().version;
         assert_eq!(v, 2, "version should bump exactly once for two ops");
     }

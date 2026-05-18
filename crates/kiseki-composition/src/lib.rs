@@ -17,6 +17,7 @@
 pub mod composition;
 pub mod error;
 pub mod hydrator;
+pub mod hydrator_registry;
 pub mod log_bridge;
 pub mod metrics;
 pub mod multipart;
@@ -35,5 +36,6 @@ pub use composition::{
 };
 pub use error::CompositionError;
 pub use hydrator::CompositionHydrator;
+pub use hydrator_registry::HydratorRegistry;
 pub use multipart::{MultipartState, MultipartUpload};
 pub use namespace::{ComplianceTag, Namespace};

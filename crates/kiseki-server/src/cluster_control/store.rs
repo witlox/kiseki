@@ -123,17 +123,46 @@ pub struct ShardStoreApplyHook {
     /// the source's config implicitly via the per-shard Raft state
     /// machine; this default is for `CreateNamespace` apply.
     config: kiseki_log::ShardConfig,
+    /// Optional composition-hydrator registry. When set, every
+    /// `on_create_namespace` / `on_split` also registers the new
+    /// shard with the registry so a per-shard hydrator task spawns
+    /// alongside the per-shard Raft group. Without this the
+    /// follower's composition store never installs Create deltas
+    /// for non-bootstrap shards (the original Phase 16f wiring was
+    /// single-shard); see `multi-node-raft.feature:310`.
+    ///
+    /// `OnceLock` (init-once, then read-only) because the registry
+    /// is attached after the gateway's `CompositionStore` is built
+    /// — which happens later in `runtime::run` than the apply hook
+    /// itself. Pre-attach, `on_create_namespace` simply skips the
+    /// registry step (no shards are committed before boot reaches
+    /// the attach point in any normal flow).
+    hydrator_registry: std::sync::OnceLock<Arc<kiseki_composition::HydratorRegistry>>,
 }
 
 impl ShardStoreApplyHook {
-    /// Build a hook bound to the given `RaftShardStore`.
+    /// Build a hook bound to the given `RaftShardStore`. The
+    /// composition-hydrator registry is attached separately via
+    /// [`Self::attach_hydrator_registry`] because the registry
+    /// needs the gateway's `CompositionStore` handle which isn't
+    /// constructed until later in `runtime::run`.
     #[must_use]
     pub fn new(raft_store: Arc<kiseki_log::RaftShardStore>, self_node_id: u64) -> Self {
         Self {
             raft_store,
             self_node_id,
             config: kiseki_log::ShardConfig::default(),
+            hydrator_registry: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Attach the composition-hydrator registry to an existing
+    /// hook. Once attached, every shard the apply hook locally
+    /// registers (on create or split) also gets a per-shard
+    /// hydrator task. Idempotent — calling twice keeps the first
+    /// registry.
+    pub fn attach_hydrator_registry(&self, registry: Arc<kiseki_composition::HydratorRegistry>) {
+        let _ = self.hydrator_registry.set(registry);
     }
 
     fn create_shard_idempotent(&self, shard_id: ShardId, tenant_id: OrgId) {
@@ -142,6 +171,14 @@ impl ShardStoreApplyHook {
                 shard_id = %shard_id.0,
                 "control-plane apply hook: shard already exists locally — skipping create",
             );
+            // Still register with the hydrator registry even if the
+            // Raft group already exists locally: on replay through
+            // snapshot install + tail catch-up the apply hook re-
+            // fires, and we want every known shard to have a poll
+            // loop. `register` is itself idempotent.
+            if let Some(registry) = self.hydrator_registry.get() {
+                registry.register(shard_id);
+            }
             return;
         }
         // `raft_addr=None` because the listener is already running
@@ -158,6 +195,14 @@ impl ShardStoreApplyHook {
             self.config.clone(),
             None,
         );
+        // The hydrator registry must learn about every per-shard
+        // Raft group this node hosts. Without this the composition
+        // hydrator only polls the bootstrap shard and Create deltas
+        // on every other shard go unapplied on followers (the bug
+        // root-caused 2026-05-18).
+        if let Some(registry) = self.hydrator_registry.get() {
+            registry.register(shard_id);
+        }
         tracing::info!(
             shard_id = %shard_id.0,
             tenant_id = %tenant_id.0,
