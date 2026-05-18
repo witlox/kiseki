@@ -275,12 +275,22 @@ async fn submit_with_leader_retry(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut attempt = 0u32;
     loop {
-        match ctrl_store.submit(cmd.clone()).await {
+        // ADR-033 §5 + 2026-05-18 RCA: use the wait-for-voters variant
+        // so the apply hook (ShardStoreApplyHook::on_create_namespace
+        // + hydrate_shard_map) has fired on every voter before this
+        // returns. Without the barrier, follower nodes serve PUTs /
+        // GETs against an empty shard_map for several hundred ms after
+        // boot — manifested as 6-node EC GET-from-followers returning
+        // 404 NoSuchKey (slow-tier failure 2026-05-18).
+        match ctrl_store
+            .submit_and_wait_for_voters(cmd.clone(), std::time::Duration::from_secs(10))
+            .await
+        {
             Ok(_) => {
                 tracing::info!(
                     label,
                     attempts = attempt + 1,
-                    "control-plane: namespace seeded",
+                    "control-plane: namespace seeded + voters caught up",
                 );
                 return;
             }
@@ -360,9 +370,18 @@ impl kiseki_gateway::mem_gateway::NamespaceProvisioner for ControlPlaneProvision
         // Raft runtime so we don't deadlock when the leader's apply
         // pipeline parks on the host runtime's reactor.
         let ctrl = Arc::clone(&self.ctrl_store);
+        // Use submit_and_wait_for_voters: the gateway's caller of
+        // ensure_namespace_exists proceeds to read/write against the
+        // shard_map on RETURN — so the apply hook must have fired on
+        // this node (and ideally on every voter) BEFORE we return.
+        // Without this, the very next op routes through an empty
+        // shard_map (slow-tier 6-node EC RCA, 2026-05-18).
         let res = self
             .raft_runtime
-            .spawn(async move { ctrl.submit(cmd).await })
+            .spawn(async move {
+                ctrl.submit_and_wait_for_voters(cmd, std::time::Duration::from_secs(10))
+                    .await
+            })
             .await
             .map_err(|e| {
                 kiseki_gateway::error::GatewayError::Upstream(format!("raft join failed: {e}"))

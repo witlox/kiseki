@@ -22,6 +22,8 @@ use kiseki_common::ids::{NodeId, OrgId, ShardId};
 use kiseki_raft::{
     FjallRaftLogStore, KisekiNode, KisekiRaftConfig, MemLogStore, RegistryHandle, TcpNetworkFactory,
 };
+use openraft::log_id::RaftLogId;
+use openraft::type_config::async_runtime::WatchReceiver;
 use openraft::Raft;
 
 use super::commands::ControlCommand;
@@ -408,6 +410,110 @@ impl OpenRaftControlStore {
             m.record_submit(op, outcome, elapsed);
         }
         result.map(|r| r.response().clone())
+    }
+
+    /// Submit `cmd` and wait until every voter's `matched` log index
+    /// reaches the committed entry — so the apply hook has fired on
+    /// every voter before this returns.
+    ///
+    /// Without this barrier, callers that depend on side effects of
+    /// the apply hook (e.g. `ShardStoreApplyHook::on_create_namespace`
+    /// creating per-shard Raft groups on followers, or
+    /// `ControlStateMachine::hydrate_shard_map` populating the
+    /// gateway-readable shard map) race against follower replication:
+    /// `submit` returns once the LEADER applies, but followers'
+    /// applies happen asynchronously over `AppendEntries`. The 2026-05-18
+    /// slow-tier RCA pinned this race to 6-node EC GET-from-followers
+    /// returning 404 immediately after a bootstrap-time
+    /// `CreateNamespace`.
+    ///
+    /// `matched` on the leader's replication metric is the highest log
+    /// index a follower has confirmed *receiving* (not strictly
+    /// applying). For our case it's a good-enough proxy — openraft's
+    /// apply task drains the log monotonically and apply latency on
+    /// the follower side is sub-millisecond once an entry lands. A
+    /// tiny tail sleep after the matched check absorbs that gap.
+    pub async fn submit_and_wait_for_voters(
+        &self,
+        cmd: ControlCommand,
+        deadline: std::time::Duration,
+    ) -> Result<ControlResponse, std::io::Error> {
+        let op = super::ClusterControlMetrics::op_label(&cmd);
+        let started = std::time::Instant::now();
+        let result = self
+            .raft
+            .client_write(cmd)
+            .await
+            .map_err(|e| std::io::Error::other(format!("control client_write: {e}")));
+        let resp = match result {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(m) = self.metrics.as_ref() {
+                    let outcome = if e.to_string().contains("forward request to") {
+                        super::metrics::outcome::FORWARD
+                    } else {
+                        super::metrics::outcome::ERROR
+                    };
+                    m.record_submit(op, outcome, started.elapsed());
+                }
+                return Err(e);
+            }
+        };
+        let target_index = RaftLogId::index(resp.log_id());
+        self.wait_for_voters_applied(target_index, deadline).await?;
+        if let Some(m) = self.metrics.as_ref() {
+            m.record_submit(op, super::metrics::outcome::OK, started.elapsed());
+        }
+        Ok(resp.response().clone())
+    }
+
+    /// Poll openraft metrics until every replication peer's `matched`
+    /// log index reaches `target_index`. Returns Ok on success or a
+    /// timeout error after `deadline`.
+    ///
+    /// On a non-leader the leader's per-follower replication state
+    /// isn't observable from this node — fall back to a leader-local
+    /// applied-index check.
+    pub async fn wait_for_voters_applied(
+        &self,
+        target_index: u64,
+        deadline: std::time::Duration,
+    ) -> Result<(), std::io::Error> {
+        let stop = std::time::Instant::now() + deadline;
+        loop {
+            let m = self.raft.metrics().borrow_watched().clone();
+            let leader_applied = m.last_applied.as_ref().map_or(0, RaftLogId::index);
+            if leader_applied < target_index {
+                if std::time::Instant::now() > stop {
+                    return Err(std::io::Error::other(format!(
+                        "control-plane leader did not apply through {target_index} within {deadline:?}",
+                    )));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                continue;
+            }
+            // `replication` is `Some` only on the leader. On a non-
+            // leader we can't observe follower state — `last_applied`
+            // above is the best signal we have, so return.
+            let Some(repl) = m.replication.as_ref() else {
+                return Ok(());
+            };
+            let all_caught_up = repl.iter().all(|(_, opt_log_id)| {
+                opt_log_id.as_ref().map_or(0, RaftLogId::index) >= target_index
+            });
+            if all_caught_up {
+                // Small tail sleep so the follower's apply task drains
+                // the in-flight entry before the caller proceeds.
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                return Ok(());
+            }
+            if std::time::Instant::now() > stop {
+                return Err(std::io::Error::other(format!(
+                    "control-plane voters did not match through {target_index} within {deadline:?}",
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     /// Dispatch a control-plane apply hook for a single command.
