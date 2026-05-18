@@ -245,8 +245,15 @@ pub fn s3_router_with_peers<G: GatewayOps + Send + Sync + 'static>(
                 .delete(delete_bucket::<G>)
                 .head(head_bucket::<G>),
         )
+        // Wildcard match on `{*key}` rather than `{key}` so keys
+        // with embedded slashes (the conventional S3 pseudo-directory
+        // shape — e.g. `del/should-be-gone.bin`, `logs/2026/05/x.bin`)
+        // route correctly. Without the wildcard axum 0.8 treats the
+        // first segment after the bucket as the entire `{key}` and
+        // the URL fails to match, returning a 404 at the router
+        // level before any handler runs.
         .route(
-            "/{bucket}/{key}",
+            "/{bucket}/{*key}",
             put(put_or_upload_part::<G>)
                 .get(get_object::<G>)
                 .head(head_object::<G>)

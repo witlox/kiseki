@@ -98,6 +98,10 @@ def _run_in_client(
     *,
     timeout: int = 60,
 ) -> subprocess.CompletedProcess[str]:
+    # `kiseki-pnfs-client` image has `ENTRYPOINT []` + a no-op CMD
+    # (#57); passing the script as the first arg makes runc try to
+    # `exec(script_as_binary)`. Wrap with `bash -c` so the script is
+    # interpreted, not exec'd.
     return subprocess.run(
         [
             "docker",
@@ -111,6 +115,8 @@ def _run_in_client(
             "--cap-add",
             "DAC_READ_SEARCH",
             image,
+            "bash",
+            "-c",
             script,
         ],
         check=False,

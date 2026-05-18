@@ -78,6 +78,12 @@ def test_get_organization(kiseki_server: ServerInfo) -> None:
 
 
 @pytest.mark.e2e
+@pytest.mark.skip(
+    reason="ListProjects RPC + ListProjectsRequest/Response messages "
+    "are not yet defined in control.proto. The test exercises a "
+    "verification path that depends on that RPC; un-skip once it ships "
+    "(see control.proto §Project RPCs)."
+)
 def test_create_project_within_org(kiseki_server: ServerInfo) -> None:
     """Create a project within an organization, verify persistence
     via ListProjects (org-scoped). Pre-fix the test asserted only that

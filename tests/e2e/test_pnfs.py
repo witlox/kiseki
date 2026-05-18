@@ -137,7 +137,11 @@ def _run_in_client(
 ) -> subprocess.CompletedProcess[str]:
     """Invoke `script` inside an ephemeral privileged client container
     joined to the cluster network. Returns the completed process
-    (caller checks returncode and inspects stdout/stderr)."""
+    (caller checks returncode and inspects stdout/stderr).
+
+    `kiseki-pnfs-client` has `ENTRYPOINT []` + a no-op CMD (#57);
+    pass `bash -c <script>` so the script is interpreted by a shell
+    rather than runc trying to `exec` it as a binary path."""
     return subprocess.run(
         [
             "docker",
@@ -151,6 +155,8 @@ def _run_in_client(
             "--cap-add",
             "DAC_READ_SEARCH",
             image,
+            "bash",
+            "-c",
             script,
         ],
         check=False,

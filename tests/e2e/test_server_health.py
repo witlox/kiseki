@@ -22,11 +22,15 @@ from kiseki.v1 import (
 )
 
 
-def _make_timestamp() -> log_pb2.DeltaTimestamp:
-    # Match test_log_roundtrip's helper — a minimal valid HLC.
-    return log_pb2.DeltaTimestamp(
-        hlc=log_pb2.HybridLogicalClock(physical_ms=0, logical=0, node_id=1),
-        wall=log_pb2.WallTime(millis_since_epoch=0, timezone="UTC"),
+def _make_timestamp() -> common_pb2.DeltaTimestamp:
+    # `DeltaTimestamp`, `HybridLogicalClock`, and `WallTime` are
+    # defined in common.proto, not log.proto — `log.proto` only
+    # *references* them. Looking up `log_pb2.DeltaTimestamp` was
+    # always an AttributeError at test-collection time; the Python
+    # proto bindings don't re-export the type into log_pb2.
+    return common_pb2.DeltaTimestamp(
+        hlc=common_pb2.HybridLogicalClock(physical_ms=0, logical=0, node_id=1),
+        wall=common_pb2.WallTime(millis_since_epoch=0, timezone="UTC"),
         quality=1,  # NTP
     )
 
