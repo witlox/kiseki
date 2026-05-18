@@ -340,6 +340,44 @@ impl kiseki_gateway::mem_gateway::NamespaceProvisioner for ControlPlaneProvision
                     initialize_seeded_shards(&store, &shard_ids, None, "first-touch namespace")
                         .await;
                 }
+                // Completing the namespace-creation contract: `provision`
+                // must not return success until each fresh shard has an
+                // elected leader. Without this, callers like S3
+                // `CreateBucket` would receive `200 OK` for a bucket
+                // that is not yet writable — the subsequent `PutObject`
+                // races the per-shard Raft election and 5xx's with
+                // `leader unavailable: ShardId(...)`. Same contract
+                // logic for any namespace-creating path (admin API,
+                // future first-touch auto-provisioning): when this
+                // function returns success, the namespace is fully
+                // ready for writes.
+                //
+                // openraft's `Raft::initialize()` returns once the
+                // configuration is recorded locally but BEFORE the
+                // election has converged across the cluster.
+                // `shard_health` returns `ShardNotFound` on a voter
+                // that hasn't applied the CreateNamespace yet, so the
+                // same poll naturally absorbs the apply-lag race too.
+                // 30 s upper bound matches the BDD harness's outer
+                // retry budget — if consensus genuinely hasn't
+                // happened in 30 s, something is wrong and the
+                // failure should surface, not be hidden by a longer
+                // wait.
+                if resp.is_ok() {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    for shard_id in &shard_ids {
+                        while std::time::Instant::now() < deadline {
+                            if let Ok(info) =
+                                kiseki_log::LogOps::shard_health(&*store, *shard_id).await
+                            {
+                                if info.leader.is_some() {
+                                    break;
+                                }
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    }
+                }
                 resp
             })
             .await
