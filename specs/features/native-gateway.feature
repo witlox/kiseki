@@ -204,7 +204,7 @@ Feature: Native Gateway Data Service — gRPC data-plane for native clients
   @native @routing
   Scenario: ADR-042 §4 proxy gate enforces hop cap (gate-1 C-H4)
     Given a node-1 with KISEKI_NATIVE_PROXY_FALLBACK=on and node-2 registered as a proxy target
-    When the proxy code path is asked to forward to node-2 at hop_count 2
+    When the proxy code path is asked to forward to leader_node_id == node-2 at hop_count 2
     Then validate_forward returns HopLimitExceeded
     And the client must refresh its own topology cache before retry
 

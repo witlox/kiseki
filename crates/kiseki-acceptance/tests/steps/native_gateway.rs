@@ -2400,8 +2400,12 @@ async fn given_proxy_empty_pool(w: &mut KisekiWorld) {
     stash_proxy_client(w, pc);
 }
 
+// Accept both spellings of the When step — the surrounding three
+// scenarios use `leader_node_id == node-N`, but
+// `Scenario: ADR-042 §4 proxy gate enforces hop cap` historically
+// used the shorter `node-N` form. Both forms route to the same call.
 #[when(
-    regex = r#"^the proxy code path is asked to forward to leader_node_id == node-(\d+) at hop_count (\d+)$"#
+    regex = r#"^the proxy code path is asked to forward to (?:leader_node_id == )?node-(\d+) at hop_count (\d+)$"#
 )]
 async fn when_validate_forward(w: &mut KisekiWorld, target: u64, hop: u8) {
     let pc = read_proxy_client(w);
