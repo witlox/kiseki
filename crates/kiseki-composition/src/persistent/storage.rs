@@ -196,11 +196,23 @@ pub trait CompositionStorage: Send + Sync {
     fn halted(&self, shard_id: ShardId) -> Result<bool, PersistentStoreError>;
 
     /// True iff any shard on this node is currently halted.
-    /// Temporary helper (issue #87 PR-2) for callers that don't yet
-    /// route reads through the `composition_id → shard_id` resolver.
-    /// The gateway's read-path 503 short-circuit uses this until
-    /// PR-3 wires per-composition shard resolution. New code should
-    /// prefer the shard-scoped [`halted`] accessor.
+    ///
+    /// Used by the gateway's read-path 503 short-circuit, which fires
+    /// only on lookup-miss (`guard.get(composition_id)` returned
+    /// `NotFound`). At that point the gateway doesn't know which shard
+    /// the missing composition belongs to — composition records are
+    /// keyed by `CompositionId` (a `UUIDv4`, not derived from a routable
+    /// key) and don't carry a `shard_id` field. Per-composition shard
+    /// resolution would require a data-model change (adding `shard_id`
+    /// to `Composition`, snapshot-format bump, migration) whose cost
+    /// exceeds the residual blast-radius savings now that the trip
+    /// predicate (I-CP5) requires positive compaction evidence.
+    ///
+    /// New code that has `shard_id` in scope (the hydrator, the
+    /// per-shard `/cluster/shards/{id}/leader` health endpoint) should
+    /// use the shard-scoped [`halted`] accessor directly. `halted_any`
+    /// is intentionally the gateway's coarse signal; the per-shard
+    /// storage layout (I-CP5b) still bounds the durable halt state.
     fn halted_any(&self) -> Result<bool, PersistentStoreError>;
 
     /// Apply a hydrator batch atomically. The persistent backend
