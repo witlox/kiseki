@@ -517,6 +517,69 @@ async fn api_create_sharded_namespace(
                 }
                 _ => shard_count,
             };
+
+            // Issue #93: the control-plane submit creates per-shard
+            // Raft groups + populates the NamespaceShardMap (via the
+            // apply hooks), but does NOT register the namespace in
+            // the gateway's composition store or emit a
+            // NamespaceCreate delta. Without these two steps, any
+            // gateway write that addresses the namespace by ID (the
+            // native protocol path, FUSE/NFS writes, anything that
+            // bypasses the S3 `ensure_namespace_exists` fallback)
+            // returns "namespace not found".
+            //
+            // Mirror the steps the S3 first-touch path takes in
+            // `mem_gateway::ensure_namespace_exists`:
+            //   1. Add the namespace to the local composition store
+            //      (idempotent — skip if already present).
+            //   2. Emit a `NamespaceCreate` delta on the bootstrap
+            //      shard so followers' hydrators register the
+            //      namespace on their composition stores.
+            //
+            // namespace_id at this layer is a String; the composition
+            // store is keyed by `NamespaceId(Uuid)`. The CLI + bench
+            // pass UUID strings; legacy non-UUID names just skip this
+            // step (the older behavior — admin RPC stays usable for
+            // non-UUID namespace identifiers without surfacing 5xx).
+            if let (Some(comps), Some(log)) =
+                (state.compositions.as_ref(), state.log_store.as_ref())
+            {
+                if let Ok(ns_uuid) = uuid::Uuid::parse_str(&namespace_id) {
+                    let ns_id = kiseki_common::ids::NamespaceId(ns_uuid);
+                    if comps.namespace(ns_id).is_none() {
+                        let shard_id = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
+                        let ns = kiseki_composition::namespace::Namespace {
+                            id: ns_id,
+                            tenant_id,
+                            shard_id,
+                            read_only: false,
+                            versioning_enabled: false,
+                            compliance_tags: Vec::new(),
+                        };
+                        comps.add_namespace(ns.clone());
+                        if let Err(e) = kiseki_composition::log_bridge::emit_namespace_create(
+                            log.as_ref(),
+                            shard_id,
+                            tenant_id,
+                            &ns,
+                        )
+                        .await
+                        {
+                            // Roll back the local add — without
+                            // follower visibility this would be a
+                            // stealth single-node namespace. Same
+                            // contract as `ensure_namespace_exists`.
+                            comps.remove_namespace(ns_id);
+                            tracing::warn!(
+                                namespace_id = %ns_uuid,
+                                error = %e,
+                                "admin namespace-create: NamespaceCreate delta emit failed — rolled back",
+                            );
+                        }
+                    }
+                }
+            }
+
             let shard_json: Vec<serde_json::Value> = shards
                 .iter()
                 .map(|s| {
