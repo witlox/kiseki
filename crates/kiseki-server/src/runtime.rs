@@ -278,7 +278,6 @@ struct ControlPlaneProvisioner {
     ctrl_store: Arc<crate::cluster_control::OpenRaftControlStore>,
     raft_store: Arc<kiseki_log::RaftShardStore>,
     active_nodes: Vec<kiseki_common::ids::NodeId>,
-    is_bootstrap: bool,
     raft_runtime: tokio::runtime::Handle,
 }
 
@@ -322,21 +321,43 @@ impl kiseki_gateway::mem_gateway::NamespaceProvisioner for ControlPlaneProvision
         // pipeline parks on the host runtime's reactor.
         let ctrl = Arc::clone(&self.ctrl_store);
         let store = Arc::clone(&self.raft_store);
-        let is_bootstrap = self.is_bootstrap;
         // submit_and_wait_for_voters waits for all voters to receive
         // the CreateNamespace log entry — the apply hook will have
         // fired (or will fire imminently) on every node. After that
-        // the bootstrap node initializes membership on each fresh
-        // per-shard Raft group so writes can land. Only the bootstrap
-        // node calls initialize — followers learn membership through
-        // AppendEntries.
+        // the *control-plane leader* (the node whose `submit`
+        // returned `Ok`) initializes membership on each fresh
+        // per-shard Raft group so writes can land. Followers learn
+        // membership through AppendEntries.
+        //
+        // Earlier this branch was gated on `is_bootstrap` (the
+        // `KISEKI_BOOTSTRAP=true` flag), under the assumption that
+        // the bootstrap node was always the control-plane Raft
+        // leader. That breaks the moment leadership rotates to any
+        // other node: the bootstrap's `submit` returns
+        // `ForwardToLeader` (Err, so the initialize branch is
+        // skipped), and the actual leader has `is_bootstrap=false`
+        // (so it also skips). The new per-shard group ends up
+        // created on every node via the apply hook but with no
+        // membership initialized — no election, no leader, every
+        // write 5xx's with "leader unavailable" until a node
+        // restart. CI tracing pinned this 2026-05-19: control-plane
+        // term T3 had node-2 as leader; node-1's provision returned
+        // ForwardToLeader, the test retried via node-2, node-2
+        // submitted successfully but skipped initialize because
+        // `is_bootstrap=false`.
+        //
+        // The leader is the only node whose `submit` can succeed
+        // (openraft maps follower writes to `ForwardToLeader` Err),
+        // so gating on `resp.is_ok()` alone is equivalent to "I am
+        // the control-plane leader" — which is the right condition
+        // for who-initializes-the-new-shard.
         let res = self
             .raft_runtime
             .spawn(async move {
                 let resp = ctrl
                     .submit_and_wait_for_voters(cmd, std::time::Duration::from_secs(10))
                     .await;
-                if resp.is_ok() && is_bootstrap {
+                if resp.is_ok() {
                     initialize_seeded_shards(&store, &shard_ids, None, "first-touch namespace")
                         .await;
                 }
@@ -1453,7 +1474,6 @@ pub async fn run_main(
             ctrl_store: Arc::clone(ctrl_store),
             raft_store: Arc::clone(raft_store),
             active_nodes,
-            is_bootstrap: cfg.bootstrap,
             raft_runtime: raft_store.raft_runtime_handle(),
         });
         gw.set_namespace_provisioner(provisioner);
