@@ -66,7 +66,23 @@ jobs:
         # `harness = false` with a cucumber clap CLI that rejects
         # nextest's `--list --format terse` probe (commit e2d5de4).
         # bdd.yml uses the same form.
+        #
+        # KISEKI_HARNESS_LOG_DIR + KISEKI_HARNESS_RUST_LOG capture
+        # per-node tracing from the spawned kiseki-server children.
+        # Uploaded as artifacts on failure so we can post-mortem
+        # CI-only races.
+        env:
+          KISEKI_HARNESS_LOG_DIR: ${{ runner.temp }}/kiseki-bdd-logs
+          KISEKI_HARNESS_RUST_LOG: "info,openraft=debug,kiseki_log=debug,kiseki_raft=debug,kiseki_server::cluster_control=debug"
         run: cargo test --locked --features kiseki-acceptance/slow-tests -p kiseki-acceptance --test acceptance --release
+      - name: Upload BDD server logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preflight-bdd-server-logs
+          path: ${{ runner.temp }}/kiseki-bdd-logs
+          if-no-files-found: warn
+          retention-days: 14
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   # ---------------------------------------------------------------------------

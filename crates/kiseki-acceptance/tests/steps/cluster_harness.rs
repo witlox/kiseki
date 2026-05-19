@@ -564,7 +564,16 @@ fn spawn_with_env(
         ;
     if let Ok(dir) = std::env::var("KISEKI_HARNESS_LOG_DIR") {
         let _ = std::fs::create_dir_all(&dir);
-        let path = format!("{dir}/node-{node_id}.log");
+        // Each scenario spawns fresh node-1/2/3; without a unique
+        // suffix every scenario appends to the same node-N.log and
+        // post-mortem requires guessing which run a log section
+        // belongs to. The data_dir basename is a unique tempdir name
+        // per spawn, so it cleanly partitions logs per scenario run.
+        let suffix = data_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        let path = format!("{dir}/node-{node_id}-{suffix}.log");
         let opened = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
