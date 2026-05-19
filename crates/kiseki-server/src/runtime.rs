@@ -1111,7 +1111,31 @@ pub async fn run_main(
     // (populated by the leader's own local-fragment writes). Without
     // this, peers fetching the leader's local fragment receive an
     // envelope with zero auth_tag/nonce — AES-GCM verify fails.
-    let envelope_registry = kiseki_chunk_cluster::ChunkEnvelopeRegistry::default();
+    // Issue #92 deeper fix (2026-05-19): persist envelope metadata so
+    // the registry survives restart. Pre-fix the registry was
+    // `Mutex<HashMap>` in-memory only; any chunk written by a
+    // previous server generation had no metadata on read, which
+    // post-PR-1 surfaces as `ChunkError::NotFound` (pre-PR-1
+    // surfaced as a misleading AEAD verify failure). With persistence
+    // wired here, restart is transparent — the in-memory cache warms
+    // back up via `lookup` falling back to disk on miss.
+    //
+    // In-memory-only mode is preserved when `cfg.data_dir` is `None`
+    // (single-node compose, tests).
+    let envelope_registry = if let Some(ref dir) = cfg.data_dir {
+        match kiseki_chunk_cluster::ChunkEnvelopeRegistry::with_data_dir(dir) {
+            Ok(reg) => reg,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "envelope registry: failed to open persistent store — falling back to in-memory only (post-restart cross-leader reads will fail until chunks are re-written)",
+                );
+                kiseki_chunk_cluster::ChunkEnvelopeRegistry::default()
+            }
+        }
+    } else {
+        kiseki_chunk_cluster::ChunkEnvelopeRegistry::default()
+    };
     let chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> = Arc::new(
         kiseki_chunk_cluster::ClusteredChunkStore::new(
             Arc::clone(&local_chunk_store),
