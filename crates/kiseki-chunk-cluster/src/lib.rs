@@ -569,35 +569,56 @@ impl ClusteredChunkStore {
             bytes.truncate(trimmed_len);
             bytes
         };
-        let (auth_tag, nonce, system_epoch, tenant_epoch, tenant_wrapped_material) = crypto
-            .map_or_else(
-                || {
-                    (
-                        [0u8; 16],
-                        [0u8; 12],
-                        kiseki_common::tenancy::KeyEpoch(1),
-                        None,
-                        None,
-                    )
-                },
-                |e| {
-                    (
-                        e.auth_tag,
-                        e.nonce,
-                        e.system_epoch,
-                        e.tenant_epoch,
-                        e.tenant_wrapped_material,
-                    )
-                },
+        // Issue #92: when every fragment came from the local store
+        // (placement happened to put everything on self_node_id, or all
+        // remote peers timed out but local satisfied min_fragments),
+        // `crypto` is still `None` because the local-fragment path
+        // only fetches bytes, not envelope metadata. Pre-fix the code
+        // fell back to zeroed crypto here, which caused AEAD verify
+        // to fail on the caller with "AEAD authentication failed" —
+        // misleading the operator into thinking ciphertext was
+        // tampered when really the side-table-vs-fragment-bytes
+        // coverage was incomplete.
+        //
+        // Recovery: consult the local envelope registry as the
+        // last-resort source of crypto. The leader populates the
+        // registry on every chunk it issues a PutFragment fan-out
+        // for (`ClusteredChunkStore` write path), so for any chunk
+        // the leader wrote there's an authoritative entry here.
+        // If neither remote peers NOR the local registry have
+        // metadata, surface a clean error instead of zeroing —
+        // the previous behavior buried the real failure under an
+        // AEAD-tampering symptom.
+        let crypto = crypto.or_else(|| {
+            self.envelope_registry.as_ref().and_then(|reg| {
+                reg.lookup(chunk_id).map(|m| Envelope {
+                    chunk_id: *chunk_id,
+                    ciphertext: Vec::new(),
+                    auth_tag: m.auth_tag(),
+                    nonce: m.nonce(),
+                    system_epoch: m.system_epoch(),
+                    tenant_epoch: m.tenant_epoch(),
+                    tenant_wrapped_material: m.tenant_wrapped_material(),
+                })
+            })
+        });
+        let Some(crypto) = crypto else {
+            tracing::warn!(
+                ?chunk_id,
+                "read_chunk_ec: no peer or local registry has envelope metadata — \
+                 chunk likely written by a different leader generation \
+                 (registry is in-memory and not persisted across restart)",
             );
+            return Err(ChunkError::NotFound(*chunk_id));
+        };
         Ok(Envelope {
             chunk_id: *chunk_id,
             ciphertext: bytes,
-            auth_tag,
-            nonce,
-            system_epoch,
-            tenant_epoch,
-            tenant_wrapped_material,
+            auth_tag: crypto.auth_tag,
+            nonce: crypto.nonce,
+            system_epoch: crypto.system_epoch,
+            tenant_epoch: crypto.tenant_epoch,
+            tenant_wrapped_material: crypto.tenant_wrapped_material,
         })
     }
 

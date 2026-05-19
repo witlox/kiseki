@@ -127,12 +127,30 @@ impl ChunkEnvelopeRegistry {
         });
     }
 
-    fn lookup(&self, chunk_id: &RustChunkId) -> Option<EnvelopeMeta> {
+    pub(crate) fn lookup(&self, chunk_id: &RustChunkId) -> Option<EnvelopeMeta> {
         self.inner
             .lock()
             .lock_or_die("server.inner")
             .get(chunk_id)
             .cloned()
+    }
+}
+
+impl EnvelopeMeta {
+    pub(crate) fn auth_tag(&self) -> [u8; 16] {
+        self.auth_tag
+    }
+    pub(crate) fn nonce(&self) -> [u8; 12] {
+        self.nonce
+    }
+    pub(crate) fn system_epoch(&self) -> kiseki_common::tenancy::KeyEpoch {
+        self.system_epoch
+    }
+    pub(crate) fn tenant_epoch(&self) -> Option<kiseki_common::tenancy::KeyEpoch> {
+        self.tenant_epoch
+    }
+    pub(crate) fn tenant_wrapped_material(&self) -> Option<Vec<u8>> {
+        self.tenant_wrapped_material.clone()
     }
 }
 
