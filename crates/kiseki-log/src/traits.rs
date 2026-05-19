@@ -158,6 +158,23 @@ pub trait LogOps: Send + Sync {
     /// Get shard health and metadata.
     async fn shard_health(&self, shard_id: ShardId) -> Result<ShardInfo, LogError>;
 
+    /// The lowest sequence number still visible to readers of this
+    /// shard's delta log, after any truncate/compact GC. Returns
+    /// `SequenceNumber(0)` for a shard that has either never accepted
+    /// any deltas (fresh provisioning) or whose entire delta history
+    /// has been GC'd away — both are "no compaction-gap evidence",
+    /// distinct from a non-zero earliest visible sequence which is
+    /// positive proof that earlier deltas are gone.
+    ///
+    /// Required by the composition hydrator's gap-detection rule
+    /// (ADR-040 §D6.3, amended for issue #87). The default impl
+    /// returns `Ok(SequenceNumber(0))` so test doubles and in-memory
+    /// stores that don't GC don't need to implement it; production
+    /// log backends override.
+    async fn earliest_visible_seq(&self, _shard_id: ShardId) -> Result<SequenceNumber, LogError> {
+        Ok(SequenceNumber(0))
+    }
+
     /// Set or clear maintenance mode on a shard (I-O6).
     async fn set_maintenance(&self, shard_id: ShardId, enabled: bool) -> Result<(), LogError>;
 
