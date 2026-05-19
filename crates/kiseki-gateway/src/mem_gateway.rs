@@ -1302,14 +1302,18 @@ impl GatewayOps for InMemoryGateway {
                     }
                     Ok(c.clone())
                 } else if guard.with_storage_locked(|s| s.halted_any().unwrap_or(false)) {
-                    // Halt-mode short-circuit: if ANY shard's hydrator
-                    // is halted, surface ServiceUnavailable. This is a
-                    // temporary node-wide fail-safe pending PR-3 of
-                    // issue #87 which threads composition_id → shard_id
-                    // resolution into this path so the short-circuit
-                    // fires only when the affected composition's own
-                    // shard is halted. Storage is already per-shard
-                    // (I-CP5b), only the read-side resolution is TBD.
+                    // Halt-mode short-circuit: on lookup-miss, if any
+                    // shard's hydrator is halted, surface 503 so the
+                    // client retries elsewhere. The composition record
+                    // doesn't carry `shard_id` (it's keyed by UUIDv4,
+                    // not by a routable key), so we can't cheaply ask
+                    // "is THIS composition's shard halted" — we'd need
+                    // a data-model change. The trade-off after I-CP5
+                    // tightened the trip predicate (positive compaction
+                    // evidence only) is acceptable: real halts are
+                    // rare, lookup-misses are rare on healthy clusters,
+                    // and a false 503 just causes the client to retry
+                    // against another node. See `halted_any()` doc.
                     tracing::warn!(
                         "gateway read: composition hydrator halted — returning ServiceUnavailable"
                     );
