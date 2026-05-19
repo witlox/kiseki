@@ -1301,9 +1301,15 @@ impl GatewayOps for InMemoryGateway {
                         m.read_retry_total.inc();
                     }
                     Ok(c.clone())
-                } else if guard.with_storage_locked(|s| s.halted().unwrap_or(false)) {
-                    // Halt-mode short-circuit: if the hydrator can't
-                    // catch up, surface ServiceUnavailable now.
+                } else if guard.with_storage_locked(|s| s.halted_any().unwrap_or(false)) {
+                    // Halt-mode short-circuit: if ANY shard's hydrator
+                    // is halted, surface ServiceUnavailable. This is a
+                    // temporary node-wide fail-safe pending PR-3 of
+                    // issue #87 which threads composition_id → shard_id
+                    // resolution into this path so the short-circuit
+                    // fires only when the affected composition's own
+                    // shard is halted. Storage is already per-shard
+                    // (I-CP5b), only the read-side resolution is TBD.
                     tracing::warn!(
                         "gateway read: composition hydrator halted — returning ServiceUnavailable"
                     );
