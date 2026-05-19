@@ -146,8 +146,9 @@ pub struct CompositionHydrator {
     /// polls don't pay a backend read for the meta key. Refreshed on
     /// apply.
     last_applied_cache: SequenceNumber,
-    /// Cache of the durable (node-global) halt flag so a halted
-    /// hydrator skips the poll without acquiring the storage lock.
+    /// Cache of the durable per-shard halt flag (I-CP5b) for
+    /// `self.shard_id`, so a halted hydrator skips the poll without
+    /// acquiring the storage lock. Was node-global pre-PR-2 of #87.
     halted_cache: bool,
     transient_retry_threshold: u32,
     /// §D10 metrics surface. Optional so unit tests get no-op behavior.
@@ -167,7 +168,9 @@ impl CompositionHydrator {
         let (last_applied_cache, halted_cache) = compositions.with_storage_locked(|s| {
             (
                 s.last_applied_seq(shard_id).unwrap_or(SequenceNumber(0)),
-                s.halted().unwrap_or(false),
+                // Per-shard halt read (I-CP5b, issue #87 PR-2). Was a
+                // node-global flag before the amendment.
+                s.halted(shard_id).unwrap_or(false),
             )
         });
         Self {
@@ -1159,9 +1162,9 @@ mod tests {
         assert_eq!(applied, 0, "halt mode must not apply anything");
         assert!(hydrator.halted(), "hydrator must enter halt mode");
 
-        // Halt is durable — re-reading the storage's flag confirms
-        // it persisted (I-CP5).
-        assert!(store.with_storage_locked(|s| s.halted().unwrap()));
+        // Halt is durable — re-reading the storage's per-shard flag
+        // confirms it persisted (I-CP5 / I-CP5b).
+        assert!(store.with_storage_locked(|s| s.halted(ShardId(uuid::Uuid::from_u128(1))).unwrap()));
     }
 
     /// Issue #87 (2026-05-19): the pre-amendment §D6.3 said "empty +
@@ -1199,7 +1202,7 @@ mod tests {
             "empty deltas + advanced tip + no compaction evidence MUST NOT halt (issue #87)",
         );
         assert!(
-            !store.with_storage_locked(|s| s.halted().unwrap()),
+            !store.with_storage_locked(|s| s.halted(ShardId(uuid::Uuid::from_u128(1))).unwrap()),
             "halt flag MUST NOT have been persisted (issue #87)",
         );
     }
@@ -1230,6 +1233,50 @@ mod tests {
         assert!(
             hydrator.halted(),
             "empty + earliest_visible past us is genuine compaction-gap, must halt",
+        );
+    }
+
+    /// Issue #87 PR-2 (I-CP5b): per-shard halt scope. One shard's
+    /// hydrator tripping its compaction-gap MUST NOT propagate the
+    /// halt state to other shards sharing the same `CompositionStore`
+    /// on the same node. Pre-PR-2 the `halted` field was a single
+    /// node-global bool; a single per-shard trip 503'd every read on
+    /// the node.
+    #[tokio::test]
+    async fn shard_halt_does_not_propagate_to_other_shards_on_same_store() {
+        let store = fresh_store_with_default_ns();
+        let shard_a = ShardId(uuid::Uuid::from_u128(1));
+        let shard_b = ShardId(uuid::Uuid::from_u128(2));
+
+        // Trip the halt on shard_a via a genuine compaction-gap.
+        let log_a = GapInjectingLog {
+            deltas: std::sync::Mutex::new(Vec::new()),
+            tip: kiseki_common::ids::SequenceNumber(50),
+            earliest_visible: kiseki_common::ids::SequenceNumber(30),
+            shard_id: shard_a,
+            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
+        };
+        let mut hydrator_a = CompositionHydrator::new(Arc::clone(&store), shard_a);
+        hydrator_a.poll(&log_a).await;
+        assert!(hydrator_a.halted(), "precondition: shard_a halted");
+        assert!(
+            store.with_storage_locked(|s| s.halted(shard_a).unwrap()),
+            "precondition: shard_a halt persisted",
+        );
+
+        // The blast radius assertion: shard_b is unrelated to
+        // shard_a's failure and MUST NOT inherit the halt flag.
+        assert!(
+            !store.with_storage_locked(|s| s.halted(shard_b).unwrap()),
+            "halt on shard_a MUST NOT propagate to shard_b (I-CP5b, issue #87 PR-2)",
+        );
+
+        // And a fresh hydrator for shard_b must observe halted=false
+        // at boot.
+        let hydrator_b = CompositionHydrator::new(Arc::clone(&store), shard_b);
+        assert!(
+            !hydrator_b.halted(),
+            "fresh hydrator on unrelated shard_b MUST boot un-halted (I-CP5b)",
         );
     }
 

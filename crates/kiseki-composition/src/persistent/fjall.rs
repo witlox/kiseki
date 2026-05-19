@@ -67,9 +67,6 @@ mod meta_keys {
     use kiseki_common::ids::ShardId;
 
     pub const SCHEMA_VERSION: &[u8] = b"schema_version";
-    /// Halt is global (any shard's hydrator can set it; reads on the
-    /// node fail safe across shards).
-    pub const HALTED: &[u8] = b"halted";
 
     /// Per-shard `last_applied_seq` key: `b"last_applied_seq:" || shard_uuid_bytes`.
     pub fn last_applied_seq(shard_id: ShardId) -> Vec<u8> {
@@ -83,6 +80,19 @@ mod meta_keys {
     /// Per-shard `stuck_state` key: `b"stuck_state:" || shard_uuid_bytes`.
     pub fn stuck_state(shard_id: ShardId) -> Vec<u8> {
         let prefix = b"stuck_state:";
+        let mut out = Vec::with_capacity(prefix.len() + 16);
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(shard_id.0.as_bytes());
+        out
+    }
+
+    /// Per-shard halt-flag key (I-CP5b, issue #87 PR-2):
+    /// `b"halted:" || shard_uuid_bytes`. Replaces the pre-PR-2
+    /// node-global `b"halted"` single-key. Migration: any stale
+    /// global key is ignored on read (the new lookup is by shard
+    /// prefix) and overwritten on the next per-shard write.
+    pub fn halted(shard_id: ShardId) -> Vec<u8> {
+        let prefix = b"halted:";
         let mut out = Vec::with_capacity(prefix.len() + 16);
         out.extend_from_slice(prefix);
         out.extend_from_slice(shard_id.0.as_bytes());
@@ -442,11 +452,24 @@ impl CompositionStorage for FjallStorage {
         }
     }
 
-    fn halted(&self) -> Result<bool, PersistentStoreError> {
-        match self.meta.get(meta_keys::HALTED)? {
+    fn halted(&self, shard_id: ShardId) -> Result<bool, PersistentStoreError> {
+        match self.meta.get(meta_keys::halted(shard_id))? {
             None => Ok(false),
             Some(slice) => Ok(slice.first().is_some_and(|&b| b != 0)),
         }
+    }
+
+    fn halted_any(&self) -> Result<bool, PersistentStoreError> {
+        // Scan the b"halted:" key-prefix. Sparse — only as many
+        // entries as shards that have ever set the flag, so the
+        // scan stays bounded.
+        for entry in self.meta.prefix(b"halted:") {
+            let (_, v) = entry.into_inner()?;
+            if v.first().is_some_and(|&b| b != 0) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn apply_hydration_batch(&self, batch: HydrationBatch) -> Result<(), PersistentStoreError> {
@@ -512,7 +535,7 @@ impl CompositionStorage for FjallStorage {
         if let Some(halted) = batch.halted {
             wb.insert(
                 &self.meta,
-                meta_keys::HALTED.to_vec(),
+                meta_keys::halted(batch.shard_id),
                 vec![u8::from(halted)],
             );
         }
