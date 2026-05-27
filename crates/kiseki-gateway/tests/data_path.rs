@@ -53,6 +53,7 @@ async fn write_then_read_roundtrip() {
 
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
         })
         .await
         .unwrap();
@@ -92,6 +93,7 @@ async fn read_with_offset_and_length() {
 
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
         })
         .await
         .unwrap();
@@ -128,6 +130,7 @@ async fn read_past_eof_returns_empty() {
 
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
         })
         .await
         .unwrap();
@@ -163,6 +166,7 @@ async fn tenant_mismatch_rejected() {
 
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
         })
         .await
         .unwrap();
@@ -227,6 +231,7 @@ async fn bucket_isolation_list_returns_only_own_objects() {
 
         forwarded_from_node: None,
         comp_id_override: None,
+        tier: None,
     })
     .await
     .unwrap();
@@ -243,6 +248,7 @@ async fn bucket_isolation_list_returns_only_own_objects() {
 
         forwarded_from_node: None,
         comp_id_override: None,
+        tier: None,
     })
     .await
     .unwrap();

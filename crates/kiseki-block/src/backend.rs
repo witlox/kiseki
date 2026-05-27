@@ -2,7 +2,7 @@
 
 use crate::error::{AllocError, BlockError};
 use crate::extent::Extent;
-use crate::probe::{DetectedMedium, DeviceCharacteristics};
+use crate::probe::{DetectedMedium, DeviceCharacteristics, StorageTier};
 
 /// Per-device capacity snapshot — one physical pool member.
 ///
@@ -29,6 +29,14 @@ pub trait DeviceBackend: Send + Sync {
     /// Allocate a contiguous extent of at least `size` bytes.
     /// Alignment matches the device's physical block size.
     fn alloc(&self, size: u64) -> Result<Extent, AllocError>;
+
+    /// Allocate preferring a cost/performance tier (ADR-045 §D4).
+    /// Default ignores the hint (single-tier backends fall back to
+    /// [`alloc`](Self::alloc)). `DevicePool` places on the hinted tier
+    /// and spills cost-ordered (fast → cold) when it's full.
+    fn alloc_in_tier(&self, size: u64, _tier: Option<StorageTier>) -> Result<Extent, AllocError> {
+        self.alloc(size)
+    }
 
     /// Write data at the given extent. Appends CRC32 trailer.
     fn write(&self, extent: &Extent, data: &[u8]) -> Result<(), BlockError>;

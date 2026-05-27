@@ -584,7 +584,7 @@ impl ClusterChunkService for ClusterChunkServer {
             Ok(Response::new(pb::PutFragmentResponse { stored }))
         } else {
             self.local
-                .write_fragment(&chunk_id, req.fragment_index, envelope.ciphertext)
+                .write_fragment_in_pool(&chunk_id, req.fragment_index, envelope.ciphertext, &pool)
                 .await
                 .map_err(|e| chunk_err_to_status(&e))?;
             if let Some(m) = self.metrics.as_ref() {

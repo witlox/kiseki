@@ -383,6 +383,7 @@ impl<G: GatewayOps> KisekiFuse<G> {
 
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
         })
     }
 
@@ -476,6 +477,7 @@ impl<G: GatewayOps> KisekiFuse<G> {
 
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
         })
     }
 

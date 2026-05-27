@@ -518,6 +518,7 @@ impl ServerImpl {
                 idempotency_key: Some(cf.idempotency_key.clone()),
                 forwarded_from_node: cf.forwarded_from_node,
                 comp_id_override: None,
+                tier: None,
             };
             match self.ops.write_with_forwarding(wreq).await {
                 Ok(r) => r,
@@ -583,6 +584,7 @@ impl ServerImpl {
                 idempotency_key: Some(cf.idempotency_key.clone()),
                 forwarded_from_node: cf.forwarded_from_node,
                 comp_id_override: None,
+                tier: None,
             };
             self.ops.write(wreq).await.map_err(map_gateway_error)?
         };

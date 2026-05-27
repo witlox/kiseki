@@ -137,6 +137,9 @@ impl<G: GatewayOps> S3Gateway<G> {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                // S3 x-amz-storage-class → tier mapping is a thin
+                // per-protocol adapter (ADR-045 §D5); not yet wired.
+                tier: None,
             })
             .await?;
 

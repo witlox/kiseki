@@ -124,6 +124,19 @@ pub trait AsyncChunkOps: Send + Sync {
         Err(ChunkError::Io("write_fragment not implemented".into()))
     }
 
+    /// Write one EC fragment with a placement-tier hint from `pool`
+    /// (ADR-045 §D4). Default ignores `pool` and delegates to
+    /// [`write_fragment`](Self::write_fragment).
+    async fn write_fragment_in_pool(
+        &self,
+        chunk_id: &ChunkId,
+        fragment_index: u32,
+        bytes: Vec<u8>,
+        _pool: &str,
+    ) -> Result<(), ChunkError> {
+        self.write_fragment(chunk_id, fragment_index, bytes).await
+    }
+
     /// Phase 16c step 6: read one EC fragment.
     async fn read_fragment(
         &self,
@@ -335,6 +348,18 @@ impl<T: ChunkOps + Send + Sync + 'static> AsyncChunkOps for SyncBridge<T> {
         self.inner
             .write()
             .write_fragment(chunk_id, fragment_index, bytes)
+    }
+
+    async fn write_fragment_in_pool(
+        &self,
+        chunk_id: &ChunkId,
+        fragment_index: u32,
+        bytes: Vec<u8>,
+        pool: &str,
+    ) -> Result<(), ChunkError> {
+        self.inner
+            .write()
+            .write_fragment_in_pool(chunk_id, fragment_index, bytes, pool)
     }
 
     async fn read_fragment(

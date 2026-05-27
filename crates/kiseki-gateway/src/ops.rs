@@ -96,6 +96,15 @@ pub struct WriteRequest {
     /// `None` for callers (S3 PUT, native, in-memory) that don't
     /// need a stable cross-protocol id.
     pub comp_id_override: Option<CompositionId>,
+    /// Optional placement-tier hint (ADR-045 §D4/D5). The reserved
+    /// names `fast` / `bulk` / `cold` steer the write onto a device
+    /// class; `None` (or any other value) means fastest-fit. Carried on
+    /// the existing chunk-store `pool` seam, so it propagates to every
+    /// node's local placement through the EC/replication fan-out without
+    /// changing durability placement. Per-protocol adapters populate it
+    /// (S3 `x-amz-storage-class`, a native field, or a namespace default
+    /// once namespace metadata is replicated — Phase 18 / ADR-045 §D3).
+    pub tier: Option<String>,
 }
 
 /// HTTP-derived conditional check applied to a `WriteRequest` against
@@ -466,6 +475,7 @@ mod tests {
             idempotency_key: Some(vec![0xAB; 16]),
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
         };
         let cloned = req.clone();
         assert_eq!(
@@ -493,6 +503,7 @@ mod tests {
             idempotency_key: Some(vec![1, 2, 3]),
             forwarded_from_node: Some(7),
             comp_id_override: None,
+            tier: None,
         };
         assert_eq!(req.clone().forwarded_from_node, Some(7));
     }

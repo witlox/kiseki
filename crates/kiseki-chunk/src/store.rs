@@ -81,6 +81,24 @@ impl StorageStats {
     }
 }
 
+/// Map a chunk-store pool name to a placement tier (ADR-045 §D3/D4).
+///
+/// The reserved names `fast` / `bulk` / `cold` select a device class;
+/// any other name (including `default`) means "no preference" →
+/// fastest-fit. The pool name rides the existing `write_chunk` /
+/// `PutFragment` seam and propagates to every node, so a tier hint
+/// reaches each node's local placement without changing the EC
+/// durability fan-out.
+#[must_use]
+pub fn tier_for_pool(pool: &str) -> Option<kiseki_block::StorageTier> {
+    match pool {
+        "fast" => Some(kiseki_block::StorageTier::Fast),
+        "bulk" => Some(kiseki_block::StorageTier::Bulk),
+        "cold" => Some(kiseki_block::StorageTier::Cold),
+        _ => None,
+    }
+}
+
 /// Chunk storage operations trait.
 pub trait ChunkOps {
     /// Write a chunk. If the chunk ID already exists (dedup hit),
@@ -156,6 +174,20 @@ pub trait ChunkOps {
         _bytes: Vec<u8>,
     ) -> Result<(), ChunkError> {
         Err(ChunkError::Io("write_fragment not implemented".into()))
+    }
+
+    /// Write a fragment with a placement-tier hint derived from `pool`
+    /// (ADR-045 §D4). Default ignores the pool and delegates to
+    /// [`write_fragment`](Self::write_fragment); the persistent store
+    /// overrides it to place the fragment on the pool's device class.
+    fn write_fragment_in_pool(
+        &mut self,
+        chunk_id: &ChunkId,
+        fragment_index: u32,
+        bytes: Vec<u8>,
+        _pool: &str,
+    ) -> Result<(), ChunkError> {
+        self.write_fragment(chunk_id, fragment_index, bytes)
     }
 
     /// Read a fragment by `(chunk_id, fragment_index)`. Returns

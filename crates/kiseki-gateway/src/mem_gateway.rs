@@ -2090,6 +2090,11 @@ impl InMemoryGateway {
         req: WriteRequest,
         with_forwarding: bool,
     ) -> Result<WriteResponse, GatewayError> {
+        // ADR-045 §D4/D5: placement-tier hint rides the chunk-store
+        // `pool` seam. `fast`/`bulk`/`cold` steer onto a device class;
+        // anything else (incl. the default) is fastest-fit. Bound early
+        // (before `req` is consumed) so the chunk write below can use it.
+        let pool = req.tier.clone().unwrap_or_else(|| "default".to_string());
         // #111: forwarding now happens inside the forward-aware emit
         // (`emit_chunk_and_delta_forwarding_to`), which re-issues the
         // built append to the leader. The origin request carries
@@ -2299,7 +2304,7 @@ impl InMemoryGateway {
                     ciphertext_len,
                     "gateway write: chunk path → chunks.write_chunk",
                 );
-                let is_new = self.chunks.write_chunk(env, "default").await.map_err(|e| {
+                let is_new = self.chunks.write_chunk(env, &pool).await.map_err(|e| {
                     tracing::warn!(?chunk_id, error = %e, "gateway write: chunks.write_chunk failed");
                     map_chunk_write_error(e)
                 })?;
@@ -2952,6 +2957,7 @@ mod chunking_tests {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .expect("write must succeed");
@@ -2999,6 +3005,7 @@ mod chunking_tests {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .unwrap();
@@ -3048,6 +3055,7 @@ mod chunking_tests {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .unwrap();
@@ -3096,6 +3104,7 @@ mod chunking_tests {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .unwrap();
@@ -3137,6 +3146,7 @@ mod chunking_tests {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .unwrap();
@@ -3184,6 +3194,7 @@ mod chunking_tests {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .unwrap();
@@ -3220,6 +3231,7 @@ mod chunking_tests {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .unwrap();
@@ -3255,6 +3267,7 @@ mod chunking_tests {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .unwrap();
@@ -3290,6 +3303,7 @@ mod chunking_tests {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .unwrap();
@@ -3451,6 +3465,7 @@ mod phase_duration_tests {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .expect("write must succeed");

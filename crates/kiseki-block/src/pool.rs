@@ -80,6 +80,29 @@ impl DevicePool {
         self.members.is_empty()
     }
 
+    /// Free bytes on member `i`.
+    fn member_free(&self, i: usize) -> u64 {
+        let (used, total) = self.members[i].capacity();
+        total.saturating_sub(used)
+    }
+
+    /// Try members in `order` until one satisfies the request; translate
+    /// the chosen member's local extent into the pool's global address
+    /// space.
+    fn try_alloc_ordered(&self, size: u64, order: &[usize]) -> Result<Extent, AllocError> {
+        let mut last_err = AllocError::DeviceFull {
+            requested: size,
+            available: 0,
+        };
+        for &i in order {
+            match self.members[i].alloc(size) {
+                Ok(local) => return Ok(Extent::new(self.bases[i] + local.offset, local.length)),
+                Err(e) => last_err = e,
+            }
+        }
+        Err(last_err)
+    }
+
     /// Map a global offset to `(member_index, local_offset)`.
     fn route(&self, global_offset: u64) -> (usize, u64) {
         // Largest i with bases[i] <= global_offset. N is small (≤ 16);
@@ -98,32 +121,34 @@ impl DevicePool {
 
 impl DeviceBackend for DevicePool {
     fn alloc(&self, size: u64) -> Result<Extent, AllocError> {
-        // Class-aware placement (ADR-024): prefer the fastest tier, and
-        // within a tier the member with the most free space. Spill to
-        // the next-slower tier only when the faster ones can't satisfy
-        // the request — so hot data lands on NVMe across a heterogeneous
-        // fleet, and the cluster degrades to bulk/cold instead of
-        // returning ENOSPC while slower capacity remains. (A future
-        // affinity hint can override this default for explicitly-cold
-        // data; today every write takes the fastest-fit.)
+        // Class-aware default placement (ADR-024): prefer the fastest
+        // tier, and within a tier the member with the most free space.
+        // Spill to the next-slower tier only when the faster ones can't
+        // satisfy the request — so hot data lands on NVMe across a
+        // heterogeneous fleet, and the cluster degrades to bulk/cold
+        // instead of returning ENOSPC while slower capacity remains.
+        let mut order: Vec<usize> = (0..self.members.len()).collect();
+        order.sort_by_key(|&i| (self.tiers[i], std::cmp::Reverse(self.member_free(i))));
+        self.try_alloc_ordered(size, &order)
+    }
+
+    fn alloc_in_tier(&self, size: u64, tier: Option<StorageTier>) -> Result<Extent, AllocError> {
+        // ADR-045 §D4: honor an explicit tier hint — place on the
+        // requested tier's members first (most-free), then spill to the
+        // remaining tiers in cost order (fast → cold). No hint falls
+        // back to the fastest-fit default.
+        let Some(want) = tier else {
+            return self.alloc(size);
+        };
         let mut order: Vec<usize> = (0..self.members.len()).collect();
         order.sort_by_key(|&i| {
-            let (used, total) = self.members[i].capacity();
-            (self.tiers[i], std::cmp::Reverse(total.saturating_sub(used)))
+            (
+                self.tiers[i] != want, // requested tier sorts first
+                self.tiers[i],         // then cost order among the rest
+                std::cmp::Reverse(self.member_free(i)),
+            )
         });
-        let mut last_err = AllocError::DeviceFull {
-            requested: size,
-            available: 0,
-        };
-        for i in order {
-            match self.members[i].alloc(size) {
-                Ok(local) => {
-                    return Ok(Extent::new(self.bases[i] + local.offset, local.length));
-                }
-                Err(e) => last_err = e,
-            }
-        }
-        Err(last_err)
+        self.try_alloc_ordered(size, &order)
     }
 
     fn write(&self, extent: &Extent, data: &[u8]) -> Result<(), BlockError> {
@@ -285,5 +310,89 @@ mod tests {
     #[test]
     fn empty_pool_rejected() {
         assert!(DevicePool::new(vec![]).is_err());
+    }
+
+    /// Mock that wraps a file-backed device but reports a chosen medium,
+    /// so tier-preference routing can be exercised (a real file always
+    /// probes as `Bulk`).
+    struct TierMock {
+        inner: FileBackedDevice,
+        chars: crate::probe::DeviceCharacteristics,
+    }
+
+    impl TierMock {
+        fn new(path: &std::path::Path, size: u64, medium: crate::probe::DetectedMedium) -> Self {
+            let inner = FileBackedDevice::init(path, size).unwrap();
+            let mut chars = crate::probe::DeviceCharacteristics::file_backed_defaults();
+            chars.medium = medium;
+            Self { inner, chars }
+        }
+    }
+
+    impl DeviceBackend for TierMock {
+        fn alloc(&self, size: u64) -> Result<Extent, AllocError> {
+            self.inner.alloc(size)
+        }
+        fn write(&self, e: &Extent, d: &[u8]) -> Result<(), BlockError> {
+            self.inner.write(e, d)
+        }
+        fn read(&self, e: &Extent) -> Result<Vec<u8>, BlockError> {
+            self.inner.read(e)
+        }
+        fn free(&self, e: &Extent) -> Result<(), AllocError> {
+            self.inner.free(e)
+        }
+        fn sync(&self) -> Result<(), BlockError> {
+            self.inner.sync()
+        }
+        fn capacity(&self) -> (u64, u64) {
+            self.inner.capacity()
+        }
+        fn characteristics(&self) -> &crate::probe::DeviceCharacteristics {
+            &self.chars
+        }
+        fn device_id(&self) -> [u8; 16] {
+            self.inner.device_id()
+        }
+        fn bitmap_bytes(&self) -> Vec<u8> {
+            self.inner.bitmap_bytes()
+        }
+    }
+
+    #[test]
+    fn alloc_in_tier_prefers_requested_class_then_spills() {
+        use crate::probe::{DetectedMedium, StorageTier};
+        let dir = tempdir().unwrap();
+        // member 0 = fast (NVMe), member 1 = cold (HDD).
+        let fast: Arc<dyn DeviceBackend> = Arc::new(TierMock::new(
+            &dir.path().join("fast"),
+            8 * MB,
+            DetectedMedium::NvmeSsd,
+        ));
+        let cold: Arc<dyn DeviceBackend> = Arc::new(TierMock::new(
+            &dir.path().join("cold"),
+            8 * MB,
+            DetectedMedium::Hdd,
+        ));
+        let pool = DevicePool::new(vec![fast, cold]).unwrap();
+        let fast_total = pool.members[0].capacity().1; // member-0 slice = [0, fast_total)
+
+        // Cold hint → lands on the cold member (global offset past member-0).
+        let c = pool.alloc_in_tier(4096, Some(StorageTier::Cold)).unwrap();
+        assert!(
+            c.offset >= fast_total,
+            "Cold hint must land on the cold member"
+        );
+
+        // Fast hint → lands on the fast member.
+        let f = pool.alloc_in_tier(4096, Some(StorageTier::Fast)).unwrap();
+        assert!(
+            f.offset < fast_total,
+            "Fast hint must land on the fast member"
+        );
+
+        // No hint → fastest-fit default (fast member).
+        let n = pool.alloc_in_tier(4096, None).unwrap();
+        assert!(n.offset < fast_total, "no hint defaults to fastest tier");
     }
 }

@@ -108,6 +108,7 @@ impl<G: GatewayOps> NfsGateway<G> {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: req.comp_id_override,
+                tier: None,
             })
             .await?;
 
