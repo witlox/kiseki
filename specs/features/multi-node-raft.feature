@@ -463,7 +463,7 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
   # `leader_node` field), never real per-shard raft leadership — which
   # is exactly why this slipped through to the GCP perf run.
   @integration @multi-node @shard-mgmt @cross-node @smoke
-  Scenario: Multi-shard namespace-create elects a real raft leader for every shard (GH #99)
+  Scenario: Multi-shard namespace-create elects a raft leader for every shard, distributed across nodes (GH #99, #101)
     Given a 3-node kiseki cluster
     When the admin creates a 6-shard namespace via admin HTTP
-    Then every shard of that namespace reports an elected raft leader within 20s
+    Then every shard of that namespace elects a raft leader distributed across the cluster within 20s

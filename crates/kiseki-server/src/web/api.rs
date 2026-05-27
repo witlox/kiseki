@@ -43,14 +43,6 @@ pub struct UiState {
     /// for #68's multi-shard namespace endpoint). `None` on single-
     /// node deployments — paired with `cluster_control` above.
     pub cluster_control_store: Option<Arc<crate::cluster_control::OpenRaftControlStore>>,
-    /// Typed per-shard Raft store. The multi-shard `namespace-create`
-    /// handler needs it to call `initialize_shard` on each fresh shard
-    /// after the `CreateNamespace` commit (GH #99) — the control-plane
-    /// apply hook only *registers* the per-shard groups; the leader
-    /// must explicitly initialize their membership or they never elect
-    /// a leader and every write 5xx's with "leader unavailable".
-    /// `None` on single-node deployments.
-    pub raft_store: Option<Arc<kiseki_log::RaftShardStore>>,
     /// In-process audit log. The Audit dashboard tab + `kiseki-admin
     /// audit query` read from here.
     pub audit: Option<super::admin_extra::AuditHandle>,
@@ -1052,7 +1044,6 @@ mod cluster_info_rev2_tests {
             local_chunk_store: None,
             cluster_control: Some(Arc::new(state)),
             cluster_control_store: None,
-            raft_store: None,
             audit: None,
             key_manager: None,
             tenants: None,
@@ -1141,7 +1132,6 @@ mod cluster_info_rev2_tests {
             local_chunk_store: None,
             cluster_control: None,
             cluster_control_store: None,
-            raft_store: None,
             audit: None,
             key_manager: None,
             tenants: None,
@@ -1228,7 +1218,6 @@ mod ui_router_auth_tests {
             local_chunk_store: None,
             cluster_control: None,
             cluster_control_store: None,
-            raft_store: None,
             audit: None,
             key_manager: None,
             tenants: None,

@@ -580,27 +580,31 @@ async fn api_create_sharded_namespace(
                 }
             }
 
-            // GH #99: the control-plane apply hook registered each new
-            // shard's per-shard Raft group on every node, but
-            // registration alone leaves them as empty-membership
-            // learners. `submit` is leader-only (openraft `client_write`
-            // errors on followers), so reaching this arm means this node
-            // is the control-plane leader — it must explicitly
-            // initialize each fresh shard's membership or the group
-            // never elects a leader and every write to the namespace
-            // 5xx's with "leader unavailable". This mirrors the
-            // first-touch `ControlPlaneProvisioner::provision` path,
-            // which the multi-shard admin endpoint previously skipped.
-            if let Some(raft_store) = state.raft_store.as_ref() {
-                let shard_ids: Vec<kiseki_common::ids::ShardId> =
-                    shards.iter().map(|s| s.shard_id).collect();
-                crate::runtime::initialize_seeded_shards(
-                    raft_store,
-                    &shard_ids,
-                    None,
-                    "admin namespace-create",
-                )
-                .await;
+            // GH #99/#101: the control-plane apply hook registers each
+            // new shard's per-shard Raft group on every node, and each
+            // shard's assigned `leader_node` initializes its membership
+            // (`ShardStoreApplyHook::on_create_namespace`) so leadership
+            // distributes across nodes. That initialization is
+            // asynchronous, so before returning 201 we wait until every
+            // shard has observed a leader — otherwise a client that
+            // writes immediately after create races the per-shard
+            // election and 5xx's with "leader unavailable". `submit` is
+            // leader-only, so this node hosts a (follower) replica of
+            // every shard and `shard_health` sees each leader once the
+            // assigned leader's `AppendEntries` arrives. 30 s upper
+            // bound matches `ControlPlaneProvisioner::provision`.
+            if let Some(log) = state.log_store.as_ref() {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                for s in &shards {
+                    while std::time::Instant::now() < deadline {
+                        if let Ok(info) = log.shard_health(s.shard_id).await {
+                            if info.leader.is_some() {
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
             }
 
             let shard_json: Vec<serde_json::Value> = shards

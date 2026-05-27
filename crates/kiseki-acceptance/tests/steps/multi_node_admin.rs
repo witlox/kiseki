@@ -372,7 +372,9 @@ async fn when_admin_create_sharded_ns(w: &mut KisekiWorld, shards: u32) {
     w.last_error = None;
 }
 
-#[then(regex = r"^every shard of that namespace reports an elected raft leader within (\d+)s$")]
+#[then(
+    regex = r"^every shard of that namespace elects a raft leader distributed across the cluster within (\d+)s$"
+)]
 async fn then_every_shard_has_leader(w: &mut KisekiWorld, secs: u64) {
     let port: u16 = w
         .cluster
@@ -390,39 +392,56 @@ async fn then_every_shard_has_leader(w: &mut KisekiWorld, secs: u64) {
     let http = reqwest::Client::new();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
     let mut without_leader: Vec<String> = Vec::new();
+    // shard_id -> elected leader node id (GH #101 distribution check).
+    let mut leaders: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     loop {
         without_leader.clear();
+        leaders.clear();
         for shard_id in &shard_ids {
             let url = format!("http://127.0.0.1:{port}/cluster/shards/{shard_id}/leader");
-            let has_leader = match http.get(&url).send().await {
+            let leader: Option<u64> = match http.get(&url).send().await {
                 Ok(resp) => resp
                     .json::<serde_json::Value>()
                     .await
                     .ok()
-                    .and_then(|j| j.get("leader_id").map(|v| !v.is_null()))
-                    .unwrap_or(false),
-                Err(_) => false,
+                    .and_then(|j| j.get("leader_id").and_then(serde_json::Value::as_u64)),
+                Err(_) => None,
             };
-            if !has_leader {
-                without_leader.push(shard_id.clone());
+            match leader {
+                Some(id) => {
+                    leaders.insert(shard_id.clone(), id);
+                }
+                None => without_leader.push(shard_id.clone()),
             }
         }
         if without_leader.is_empty() {
-            return;
+            break;
         }
         if std::time::Instant::now() >= deadline {
-            break;
+            panic!(
+                "GH #99: {} of {} shards never elected a raft leader within {secs}s \
+                 (leader_id stayed null): {without_leader:?}. The control-plane apply \
+                 hook registered each shard's per-shard Raft group on every node, but \
+                 the assigned leader never called initialize_membership — so the groups \
+                 sit as empty-membership learners that can never elect a leader or \
+                 accept a write.",
+                without_leader.len(),
+                shard_ids.len(),
+            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    panic!(
-        "GH #99: {} of {} shards never elected a raft leader within {secs}s \
-         (leader_id stayed null): {without_leader:?}. The control-plane apply \
-         hook registered each shard's per-shard Raft group on every node, but \
-         no node called initialize_membership for them — so the groups sit as \
-         empty-membership learners that can never elect a leader or accept a \
-         write.",
-        without_leader.len(),
+    // GH #101: leadership must distribute across the cluster, not pile
+    // onto the control-plane leader. `compute_shard_ranges` assigns
+    // leader_node round-robin, and each assigned leader initializes its
+    // own shards, so a 6-shard namespace on a 3-node cluster should land
+    // leaders on more than one node.
+    let distinct: std::collections::HashSet<u64> = leaders.values().copied().collect();
+    assert!(
+        distinct.len() > 1,
+        "GH #101: all {} shard leaders landed on a single node {distinct:?} — per-shard \
+         leadership did not distribute across the cluster (expected the assigned \
+         leader_node round-robin to spread leaders over multiple nodes). leaders={leaders:?}",
         shard_ids.len(),
     );
 }
