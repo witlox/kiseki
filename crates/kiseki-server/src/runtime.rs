@@ -1463,6 +1463,7 @@ pub async fn run_main(
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
     });
     let _ = view_store.write().create_view(kiseki_view::ViewDescriptor {
         view_id: bootstrap_view,

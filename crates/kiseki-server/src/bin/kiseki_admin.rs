@@ -683,6 +683,8 @@ enum Command {
         namespace_id: String,
         tenant_id: String,
         shards: Option<u32>,
+        /// ADR-045 §D3 tier policy: `(class, quota_bytes)` in spill order.
+        tiers: Vec<(String, u64)>,
     },
     /// `forwarding` — proxy + stale-leader counters per node.
     Forwarding,
@@ -752,6 +754,28 @@ enum Command {
         node: Option<String>,
         all: bool,
     },
+}
+
+/// Parse a byte size with an optional binary suffix (`K`/`M`/`G`/`T`,
+/// case-insensitive; bare number = bytes; `0` = unbounded).
+fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty size".into());
+    }
+    let (num, mult) = match s.chars().last().and_then(|c| c.to_uppercase().next()) {
+        Some('K') => (&s[..s.len() - 1], 1024u64),
+        Some('M') => (&s[..s.len() - 1], 1024 * 1024),
+        Some('G') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        Some('T') => (&s[..s.len() - 1], 1024u64 * 1024 * 1024 * 1024),
+        _ => (s, 1),
+    };
+    let base: u64 = num
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid size '{s}': {e}"))?;
+    base.checked_mul(mult)
+        .ok_or_else(|| format!("size '{s}' overflows u64"))
 }
 
 fn print_usage() {
@@ -981,6 +1005,7 @@ fn parse_topology(rest: &[String]) -> Result<Command, String> {
                 .ok_or("topology namespace-create requires <namespace-id>")?;
             let mut tenant_id: Option<String> = None;
             let mut shards: Option<u32> = None;
+            let mut tiers: Vec<(String, u64)> = Vec::new();
             let mut i = 2;
             while i < rest.len() {
                 match rest[i].as_str() {
@@ -999,6 +1024,27 @@ fn parse_topology(rest: &[String]) -> Result<Command, String> {
                         shards = Some(n);
                         i += 1;
                     }
+                    // ADR-045 §D3: --tier <class>=<quota>, repeatable.
+                    // Order is the spill order. <quota> accepts size
+                    // suffixes (10T / 500G / 0 = unbounded).
+                    "--tier" | "--class" => {
+                        i += 1;
+                        let raw = rest
+                            .get(i)
+                            .ok_or("--tier requires <class>=<quota> (e.g. fast=10T)")?;
+                        let (class, quota) = match raw.split_once('=') {
+                            Some((c, q)) => (c.to_owned(), parse_size(q)?),
+                            // `--class fast` sugar = unbounded.
+                            None => (raw.clone(), 0),
+                        };
+                        if !matches!(class.as_str(), "fast" | "bulk" | "cold") {
+                            return Err(format!(
+                                "--tier class must be fast|bulk|cold, got '{class}'"
+                            ));
+                        }
+                        tiers.push((class, quota));
+                        i += 1;
+                    }
                     other => {
                         return Err(format!("unknown topology namespace-create flag: {other}"));
                     }
@@ -1010,6 +1056,7 @@ fn parse_topology(rest: &[String]) -> Result<Command, String> {
                 namespace_id,
                 tenant_id,
                 shards,
+                tiers,
             })
         }
         other => Err(format!(
@@ -1425,16 +1472,30 @@ fn main() {
             namespace_id,
             tenant_id,
             shards,
+            tiers,
         } => {
             let shards_field = match shards {
                 Some(n) => format!(",\"shards\":{n}"),
                 None => String::new(),
             };
+            // ADR-045 §D3: tier policy as a JSON array of {tier, quota_bytes}.
+            let tiers_field = if tiers.is_empty() {
+                String::new()
+            } else {
+                let entries: Vec<String> = tiers
+                    .iter()
+                    .map(|(c, q)| {
+                        format!("{{\"tier\":\"{}\",\"quota_bytes\":{q}}}", json_escape(c))
+                    })
+                    .collect();
+                format!(",\"tier_policy\":[{}]", entries.join(","))
+            };
             let body = format!(
-                "{{\"namespace_id\":\"{}\",\"tenant_id\":\"{}\"{}}}",
+                "{{\"namespace_id\":\"{}\",\"tenant_id\":\"{}\"{}{}}}",
                 json_escape(&namespace_id),
                 json_escape(&tenant_id),
-                shards_field
+                shards_field,
+                tiers_field
             );
             http_post(&args.endpoint, "/admin/topology/namespaces", &body).map(|b| {
                 if json {
@@ -2236,6 +2297,7 @@ mod tests {
                 namespace_id,
                 tenant_id,
                 shards,
+                ..
             } => {
                 assert_eq!(namespace_id, "bench-ns-0");
                 assert_eq!(tenant_id, "00000000-0000-0000-0000-000000000001");

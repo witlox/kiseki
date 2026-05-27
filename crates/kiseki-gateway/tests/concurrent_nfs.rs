@@ -34,6 +34,7 @@ fn setup_nfs_gateway() -> Arc<NfsGateway<InMemoryGateway>> {
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
     });
 
     let chunks = ChunkStore::new();

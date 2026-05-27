@@ -85,6 +85,19 @@ pub fn encode_namespace_create_payload(ns: &crate::namespace::Namespace) -> Vec<
         flags |= 0b0000_0010;
     }
     out.push(flags);
+    // ADR-045 §D3 tier policy, appended after the fixed prefix:
+    // [count:1]{ [name_len:1][name utf8][quota_bytes:8 LE] }*.
+    // A 49-byte payload (no appended section) decodes to an empty
+    // policy, so pre-tier records stay readable.
+    #[allow(clippy::cast_possible_truncation)] // tier count/name len bounded by CLI parsing
+    {
+        out.push(ns.tier_policy.len() as u8);
+        for t in &ns.tier_policy {
+            out.push(t.tier.len() as u8);
+            out.extend_from_slice(t.tier.as_bytes());
+            out.extend_from_slice(&t.quota_bytes.to_le_bytes());
+        }
+    }
     out
 }
 
@@ -93,13 +106,46 @@ pub fn encode_namespace_create_payload(ns: &crate::namespace::Namespace) -> Vec<
 /// fails to parse. `compliance_tags` is always empty in v1.
 #[must_use]
 pub fn decode_namespace_create_payload(payload: &[u8]) -> Option<crate::namespace::Namespace> {
-    if payload.len() != NAMESPACE_CREATE_PAYLOAD_LEN {
+    // The fixed prefix is exactly NAMESPACE_CREATE_PAYLOAD_LEN; anything
+    // beyond it is the ADR-045 tier-policy section (optional).
+    if payload.len() < NAMESPACE_CREATE_PAYLOAD_LEN {
         return None;
     }
     let ns_uuid = uuid::Uuid::from_slice(&payload[0..16]).ok()?;
     let tenant_uuid = uuid::Uuid::from_slice(&payload[16..32]).ok()?;
     let shard_uuid = uuid::Uuid::from_slice(&payload[32..48]).ok()?;
     let flags = payload[48];
+
+    // Parse the appended tier policy, if present. Malformed/truncated
+    // trailing bytes degrade to an empty policy rather than failing the
+    // whole decode (a namespace without a policy is valid).
+    let mut tier_policy = Vec::new();
+    let mut pos = NAMESPACE_CREATE_PAYLOAD_LEN;
+    if let Some(&count) = payload.get(pos) {
+        pos += 1;
+        for _ in 0..count {
+            let Some(&name_len) = payload.get(pos) else {
+                break;
+            };
+            pos += 1;
+            let name_end = pos + name_len as usize;
+            let quota_end = name_end + 8;
+            if quota_end > payload.len() {
+                break;
+            }
+            let Ok(name) = std::str::from_utf8(&payload[pos..name_end]) else {
+                break;
+            };
+            let mut q = [0u8; 8];
+            q.copy_from_slice(&payload[name_end..quota_end]);
+            tier_policy.push(crate::namespace::TierQuota {
+                tier: name.to_owned(),
+                quota_bytes: u64::from_le_bytes(q),
+            });
+            pos = quota_end;
+        }
+    }
+
     Some(crate::namespace::Namespace {
         id: NamespaceId(ns_uuid),
         tenant_id: kiseki_common::ids::OrgId(tenant_uuid),
@@ -107,6 +153,7 @@ pub fn decode_namespace_create_payload(payload: &[u8]) -> Option<crate::namespac
         read_only: flags & 0b0000_0001 != 0,
         versioning_enabled: flags & 0b0000_0010 != 0,
         compliance_tags: Vec::new(),
+        tier_policy,
     })
 }
 
@@ -1381,6 +1428,7 @@ mod tests {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
         }
     }
 
@@ -1860,6 +1908,7 @@ mod tests {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: vec![ComplianceTag::RevFadp],
+            tier_policy: Vec::new(),
         };
 
         let effective = ns.effective_compliance_tags(&org_tags);
@@ -1885,6 +1934,7 @@ mod tests {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: vec![ComplianceTag::Hipaa, ComplianceTag::Gdpr],
+            tier_policy: Vec::new(),
         };
 
         let effective = ns.effective_compliance_tags(&org_tags);
@@ -2250,5 +2300,41 @@ mod tests {
         // values.
         assert_eq!(store.get(id_a).unwrap().size, 1);
         assert_eq!(store.get(id_b).unwrap().size, 2);
+    }
+
+    /// ADR-045 §D3: the tier policy round-trips through the
+    /// `NamespaceCreate` delta payload, and a legacy 49-byte payload
+    /// (no appended section) decodes to an empty policy.
+    #[test]
+    fn namespace_tier_policy_round_trips() {
+        use crate::namespace::{Namespace, TierQuota};
+        use kiseki_common::ids::{NamespaceId, OrgId, ShardId};
+        let ns = Namespace {
+            id: NamespaceId(uuid::Uuid::from_u128(7)),
+            tenant_id: OrgId(uuid::Uuid::from_u128(8)),
+            shard_id: ShardId(uuid::Uuid::from_u128(9)),
+            read_only: false,
+            versioning_enabled: true,
+            compliance_tags: Vec::new(),
+            tier_policy: vec![
+                TierQuota {
+                    tier: "fast".into(),
+                    quota_bytes: 10 * 1024 * 1024 * 1024 * 1024,
+                },
+                TierQuota {
+                    tier: "cold".into(),
+                    quota_bytes: 0,
+                },
+            ],
+        };
+        let bytes = encode_namespace_create_payload(&ns);
+        let back = decode_namespace_create_payload(&bytes).expect("decode");
+        assert_eq!(back.tier_policy, ns.tier_policy);
+        assert!(back.versioning_enabled);
+
+        // Legacy fixed-length payload (no tier section) → empty policy.
+        let legacy = &bytes[..NAMESPACE_CREATE_PAYLOAD_LEN];
+        let back_legacy = decode_namespace_create_payload(legacy).expect("legacy decode");
+        assert!(back_legacy.tier_policy.is_empty());
     }
 }

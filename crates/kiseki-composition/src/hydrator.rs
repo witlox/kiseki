@@ -676,6 +676,7 @@ mod tests {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
         });
         Arc::new(store)
     }

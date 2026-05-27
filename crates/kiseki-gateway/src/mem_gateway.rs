@@ -1223,6 +1223,7 @@ impl InMemoryGateway {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
         };
         // Phase 1: local mutation + capture log handle. Scope the
         // MutexGuard so it drops before any .await point.
@@ -2092,9 +2093,19 @@ impl InMemoryGateway {
     ) -> Result<WriteResponse, GatewayError> {
         // ADR-045 §D4/D5: placement-tier hint rides the chunk-store
         // `pool` seam. `fast`/`bulk`/`cold` steer onto a device class;
-        // anything else (incl. the default) is fastest-fit. Bound early
-        // (before `req` is consumed) so the chunk write below can use it.
-        let pool = req.tier.clone().unwrap_or_else(|| "default".to_string());
+        // anything else (incl. the default) is fastest-fit. Resolution
+        // order: explicit request hint → the namespace's primary (first)
+        // tier policy → fastest-fit. Bound early (before `req` is
+        // consumed) so the chunk write below can use it.
+        let pool = req
+            .tier
+            .clone()
+            .or_else(|| {
+                self.compositions
+                    .namespace(req.namespace_id)
+                    .and_then(|ns| ns.tier_policy.first().map(|t| t.tier.clone()))
+            })
+            .unwrap_or_else(|| "default".to_string());
         // #111: forwarding now happens inside the forward-aware emit
         // (`emit_chunk_and_delta_forwarding_to`), which re-issues the
         // built append to the leader. The origin request carries

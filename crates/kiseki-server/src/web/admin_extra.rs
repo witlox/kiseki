@@ -437,6 +437,25 @@ async fn api_create_sharded_namespace(
     };
     let requested_shards = parsed.get("shards").and_then(serde_json::Value::as_u64);
 
+    // ADR-045 §D3: optional tier policy — array of {tier, quota_bytes}
+    // in spill order. Absent → empty (default fastest-fit placement).
+    let tier_policy: Vec<kiseki_composition::namespace::TierQuota> = parsed
+        .get("tier_policy")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let tier = e.get("tier")?.as_str()?.to_owned();
+                    let quota_bytes = e
+                        .get("quota_bytes")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    Some(kiseki_composition::namespace::TierQuota { tier, quota_bytes })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Idempotent re-invocation: if the namespace already exists, echo
     // the current shard count back with 409 so the caller can no-op
     // without parsing an error string.
@@ -555,6 +574,7 @@ async fn api_create_sharded_namespace(
                             read_only: false,
                             versioning_enabled: false,
                             compliance_tags: Vec::new(),
+                            tier_policy: tier_policy.clone(),
                         };
                         comps.add_namespace(ns.clone());
                         if let Err(e) = kiseki_composition::log_bridge::emit_namespace_create(

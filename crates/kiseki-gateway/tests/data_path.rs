@@ -27,6 +27,7 @@ fn setup_gateway() -> InMemoryGateway {
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
     });
 
     let chunks = ChunkStore::new();
@@ -206,6 +207,7 @@ async fn bucket_isolation_list_returns_only_own_objects() {
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
     });
     compositions.add_namespace(Namespace {
         id: ns2,
@@ -214,6 +216,7 @@ async fn bucket_isolation_list_returns_only_own_objects() {
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
     });
     let chunks = ChunkStore::new();
     let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));

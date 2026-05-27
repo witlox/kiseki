@@ -53,6 +53,7 @@ fn setup() -> (Arc<MemShardStore>, CompositionStore, ViewStore) {
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
     });
 
     let mut views = ViewStore::new();

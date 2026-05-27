@@ -199,6 +199,7 @@ fn setup_with_placement_and_target(
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
     });
 
     let chunks = ChunkStore::new();
@@ -575,6 +576,7 @@ fn setup_with_chunks(
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
     });
 
     let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
@@ -859,6 +861,7 @@ async fn write_to_remote_led_shard_forwards_to_leader() {
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
     });
     let chunks = ChunkStore::new();
     let forwarder = Arc::new(MockForwarder::default());
