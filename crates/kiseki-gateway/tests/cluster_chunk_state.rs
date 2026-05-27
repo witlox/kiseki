@@ -20,7 +20,8 @@ use kiseki_composition::namespace::Namespace;
 use kiseki_crypto::envelope::Envelope;
 use kiseki_crypto::keys::SystemMasterKey;
 use kiseki_gateway::mem_gateway::InMemoryGateway;
-use kiseki_gateway::ops::GatewayOps;
+use kiseki_gateway::ops::{GatewayOps, WriteForwarder, WriteRequest, WriteResponse};
+use kiseki_gateway::GatewayError;
 use kiseki_log::error::LogError;
 use kiseki_log::shard::{ShardConfig, ShardInfo, ShardState};
 use kiseki_log::traits::{
@@ -694,5 +695,180 @@ async fn multipart_complete_records_real_original_len_for_scrub() {
     assert!(
         lens.contains(&5000),
         "part 2's length must be recorded: {lens:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// #111: gateway-internal write forwarding to the shard leader.
+//
+// A log whose forwarding-aware append returns `ForwardToLeader` (this
+// node is a follower for the target shard). With a `WriteForwarder`
+// wired, the gateway must re-issue the write to the leader and return
+// the leader's outcome — instead of surfacing the `ForwardToLeader`
+// error. This is what makes distributed-multi-shard writes work for
+// S3/NFS (which call `write()`), not just the native proxy path.
+// ---------------------------------------------------------------------
+
+/// `LogOps` whose `append_chunk_and_delta_with_forwarding` always reports
+/// the shard's leader is `leader`. Other methods are inert.
+struct ForwardToLeaderLog {
+    shard: ShardId,
+    leader: u64,
+}
+
+#[async_trait::async_trait]
+impl LogOps for ForwardToLeaderLog {
+    async fn append_delta(&self, _req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
+        Ok(SequenceNumber(1))
+    }
+    async fn append_chunk_and_delta(
+        &self,
+        _req: AppendChunkAndDeltaRequest,
+    ) -> Result<SequenceNumber, LogError> {
+        Ok(SequenceNumber(1))
+    }
+    async fn append_chunk_and_delta_with_forwarding(
+        &self,
+        _req: AppendChunkAndDeltaRequest,
+    ) -> Result<SequenceNumber, LogError> {
+        Err(LogError::ForwardToLeader {
+            shard_id: self.shard,
+            leader_node_id: NodeId(self.leader),
+        })
+    }
+    async fn increment_chunk_refcount(
+        &self,
+        _s: ShardId,
+        _t: OrgId,
+        _c: ChunkId,
+    ) -> Result<(), LogError> {
+        Ok(())
+    }
+    async fn decrement_chunk_refcount(
+        &self,
+        _s: ShardId,
+        _t: OrgId,
+        _c: ChunkId,
+    ) -> Result<bool, LogError> {
+        Ok(false)
+    }
+    async fn read_deltas(
+        &self,
+        _req: ReadDeltasRequest,
+    ) -> Result<Vec<kiseki_log::delta::Delta>, LogError> {
+        Ok(vec![])
+    }
+    async fn shard_health(&self, _s: ShardId) -> Result<ShardInfo, LogError> {
+        Err(LogError::Unavailable)
+    }
+    async fn set_maintenance(&self, _s: ShardId, _e: bool) -> Result<(), LogError> {
+        Ok(())
+    }
+    async fn truncate_log(&self, _s: ShardId) -> Result<SequenceNumber, LogError> {
+        Ok(SequenceNumber(0))
+    }
+    async fn compact_shard(&self, _s: ShardId) -> Result<u64, LogError> {
+        Ok(0)
+    }
+    fn create_shard(&self, _s: ShardId, _t: OrgId, _n: NodeId, _c: ShardConfig) {}
+    fn update_shard_range(&self, _s: ShardId, _a: [u8; 32], _b: [u8; 32]) {}
+    fn set_shard_state(&self, _s: ShardId, _st: ShardState) {}
+    fn set_shard_config(&self, _s: ShardId, _c: ShardConfig) {}
+    async fn register_consumer(
+        &self,
+        _s: ShardId,
+        _c: &str,
+        _p: SequenceNumber,
+    ) -> Result<(), LogError> {
+        Ok(())
+    }
+    async fn advance_watermark(
+        &self,
+        _s: ShardId,
+        _c: &str,
+        _p: SequenceNumber,
+    ) -> Result<(), LogError> {
+        Ok(())
+    }
+}
+
+/// Records every `forward_write` call and returns a canned success.
+#[derive(Default)]
+struct MockForwarder {
+    calls: Mutex<Vec<(u64, u64)>>, // (leader_node, bytes)
+}
+
+#[async_trait::async_trait]
+impl WriteForwarder for MockForwarder {
+    async fn forward_write(
+        &self,
+        leader_node: NodeId,
+        req: WriteRequest,
+    ) -> Result<WriteResponse, GatewayError> {
+        let bytes = req.data.len() as u64;
+        // Loop-prevention contract: the origin request must NOT already
+        // be a forward (the gateway only forwards origin requests).
+        assert!(
+            req.forwarded_from_node.is_none(),
+            "gateway must only forward origin requests (loop prevention)"
+        );
+        self.calls.lock().unwrap().push((leader_node.0, bytes));
+        Ok(WriteResponse {
+            composition_id: kiseki_common::ids::CompositionId(uuid::Uuid::from_u128(0xF00)),
+            bytes_written: bytes,
+        })
+    }
+}
+
+/// #111 RED→GREEN: a write that hits a shard this node doesn't lead is
+/// transparently re-issued to the leader via the wired forwarder, and
+/// the gateway returns the leader's outcome (NOT `ForwardToLeader`).
+#[tokio::test(flavor = "multi_thread")]
+async fn write_to_remote_led_shard_forwards_to_leader() {
+    let log: Arc<dyn LogOps + Send + Sync> = Arc::new(ForwardToLeaderLog {
+        shard: test_shard(),
+        leader: 2,
+    });
+    let compositions = CompositionStore::new().with_log(Arc::clone(&log));
+    compositions.add_namespace(Namespace {
+        id: test_namespace(),
+        tenant_id: test_tenant(),
+        shard_id: test_shard(),
+        read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
+    });
+    let chunks = ChunkStore::new();
+    let forwarder = Arc::new(MockForwarder::default());
+    let gw = InMemoryGateway::new(
+        compositions,
+        kiseki_chunk::arc_async(chunks),
+        SystemMasterKey::new([0x42; 32], KeyEpoch(1)),
+    )
+    .with_cluster_placement(vec![1, 2])
+    .with_target_copies(1)
+    .with_write_forwarder(Arc::clone(&forwarder) as Arc<dyn WriteForwarder>);
+
+    let resp = gw
+        .write(WriteRequest {
+            tenant_id: test_tenant(),
+            namespace_id: test_namespace(),
+            data: vec![0xABu8; 4096],
+            name: None,
+            conditional: None,
+            workflow_ref: None,
+            idempotency_key: None,
+            forwarded_from_node: None,
+            comp_id_override: None,
+        })
+        .await
+        .expect("write must succeed via leader-forward, not ForwardToLeader error");
+
+    assert_eq!(resp.bytes_written, 4096);
+    let calls = forwarder.calls.lock().unwrap();
+    assert_eq!(
+        &*calls,
+        &[(2, 4096)],
+        "the write must be forwarded exactly once to leader node-2"
     );
 }
