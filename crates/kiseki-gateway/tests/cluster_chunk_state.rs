@@ -494,8 +494,12 @@ impl AsyncChunkOps for RecordingChunks {
     async fn write_chunk(&self, env: Envelope, pool: &str) -> Result<bool, ChunkError> {
         self.inner.write_chunk(env, pool).await
     }
-    async fn read_chunk(&self, id: &ChunkId) -> Result<Envelope, ChunkError> {
-        self.inner.read_chunk(id).await
+    async fn read_chunk(
+        &self,
+        id: &ChunkId,
+        original_len: Option<u64>,
+    ) -> Result<Envelope, ChunkError> {
+        self.inner.read_chunk(id, original_len).await
     }
     async fn increment_refcount(&self, id: &ChunkId) -> Result<u64, ChunkError> {
         self.inner.increment_refcount(id).await
@@ -633,5 +637,62 @@ async fn non_tombstone_decrement_does_not_fan_out() {
     assert!(
         chunks.fanout_calls.lock().unwrap().is_empty(),
         "non-tombstone decrement must NOT trigger fan-out — would break I-C2",
+    );
+}
+
+/// GH #107 (scrub side): `complete_multipart` must record each new
+/// chunk's REAL plaintext/ciphertext length in `NewChunkMeta.original_len`,
+/// never the old `0` punt. That length flows into `cluster_chunk_state`
+/// and is the decode length the EC scrub/repair path feeds to
+/// `ec::decode` — a `0` there reconstructs the chunk EMPTY and writes a
+/// corrupt repaired fragment.
+#[tokio::test]
+async fn multipart_complete_records_real_original_len_for_scrub() {
+    let log = Arc::new(RecordingLog::default());
+    let gw = setup(Arc::clone(&log) as Arc<dyn LogOps + Send + Sync>);
+
+    let upload_id = gw
+        .start_multipart_internal(test_namespace())
+        .await
+        .expect("start multipart");
+
+    // Two parts, distinct content (both `was_new`, not dedup hits) and
+    // distinct sizes — those exact sizes must be the recorded lengths.
+    let part1 = vec![0x11u8; 4096];
+    let part2 = vec![0x22u8; 5000];
+    gw.upload_part_internal(&upload_id, 1, &part1)
+        .await
+        .expect("upload part 1");
+    gw.upload_part_internal(&upload_id, 2, &part2)
+        .await
+        .expect("upload part 2");
+
+    gw.complete_multipart_internal(&upload_id, Some("multipart-obj"))
+        .await
+        .expect("complete multipart");
+
+    let chunk_calls = log.chunk_and_delta_calls.lock().unwrap();
+    assert_eq!(
+        chunk_calls.len(),
+        1,
+        "complete_multipart emits exactly one ChunkAndDelta proposal"
+    );
+    let lens: Vec<u64> = chunk_calls[0]
+        .new_chunks
+        .iter()
+        .map(|c| c.original_len)
+        .collect();
+    assert_eq!(lens.len(), 2, "two new parts → two new chunks: {lens:?}");
+    assert!(
+        !lens.contains(&0),
+        "no chunk may carry original_len == 0 (would make scrub decode empty): {lens:?}"
+    );
+    assert!(
+        lens.contains(&4096),
+        "part 1's length must be recorded: {lens:?}"
+    );
+    assert!(
+        lens.contains(&5000),
+        "part 2's length must be recorded: {lens:?}"
     );
 }

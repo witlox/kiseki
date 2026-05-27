@@ -291,7 +291,7 @@ async fn clustered_read_chunk_concurrent_fanout_completes_within_deadline() {
             chunk_id[1] = frag_idx;
             let clustered = Arc::clone(&clustered);
             handles.push(tokio::spawn(async move {
-                let res = clustered.read_chunk(&ChunkId(chunk_id)).await;
+                let res = clustered.read_chunk(&ChunkId(chunk_id), None).await;
                 (peer_idx, slot, res)
             }));
         }

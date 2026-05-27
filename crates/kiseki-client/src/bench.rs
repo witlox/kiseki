@@ -201,6 +201,28 @@ async fn build_driver(cfg: &BenchConfig) -> Result<Arc<dyn Driver>, String> {
     ))
 }
 
+/// Generate DISTINCT, high-entropy payload bytes seeded by `seed`.
+///
+/// Kiseki dedups by content address, so a bench that writes identical
+/// bytes for every object collapses the whole run onto ONE chunk —
+/// making throughput meaningless and (pre-ADR-044) tripping the #102
+/// torn-chunk read path. Seeding per object keeps every chunk distinct.
+/// Cheap xorshift fill — not cryptographic, just non-dedupable.
+fn make_payload(size: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut buf = vec![0u8; size];
+    for chunk in buf.chunks_mut(8) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let bytes = x.to_le_bytes();
+        for (i, b) in chunk.iter_mut().enumerate() {
+            *b = bytes[i];
+        }
+    }
+    buf
+}
+
 /// Run the benchmark and emit a report on stdout. Returns the report
 /// so callers can inspect it programmatically.
 ///
@@ -210,14 +232,18 @@ async fn build_driver(cfg: &BenchConfig) -> Result<Arc<dyn Driver>, String> {
 #[allow(clippy::too_many_lines)] // workload loop + stats wiring is intrinsically long
 pub async fn run(cfg: BenchConfig) -> Result<BenchReport, String> {
     let driver = build_driver(&cfg).await?;
-    let payload = vec![0xa5u8; cfg.object_size];
 
-    // Warmup keys for GetHeavy / Mixed.
+    // Warmup keys for GetHeavy / Mixed. Each object gets DISTINCT,
+    // high-entropy content (`make_payload`) so content-addressed dedup
+    // does not collapse the whole run onto one chunk — which would make
+    // throughput meaningless (GH #102 / bench-realism). Warmup seeds use
+    // the top half of the seed space so they never alias workload seeds.
     let warmup_keys: Vec<Key> = if matches!(cfg.shape, Shape::GetHeavy | Shape::Mixed) {
         let n = cfg.warmup_objects.max(1);
         let mut keys = Vec::with_capacity(n);
-        for _ in 0..n {
-            keys.push(driver.put(&payload).await?);
+        for i in 0..n {
+            let seed = (1u64 << 63) | i as u64;
+            keys.push(driver.put(&make_payload(cfg.object_size, seed)).await?);
         }
         keys
     } else {
@@ -240,7 +266,7 @@ pub async fn run(cfg: BenchConfig) -> Result<BenchReport, String> {
         let ops = Arc::clone(&ops);
         let errs = Arc::clone(&errs);
         let latency_samples = Arc::clone(&latency_samples);
-        let payload = payload.clone();
+        let object_size = cfg.object_size;
         let warmup_keys = warmup_keys.clone();
         let shape = cfg.shape;
         handles.push(tokio::spawn(async move {
@@ -262,7 +288,13 @@ pub async fn run(cfg: BenchConfig) -> Result<BenchReport, String> {
                 };
                 let t0 = Instant::now();
                 let res = if is_put {
-                    driver.put(&payload).await.map(|_| 0)
+                    // Distinct content per (worker, op) so dedup doesn't
+                    // collapse the write workload onto one chunk.
+                    let seed = (worker_id as u64).wrapping_shl(40) ^ n;
+                    driver
+                        .put(&make_payload(object_size, seed))
+                        .await
+                        .map(|_| 0)
                 } else {
                     let idx = (worker_id + n_usize) % warmup_keys.len();
                     driver.get(&warmup_keys[idx]).await

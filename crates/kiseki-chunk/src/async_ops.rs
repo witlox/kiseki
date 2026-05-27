@@ -38,7 +38,22 @@ pub trait AsyncChunkOps: Send + Sync {
     async fn write_chunk(&self, envelope: Envelope, pool: &str) -> Result<bool, ChunkError>;
 
     /// Read a chunk by ID.
-    async fn read_chunk(&self, chunk_id: &ChunkId) -> Result<Envelope, ChunkError>;
+    ///
+    /// `original_len` is the chunk's exact ciphertext length (== plaintext
+    /// length; this AEAD stores the tag separately, see
+    /// `kiseki_crypto::envelope`). The caller — the gateway — knows it from
+    /// the object composition, which is Raft-replicated to every node, so
+    /// it is available on any reader regardless of whether that node holds
+    /// a fragment. The EC read path needs it to trim the reassembled stripe
+    /// to the exact length; without it `read_chunk_ec` falls back to a
+    /// strip-trailing-zeros heuristic that corrupts ciphertext ending in
+    /// `0x00` (GH #107). Pass `None` only when the length is genuinely
+    /// unknown (tests, non-EC stores that ignore it).
+    async fn read_chunk(
+        &self,
+        chunk_id: &ChunkId,
+        original_len: Option<u64>,
+    ) -> Result<Envelope, ChunkError>;
 
     /// Increment refcount for an existing chunk.
     async fn increment_refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError>;
@@ -249,7 +264,13 @@ impl<T: ChunkOps + Send + Sync + 'static> AsyncChunkOps for SyncBridge<T> {
         self.inner.write().write_chunk(envelope, pool)
     }
 
-    async fn read_chunk(&self, chunk_id: &ChunkId) -> Result<Envelope, ChunkError> {
+    async fn read_chunk(
+        &self,
+        chunk_id: &ChunkId,
+        _original_len: Option<u64>,
+    ) -> Result<Envelope, ChunkError> {
+        // The local sync store holds the whole chunk; no EC reassembly,
+        // so `original_len` is irrelevant here.
         self.inner.read().read_chunk(chunk_id)
     }
 
@@ -424,7 +445,7 @@ mod tests {
         let original_bytes = env.ciphertext.clone();
 
         bridge.write_chunk(env, "p").await.expect("write");
-        let got = bridge.read_chunk(&chunk_id).await.expect("read");
+        let got = bridge.read_chunk(&chunk_id, None).await.expect("read");
 
         assert_eq!(got.chunk_id, chunk_id);
         assert_eq!(got.ciphertext, original_bytes);
