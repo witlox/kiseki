@@ -70,8 +70,13 @@ pub struct ServerImpl {
     #[allow(dead_code)]
     max_streams_per_tenant: u64,
     /// ADR-042 §4 proxy fallback toggle — `KISEKI_NATIVE_PROXY_FALLBACK`.
-    /// `false` by default (ADR-042 §4 "explicit-routing-only"). When
-    /// `true`, the per-verb proxy code paths catch
+    /// `true` by default (flipped 2026-05-20 per GH #97 — single-
+    /// endpoint native/FUSE/NFS clients against multi-shard topology
+    /// are unusable otherwise, since ~(N-1)/N of writes hit a
+    /// non-local-leader shard and 5xx with `LeaderUnavailable`).
+    /// Operators that want ADR-042 §4's original "explicit-routing-
+    /// only" semantics set `KISEKI_NATIVE_PROXY_FALLBACK=off`. When
+    /// on, per-verb proxy code paths catch
     /// [`GatewayError::ForwardToLeader`] and dial the leader via
     /// [`proxy_client`].
     proxy_fallback_enabled: AtomicBool,
@@ -124,8 +129,7 @@ impl TopologyInjector {
 
 impl ServerImpl {
     /// Build a new handler with sensible defaults
-    /// (`max_streams_per_tenant = 256`, proxy fallback disabled per
-    /// ADR-042 §4).
+    /// (`max_streams_per_tenant = 256`, proxy fallback ON per GH #97).
     #[must_use]
     pub fn new(ops: Arc<dyn GatewayOps>, signing_keys: Arc<SigningKeys>) -> Self {
         Self {
@@ -135,7 +139,7 @@ impl ServerImpl {
             topology: Arc::new(TopologyInjector::empty()),
             stream_caps: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             max_streams_per_tenant: 256,
-            proxy_fallback_enabled: AtomicBool::new(false),
+            proxy_fallback_enabled: AtomicBool::new(true),
             proxy_client: None,
         }
     }
@@ -1328,6 +1332,23 @@ mod tests {
             compliance_tags: Vec::new(),
         })
         .await;
+    }
+
+    /// GH #97 regression guard. A single-endpoint native/FUSE/NFS
+    /// client against a multi-shard topology maps ~(N-1)/N of its
+    /// writes to a shard led by a peer node; without proxy fallback
+    /// those `ForwardToLeader` results 5xx as `LeaderUnavailable`
+    /// (observed as 394 805 errors / 0 ops on the 2026-05-20 GCP
+    /// 18-shard run). The constructed default MUST be `on` so an
+    /// out-of-the-box deployment is usable; operators opt back into
+    /// ADR-042 §4 explicit-routing-only via the env knob.
+    #[test]
+    fn proxy_fallback_defaults_on() {
+        let (_gw, server) = make_server();
+        assert!(
+            server.is_proxy_fallback_enabled(),
+            "ServerImpl::new() must default proxy fallback ON (GH #97)"
+        );
     }
 
     #[tokio::test]

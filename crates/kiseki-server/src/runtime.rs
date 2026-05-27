@@ -2277,7 +2277,7 @@ pub async fn run_main(
     let proxy_fallback_enabled = std::env::var("KISEKI_NATIVE_PROXY_FALLBACK")
         .ok()
         .as_deref()
-        .is_some_and(|v| matches!(v, "on" | "1" | "true" | "yes"));
+        .is_none_or(|v| matches!(v, "on" | "1" | "true" | "yes"));
     let native_server = std::sync::Arc::new(
         kiseki_gateway::native::ServerImpl::new(
             std::sync::Arc::clone(&gw) as std::sync::Arc<dyn kiseki_gateway::ops::GatewayOps>,
