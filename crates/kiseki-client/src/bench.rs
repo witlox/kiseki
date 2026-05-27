@@ -201,12 +201,6 @@ async fn build_driver(cfg: &BenchConfig) -> Result<Arc<dyn Driver>, String> {
     ))
 }
 
-/// Run the benchmark and emit a report on stdout. Returns the report
-/// so callers can inspect it programmatically.
-///
-/// # Errors
-/// Returns the underlying driver error if the endpoint scheme is
-/// unsupported, the connection fails, or the warmup PUTs fail.
 /// Generate DISTINCT, high-entropy payload bytes seeded by `seed`.
 ///
 /// Kiseki dedups by content address, so a bench that writes identical
@@ -229,6 +223,12 @@ fn make_payload(size: usize, seed: u64) -> Vec<u8> {
     buf
 }
 
+/// Run the benchmark and emit a report on stdout. Returns the report
+/// so callers can inspect it programmatically.
+///
+/// # Errors
+/// Returns the underlying driver error if the endpoint scheme is
+/// unsupported, the connection fails, or the warmup PUTs fail.
 #[allow(clippy::too_many_lines)] // workload loop + stats wiring is intrinsically long
 pub async fn run(cfg: BenchConfig) -> Result<BenchReport, String> {
     let driver = build_driver(&cfg).await?;
