@@ -1381,6 +1381,43 @@ pub async fn run_main(
     // empty (the gateway carries vec![] in NewChunkMeta), matching
     // the single-node-degenerate path.
     let cluster_placement: Vec<u64> = cfg.raft_peers.iter().map(|(id, _)| *id).collect();
+    // ADR-042 §4 / #103 / #111: proxy-fallback channel pool, constructed
+    // BEFORE the gateway so it backs both the native server's proxy AND
+    // the gateway's append-forwarder (#111 — forward writes/deletes/
+    // multipart to a remote shard leader for every ingress). Peer
+    // registration precedence: `KISEKI_PEER_DATA_ADDRS` (localhost-multi-
+    // node test harness) else uniform per-node data port (prod posture).
+    let proxy_client_for_native =
+        std::sync::Arc::new(kiseki_gateway::native::proxy_client::ProxyClient::new(
+            kiseki_common::ids::NodeId(cfg.node_id),
+        ));
+    {
+        let registered =
+            parse_peer_data_addrs(std::env::var("KISEKI_PEER_DATA_ADDRS").ok().as_deref());
+        if registered.is_empty() {
+            let peer_data_port = cfg.data_addr.port();
+            for (peer_id, peer_addr) in &cfg.raft_peers {
+                if *peer_id == cfg.node_id {
+                    continue;
+                }
+                let host = peer_addr
+                    .rsplit_once(':')
+                    .map_or(peer_addr.as_str(), |(h, _)| h);
+                proxy_client_for_native.register_node(
+                    kiseki_common::ids::NodeId(*peer_id),
+                    format!("{host}:{peer_data_port}"),
+                );
+            }
+        } else {
+            for (peer_id, data_addr) in registered {
+                if peer_id == cfg.node_id {
+                    continue;
+                }
+                proxy_client_for_native
+                    .register_node(kiseki_common::ids::NodeId(peer_id), data_addr);
+            }
+        }
+    }
     let mut gw_builder = kiseki_gateway::InMemoryGateway::new(comp_store, chunk_store, master_key)
         .with_view_store(Arc::clone(&view_store))
         // ADR-044: tenant-isolated content-addressed dedup.
@@ -1388,6 +1425,13 @@ pub async fn run_main(
             kiseki_common::tenancy::DedupPolicy::TenantIsolated,
             Some(tenant_dedup_key),
         )
+        // #111: forward a remote-led shard's metadata mutation to the
+        // leader's LogService (write/delete/multipart, every ingress).
+        .with_append_forwarder(std::sync::Arc::new(
+            kiseki_gateway::native::append_forwarder::ProxyAppendForwarder::new(
+                std::sync::Arc::clone(&proxy_client_for_native),
+            ),
+        ))
         .with_cluster_placement(cluster_placement)
         // Phase 16c step 2: cap per-chunk placement at the
         // size-derived `copies` so a 6-node Replication-3 cluster
@@ -2219,56 +2263,9 @@ pub async fn run_main(
             cfg.tls.is_some(),
         ),
     );
-    // ADR-042 §4 — proxy fallback channel pool. The runtime wires this
-    // unconditionally so a runtime-toggled
-    // `KISEKI_NATIVE_PROXY_FALLBACK` flip doesn't need to allocate
-    // the pool on the hot path. `register_node` for peer addresses is
-    // populated below from the cluster topology (the data_addr port
-    // is shared across nodes in `docker-compose` deployments;
-    // localhost-multi-node test harnesses populate it via the
-    // `peer_data_addrs` config — Step C wiring lands per node when
-    // topology gossip becomes available).
-    let proxy_client_for_native =
-        std::sync::Arc::new(kiseki_gateway::native::proxy_client::ProxyClient::new(
-            kiseki_common::ids::NodeId(cfg.node_id),
-        ));
-    // Peer registration for the proxy fallback (#103). Precedence:
-    //
-    // 1. `KISEKI_PEER_DATA_ADDRS=id=host:port,…` — explicit per-node
-    //    native-data endpoints. Required for **localhost-multi-node**
-    //    (every node on a distinct ephemeral data port), so the BDD
-    //    `ClusterHarness` can exercise the ADR-042 §4 proxied write
-    //    path. Mirrors `KISEKI_DS_PEERS` for the fabric.
-    // 2. Fallback: substitute each Raft peer's host with the **local**
-    //    data port — correct for the uniform-port container/GCP
-    //    deployment (every node binds the same data port, e.g. 9100),
-    //    which is the production posture (#103 verified the proxied
-    //    native write path at 14.7k ops/s there).
-    let registered = parse_peer_data_addrs(std::env::var("KISEKI_PEER_DATA_ADDRS").ok().as_deref());
-    if registered.is_empty() {
-        // Fallback (production): substitute each Raft peer's host with
-        // the local data port — correct where every node binds the same
-        // port (GCP/docker `:9100`).
-        let peer_data_port = cfg.data_addr.port();
-        for (peer_id, peer_addr) in &cfg.raft_peers {
-            if *peer_id == cfg.node_id {
-                continue;
-            }
-            let host = peer_addr
-                .rsplit_once(':')
-                .map_or(peer_addr.as_str(), |(h, _)| h);
-            let data_addr = format!("{host}:{peer_data_port}");
-            proxy_client_for_native.register_node(kiseki_common::ids::NodeId(*peer_id), data_addr);
-        }
-    } else {
-        // Explicit per-node endpoints (localhost-multi-node / harness).
-        for (peer_id, data_addr) in registered {
-            if peer_id == cfg.node_id {
-                continue;
-            }
-            proxy_client_for_native.register_node(kiseki_common::ids::NodeId(peer_id), data_addr);
-        }
-    }
+    // `proxy_client_for_native` was constructed + peer-registered above
+    // (before the gateway, so it backs both the gateway's #111
+    // append-forwarder and the native server's proxy below).
     let proxy_fallback_enabled = std::env::var("KISEKI_NATIVE_PROXY_FALLBACK")
         .ok()
         .as_deref()

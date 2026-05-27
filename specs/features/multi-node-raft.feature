@@ -337,6 +337,20 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     When 4 clients concurrently PUT identical 1MB content to distinct keys
     Then S3 GET of each key from node-2 returns the identical 1MB
 
+  # GH #111: distributed multi-shard writes. A `--shards N` namespace
+  # spreads shard leaders across nodes; an S3 PUT landing on a node that
+  # does NOT lead the target shard must forward the built append to the
+  # leader's LogService (the gateway append-forwarder), not 500 with
+  # "leader unavailable". All objects are written to node-1 on purpose,
+  # so ~5/6 route to remote-led shards and exercise the forward.
+  @integration @multi-node @cross-node @forwarding
+  Scenario: Distributed multi-shard S3 writes forward to the shard leader (GH #111)
+    Given a 6-node kiseki cluster
+    And a 6-shard namespace "msfwd" with leaders distributed across the cluster
+    When 60 distinct 64KB objects are written via S3 to node-1
+    Then every S3 write committed with no errors
+    And each object reads back identically from node-2
+
   @integration @multi-node @cross-node @smoke
   Scenario: Read survives leader failure (D-1)
     Given a 3-node kiseki cluster

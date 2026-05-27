@@ -20,12 +20,11 @@ use kiseki_composition::namespace::Namespace;
 use kiseki_crypto::envelope::Envelope;
 use kiseki_crypto::keys::SystemMasterKey;
 use kiseki_gateway::mem_gateway::InMemoryGateway;
-use kiseki_gateway::ops::{GatewayOps, WriteForwarder, WriteRequest, WriteResponse};
-use kiseki_gateway::GatewayError;
+use kiseki_gateway::ops::{GatewayOps, WriteRequest};
 use kiseki_log::error::LogError;
 use kiseki_log::shard::{ShardConfig, ShardInfo, ShardState};
 use kiseki_log::traits::{
-    AppendChunkAndDeltaRequest, AppendDeltaRequest, LogOps, ReadDeltasRequest,
+    AppendChunkAndDeltaRequest, AppendDeltaRequest, AppendForwarder, LogOps, ReadDeltasRequest,
 };
 
 fn test_tenant() -> OrgId {
@@ -61,6 +60,26 @@ impl LogOps for RecordingLog {
     }
 
     async fn append_chunk_and_delta(
+        &self,
+        req: AppendChunkAndDeltaRequest,
+    ) -> Result<SequenceNumber, LogError> {
+        self.chunk_and_delta_calls.lock().unwrap().push(req);
+        Ok(SequenceNumber(1))
+    }
+
+    // The gateway now routes through the forward-aware emit (#111), which
+    // calls the `_with_forwarding` variants. Production's variants do the
+    // same `client_write` as their plain siblings (only the error mapping
+    // differs), so the mock records them identically.
+    async fn append_delta_with_forwarding(
+        &self,
+        req: AppendDeltaRequest,
+    ) -> Result<SequenceNumber, LogError> {
+        self.plain_calls.lock().unwrap().push(req);
+        Ok(SequenceNumber(1))
+    }
+
+    async fn append_chunk_and_delta_with_forwarding(
         &self,
         req: AppendChunkAndDeltaRequest,
     ) -> Result<SequenceNumber, LogError> {
@@ -792,37 +811,31 @@ impl LogOps for ForwardToLeaderLog {
     }
 }
 
-/// Records every `forward_write` call and returns a canned success.
+/// Records every `forward_append` call and returns a canned sequence.
 #[derive(Default)]
 struct MockForwarder {
-    calls: Mutex<Vec<(u64, u64)>>, // (leader_node, bytes)
+    calls: Mutex<Vec<(u64, usize)>>, // (leader_node, new_chunks count)
 }
 
 #[async_trait::async_trait]
-impl WriteForwarder for MockForwarder {
-    async fn forward_write(
+impl AppendForwarder for MockForwarder {
+    async fn forward_append(
         &self,
         leader_node: NodeId,
-        req: WriteRequest,
-    ) -> Result<WriteResponse, GatewayError> {
-        let bytes = req.data.len() as u64;
-        // Loop-prevention contract: the origin request must NOT already
-        // be a forward (the gateway only forwards origin requests).
-        assert!(
-            req.forwarded_from_node.is_none(),
-            "gateway must only forward origin requests (loop prevention)"
-        );
-        self.calls.lock().unwrap().push((leader_node.0, bytes));
-        Ok(WriteResponse {
-            composition_id: kiseki_common::ids::CompositionId(uuid::Uuid::from_u128(0xF00)),
-            bytes_written: bytes,
-        })
+        req: AppendChunkAndDeltaRequest,
+    ) -> Result<SequenceNumber, LogError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((leader_node.0, req.new_chunks.len()));
+        Ok(SequenceNumber(42))
     }
 }
 
 /// #111 RED→GREEN: a write that hits a shard this node doesn't lead is
-/// transparently re-issued to the leader via the wired forwarder, and
-/// the gateway returns the leader's outcome (NOT `ForwardToLeader`).
+/// transparently re-issued (the built append) to the leader via the
+/// wired forwarder, and the gateway returns success — NOT a
+/// `ForwardToLeader` error.
 #[tokio::test(flavor = "multi_thread")]
 async fn write_to_remote_led_shard_forwards_to_leader() {
     let log: Arc<dyn LogOps + Send + Sync> = Arc::new(ForwardToLeaderLog {
@@ -847,7 +860,7 @@ async fn write_to_remote_led_shard_forwards_to_leader() {
     )
     .with_cluster_placement(vec![1, 2])
     .with_target_copies(1)
-    .with_write_forwarder(Arc::clone(&forwarder) as Arc<dyn WriteForwarder>);
+    .with_append_forwarder(Arc::clone(&forwarder) as Arc<dyn AppendForwarder>);
 
     let resp = gw
         .write(WriteRequest {
@@ -862,13 +875,14 @@ async fn write_to_remote_led_shard_forwards_to_leader() {
             comp_id_override: None,
         })
         .await
-        .expect("write must succeed via leader-forward, not ForwardToLeader error");
+        .expect("write must succeed via leader append-forward, not ForwardToLeader error");
 
     assert_eq!(resp.bytes_written, 4096);
     let calls = forwarder.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "forwarded exactly once");
+    assert_eq!(calls[0].0, 2, "forwarded to leader node-2");
     assert_eq!(
-        &*calls,
-        &[(2, 4096)],
-        "the write must be forwarded exactly once to leader node-2"
+        calls[0].1, 1,
+        "the write's single new chunk rides the forwarded append"
     );
 }

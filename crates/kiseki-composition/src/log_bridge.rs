@@ -9,7 +9,7 @@ use kiseki_common::time::{ClockQuality, DeltaTimestamp, HybridLogicalClock, Wall
 use kiseki_log::delta::OperationType;
 use kiseki_log::error::LogError;
 use kiseki_log::raft_store::NewChunkMeta;
-use kiseki_log::traits::{AppendChunkAndDeltaRequest, AppendDeltaRequest, LogOps};
+use kiseki_log::traits::{AppendChunkAndDeltaRequest, AppendDeltaRequest, AppendForwarder, LogOps};
 
 /// Emit a delta to the log for a composition mutation.
 ///
@@ -139,6 +139,65 @@ pub async fn emit_chunk_and_delta_with_forwarding<L: LogOps + ?Sized>(
     } else {
         log.append_chunk_and_delta_with_forwarding(AppendChunkAndDeltaRequest { delta, new_chunks })
             .await
+    }
+}
+
+/// #111: forward-aware emit. Builds the append, attempts the local
+/// commit, and on `ForwardToLeader` re-issues the **same** built append
+/// to the leader via `forwarder` (if present), so the write commits on
+/// the shard leader regardless of which node the client hit. Covers
+/// write / delete / multipart-complete uniformly. Local behaviour is
+/// preserved (delta-only emits still use `append_delta`); only the
+/// follower-forward path is new. With `forwarder == None` it degrades
+/// to surfacing the `ForwardToLeader` hint (single-node / tests).
+#[allow(clippy::too_many_arguments)]
+pub async fn emit_chunk_and_delta_forwarding_to<L: LogOps + ?Sized>(
+    log: &L,
+    forwarder: Option<&dyn AppendForwarder>,
+    shard_id: ShardId,
+    tenant_id: OrgId,
+    operation: OperationType,
+    hashed_key: [u8; 32],
+    chunk_refs: Vec<ChunkId>,
+    payload: Vec<u8>,
+    new_chunks: Vec<NewChunkMeta>,
+) -> Result<SequenceNumber, LogError> {
+    let timestamp = now_timestamp();
+    let delta = AppendDeltaRequest {
+        shard_id,
+        tenant_id,
+        operation,
+        timestamp,
+        hashed_key,
+        chunk_refs,
+        payload,
+        has_inline_data: false,
+    };
+    // Keep a copy of the built append for the forward path (the local
+    // attempt consumes its inputs). The payload here is the composition
+    // metadata, not the file data, so the clone is cheap.
+    let forward_req = AppendChunkAndDeltaRequest {
+        delta: delta.clone(),
+        new_chunks: new_chunks.clone(),
+    };
+    let local = if new_chunks.is_empty() {
+        log.append_delta_with_forwarding(delta).await
+    } else {
+        log.append_chunk_and_delta_with_forwarding(AppendChunkAndDeltaRequest { delta, new_chunks })
+            .await
+    };
+    match local {
+        Err(LogError::ForwardToLeader {
+            shard_id: sid,
+            leader_node_id,
+        }) => match forwarder {
+            Some(fwd) => fwd.forward_append(leader_node_id, forward_req).await,
+            None => Err(LogError::ForwardToLeader {
+                shard_id: sid,
+                leader_node_id,
+            }),
+        },
+        other => other,
     }
 }
 

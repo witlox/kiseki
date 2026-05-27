@@ -6,9 +6,9 @@
 use kiseki_common::ids::{ChunkId, OrgId, SequenceNumber, ShardId};
 use kiseki_proto::v1::log_service_server::LogService;
 use kiseki_proto::v1::{
-    AppendDeltaRequest as ProtoAppendReq, AppendDeltaResponse, ReadDeltasRequest as ProtoReadReq,
-    ReadDeltasResponse, SetMaintenanceRequest, SetMaintenanceResponse, ShardHealthRequest,
-    ShardHealthResponse,
+    AppendChunkAndDeltaRequest as ProtoChunkAppendReq, AppendDeltaRequest as ProtoAppendReq,
+    AppendDeltaResponse, ReadDeltasRequest as ProtoReadReq, ReadDeltasResponse,
+    SetMaintenanceRequest, SetMaintenanceResponse, ShardHealthRequest, ShardHealthResponse,
 };
 use tonic::{Request, Response, Status};
 
@@ -57,6 +57,46 @@ fn proto_op_to_domain(op: i32) -> Result<crate::delta::OperationType, Status> {
         _ => Err(Status::invalid_argument(format!(
             "unknown operation type: {op}"
         ))),
+    }
+}
+
+/// Convert a Rust `AppendChunkAndDeltaRequest` to its proto form for
+/// inter-node forwarding (#111). The inverse of the
+/// `append_chunk_and_delta` handler's parse — a follower gateway uses
+/// this to re-issue an append against the shard leader's `LogService`.
+#[must_use]
+pub fn append_chunk_and_delta_request_to_proto(
+    req: &crate::traits::AppendChunkAndDeltaRequest,
+) -> ProtoChunkAppendReq {
+    let d = &req.delta;
+    ProtoChunkAppendReq {
+        shard_id: Some(kiseki_proto::v1::ShardId {
+            value: d.shard_id.0.to_string(),
+        }),
+        tenant_id: Some(kiseki_proto::v1::OrgId {
+            value: d.tenant_id.0.to_string(),
+        }),
+        operation: domain_op_to_proto(d.operation),
+        timestamp: Some(to_proto_timestamp(&d.timestamp)),
+        hashed_key: d.hashed_key.to_vec(),
+        chunk_refs: d
+            .chunk_refs
+            .iter()
+            .map(|c| kiseki_proto::v1::ChunkId {
+                value: c.0.to_vec(),
+            })
+            .collect(),
+        payload: d.payload.clone(),
+        has_inline_data: d.has_inline_data,
+        new_chunks: req
+            .new_chunks
+            .iter()
+            .map(|n| kiseki_proto::v1::NewChunkMeta {
+                chunk_id: n.chunk_id.to_vec(),
+                placement: n.placement.clone(),
+                original_len: n.original_len,
+            })
+            .collect(),
     }
 }
 
@@ -249,6 +289,77 @@ impl LogService for LogGrpc {
         let seq = self
             .ops
             .append_delta(domain_req)
+            .await
+            .map_err(|e| to_status(&e))?;
+        Ok(Response::new(AppendDeltaResponse { sequence: seq.0 }))
+    }
+
+    // #111: leader-side commit of a forwarded `ChunkAndDelta`. The
+    // follower gateway re-issues its already-built append here; this
+    // node (the shard leader) runs `append_chunk_and_delta` locally,
+    // which `client_write`s and replicates to all members.
+    async fn append_chunk_and_delta(
+        &self,
+        request: Request<ProtoChunkAppendReq>,
+    ) -> Result<Response<AppendDeltaResponse>, Status> {
+        let _s = kiseki_tracing::span("LogService.AppendChunkAndDelta");
+        let req = request.into_inner();
+        let shard_id = extract_shard_id(req.shard_id)?;
+        let tenant_id = req
+            .tenant_id
+            .ok_or_else(|| Status::invalid_argument("tenant_id required"))?;
+        let org_id = uuid::Uuid::parse_str(&tenant_id.value)
+            .map_err(|e| Status::invalid_argument(format!("invalid tenant_id: {e}")))?;
+        let operation = proto_op_to_domain(req.operation)?;
+        let timestamp = from_proto_timestamp(req.timestamp)?;
+        let hashed_key: [u8; 32] = req
+            .hashed_key
+            .try_into()
+            .map_err(|_| Status::invalid_argument("hashed_key must be 32 bytes"))?;
+        let chunk_refs: Vec<ChunkId> = req
+            .chunk_refs
+            .into_iter()
+            .map(|c| {
+                let bytes: [u8; 32] = c
+                    .value
+                    .try_into()
+                    .map_err(|_| "chunk_id must be 32 bytes")?;
+                Ok(ChunkId(bytes))
+            })
+            .collect::<Result<Vec<_>, &str>>()
+            .map_err(Status::invalid_argument)?;
+        let new_chunks: Vec<crate::raft_store::NewChunkMeta> = req
+            .new_chunks
+            .into_iter()
+            .map(|n| {
+                let chunk_id: [u8; 32] = n
+                    .chunk_id
+                    .try_into()
+                    .map_err(|_| "new_chunks.chunk_id must be 32 bytes")?;
+                Ok(crate::raft_store::NewChunkMeta {
+                    chunk_id,
+                    placement: n.placement,
+                    original_len: n.original_len,
+                })
+            })
+            .collect::<Result<Vec<_>, &str>>()
+            .map_err(Status::invalid_argument)?;
+        let domain_req = crate::traits::AppendChunkAndDeltaRequest {
+            delta: crate::traits::AppendDeltaRequest {
+                shard_id,
+                tenant_id: OrgId(org_id),
+                operation,
+                timestamp,
+                hashed_key,
+                chunk_refs,
+                payload: req.payload,
+                has_inline_data: req.has_inline_data,
+            },
+            new_chunks,
+        };
+        let seq = self
+            .ops
+            .append_chunk_and_delta(domain_req)
             .await
             .map_err(|e| to_status(&e))?;
         Ok(Response::new(AppendDeltaResponse { sequence: seq.0 }))

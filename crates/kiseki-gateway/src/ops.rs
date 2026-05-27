@@ -120,25 +120,12 @@ pub struct WriteResponse {
     pub bytes_written: u64,
 }
 
-/// Forwards a write to the shard's Raft leader on another node (#111).
-///
-/// When `write_impl` gets a `ForwardToLeader` hint (the local node isn't
-/// the target shard's leader), it re-issues the write to the leader
-/// through this trait — making distributed-multi-shard writes work for
-/// EVERY ingress (S3 / NFS / FUSE / native), not just the native server's
-/// proxy path. The runtime backs it with the ADR-042 §4 `ProxyClient`
-/// (wire-level `put_object` re-issue); unit tests use a mock.
-#[async_trait::async_trait]
-pub trait WriteForwarder: Send + Sync {
-    /// Re-issue `req` to `leader_node`'s gateway and return its outcome.
-    /// The implementation MUST stamp `forwarded_from_node` so the leader
-    /// commits locally without re-forwarding (loop prevention).
-    async fn forward_write(
-        &self,
-        leader_node: kiseki_common::ids::NodeId,
-        req: WriteRequest,
-    ) -> Result<WriteResponse, GatewayError>;
-}
+// #111: write forwarding is handled below the gateway by
+// `kiseki_log::traits::AppendForwarder` (forward the built append to the
+// shard leader's LogService), covering write/delete/multipart uniformly.
+// The earlier gateway-level `WriteForwarder` (re-issue the whole write)
+// was superseded — re-issuing the op can't work for multipart-complete
+// (the upload's part-state is local to the origin node).
 
 /// Protocol-agnostic gateway operations.
 ///
