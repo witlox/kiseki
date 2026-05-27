@@ -139,7 +139,10 @@ pub struct InMemoryGateway {
     aead: Aead,
     master_key: SystemMasterKey,
     dedup_policy: DedupPolicy,
-    tenant_hmac_key: Option<Vec<u8>>,
+    // Secret per-tenant dedup HMAC key (ADR-044). Held in `Zeroizing`
+    // so it is scrubbed from memory on drop — it derives from the system
+    // master key and gates content-confirmation, so it is key material.
+    tenant_hmac_key: Option<zeroize::Zeroizing<Vec<u8>>>,
     /// `parking_lot::RwLock`: read-mostly (every gateway read takes
     /// a read lock; only the stream processor's 100 ms watermark
     /// advance takes a write lock). `std::sync::Mutex` here was a
@@ -830,7 +833,7 @@ impl InMemoryGateway {
         let chunk_id = kiseki_crypto::chunk_id::derive_chunk_id(
             data,
             self.dedup_policy,
-            self.tenant_hmac_key.as_deref(),
+            self.tenant_hmac_key.as_ref().map(|k| k.as_slice()),
         )
         .map_err(|e| GatewayError::Upstream(e.to_string()))?;
 
@@ -890,19 +893,25 @@ impl InMemoryGateway {
         // Phase 1: lock store, finalize, gather everything we need
         // for the Raft emit + name bind, drop the lock before any
         // await on Raft consensus (ADR-032).
-        let (comp_id, log, emit_params, new_chunk_ids) = {
+        let (comp_id, log, emit_params, new_chunks_sized) = {
             let comps = self.compositions.as_ref();
             let comp_id = comps.finalize_multipart(upload_id).map_err(|e| {
                 tracing::warn!(error = %e, "complete_multipart: finalize_multipart failed");
                 GatewayError::Upstream(e.to_string())
             })?;
             // Pull part-level metadata while we still hold the lock.
-            // Need `was_new` to build the new_chunks list below.
-            let new_chunk_ids: Vec<kiseki_common::ids::ChunkId> = comps
+            // Need `was_new` to build the new_chunks list below, plus
+            // `size` (the part's plaintext length — == ciphertext length,
+            // since the AEAD stores the tag separately) to record each
+            // chunk's `original_len`. Without it the EC scrub/repair path
+            // reads `cluster_chunk_state.original_len == 0`, and
+            // `ec::decode` reconstructs the chunk EMPTY → it would write a
+            // corrupt repaired fragment (GH #107, scrub side).
+            let new_chunks_sized: Vec<(kiseki_common::ids::ChunkId, u64)> = comps
                 .multipart_parts(upload_id)
                 .into_iter()
                 .filter(|p| p.was_new)
-                .map(|p| p.chunk_id)
+                .map(|p| (p.chunk_id, p.size))
                 .collect();
             let comp = comps.get(comp_id).map_err(|e| {
                 tracing::warn!(error = %e, "complete_multipart: get post-finalize failed");
@@ -928,12 +937,12 @@ impl InMemoryGateway {
                     })?;
             }
             let log = comps.log();
-            (comp_id, log, params, new_chunk_ids)
+            (comp_id, log, params, new_chunks_sized)
         };
         tracing::debug!(
             comp_id = %comp_id.0,
             shard_id = %emit_params.0.0,
-            new_chunks = new_chunk_ids.len(),
+            new_chunks = new_chunks_sized.len(),
             "complete_multipart: pre-Raft",
         );
 
@@ -957,9 +966,9 @@ impl InMemoryGateway {
             } else {
                 emit_params.0
             };
-            let new_chunks: Vec<kiseki_log::raft_store::NewChunkMeta> = new_chunk_ids
+            let new_chunks: Vec<kiseki_log::raft_store::NewChunkMeta> = new_chunks_sized
                 .iter()
-                .map(|chunk_id| {
+                .map(|(chunk_id, original_len)| {
                     let placement = if self.target_copies > 0 {
                         kiseki_chunk_cluster::pick_placement(
                             chunk_id,
@@ -969,18 +978,17 @@ impl InMemoryGateway {
                     } else {
                         self.cluster_placement.clone()
                     };
-                    // Multipart parts went through `chunks.write_chunk`
-                    // (which wrapped each part in an envelope) so the
-                    // ciphertext length per chunk is the per-part
-                    // ciphertext, not the composition total. We don't
-                    // have it cleanly accessible here without re-reading
-                    // the chunk; use 0 to indicate "use the trim-zeros
-                    // fallback on read" — the EC layer's trim heuristic
-                    // is correct for AES-GCM ciphertext.
+                    // `original_len` is the part's plaintext length (==
+                    // ciphertext length; the AEAD tag is stored
+                    // separately). Recording it — rather than the old
+                    // `0` punt — gives the EC read AND scrub/repair paths
+                    // the exact decode length from one source
+                    // (`cluster_chunk_state`), closing the GH #107
+                    // corruption on both sides.
                     kiseki_log::raft_store::NewChunkMeta {
                         chunk_id: chunk_id.0,
                         placement,
-                        original_len: 0,
+                        original_len: *original_len,
                     }
                 })
                 .collect();
@@ -1055,7 +1063,9 @@ impl InMemoryGateway {
     #[must_use]
     pub fn with_dedup_policy(mut self, policy: DedupPolicy, hmac_key: Option<Vec<u8>>) -> Self {
         self.dedup_policy = policy;
-        self.tenant_hmac_key = hmac_key;
+        // Wrap in Zeroizing: the buffer the caller passes becomes the
+        // gateway-resident key and is scrubbed on drop.
+        self.tenant_hmac_key = hmac_key.map(zeroize::Zeroizing::new);
         self
     }
 
@@ -2143,12 +2153,15 @@ impl InMemoryGateway {
         let mut landed: Vec<ChunkLanded> = Vec::with_capacity(pieces_len);
 
         for piece in raw_pieces {
-            let chunk_id =
-                derive_chunk_id(piece, self.dedup_policy, self.tenant_hmac_key.as_deref())
-                    .map_err(|e| {
-                        tracing::warn!(error = %e, "gateway write: derive_chunk_id failed");
-                        GatewayError::Upstream(e.to_string())
-                    })?;
+            let chunk_id = derive_chunk_id(
+                piece,
+                self.dedup_policy,
+                self.tenant_hmac_key.as_ref().map(|k| k.as_slice()),
+            )
+            .map_err(|e| {
+                tracing::warn!(error = %e, "gateway write: derive_chunk_id failed");
+                GatewayError::Upstream(e.to_string())
+            })?;
 
             // Dedup short-circuit: if the chunk already exists, skip
             // the per-write HKDF + AEAD seal + nonce-RNG and just

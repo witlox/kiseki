@@ -90,16 +90,36 @@ plaintexts.
   - `DedupPolicy::CrossTenant` (no tenant key) enables cross-tenant dedup and a
     cross-tenant confirmation oracle; it is **reserved for non-sensitive / system
     data only** and must never be selected for tenant payloads.
-  - **Current wiring gap (pre-GA, tracked):** the gateway DEFAULTS to
-    `DedupPolicy::CrossTenant` with no `tenant_hmac_key`
-    (`MemGateway` constructor); `TenantIsolated` is available via
-    `with_dedup_policy(policy, hmac_key)` but the production server
-    (`kiseki-server`) does not yet select it. This is acceptable **only**
-    while there is no durable tenant data (pre-production). Before GA — and
-    before any tenant payload is stored — the production wiring MUST default
-    to `TenantIsolated` with a per-tenant HMAC key source. Until then the
-    cross-tenant confirmation oracle above is open. Changing the default is a
-    crypto-posture change and requires adversary review.
+  - **Wiring (done):** `kiseki-server`'s data-plane gateway selects
+    `TenantIsolated`, with the key from
+    `kiseki_crypto::hkdf::derive_tenant_dedup_key(master, tenant_id)`
+    (HKDF, info `kiseki-tenant-dedup-hmac-v1`). The `MemGateway`
+    constructor default stays `CrossTenant` for system / non-tenant data;
+    the gateway holds the key in `Zeroizing`. New tenant orgs default to
+    `TenantIsolated`.
+- **Two open constraints on the dedup key (adversary review of the wiring,
+  2026-05-27):**
+  - **Rotation stability (Finding B).** Content-addressed dedup needs the
+    dedup key to be **stable for the life of the tenant's data** — if it
+    changes, identical content re-derives a new `chunk_id`, splitting
+    refcount identity and breaking dedup continuity. `derive_tenant_dedup_key`
+    currently keys on the **system master key**, which rotates (ADR-003 /
+    `MasterKeyCache` epochs). This is **latent today** — the master key is a
+    fixed constant and each gateway holds a single key, so no rotation
+    occurs — but when real key management + rotation lands, the dedup key
+    MUST hang off a **rotation-stable tenant root**, not the rotating system
+    master. This lifetime requirement is a key-management design constraint
+    (belongs alongside ADR-003); recorded here so it is not lost.
+  - **Master-key sourcing (Finding C).** The oracle-closure property (a
+    *secret* `chunk_id` an attacker cannot compute offline) holds only once
+    the system master key comes from the keymanager/KMS. Today it is the
+    fixed placeholder `[0x42; 32]` (`runtime.rs`) used by the **entire**
+    data-plane encryption, so the oracle is effectively open in any deploy
+    of the current code. Acceptable for **pre-production** (no durable
+    tenant data); it is **not** dev-gated — it is the only path — so the
+    real master key MUST be sourced from the keymanager before any
+    production deploy. This is a pre-existing data-plane-key gap, not
+    specific to dedup.
 - **Nonce secrecy is irrelevant** — GCM nonces are public (stored in the
   envelope). Determinism + per-key uniqueness are the only requirements, both
   met.
