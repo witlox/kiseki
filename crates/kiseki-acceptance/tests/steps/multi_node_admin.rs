@@ -603,6 +603,107 @@ async fn then_bench_lands_ops(w: &mut KisekiWorld, shape: String) {
     );
 }
 
+/// GH #102 end-to-end guard (adversary Finding 3, ADR-044). N clients
+/// **concurrently** PUT IDENTICAL content (the bench's `0xa5` payload —
+/// the literal #102 trigger) to distinct S3 keys on the 6-node EC-4+2
+/// cluster. Identical content ⇒ one content-addressed `chunk_id`, and
+/// the concurrency races past the dedup-skip so multiple seals hit the
+/// EC fan-out at once. Pre-fix (random nonce) the per-node fragments +
+/// crypto registry tore → AEAD fail on read; convergent encryption
+/// (deterministic nonce) makes every seal byte-identical, so the reads
+/// stay consistent. S3-only — does not need the native proxy (#103).
+#[when(regex = r"^(\d+) clients concurrently PUT identical 1MB content to distinct keys$")]
+async fn when_concurrent_identical_puts(w: &mut KisekiWorld, n: usize) {
+    // Stage 1: discover the leader without holding the cluster borrow
+    // across an await (S3 PUT to a follower 307s; the "default" bucket
+    // is single-shard, led by the bootstrap/control-plane leader).
+    let (n1_info_url, n1_http) = {
+        let n1 = cluster(w).node(1);
+        (n1.admin_url("cluster/info"), n1.http.clone())
+    };
+    let leader_id = match n1_http.get(&n1_info_url).send().await {
+        Ok(r) if r.status().is_success() => r
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|j| j.get("leader_id").and_then(serde_json::Value::as_u64))
+            .unwrap_or(1),
+        _ => 1,
+    };
+    let (s3_base, http) = {
+        let leader = cluster(w).node(leader_id);
+        (leader.s3_base.clone(), leader.http.clone())
+    };
+
+    let payload = vec![0xa5u8; 1024 * 1024];
+    let keys: Vec<String> = (0..n)
+        .map(|i| format!("dedup-{}-{i}", uuid::Uuid::new_v4().simple()))
+        .collect();
+
+    // Fire all PUTs concurrently.
+    let puts = keys.iter().map(|key| {
+        let url = format!("{s3_base}/default/{key}");
+        let http = http.clone();
+        let body = payload.clone();
+        async move { (url.clone(), http.put(&url).body(body).send().await) }
+    });
+    let results = futures::future::join_all(puts).await;
+    for (url, res) in &results {
+        match res {
+            Ok(resp) => assert!(
+                resp.status().is_success(),
+                "concurrent PUT {url} returned {}",
+                resp.status(),
+            ),
+            Err(e) => panic!("concurrent PUT {url} failed: {e}"),
+        }
+    }
+    w.cluster
+        .name_index_state
+        .insert("dedup_keys".into(), keys.join(","));
+}
+
+#[then(regex = r"^S3 GET of each key from node-(\d+) returns the identical 1MB$")]
+async fn then_get_each_dedup_key(w: &mut KisekiWorld, node_id: u64) {
+    let keys: Vec<String> = w
+        .cluster
+        .name_index_state
+        .get("dedup_keys")
+        .map(|s| s.split(',').map(String::from).collect())
+        .expect("the concurrent-PUT step must run first");
+    let (s3_base, http) = {
+        let node = cluster(w).node(node_id);
+        (node.s3_base.clone(), node.http.clone())
+    };
+    let expected = vec![0xa5u8; 1024 * 1024];
+    for key in &keys {
+        let url = format!("{s3_base}/default/{key}");
+        // Followers hydrate the composition via Raft; poll up to 30s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let body = loop {
+            if let Ok(resp) = http.get(&url).send().await {
+                if resp.status().is_success() {
+                    break resp.bytes().await.expect("read body").to_vec();
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("S3 GET {url} from node-{node_id} never succeeded within 30s");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        };
+        assert_eq!(
+            body.len(),
+            expected.len(),
+            "node-{node_id} {key}: length mismatch"
+        );
+        assert_eq!(
+            body, expected,
+            "GH #102: node-{node_id} {key}: dedup'd EC chunk decrypted to wrong bytes \
+             (convergent encryption torn?)",
+        );
+    }
+}
+
 #[then("the MergeShards response merged_shard_id equals the left shard id")]
 async fn then_merge_response_id_matches_left(w: &mut KisekiWorld) {
     let left = w

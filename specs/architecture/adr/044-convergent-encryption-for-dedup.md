@@ -1,6 +1,6 @@
 # ADR-044: Convergent encryption for content-addressed dedup
 
-**Status:** Proposed (needs adversary review — security-sensitive)
+**Status:** Accepted (adversary-reviewed 2026-05-27; findings addressed below)
 **Date:** 2026-05-27
 **Relates to:** ADR-002 (two-layer encryption), ADR-003 (HKDF DEK derivation), ADR-017 (dedup + refcount), GH #102
 
@@ -51,10 +51,12 @@ registry crypto are byte-identical regardless of which write "wins," so the EC
 reassembly can never tear.
 
 `Aead` gains `seal_with_nonce(key, nonce, plaintext, aad)`; `seal` (random nonce)
-is retained for any non-content-addressed callers. The nonce is still stored in
-the envelope and `open` still reads it from there — so **existing chunks sealed
-with a random nonce continue to decrypt unchanged; no migration**. Only new
-seals become deterministic.
+is retained for the one non-content-addressed caller, `wrap_for_tenant`. The
+nonce is still stored in the envelope and `open` still reads it from there — so
+an envelope sealed with a random nonce would still decrypt (a free property of
+the stored-nonce design, not a backward-compat constraint we engineered for —
+Kiseki is pre-production with no durable data; see Consequences). Only new seals
+become deterministic.
 
 ## Why this is GCM-safe
 
@@ -75,19 +77,33 @@ plaintexts.
 - **Confirmation-of-content exposure** (the standard convergent-encryption
   trade-off): an adversary who can supply a candidate plaintext and observe
   either the dedup outcome (refcount vs new store) or the ciphertext can confirm
-  whether that exact content already exists. Scope is bounded by the dedup
-  policy: `TenantIsolated` (default for tenant data) confines it **within a
-  tenant** (the attacker must already hold the tenant HMAC key). `CrossTenant`
-  widens it cross-tenant and should be reserved for non-sensitive/system data.
-  This exposure already existed at the **dedup** layer (ADR-017: a dedup hit is
-  observable); convergent encryption does not materially widen it beyond what
-  content-addressing already implies.
+  whether that exact content already exists. This exposure already existed at the
+  **dedup** layer (ADR-017: a dedup hit is observable); convergent encryption
+  does not materially widen it beyond what content-addressing already implies.
+  Bounding it is a **requirement, not a default** (adversary Finding 4):
+  - Tenant data **MUST** use `DedupPolicy::TenantIsolated`
+    (`chunk_id = HMAC(tenant_hmac_key, plaintext)`), which confines confirmation
+    **within a single tenant** — an attacker must already hold that tenant's HMAC
+    key. The gateway is wired with `tenant_hmac_key` for this reason.
+  - `DedupPolicy::CrossTenant` (no tenant key) enables cross-tenant dedup and a
+    cross-tenant confirmation oracle; it is **reserved for non-sensitive / system
+    data only** and must never be selected for tenant payloads.
 - **Nonce secrecy is irrelevant** — GCM nonces are public (stored in the
   envelope). Determinism + per-key uniqueness are the only requirements, both
   met.
 - **Crypto-agility**: the `…-nonce-v1` info label lets us rotate the derivation
   without ambiguity; the stored-nonce-on-open path means old chunks are never
   re-derived.
+- **Migration / rollout (adversary Findings 1 & 2 — N/A pre-production):**
+  Kiseki has no deployed clients yet (no durable data, no live fleet), so the
+  forward-only nature of the fix is moot: a fresh deploy seals **every** chunk
+  convergently from the first write, and any pre-existing test data is
+  disposable. The properties only matter at GA and are recorded here to revisit
+  then: (1) chunks torn by the old random-nonce path are not auto-repaired —
+  they need delete+rewrite or a scrub pass; (2) a rolling upgrade across mixed
+  old/new nodes could tear a chunk if both versions seal the *same new content*
+  concurrently — so the GA cutover should be fleet-wide-atomic or gated. Neither
+  applies now; do **not** add backward-compat machinery for them pre-GA.
 
 ## Alternatives considered
 

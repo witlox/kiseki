@@ -324,6 +324,19 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     When a client writes 1MB via S3 PUT to node-1
     Then S3 GET from node-2 returns the same 1MB
 
+  # GH #102 / ADR-044 convergent-encryption guard (adversary Finding 3):
+  # concurrent writes of IDENTICAL content collide on one content-
+  # addressed chunk_id and race past the dedup-skip onto the EC fan-out.
+  # Pre-fix (random nonce) the fragments tore → AEAD fail on read; the
+  # deterministic nonce makes every seal byte-identical so reads stay
+  # consistent. S3-only, so not blocked by the native-proxy harness gap
+  # (#103).
+  @integration @multi-node @cross-node @dedup
+  Scenario: 6-node EC-4+2 concurrent identical-content writes dedup and read back (GH #102)
+    Given a 6-node kiseki cluster
+    When 4 clients concurrently PUT identical 1MB content to distinct keys
+    Then S3 GET of each key from node-2 returns the identical 1MB
+
   @integration @multi-node @cross-node @smoke
   Scenario: Read survives leader failure (D-1)
     Given a 3-node kiseki cluster
