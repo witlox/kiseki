@@ -212,7 +212,7 @@ fn fabric_addr_from_raft_peer(raft_peer: &str, data_port: u16) -> String {
 /// `initialize_membership` returns `NotAllowed` after the first
 /// commit, which `OpenRaftLogStore::initialize_membership` maps to
 /// `Ok(())`.
-async fn initialize_seeded_shards(
+pub(crate) async fn initialize_seeded_shards(
     store: &Arc<kiseki_log::RaftShardStore>,
     shard_ids: &[kiseki_common::ids::ShardId],
     skip: Option<kiseki_common::ids::ShardId>,
@@ -1631,6 +1631,11 @@ pub async fn run_main(
     // (`POST /admin/topology/namespaces`, #68). Read-only callers
     // already use `cluster_control_state_for_ui` above.
     let cluster_control_store_for_ui = cluster_control_store.clone();
+    // GH #99: the multi-shard `namespace-create` admin handler needs the
+    // typed per-shard store to initialize each fresh shard's membership
+    // after the control-plane commit. Clone (not move) — the storage
+    // admin RPC wiring below still borrows `raft_shard_store_for_admin`.
+    let raft_shard_store_for_ui = raft_shard_store_for_admin.clone();
     // Pre-construct the tenant + namespace + drain handles so the
     // admin UI can share them with the gRPC `ControlService` further
     // below. The gRPC service is built after this point — both
@@ -1659,6 +1664,7 @@ pub async fn run_main(
             metrics_local_chunk_store,
             cluster_control_state_for_ui,
             cluster_control_store_for_ui,
+            raft_shard_store_for_ui,
             Some(audit_for_spawn),
             Some(key_store_for_spawn),
             Some(tenants_for_spawn),

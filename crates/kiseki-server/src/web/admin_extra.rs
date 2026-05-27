@@ -580,6 +580,29 @@ async fn api_create_sharded_namespace(
                 }
             }
 
+            // GH #99: the control-plane apply hook registered each new
+            // shard's per-shard Raft group on every node, but
+            // registration alone leaves them as empty-membership
+            // learners. `submit` is leader-only (openraft `client_write`
+            // errors on followers), so reaching this arm means this node
+            // is the control-plane leader — it must explicitly
+            // initialize each fresh shard's membership or the group
+            // never elects a leader and every write to the namespace
+            // 5xx's with "leader unavailable". This mirrors the
+            // first-touch `ControlPlaneProvisioner::provision` path,
+            // which the multi-shard admin endpoint previously skipped.
+            if let Some(raft_store) = state.raft_store.as_ref() {
+                let shard_ids: Vec<kiseki_common::ids::ShardId> =
+                    shards.iter().map(|s| s.shard_id).collect();
+                crate::runtime::initialize_seeded_shards(
+                    raft_store,
+                    &shard_ids,
+                    None,
+                    "admin namespace-create",
+                )
+                .await;
+            }
+
             let shard_json: Vec<serde_json::Value> = shards
                 .iter()
                 .map(|s| {
