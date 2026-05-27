@@ -2245,14 +2245,10 @@ pub async fn run_main(
     //    which is the production posture (#103 verified the proxied
     //    native write path at 14.7k ops/s there).
     let registered = parse_peer_data_addrs(std::env::var("KISEKI_PEER_DATA_ADDRS").ok().as_deref());
-    if !registered.is_empty() {
-        for (peer_id, data_addr) in registered {
-            if peer_id == cfg.node_id {
-                continue;
-            }
-            proxy_client_for_native.register_node(kiseki_common::ids::NodeId(peer_id), data_addr);
-        }
-    } else {
+    if registered.is_empty() {
+        // Fallback (production): substitute each Raft peer's host with
+        // the local data port — correct where every node binds the same
+        // port (GCP/docker `:9100`).
         let peer_data_port = cfg.data_addr.port();
         for (peer_id, peer_addr) in &cfg.raft_peers {
             if *peer_id == cfg.node_id {
@@ -2263,6 +2259,14 @@ pub async fn run_main(
                 .map_or(peer_addr.as_str(), |(h, _)| h);
             let data_addr = format!("{host}:{peer_data_port}");
             proxy_client_for_native.register_node(kiseki_common::ids::NodeId(*peer_id), data_addr);
+        }
+    } else {
+        // Explicit per-node endpoints (localhost-multi-node / harness).
+        for (peer_id, data_addr) in registered {
+            if peer_id == cfg.node_id {
+                continue;
+            }
+            proxy_client_for_native.register_node(kiseki_common::ids::NodeId(peer_id), data_addr);
         }
     }
     let proxy_fallback_enabled = std::env::var("KISEKI_NATIVE_PROXY_FALLBACK")
