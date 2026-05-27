@@ -49,6 +49,34 @@ pub struct AppendChunkAndDeltaRequest {
     pub new_chunks: Vec<NewChunkMeta>,
 }
 
+/// Forwards an already-built `ChunkAndDelta` append to the shard's
+/// Raft **leader** on another node (#111).
+///
+/// When the local node is a follower for the target shard,
+/// `append_chunk_and_delta_with_forwarding` returns
+/// [`LogError::ForwardToLeader`]. Rather than surface that to the
+/// client (the old behaviour — a 500 on S3/NFS), the gateway re-issues
+/// the *same* built append to the leader through this trait; the leader
+/// `client_write`s it locally and replicates back to all members.
+///
+/// One mechanism covers every metadata mutation — write, delete,
+/// multipart-complete — because they all funnel through the shard's
+/// append (refcount inc/dec ride inside those flows). The production
+/// impl dials the leader's `LogService.AppendChunkAndDelta`; tests use
+/// a mock.
+#[async_trait::async_trait]
+pub trait AppendForwarder: Send + Sync {
+    /// Re-issue `req` against `leader_node`'s shard log and return the
+    /// assigned sequence. The implementation MUST be loop-safe (it dials
+    /// the leader's `LogService`, which commits locally and does not
+    /// re-forward).
+    async fn forward_append(
+        &self,
+        leader_node: NodeId,
+        req: AppendChunkAndDeltaRequest,
+    ) -> Result<SequenceNumber, LogError>;
+}
+
 /// Request to read a range of deltas.
 #[derive(Clone, Debug)]
 pub struct ReadDeltasRequest {

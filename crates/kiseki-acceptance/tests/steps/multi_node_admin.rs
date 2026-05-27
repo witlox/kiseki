@@ -15,7 +15,7 @@
 //!     so the source-side range tightening and state reset never
 //!     loses the bootstrap shard from any replica.
 
-use cucumber::{then, when};
+use cucumber::{given, then, when};
 use kiseki_proto::v1 as pb;
 use kiseki_proto::v1::storage_admin_service_client::StorageAdminServiceClient;
 use tonic::transport::{Channel, Endpoint};
@@ -724,5 +724,189 @@ async fn then_merge_response_id_matches_left(w: &mut KisekiWorld) {
     assert_eq!(
         merged, left,
         "MergeShards merged_shard_id should equal the left input shard",
+    );
+}
+
+// ---------------------------------------------------------------------
+// GH #111: distributed multi-shard write forwarding (S3 ingress).
+// ---------------------------------------------------------------------
+
+/// Bootstrap tenant (`OrgId(Uuid::from_u128(1))`) — the single tenant
+/// the harness's plaintext data plane writes under.
+const FWD_BOOTSTRAP_TENANT: &str = "00000000-0000-0000-0000-000000000001";
+
+/// Deterministic, distinct, high-entropy payload per object index, so a
+/// read-back can recompute the expected bytes without storing them.
+fn ms_payload(index: usize, kb: usize) -> Vec<u8> {
+    let mut data = vec![0u8; kb * 1024];
+    let mut x = (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    for chunk in data.chunks_mut(8) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let b = x.to_le_bytes();
+        for (j, bb) in chunk.iter_mut().enumerate() {
+            *bb = b[j];
+        }
+    }
+    data
+}
+
+#[given(
+    regex = r#"^a (\d+)-shard namespace "([^"]+)" with leaders distributed across the cluster$"#
+)]
+async fn given_sharded_ns_for_s3(w: &mut KisekiWorld, shards: u32, bucket: String) {
+    // namespace_id MUST be UUIDv5(NAMESPACE_DNS, bucket) so the S3
+    // gateway routes `PUT /<bucket>/...` to this namespace.
+    let nsid = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, bucket.as_bytes()).to_string();
+    let ports: Vec<(u64, u16)> = {
+        let g = cluster(w);
+        g.nodes().map(|n| (n.node_id, n.ports.metrics)).collect()
+    };
+    let body = serde_json::json!({
+        "namespace_id": nsid,
+        "tenant_id": FWD_BOOTSTRAP_TENANT,
+        "shards": shards,
+    });
+    let http = reqwest::Client::new();
+    // namespace-create is leader-only (the HTTP handler does not forward);
+    // hit every node until the control-plane leader accepts.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut accepted = false;
+    let mut last = String::new();
+    'outer: loop {
+        for (nid, port) in &ports {
+            let url = format!("http://127.0.0.1:{port}/admin/topology/namespaces");
+            match http.post(&url).json(&body).send().await {
+                Ok(r) if r.status().is_success() => {
+                    accepted = true;
+                    break 'outer;
+                }
+                Ok(r) => last = format!("node-{nid} HTTP {}", r.status()),
+                Err(e) => last = format!("node-{nid} {e}"),
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert!(
+        accepted,
+        "namespace-create for '{bucket}' ({shards} shards) not accepted within 30s (last: {last})"
+    );
+    // Settle: shard leaders elect + the shard map hydrates on every node.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    w.cluster
+        .name_index_state
+        .insert("fwd_bucket".into(), bucket);
+}
+
+#[when(regex = r"^(\d+) distinct (\d+)KB objects are written via S3 to node-(\d+)$")]
+async fn when_distinct_s3_writes_to_node(w: &mut KisekiWorld, n: usize, kb: usize, node_id: u64) {
+    let bucket = w
+        .cluster
+        .name_index_state
+        .get("fwd_bucket")
+        .expect("the namespace step must run first")
+        .clone();
+    let (s3_base, http) = {
+        let nd = cluster(w).node(node_id);
+        (nd.s3_base.clone(), nd.http.clone())
+    };
+    let mut fail = 0usize;
+    for i in 0..n {
+        let url = format!("{s3_base}/{bucket}/o-{i}");
+        match http.put(&url).body(ms_payload(i, kb)).send().await {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => {
+                fail += 1;
+                eprintln!("#111 PUT o-{i} -> {}", r.status());
+            }
+            Err(e) => {
+                fail += 1;
+                eprintln!("#111 PUT o-{i} error: {e}");
+            }
+        }
+    }
+    w.cluster
+        .name_index_state
+        .insert("fwd_count".into(), n.to_string());
+    w.cluster
+        .name_index_state
+        .insert("fwd_kb".into(), kb.to_string());
+    w.cluster
+        .name_index_state
+        .insert("fwd_writefail".into(), fail.to_string());
+}
+
+#[then("every S3 write committed with no errors")]
+async fn then_fwd_writes_no_errors(w: &mut KisekiWorld) {
+    let fail: usize = w
+        .cluster
+        .name_index_state
+        .get("fwd_writefail")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
+    assert_eq!(
+        fail, 0,
+        "GH #111: distributed multi-shard S3 writes must all commit by forwarding to the \
+         shard leader; {fail} failed (pre-fix these 500'd with 'leader unavailable')"
+    );
+}
+
+#[then(regex = r"^each object reads back identically from node-(\d+)$")]
+async fn then_fwd_reads_back(w: &mut KisekiWorld, node_id: u64) {
+    let bucket = w
+        .cluster
+        .name_index_state
+        .get("fwd_bucket")
+        .expect("namespace step")
+        .clone();
+    let n: usize = w
+        .cluster
+        .name_index_state
+        .get("fwd_count")
+        .and_then(|s| s.parse().ok())
+        .expect("write step");
+    let kb: usize = w
+        .cluster
+        .name_index_state
+        .get("fwd_kb")
+        .and_then(|s| s.parse().ok())
+        .expect("write step");
+    // Settle for the committed appends to replicate to the read node.
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    let (s3_base, http) = {
+        let nd = cluster(w).node(node_id);
+        (nd.s3_base.clone(), nd.http.clone())
+    };
+    let mut gf = 0usize;
+    let mut mm = 0usize;
+    for i in 0..n {
+        let url = format!("{s3_base}/{bucket}/o-{i}");
+        match http.get(&url).send().await {
+            Ok(r) if r.status().is_success() => {
+                let got = r.bytes().await.expect("body");
+                if got[..] != ms_payload(i, kb)[..] {
+                    mm += 1;
+                    eprintln!("#111 GET o-{i} from node-{node_id}: byte mismatch");
+                }
+            }
+            Ok(r) => {
+                gf += 1;
+                eprintln!("#111 GET o-{i} from node-{node_id} -> {}", r.status());
+            }
+            Err(e) => {
+                gf += 1;
+                eprintln!("#111 GET o-{i} error: {e}");
+            }
+        }
+    }
+    assert_eq!(
+        (gf, mm),
+        (0, 0),
+        "GH #111: every object must read back identically from node-{node_id} \
+         (get-failures={gf}, mismatches={mm})"
     );
 }

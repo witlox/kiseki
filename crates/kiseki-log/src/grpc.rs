@@ -60,6 +60,46 @@ fn proto_op_to_domain(op: i32) -> Result<crate::delta::OperationType, Status> {
     }
 }
 
+/// Convert a Rust `AppendChunkAndDeltaRequest` to its proto form for
+/// inter-node forwarding (#111). The inverse of the
+/// `append_chunk_and_delta` handler's parse — a follower gateway uses
+/// this to re-issue an append against the shard leader's `LogService`.
+#[must_use]
+pub fn append_chunk_and_delta_request_to_proto(
+    req: &crate::traits::AppendChunkAndDeltaRequest,
+) -> ProtoChunkAppendReq {
+    let d = &req.delta;
+    ProtoChunkAppendReq {
+        shard_id: Some(kiseki_proto::v1::ShardId {
+            value: d.shard_id.0.to_string(),
+        }),
+        tenant_id: Some(kiseki_proto::v1::OrgId {
+            value: d.tenant_id.0.to_string(),
+        }),
+        operation: domain_op_to_proto(d.operation),
+        timestamp: Some(to_proto_timestamp(&d.timestamp)),
+        hashed_key: d.hashed_key.to_vec(),
+        chunk_refs: d
+            .chunk_refs
+            .iter()
+            .map(|c| kiseki_proto::v1::ChunkId {
+                value: c.0.to_vec(),
+            })
+            .collect(),
+        payload: d.payload.clone(),
+        has_inline_data: d.has_inline_data,
+        new_chunks: req
+            .new_chunks
+            .iter()
+            .map(|n| kiseki_proto::v1::NewChunkMeta {
+                chunk_id: n.chunk_id.to_vec(),
+                placement: n.placement.clone(),
+                original_len: n.original_len,
+            })
+            .collect(),
+    }
+}
+
 fn domain_op_to_proto(op: crate::delta::OperationType) -> i32 {
     match op {
         crate::delta::OperationType::Create => 1,
