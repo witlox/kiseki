@@ -605,6 +605,34 @@ impl ChunkOps for PersistentChunkStore {
         self.reconstruct_envelope(&entry.record, &entry.extents)
     }
 
+    fn storage_stats(&self) -> crate::store::StorageStats {
+        // Device capacity is authoritative for used/total (a DevicePool
+        // sums every JBOD member). Dedup accounting iterates the
+        // in-memory chunk map (the same map already held fully in RAM),
+        // so it can't drift from a missed mutation site. Called at a low
+        // cadence (metric refresh + admin query), not on the hot path.
+        let (device_used_bytes, device_total_bytes) = self.device.capacity();
+        let chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
+        let mut logical_bytes = 0u64;
+        let mut physical_bytes = 0u64;
+        for entry in chunks.values() {
+            physical_bytes = physical_bytes.saturating_add(entry.record.data_bytes);
+            logical_bytes = logical_bytes.saturating_add(
+                entry
+                    .record
+                    .data_bytes
+                    .saturating_mul(entry.record.refcount),
+            );
+        }
+        crate::store::StorageStats {
+            device_used_bytes,
+            device_total_bytes,
+            logical_bytes,
+            physical_bytes,
+            chunk_count: u64::try_from(chunks.len()).unwrap_or(u64::MAX),
+        }
+    }
+
     fn increment_refcount(&mut self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
         let mut chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
         let entry = chunks

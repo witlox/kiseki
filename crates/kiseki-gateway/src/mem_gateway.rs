@@ -42,6 +42,27 @@ struct ChunkLanded {
 /// metadata / refcount overhead.
 pub const MAX_PLAINTEXT_PER_CHUNK: usize = 64 * 1024 * 1024;
 
+/// Map a chunk-store write failure to a gateway error, surfacing an
+/// out-of-space condition as a clean [`GatewayError::InsufficientStorage`]
+/// (HTTP 507 / POSIX `ENOSPC`) rather than a generic 500. A full device
+/// reports `device full` locally and, across the EC fabric, `quorum
+/// lost` / `peer unavailable: ... device full` (the GH #115 chain); we
+/// match those markers on the rendered error.
+fn map_chunk_write_error<E: std::fmt::Display>(e: E) -> GatewayError {
+    let rendered = e.to_string();
+    let lower = rendered.to_ascii_lowercase();
+    if lower.contains("device full")
+        || lower.contains("quorum lost")
+        || lower.contains("largest free extent")
+        || lower.contains("no space")
+        || lower.contains("enospc")
+    {
+        GatewayError::InsufficientStorage(rendered)
+    } else {
+        GatewayError::Upstream(rendered)
+    }
+}
+
 /// Copy the bytes of one chunk's plaintext that fall inside the
 /// requested `[start, end)` range into `out`. Used by the range-aware
 /// read path; pulled out so the cache-hit and cache-miss branches
@@ -2238,23 +2259,41 @@ impl InMemoryGateway {
             // fast path so small-object storage is unchanged.
             let mut chunk_was_new = false;
             let chunk_write_started = std::time::Instant::now();
+            // Try the inline (small-tier) path for single small pieces.
+            // ADR-030 spillover: if the small tier can't take it (system
+            // disk over budget / objects.redb full), fall through to the
+            // chunk tier rather than failing the write — the small tier
+            // is an optimization, not the only home for the bytes.
+            let mut took_inline = false;
             if pieces_len == 1 && piece_len <= self.inline_threshold && self.small_store.is_some() {
-                tracing::debug!(
-                    ?chunk_id,
-                    inline_threshold = self.inline_threshold,
-                    "gateway write: inline path",
-                );
                 let env_bytes = serde_json::to_vec(&env).map_err(|e| {
                     tracing::warn!(?chunk_id, error = %e, "gateway write: inline encode failed");
                     GatewayError::Upstream(e.to_string())
                 })?;
                 if let Some(ref store) = self.small_store {
-                    store.put(&chunk_id.0, &env_bytes).map_err(|e| {
-                        tracing::warn!(?chunk_id, error = %e, "gateway write: small_store.put failed");
-                        GatewayError::Upstream(e.to_string())
-                    })?;
+                    match store.put(&chunk_id.0, &env_bytes) {
+                        Ok(_) => {
+                            tracing::debug!(
+                                ?chunk_id,
+                                inline_threshold = self.inline_threshold,
+                                "gateway write: inline path",
+                            );
+                            took_inline = true;
+                        }
+                        Err(e) => {
+                            // Small tier full / over budget → spill to
+                            // the chunk tier (ADR-030 emergency response:
+                            // disable inline, route to data tier).
+                            tracing::warn!(
+                                ?chunk_id,
+                                error = %e,
+                                "gateway write: small tier rejected put — spilling to chunk tier",
+                            );
+                        }
+                    }
                 }
-            } else {
+            }
+            if !took_inline {
                 tracing::debug!(
                     ?chunk_id,
                     ciphertext_len,
@@ -2262,7 +2301,7 @@ impl InMemoryGateway {
                 );
                 let is_new = self.chunks.write_chunk(env, "default").await.map_err(|e| {
                     tracing::warn!(?chunk_id, error = %e, "gateway write: chunks.write_chunk failed");
-                    GatewayError::Upstream(e.to_string())
+                    map_chunk_write_error(e)
                 })?;
                 if is_new {
                     chunk_was_new = true;

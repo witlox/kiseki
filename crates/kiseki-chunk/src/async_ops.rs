@@ -87,6 +87,12 @@ pub trait AsyncChunkOps: Send + Sync {
     /// Get the refcount for a chunk.
     async fn refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError>;
 
+    /// Storage capacity + dedup statistics. Default returns zeroes;
+    /// persistent backends report real device capacity + dedup.
+    async fn storage_stats(&self) -> crate::store::StorageStats {
+        crate::store::StorageStats::default()
+    }
+
     /// Phase 16c step 1: fan a `DeleteFragment` out to every cluster
     /// peer that holds a copy of `chunk_id`. Default no-op so the
     /// in-memory + persistent stores (which know about no peers) stay
@@ -310,6 +316,10 @@ impl<T: ChunkOps + Send + Sync + 'static> AsyncChunkOps for SyncBridge<T> {
 
     async fn refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
         self.inner.read().refcount(chunk_id)
+    }
+
+    async fn storage_stats(&self) -> crate::store::StorageStats {
+        self.inner.read().storage_stats()
     }
 
     async fn list_chunk_ids(&self) -> Vec<ChunkId> {

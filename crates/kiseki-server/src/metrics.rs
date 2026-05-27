@@ -101,6 +101,42 @@ pub struct KisekiMetrics {
     /// surfaces media trouble before a full health probe runs.
     pub pool_device_errors_total: IntCounterVec,
 
+    // --- Node storage (GH #115 chunk-store capacity + dedup) ---
+    // Node-level, unlabeled so the cluster aggregator can sum them
+    // directly. Refreshed periodically from
+    // `AsyncChunkOps::storage_stats()`.
+    /// Physical bytes used on this node's chunk-store device pool.
+    pub storage_device_used_bytes: IntGauge,
+    /// Total physical capacity of this node's chunk-store device pool.
+    pub storage_device_total_bytes: IntGauge,
+    /// Logical bytes addressed by clients (`sum(refcount × payload)`).
+    pub storage_logical_bytes: IntGauge,
+    /// Unique stored payload bytes (each content-addressed chunk once).
+    pub storage_physical_bytes: IntGauge,
+    /// Unique chunk count held locally.
+    pub storage_chunk_count: IntGauge,
+    /// Metadata tier on-disk bytes (`KISEKI_DATA_DIR/metadata` —
+    /// compositions/views; ADR-030 "meta" tier on the system disk).
+    pub storage_meta_bytes: IntGauge,
+    /// Small-object tier on-disk bytes (`KISEKI_DATA_DIR/small` —
+    /// ADR-030 inline content tier).
+    pub storage_small_bytes: IntGauge,
+    /// Chunk-pool capacity split by cost/performance tier (ADR-024):
+    /// `{used, total}` for fast (`NVMe`), bulk (`SSD`), cold (`HDD`). The
+    /// cluster aggregator sums these so `kiseki-admin capacity` can show
+    /// per-class capacity across the heterogeneous fleet.
+    pub storage_tier_fast_used: IntGauge,
+    /// Fast-tier (`NVMe`) total capacity, this node.
+    pub storage_tier_fast_total: IntGauge,
+    /// Bulk-tier (`SSD`) used bytes, this node.
+    pub storage_tier_bulk_used: IntGauge,
+    /// Bulk-tier (`SSD`) total capacity, this node.
+    pub storage_tier_bulk_total: IntGauge,
+    /// Cold-tier (`HDD`) used bytes, this node.
+    pub storage_tier_cold_used: IntGauge,
+    /// Cold-tier (`HDD`) total capacity, this node.
+    pub storage_tier_cold_total: IntGauge,
+
     // --- Transport ---
     /// Active transport connections.
     pub transport_connections_active: IntGauge,
@@ -399,6 +435,106 @@ impl KisekiMetrics {
             .register(Box::new(pool_device_errors_total.clone()))
             .expect("register");
 
+        // Node storage capacity + dedup (GH #115).
+        let storage_device_used_bytes = IntGauge::new(
+            "kiseki_storage_device_used_bytes",
+            "Chunk-store device pool bytes used (this node)",
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(storage_device_used_bytes.clone()))
+            .expect("register");
+
+        let storage_device_total_bytes = IntGauge::new(
+            "kiseki_storage_device_total_bytes",
+            "Chunk-store device pool total capacity (this node)",
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(storage_device_total_bytes.clone()))
+            .expect("register");
+
+        let storage_logical_bytes = IntGauge::new(
+            "kiseki_storage_logical_bytes",
+            "Logical bytes addressed by clients (sum refcount × payload)",
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(storage_logical_bytes.clone()))
+            .expect("register");
+
+        let storage_physical_bytes = IntGauge::new(
+            "kiseki_storage_physical_bytes",
+            "Unique stored payload bytes (each chunk once)",
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(storage_physical_bytes.clone()))
+            .expect("register");
+
+        let storage_chunk_count = IntGauge::new(
+            "kiseki_storage_chunk_count",
+            "Unique chunk count held locally",
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(storage_chunk_count.clone()))
+            .expect("register");
+
+        let storage_meta_bytes = IntGauge::new(
+            "kiseki_storage_meta_bytes",
+            "Metadata tier on-disk bytes (system disk, ADR-030 last-resort tier)",
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(storage_meta_bytes.clone()))
+            .expect("register");
+
+        let storage_small_bytes = IntGauge::new(
+            "kiseki_storage_small_bytes",
+            "Small-object inline tier on-disk bytes (system disk, ADR-030)",
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(storage_small_bytes.clone()))
+            .expect("register");
+
+        let mk_tier = |name: &str, help: &str, reg: &Registry| -> IntGauge {
+            let g = IntGauge::new(name, help).expect("metric");
+            reg.register(Box::new(g.clone())).expect("register");
+            g
+        };
+        let storage_tier_fast_used = mk_tier(
+            "kiseki_storage_tier_fast_used_bytes",
+            "Fast-tier (NVMe) used",
+            &registry,
+        );
+        let storage_tier_fast_total = mk_tier(
+            "kiseki_storage_tier_fast_total_bytes",
+            "Fast-tier (NVMe) total",
+            &registry,
+        );
+        let storage_tier_bulk_used = mk_tier(
+            "kiseki_storage_tier_bulk_used_bytes",
+            "Bulk-tier (SSD) used",
+            &registry,
+        );
+        let storage_tier_bulk_total = mk_tier(
+            "kiseki_storage_tier_bulk_total_bytes",
+            "Bulk-tier (SSD) total",
+            &registry,
+        );
+        let storage_tier_cold_used = mk_tier(
+            "kiseki_storage_tier_cold_used_bytes",
+            "Cold-tier (HDD) used",
+            &registry,
+        );
+        let storage_tier_cold_total = mk_tier(
+            "kiseki_storage_tier_cold_total_bytes",
+            "Cold-tier (HDD) total",
+            &registry,
+        );
+
         let transport_connections_active = IntGauge::new(
             "kiseki_transport_connections_active",
             "Active transport connections",
@@ -520,6 +656,19 @@ impl KisekiMetrics {
             pool_capacity_used,
             pool_device_capacity_bytes,
             pool_device_errors_total,
+            storage_device_used_bytes,
+            storage_device_total_bytes,
+            storage_logical_bytes,
+            storage_physical_bytes,
+            storage_chunk_count,
+            storage_meta_bytes,
+            storage_small_bytes,
+            storage_tier_fast_used,
+            storage_tier_fast_total,
+            storage_tier_bulk_used,
+            storage_tier_bulk_total,
+            storage_tier_cold_used,
+            storage_tier_cold_total,
             transport_connections_active,
             transport_connections_idle,
             shard_delta_count,

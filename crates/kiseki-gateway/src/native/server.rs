@@ -355,6 +355,7 @@ fn map_gateway_error(e: GatewayError) -> Status {
             Status::out_of_range(format!("key out of range for shard {shard_id:?}"))
         }
         GatewayError::ReadOnlyNamespace => Status::failed_precondition("namespace is read-only"),
+        GatewayError::InsufficientStorage(m) => Status::resource_exhausted(m),
         GatewayError::ServiceUnavailable(m) => Status::unavailable(m),
         GatewayError::PreconditionFailed(m) => Status::failed_precondition(m),
         // Both NotFound (composition missing) and NamespaceNotFound

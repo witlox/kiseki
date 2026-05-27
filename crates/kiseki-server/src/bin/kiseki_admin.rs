@@ -344,6 +344,107 @@ fn shorten_timestamp(time: &str) -> &str {
     }
 }
 
+fn format_capacity(body: &str) -> String {
+    use std::fmt::Write as _;
+    let total_nodes = json_u64(body, "total_nodes").unwrap_or(0);
+    let healthy = json_u64(body, "healthy_nodes").unwrap_or(0);
+
+    let agg_start = body.find("\"aggregate\"").unwrap_or(0);
+    let agg = &body[agg_start..];
+
+    let used = json_u64(agg, "storage_used_bytes").unwrap_or(0);
+    let total = json_u64(agg, "storage_total_bytes").unwrap_or(0);
+    let logical = json_u64(agg, "storage_logical_bytes").unwrap_or(0);
+    let physical = json_u64(agg, "storage_physical_bytes").unwrap_or(0);
+    let chunks = json_u64(agg, "storage_chunk_count").unwrap_or(0);
+    let free = total.saturating_sub(used);
+    let saved = logical.saturating_sub(physical);
+
+    let meta = json_u64(agg, "storage_meta_bytes").unwrap_or(0);
+    let small = json_u64(agg, "storage_small_bytes").unwrap_or(0);
+    let tiers = [
+        (
+            "fast (NVMe)",
+            "storage_tier_fast_used",
+            "storage_tier_fast_total",
+        ),
+        (
+            "bulk (SSD) ",
+            "storage_tier_bulk_used",
+            "storage_tier_bulk_total",
+        ),
+        (
+            "cold (HDD) ",
+            "storage_tier_cold_used",
+            "storage_tier_cold_total",
+        ),
+    ];
+    let mut tier_lines = String::new();
+    for (label, used_key, total_key) in tiers {
+        let tu = json_u64(agg, used_key).unwrap_or(0);
+        let tt = json_u64(agg, total_key).unwrap_or(0);
+        if tt == 0 {
+            continue; // tier not present in this cluster
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let tp = tu as f64 / tt as f64 * 100.0;
+        let _ = writeln!(
+            tier_lines,
+            "  {label}  {} / {}  ({tp:.1}%)",
+            format_bytes(tu),
+            format_bytes(tt),
+        );
+    }
+
+    #[allow(clippy::cast_precision_loss)] // display ratios; precision loss is fine
+    let pct = if total == 0 {
+        0.0
+    } else {
+        used as f64 / total as f64 * 100.0
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let dedup = if physical == 0 {
+        1.0
+    } else {
+        logical as f64 / physical as f64
+    };
+
+    // ADR-024 capacity thresholds (SSD): warning 75 %, read-only 92 %.
+    let color = if pct >= 92.0 {
+        RED
+    } else if pct >= 75.0 {
+        YELLOW
+    } else {
+        GREEN
+    };
+
+    let by_tier = if tier_lines.is_empty() {
+        String::new()
+    } else {
+        format!("By class (chunk pool):\n{tier_lines}")
+    };
+
+    format!(
+        "\n{BOLD}Storage Capacity{RESET}\n\
+         \u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\n\
+         Nodes:    {healthy}/{total_nodes} reporting\n\
+         Chunk pool: {color}{} / {}{RESET}  ({pct:.1}%)   free {}\n\
+         Dedup:    {dedup:.2}\u{00d7}  (logical {} \u{2192} physical {}, saved {})\n\
+         Chunks:   {}\n\
+         {by_tier}\
+         System disk (last-resort tiers): meta {}  small {}\n",
+        format_bytes(used),
+        format_bytes(total),
+        format_bytes(free),
+        format_bytes(logical),
+        format_bytes(physical),
+        format_bytes(saved),
+        format_number(chunks),
+        format_bytes(meta),
+        format_bytes(small),
+    )
+}
+
 fn format_cluster_status(body: &str) -> String {
     let total = json_u64(body, "total_nodes").unwrap_or(0);
     let healthy = json_u64(body, "healthy_nodes").unwrap_or(0);
@@ -532,6 +633,9 @@ struct Args {
 enum Command {
     Status,
     Nodes,
+    /// `capacity` (alias `df`) — cluster storage capacity + usage +
+    /// dedup ratio, aggregated from per-node `/metrics` (GH #115).
+    Capacity,
     Events {
         severity: Option<String>,
         hours: Option<f64>,
@@ -660,6 +764,7 @@ fn print_usage() {
          Commands:\n\
          \x20 status                         Cluster status summary\n\
          \x20 nodes                          Node list with health and metrics\n\
+         \x20 capacity (df)                  Storage capacity, usage + dedup ratio\n\
          \x20 events [--severity S] [--hours N]  Event log\n\
          \x20 history [--hours N]            Metric history time series\n\
          \x20 maintenance on|off             Toggle cluster maintenance mode\n\
@@ -736,6 +841,7 @@ fn parse_subcommand(args: &[String], start: usize) -> Result<Command, String> {
     match cmd {
         "status" => Ok(Command::Status),
         "nodes" => Ok(Command::Nodes),
+        "capacity" | "df" => Ok(Command::Capacity),
         "events" => {
             let mut severity = None;
             let mut hours = None;
@@ -1213,6 +1319,13 @@ fn main() {
             http_get(&args.endpoint, "/ui/api/nodes")
                 .map(|b| if json { b } else { format_nodes(&b) })
         }
+        Command::Capacity => http_get(&args.endpoint, "/ui/api/cluster").map(|b| {
+            if json {
+                b
+            } else {
+                format_capacity(&b)
+            }
+        }),
         Command::Events { severity, hours } => {
             let mut params = Vec::new();
             if let Some(s) = &severity {

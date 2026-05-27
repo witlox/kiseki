@@ -40,4 +40,4 @@ pub use gpu_direct::{GpuBackend, GpuDmaAllocator, GpuDmaBuffer, MockDmaAllocator
 pub use persistent_store::PersistentChunkStore;
 pub use pool::{select_pool_for_write, AffinityPool, DeviceClass, DurabilityStrategy};
 pub use small_object_store::SmallObjectStore;
-pub use store::{ChunkOps, ChunkStore};
+pub use store::{ChunkOps, ChunkStore, StorageStats};
