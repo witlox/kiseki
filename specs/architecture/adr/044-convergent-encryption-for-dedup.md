@@ -99,7 +99,7 @@ plaintexts.
     `TenantIsolated`.
 - **Two open constraints on the dedup key (adversary review of the wiring,
   2026-05-27):**
-  - **Rotation stability (Finding B).** Content-addressed dedup needs the
+  - **Rotation stability (Finding B — tracked in GH #110).** Content-addressed dedup needs the
     dedup key to be **stable for the life of the tenant's data** — if it
     changes, identical content re-derives a new `chunk_id`, splitting
     refcount identity and breaking dedup continuity. `derive_tenant_dedup_key`
@@ -110,7 +110,7 @@ plaintexts.
     MUST hang off a **rotation-stable tenant root**, not the rotating system
     master. This lifetime requirement is a key-management design constraint
     (belongs alongside ADR-003); recorded here so it is not lost.
-  - **Master-key sourcing (Finding C).** The oracle-closure property (a
+  - **Master-key sourcing (Finding C — tracked in GH #109).** The oracle-closure property (a
     *secret* `chunk_id` an attacker cannot compute offline) holds only once
     the system master key comes from the keymanager/KMS. Today it is the
     fixed placeholder `[0x42; 32]` (`runtime.rs`) used by the **entire**
