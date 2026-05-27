@@ -650,7 +650,7 @@ async fn api_topology_forwarding(State(state): State<UiState>) -> impl IntoRespo
     let proxy_fallback = std::env::var("KISEKI_NATIVE_PROXY_FALLBACK")
         .ok()
         .map(|v| matches!(v.as_str(), "on" | "1" | "true" | "yes"))
-        .unwrap_or(false);
+        .unwrap_or(true);
 
     axum::Json(serde_json::json!({
         "node_id": state.node_info.node_id,
@@ -709,7 +709,7 @@ async fn fragment_topology_forwarding(State(state): State<UiState>) -> Html<Stri
     let proxy_fallback = std::env::var("KISEKI_NATIVE_PROXY_FALLBACK")
         .ok()
         .map(|v| matches!(v.as_str(), "on" | "1" | "true" | "yes"))
-        .unwrap_or(false);
+        .unwrap_or(true);
 
     let mut html = String::new();
     let _ = write!(
