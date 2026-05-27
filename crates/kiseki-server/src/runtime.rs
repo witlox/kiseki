@@ -81,6 +81,28 @@ pub(crate) fn compute_s3_peer_addrs(
         .collect()
 }
 
+/// Parse `KISEKI_PEER_DATA_ADDRS=id=host:port,id=host:port,…` into
+/// `(node_id, "host:port")` pairs for the native proxy fallback (#103).
+/// Malformed entries (no `=`, non-numeric id) are skipped — the caller
+/// falls back to uniform-port derivation if the result is empty.
+/// Mirrors the `KISEKI_DS_PEERS` shape used for the fabric.
+fn parse_peer_data_addrs(env: Option<&str>) -> Vec<(u64, String)> {
+    let Some(raw) = env else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .filter_map(|entry| {
+            let (id, addr) = entry.trim().split_once('=')?;
+            let id = id.trim().parse::<u64>().ok()?;
+            let addr = addr.trim();
+            if addr.is_empty() {
+                return None;
+            }
+            Some((id, addr.to_owned()))
+        })
+        .collect()
+}
+
 /// Pick the per-node identity source for the at-rest key store
 /// (Phase 14e). Precedence: SPIFFE > mTLS > file-in-data-dir.
 ///
@@ -2210,23 +2232,38 @@ pub async fn run_main(
         std::sync::Arc::new(kiseki_gateway::native::proxy_client::ProxyClient::new(
             kiseki_common::ids::NodeId(cfg.node_id),
         ));
-    // Best-effort peer registration: for every Raft peer we know the
-    // address of, register a placeholder data_addr derived from the
-    // local data_addr port. This mirrors what `config.rs` does for
-    // the fabric path. Operators with non-uniform port deployments
-    // override via `KISEKI_PEER_DATA_ADDRS=id=host:port,…` (Step C
-    // makes this the topology-published source). Empty unless the
-    // local node has peers.
-    let peer_data_port = cfg.data_addr.port();
-    for (peer_id, peer_addr) in &cfg.raft_peers {
-        if *peer_id == cfg.node_id {
-            continue;
+    // Peer registration for the proxy fallback (#103). Precedence:
+    //
+    // 1. `KISEKI_PEER_DATA_ADDRS=id=host:port,…` — explicit per-node
+    //    native-data endpoints. Required for **localhost-multi-node**
+    //    (every node on a distinct ephemeral data port), so the BDD
+    //    `ClusterHarness` can exercise the ADR-042 §4 proxied write
+    //    path. Mirrors `KISEKI_DS_PEERS` for the fabric.
+    // 2. Fallback: substitute each Raft peer's host with the **local**
+    //    data port — correct for the uniform-port container/GCP
+    //    deployment (every node binds the same data port, e.g. 9100),
+    //    which is the production posture (#103 verified the proxied
+    //    native write path at 14.7k ops/s there).
+    let registered = parse_peer_data_addrs(std::env::var("KISEKI_PEER_DATA_ADDRS").ok().as_deref());
+    if !registered.is_empty() {
+        for (peer_id, data_addr) in registered {
+            if peer_id == cfg.node_id {
+                continue;
+            }
+            proxy_client_for_native.register_node(kiseki_common::ids::NodeId(peer_id), data_addr);
         }
-        let host = peer_addr
-            .rsplit_once(':')
-            .map_or(peer_addr.as_str(), |(h, _)| h);
-        let data_addr = format!("{host}:{peer_data_port}");
-        proxy_client_for_native.register_node(kiseki_common::ids::NodeId(*peer_id), data_addr);
+    } else {
+        let peer_data_port = cfg.data_addr.port();
+        for (peer_id, peer_addr) in &cfg.raft_peers {
+            if *peer_id == cfg.node_id {
+                continue;
+            }
+            let host = peer_addr
+                .rsplit_once(':')
+                .map_or(peer_addr.as_str(), |(h, _)| h);
+            let data_addr = format!("{host}:{peer_data_port}");
+            proxy_client_for_native.register_node(kiseki_common::ids::NodeId(*peer_id), data_addr);
+        }
     }
     let proxy_fallback_enabled = std::env::var("KISEKI_NATIVE_PROXY_FALLBACK")
         .ok()
@@ -2620,6 +2657,27 @@ mod tests {
     /// `KISEKI_DS_PEERS` wins outright — it's the only mode that can
     /// represent localhost-multi-node where every peer has a distinct
     /// ephemeral DS port.
+    /// #103: `KISEKI_PEER_DATA_ADDRS` parses to per-node native-data
+    /// endpoints; malformed entries are skipped; absent → empty (caller
+    /// falls back to uniform-port derivation).
+    #[test]
+    fn parse_peer_data_addrs_explicit_and_malformed() {
+        assert!(super::parse_peer_data_addrs(None).is_empty());
+        assert!(super::parse_peer_data_addrs(Some("")).is_empty());
+        let got = super::parse_peer_data_addrs(Some(
+            "1=127.0.0.1:41001, 2=127.0.0.1:41002 ,bad,3=,=127.0.0.1:9,4=127.0.0.1:41004",
+        ));
+        assert_eq!(
+            got,
+            vec![
+                (1, "127.0.0.1:41001".to_string()),
+                (2, "127.0.0.1:41002".to_string()),
+                (4, "127.0.0.1:41004".to_string()),
+            ],
+            "explicit entries parsed; `bad` (no =), `3=` (empty addr), `=…` (empty id) skipped"
+        );
+    }
+
     #[test]
     fn ds_peers_take_priority() {
         let ds_peers = vec![

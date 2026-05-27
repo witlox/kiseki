@@ -523,6 +523,13 @@ fn spawn_with_env(
         .env("KISEKI_NODE_ID", node_id.to_string())
         .env("KISEKI_RAFT_PEERS", raft_peers_env)
         .env("KISEKI_FABRIC_PEERS", fabric_peers_env)
+        // #103: explicit per-node native-data endpoints so the ADR-042 §4
+        // proxy fallback can reach peers on their real ephemeral ports
+        // (localhost-multi-node). Same id→grpc_data map as the fabric;
+        // without it the proxy derives `<peer>:<my own data port>` and
+        // the proxied write hangs — which is why the forwarding scenarios
+        // were `@deferred-feature`.
+        .env("KISEKI_PEER_DATA_ADDRS", fabric_peers_env)
         .env("KISEKI_DS_PEERS", ds_peers_env)
         .env("KISEKI_BOOTSTRAP", if bootstrap { "true" } else { "false" })
         .env("KISEKI_ALLOW_PLAINTEXT_NFS", "true")
