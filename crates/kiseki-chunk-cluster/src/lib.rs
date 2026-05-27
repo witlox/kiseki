@@ -1012,7 +1012,13 @@ mod tests {
         /// (`chunk_id`, `fragment_index`). Used by EC tests; the
         /// existing Replication-N tests leave this empty and use
         /// `store` instead.
-        fragments: StdMutex<std::collections::HashMap<(ChunkId, u32), Vec<u8>>>,
+        // Stores the FULL per-fragment envelope (shard bytes +
+        // chunk-level crypto) so `get_fragment` returns the same
+        // auth_tag/nonce the real `ClusterChunkServer` does via its
+        // `chunk_envelope_meta` registry. Storing only `Vec<u8>` (the
+        // pre-#102 shape) returned zeroed crypto and masked the
+        // cross-node read decrypt path entirely.
+        fragments: StdMutex<std::collections::HashMap<(ChunkId, u32), Envelope>>,
         put_calls: AtomicU64,
         delete_calls: AtomicU64,
         /// If set, every put returns this error instead of storing.
@@ -1090,7 +1096,7 @@ mod tests {
                 self.fragments
                     .lock()
                     .unwrap()
-                    .insert((chunk_id, fragment_index), envelope.ciphertext);
+                    .insert((chunk_id, fragment_index), envelope);
             }
             Ok(true)
         }
@@ -1114,22 +1120,16 @@ mod tests {
                     .cloned()
                     .ok_or(FabricPeerError::NotFound)
             } else {
-                let bytes = self
-                    .fragments
+                // Return the stored per-fragment envelope verbatim —
+                // including the chunk-level auth_tag/nonce the writer
+                // supplied — mirroring the real server's
+                // `envelope_from_bytes` registry lookup.
+                self.fragments
                     .lock()
                     .unwrap()
                     .get(&(chunk_id, fragment_index))
                     .cloned()
-                    .ok_or(FabricPeerError::NotFound)?;
-                Ok(Envelope {
-                    chunk_id,
-                    ciphertext: bytes,
-                    auth_tag: [0u8; 16],
-                    nonce: [0u8; 12],
-                    system_epoch: kiseki_common::tenancy::KeyEpoch(1),
-                    tenant_epoch: None,
-                    tenant_wrapped_material: None,
-                })
+                    .ok_or(FabricPeerError::NotFound)
             }
         }
         async fn delete_fragment(
@@ -1729,6 +1729,65 @@ mod tests {
             recovered.ciphertext, payload,
             "EC reconstruction must yield the exact original payload",
         );
+    }
+
+    /// GH #102: a REAL sealed envelope written via EC fan-out must
+    /// decrypt after a cross-node read. The reader holds no local
+    /// fragment (`self_node_id=0`), so every fragment + the chunk crypto
+    /// comes from peers — the production multi-shard read shape. Mirrors
+    /// the gateway path, which calls `read_chunk_ec` with
+    /// `original_len=None` (`lib.rs:853`). Several payload sizes,
+    /// including some not divisible by `data_count` (forces shard
+    /// padding) — the `None` heuristic strips trailing zeros, which
+    /// corrupts AES-GCM ciphertext.
+    #[tokio::test]
+    async fn read_chunk_ec_real_envelope_round_trips_and_decrypts() {
+        use kiseki_crypto::aead::Aead;
+        use kiseki_crypto::envelope::{open_envelope, seal_envelope};
+        use kiseki_crypto::keys::SystemMasterKey;
+
+        let aead = Aead::new();
+        // Same shared system master key the runtime hardcodes
+        // (`runtime.rs:1333`) — identical on every node, so this is a
+        // faithful cross-node decrypt (not a key-mismatch artifact).
+        let master = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+
+        let peers: Vec<Arc<dyn FabricPeer>> = (1..=6)
+            .map(|i| {
+                let name: &'static str = Box::leak(format!("p{i}").into_boxed_str());
+                Arc::clone(&MockPeer::new(name)) as Arc<dyn FabricPeer>
+            })
+            .collect();
+        let cfg = ClusterCfg::new(OrgId(uuid::Uuid::nil()), "p");
+        let strategy = crate::ec::EcStrategy::Ec { data: 4, parity: 2 };
+        let placement = [1u64, 2, 3, 4, 5, 6];
+        let writer = ClusteredChunkStore::new(local_bridge("p"), peers.clone(), cfg.clone());
+
+        for (i, &len) in [4096usize, 65536, 4099, 1000, 16385].iter().enumerate() {
+            let plaintext: Vec<u8> = (0..len)
+                .map(|j| u8::try_from((j * 31 + i * 7) & 0xff).unwrap_or(0))
+                .collect();
+            let chunk_id = ChunkId([0xA0 + u8::try_from(i).unwrap_or(0); 32]);
+            let env = seal_envelope(&aead, &master, &chunk_id, &plaintext).expect("seal");
+            writer
+                .write_chunk_ec(env, &placement, strategy)
+                .await
+                .expect("ec write");
+
+            // Reader: empty local store, same peers. Production path
+            // passes original_len = None.
+            let reader = ClusteredChunkStore::new(local_bridge("p"), peers.clone(), cfg.clone());
+            let recovered = reader
+                .read_chunk_ec(&chunk_id, &placement, strategy, None)
+                .await
+                .expect("ec read");
+            let plain = open_envelope(&aead, &master, &recovered)
+                .unwrap_or_else(|e| panic!("len {len}: open_envelope failed: {e}"));
+            assert_eq!(
+                plain, plaintext,
+                "payload len {len} must round-trip + decrypt"
+            );
+        }
     }
 
     /// 1-node cluster degenerates: no peers means nothing to fan

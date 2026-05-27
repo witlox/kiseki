@@ -446,6 +446,163 @@ async fn then_every_shard_has_leader(w: &mut KisekiWorld, secs: u64) {
     );
 }
 
+/// Deterministic bench tenant/namespace UUIDs — must match
+/// `kiseki-client::bench::bench_default_ids` so a no-flag `kiseki-client
+/// bench` writes to the namespace this step creates.
+const BENCH_TENANT_UUID: &str = "179e565c-d506-5c59-8f82-7ae6e13f0aff";
+const BENCH_NAMESPACE_UUID: &str = "6658810a-1c4d-564c-a888-7564b5e9e576";
+
+/// GH #102: create the *bench* namespace (the deterministic UUIDs the
+/// bench client defaults to) with an explicit shard count, so a
+/// subsequent `kiseki-client bench` exercises the multi-shard
+/// native-proxied write/read path that failed 100% on reads in the
+/// 2026-05-27 GCP run.
+#[when(regex = r"^the admin creates the bench namespace with (\d+) shards via admin HTTP$")]
+async fn when_create_bench_namespace(w: &mut KisekiWorld, shards: u32) {
+    let ports: Vec<(u64, u16)> = {
+        let g = cluster(w);
+        g.nodes().map(|n| (n.node_id, n.ports.metrics)).collect()
+    };
+    let body = serde_json::json!({
+        "namespace_id": BENCH_NAMESPACE_UUID,
+        "tenant_id": BENCH_TENANT_UUID,
+        "shards": shards,
+    });
+    let http = reqwest::Client::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut last = String::new();
+    loop {
+        for (node_id, port) in &ports {
+            let url = format!("http://127.0.0.1:{port}/admin/topology/namespaces");
+            if let Ok(resp) = http.post(&url).json(&body).send().await {
+                let status = resp.status();
+                if status.is_success() {
+                    return;
+                }
+                last = format!("node-{node_id} HTTP {status}");
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("bench namespace-create not accepted within 30s (last: {last})");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// Locate the host-built `kiseki-client` binary (native feature) the
+/// bench runs from. Mirrors `find_server_binary` in the harness.
+fn find_kiseki_client() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("KISEKI_CLIENT_BIN") {
+        let path = std::path::PathBuf::from(p);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest
+        .ancestors()
+        .find(|p| p.join("Cargo.lock").exists())?;
+    // Prefer `debug` — the harness spawns `target/debug/kiseki-server`,
+    // so the debug client matches the server's build epoch. A stale
+    // `target/release/kiseki-client` (e.g. days old) speaking an older
+    // native-TCP framing against today's server hangs the bench rather
+    // than failing — checking debug first avoids that trap.
+    for profile in ["debug", "release"] {
+        let cand = workspace.join("target").join(profile).join("kiseki-client");
+        if cand.exists() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// GH #102: drive the exact GCP tool — `kiseki-client bench` over the
+/// TCP-framed native port (`ds_tcp`, ADR-042 §2.2) — against node-1, on
+/// the multi-shard bench namespace. `get-heavy` self-warms (writes
+/// objects, then reads them); on the 2026-05-27 GCP run that returned
+/// 0 ops / all errors ("AEAD authentication failed" after EC decode).
+/// Asserts the shape lands ops with no errors.
+#[then(regex = r"^kiseki-client (put-heavy|get-heavy|mixed) via node-1 lands ops over native TCP$")]
+async fn then_bench_lands_ops(w: &mut KisekiWorld, shape: String) {
+    let port = cluster(w).node(1).ports.ds_tcp;
+    let Some(client) = find_kiseki_client() else {
+        panic!(
+            "kiseki-client binary not found — build with \
+             `cargo build -p kiseki-client --features native --bin kiseki-client` \
+             or set KISEKI_CLIENT_BIN",
+        );
+    };
+    let endpoint = format!("kiseki://127.0.0.1:{port}");
+    let shape_arg = shape.clone();
+    // `std::process` (tokio's `process` feature isn't enabled in this
+    // crate) on a blocking pool so the bench's ~12 s run doesn't stall
+    // the async worker.
+    let client_str = client.to_string_lossy().into_owned();
+    let out = tokio::task::spawn_blocking(move || {
+        // Hard wall-clock cap via coreutils `timeout` — a 5 s bench
+        // that runs longer is wedged (e.g. a binary/protocol mismatch
+        // or a real write/read hang); `timeout` SIGKILLs it at 60 s
+        // (exit 124) so the step fails fast instead of blocking the
+        // whole test run for tens of minutes.
+        std::process::Command::new("timeout")
+            .args([
+                "60",
+                &client_str,
+                "bench",
+                "--endpoint",
+                &endpoint,
+                "--shape",
+                &shape_arg,
+                "--concurrency",
+                "8",
+                "--object-size",
+                "4096",
+                "--duration-secs",
+                "5",
+                "--warmup-objects",
+                "16",
+                "--json",
+            ])
+            .output()
+    })
+    .await
+    .expect("join bench task")
+    .unwrap_or_else(|e| panic!("spawn kiseki-client bench: {e}"));
+    if out.status.code() == Some(124) {
+        panic!(
+            "kiseki-client {shape} bench did NOT finish within 60s (5s bench) — wedged. \
+             stderr={}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .unwrap_or_else(|| {
+            panic!(
+                "bench produced no JSON result. status={:?} stderr={}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr),
+            )
+        });
+    let result: serde_json::Value = serde_json::from_str(line).expect("parse bench JSON result");
+    let ops = result
+        .get("ops")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let errors = result
+        .get("errors")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    assert!(
+        ops > 0 && errors == 0,
+        "GH #102: `{shape}` on the multi-shard bench namespace must land ops with no errors, \
+         got ops={ops} errors={errors}. Full: {result}",
+    );
+}
+
 #[then("the MergeShards response merged_shard_id equals the left shard id")]
 async fn then_merge_response_id_matches_left(w: &mut KisekiWorld) {
     let left = w
