@@ -791,6 +791,20 @@ impl OpenRaftLogStore {
 
     /// Get shard health metadata from the state machine.
     ///
+    /// The lowest sequence number still visible in this shard's
+    /// delta log. Returns `SequenceNumber(0)` if the delta vec is
+    /// empty (no writes yet, or all GC'd). Used by the composition
+    /// hydrator's compaction-gap detection per ADR-040 §D6.3
+    /// (amended for issue #87) — positive evidence that compaction
+    /// has GC'd entries below the returned value.
+    pub async fn earliest_visible_seq(&self) -> SequenceNumber {
+        let inner = self.state.lock().await;
+        inner
+            .deltas
+            .first()
+            .map_or(SequenceNumber(0), |d| d.header.sequence)
+    }
+
     /// Includes Raft leader and membership info from metrics.
     pub async fn shard_health(&self) -> ShardInfo {
         let inner = self.state.lock().await;

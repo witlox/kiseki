@@ -423,22 +423,63 @@ A separate ADR ratifies the bundle format + transfer protocol when
 log compaction is enabled. That ADR is **not** ADR-040; it's a
 sibling that depends on this one.
 
-**D6.3 Self-defense — gap detection without a new `LogOps` API.**
+**D6.3 Self-defense — gap detection via `earliest_visible_seq`.**
 
-The hydrator detects compaction by inspecting the deltas it
-receives, not by querying the log's earliest visible sequence
-directly. (Adversary finding F-3: `LogOps` exposes no
-`earliest_visible_seq` and adding one is more API surface than
-this case justifies.) The detection rule:
+> Amended 2026-05-19 (issue #87). The original §D6.3 used
+> `shard_health.tip > last_applied` as the empty-deltas gap
+> proxy and explicitly rejected adding an
+> `earliest_visible_seq` API as "more surface than this case
+> justifies" (adversary finding F-3). Production incident
+> 2026-05-19 (default-profile GCP cluster, 6 storage nodes)
+> proved that proxy is unsound: `tip` advances on every
+> `append_delta` AND on `install_snapshot` (state_machine.rs:589
+> sets `inner.tip = snap.tip` then replaces `inner.deltas`).
+> A follower receiving a compacted snapshot, OR any node where
+> a freshly-provisioned shard sits idle while sibling shards
+> emit deltas, can observe `tip > 0 && deltas.is_empty()`
+> from a benign state. The proxy fired on those benign states,
+> the halt persisted, and the node-global halt flag (storage.rs:
+> 291–293, see I-CP5b) propagated to every reader → cluster-wide
+> read outage. The corrected rule positively distinguishes
+> "compaction GC'd entries we hadn't read" from every other
+> source of `tip` advance.
+
+The hydrator detects compaction by reading the **earliest
+sequence still visible to the log**, not by inferring it from
+`tip`. The trait `LogOps` gains:
+
+```rust
+async fn earliest_visible_seq(
+    &self,
+    shard_id: ShardId,
+) -> Result<SequenceNumber, LogError>;
+```
+
+For an `OpenRaftLogStore`-backed shard this is
+`inner.deltas.first().map(|d| d.header.sequence).unwrap_or(SequenceNumber(0))`
+— i.e., the actual lowest sequence still in the state-machine
+view, after any truncate/compact. `SequenceNumber(0)` means
+"no deltas have been seen (or all GC'd)" and is treated as
+"no compaction yet."
 
 After `read_deltas(from = last_applied + 1, to = last_applied + 1000)`:
 
 | Response | Meaning | Action |
 |---|---|---|
 | Non-empty, first delta's `sequence == last_applied + 1` | Normal advance — no gap. | Apply per §D5.1. |
-| Non-empty, first delta's `sequence > last_applied + 1` | **Gap.** Compaction has eaten the deltas in between. | **Halt mode** (see below). |
-| Empty AND `shard_health(shard).tip > last_applied` | **Gap.** Tip is past us but no deltas are visible — they were compacted. | **Halt mode**. |
-| Empty AND `tip <= last_applied` | Steady state — no new deltas yet. | Sleep until next poll. |
+| Non-empty, first delta's `sequence > last_applied + 1` | **Gap** — positive evidence: a delta exists at `sequence = S` but `S > last_applied + 1`, so the entries in `(last_applied, S)` are not in the visible window. | **Halt mode** (see below). |
+| Empty AND `earliest_visible_seq > last_applied + 1` | **Gap** — positive evidence: the log's lowest visible sequence is past our expected next, so the entries we wanted have been GC'd. | **Halt mode**. |
+| Empty AND `earliest_visible_seq <= last_applied + 1` | Steady state. `tip` may be `> last_applied` (snapshot install in flight; fresh shard; transient race between `append_delta_inner`'s `tip++` and `deltas.push`); the hydrator's view will converge on the next poll. **Not a halt condition.** | Sleep until next poll. |
+| Empty AND `earliest_visible_seq` query failed | Transient log error. | Sleep until next poll. |
+
+The asymmetry between the second and third rows is the load-
+bearing claim: a non-empty response with a skipped sequence is
+positive evidence of compaction (we *see* sequence S without
+seeing S-1). An empty response with `earliest_visible_seq` past
+us is also positive evidence (the log itself says S-1 is gone).
+An empty response with `earliest_visible_seq <= last_applied+1`
+is *not* positive evidence — it's consistent with any number of
+benign states, so the hydrator just waits.
 
 **Halt mode**: the hydrator emits one `tracing::error!` per minute
 (throttled — don't spam the log), sets the

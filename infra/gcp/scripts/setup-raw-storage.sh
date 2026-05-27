@@ -87,6 +87,14 @@ Environment=KISEKI_ADVISORY_STREAM_ADDR=0.0.0.0:9102
 # explicit in the systemd unit so an operator looking at the file
 # sees the port plan at a glance.
 Environment=KISEKI_NATIVE_TCP_ADDR=0.0.0.0:9103
+# ADR-042 §4 server-side proxy fallback. With multi-shard topology
+# (e.g. the default profile's 18 shards across 6 nodes) a single-
+# endpoint native/FUSE/NFS client maps ~(N-1)/N of its writes to
+# shards led by a peer node; the local gateway gets ForwardToLeader
+# and would 5xx without this fallback. The Rust-side default is now
+# `on` (GH #97) — this line keeps the choice explicit in the unit
+# so an operator reading the file sees the routing decision.
+Environment=KISEKI_NATIVE_PROXY_FALLBACK=on
 Environment=KISEKI_S3_ADDR=0.0.0.0:9000
 Environment=KISEKI_NFS_ADDR=0.0.0.0:2049
 Environment=KISEKI_METRICS_ADDR=0.0.0.0:9090

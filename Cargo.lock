@@ -2130,14 +2130,18 @@ name = "kiseki-chunk-cluster"
 version = "2026.43.0"
 dependencies = [
  "async-trait",
+ "fjall",
  "futures",
  "kiseki-chunk",
  "kiseki-common",
  "kiseki-crypto",
  "kiseki-log",
  "kiseki-proto",
+ "postcard",
  "prometheus",
  "rcgen",
+ "serde",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",

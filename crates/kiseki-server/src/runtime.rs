@@ -196,72 +196,6 @@ fn fabric_addr_from_raft_peer(raft_peer: &str, data_port: u16) -> String {
     )
 }
 
-/// Initialize per-shard Raft membership for shards seeded by the
-/// control-plane `CreateNamespace` commit.
-///
-/// The apply hook on every node registers the shard's local Raft
-/// handle but doesn't call `initialize_membership` — by convention
-/// that's the leader's job, dispatched separately so vote requests
-/// don't race against peer registration. For the bootstrap path the
-/// bootstrap node is the only one that can drive it (it's the
-/// process that submitted the `CreateNamespace`).
-///
-/// `skip` lets the caller exclude the bootstrap shard, whose
-/// membership was already initialized inline before the
-/// `CreateNamespace` seed. Idempotent on a per-shard basis: a retried
-/// `initialize_membership` returns `NotAllowed` after the first
-/// commit, which `OpenRaftLogStore::initialize_membership` maps to
-/// `Ok(())`.
-async fn initialize_seeded_shards(
-    store: &Arc<kiseki_log::RaftShardStore>,
-    shard_ids: &[kiseki_common::ids::ShardId],
-    skip: Option<kiseki_common::ids::ShardId>,
-    label: &'static str,
-) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let mut initialized = 0usize;
-    for shard_id in shard_ids {
-        if skip == Some(*shard_id) {
-            continue;
-        }
-        // The apply hook fires after the CreateNamespace commit on
-        // every node, so by the time this runs the local shard
-        // handle should exist. If it doesn't yet (apply still in
-        // flight on a slow node), retry — handle registration is
-        // synchronous within the apply.
-        let mut last_err: Option<kiseki_log::LogError> = None;
-        while std::time::Instant::now() < deadline {
-            match store.initialize_shard_async(*shard_id).await {
-                Ok(()) => {
-                    last_err = None;
-                    initialized += 1;
-                    break;
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            }
-        }
-        if let Some(e) = last_err {
-            tracing::warn!(
-                label,
-                shard_id = %shard_id.0,
-                error = %e,
-                "initialize_shard: failed after 60s — shard will not accept writes",
-            );
-        }
-    }
-    if initialized > 0 {
-        tracing::info!(
-            label,
-            initialized,
-            total = shard_ids.len(),
-            "control-plane: per-shard Raft groups initialized",
-        );
-    }
-}
-
 /// `NamespaceProvisioner` impl backed by the control-plane Raft group.
 ///
 /// Called from the gateway's `ensure_namespace_exists` on the first
@@ -357,10 +291,12 @@ impl kiseki_gateway::mem_gateway::NamespaceProvisioner for ControlPlaneProvision
                 let resp = ctrl
                     .submit_and_wait_for_voters(cmd, std::time::Duration::from_secs(10))
                     .await;
-                if resp.is_ok() {
-                    initialize_seeded_shards(&store, &shard_ids, None, "first-touch namespace")
-                        .await;
-                }
+                // GH #101: the per-shard Raft membership is initialized by
+                // each shard's assigned `leader_node` via the control-plane
+                // apply hook (`ShardStoreApplyHook::on_create_namespace`),
+                // not here — that is what distributes leadership across
+                // nodes. This path only waits for the result below.
+                //
                 // Completing the namespace-creation contract: `provision`
                 // must not return success until each fresh shard has an
                 // elected leader. Without this, callers like S3
@@ -685,6 +621,7 @@ pub async fn run_main(
         let apply_hook_concrete = Arc::new(crate::cluster_control::ShardStoreApplyHook::new(
             Arc::clone(&store_arc),
             cfg.node_id,
+            raft_rt.clone(),
         ));
         apply_hook_for_registry = Some(Arc::clone(&apply_hook_concrete));
         let apply_hook: Arc<dyn crate::cluster_control::ApplyHook> = apply_hook_concrete;
@@ -1111,7 +1048,31 @@ pub async fn run_main(
     // (populated by the leader's own local-fragment writes). Without
     // this, peers fetching the leader's local fragment receive an
     // envelope with zero auth_tag/nonce — AES-GCM verify fails.
-    let envelope_registry = kiseki_chunk_cluster::ChunkEnvelopeRegistry::default();
+    // Issue #92 deeper fix (2026-05-19): persist envelope metadata so
+    // the registry survives restart. Pre-fix the registry was
+    // `Mutex<HashMap>` in-memory only; any chunk written by a
+    // previous server generation had no metadata on read, which
+    // post-PR-1 surfaces as `ChunkError::NotFound` (pre-PR-1
+    // surfaced as a misleading AEAD verify failure). With persistence
+    // wired here, restart is transparent — the in-memory cache warms
+    // back up via `lookup` falling back to disk on miss.
+    //
+    // In-memory-only mode is preserved when `cfg.data_dir` is `None`
+    // (single-node compose, tests).
+    let envelope_registry = if let Some(ref dir) = cfg.data_dir {
+        match kiseki_chunk_cluster::ChunkEnvelopeRegistry::with_data_dir(dir) {
+            Ok(reg) => reg,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "envelope registry: failed to open persistent store — falling back to in-memory only (post-restart cross-leader reads will fail until chunks are re-written)",
+                );
+                kiseki_chunk_cluster::ChunkEnvelopeRegistry::default()
+            }
+        }
+    } else {
+        kiseki_chunk_cluster::ChunkEnvelopeRegistry::default()
+    };
     let chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> = Arc::new(
         kiseki_chunk_cluster::ClusteredChunkStore::new(
             Arc::clone(&local_chunk_store),
@@ -2253,7 +2214,7 @@ pub async fn run_main(
     let proxy_fallback_enabled = std::env::var("KISEKI_NATIVE_PROXY_FALLBACK")
         .ok()
         .as_deref()
-        .is_some_and(|v| matches!(v, "on" | "1" | "true" | "yes"));
+        .is_none_or(|v| matches!(v, "on" | "1" | "true" | "yes"));
     let native_server = std::sync::Arc::new(
         kiseki_gateway::native::ServerImpl::new(
             std::sync::Arc::clone(&gw) as std::sync::Arc<dyn kiseki_gateway::ops::GatewayOps>,

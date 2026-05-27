@@ -514,6 +514,11 @@ impl LogOps for RaftShardStore {
         Ok(info)
     }
 
+    async fn earliest_visible_seq(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError> {
+        let store = self.get_shard(shard_id)?;
+        Ok(store.earliest_visible_seq().await)
+    }
+
     async fn set_maintenance(&self, shard_id: ShardId, enabled: bool) -> Result<(), LogError> {
         let store = self.get_shard(shard_id)?;
         store.set_maintenance(enabled).await
