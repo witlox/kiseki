@@ -351,6 +351,31 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     Then every S3 write committed with no errors
     And each object reads back identically from node-2
 
+  # GH #115: when the chunk-store device fills, the gateway must return a
+  # clean 507 Insufficient Storage (POSIX ENOSPC shape), not the opaque
+  # `device full -> quorum lost 0/N -> 500` chain the perf matrix hit.
+  # The cluster's chunk device is capped to 16 MiB so a handful of 1 MiB
+  # PUTs fills it. This is the real failure-mode fix end-to-end on a
+  # spawned binary — previously only unit + @library-mock coverage.
+  @integration @multi-node @capacity @enospc
+  Scenario: Chunk pool full returns a clean 507, not a 500 (GH #115)
+    Given a single-node cluster with a capped chunk device
+    When distinct 1MB S3 objects are PUT until the chunk device is full
+    Then at least one PUT returns HTTP 507 Insufficient Storage
+    And no PUT returns HTTP 500
+
+  # GH #115: capacity + dedup observability — the per-node storage gauges
+  # (used/total/logical/physical) were registered but never set; this
+  # asserts they're live end-to-end (gauge -> aggregator -> capacity API)
+  # on a real Replication-3 cluster. Identical content must dedup so the
+  # cluster-wide logical bytes exceed the physical bytes.
+  @integration @multi-node @capacity @dedup
+  Scenario: Capacity and dedup are observable on a real cluster (GH #115)
+    Given a 3-node kiseki cluster
+    When 20 distinct and 20 identical 256KB S3 objects are written for capacity accounting
+    Then the cluster capacity report shows non-zero used bytes
+    And the cluster dedup ratio exceeds 1.0
+
   @integration @multi-node @cross-node @smoke
   Scenario: Read survives leader failure (D-1)
     Given a 3-node kiseki cluster

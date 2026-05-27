@@ -487,6 +487,7 @@ fn handle_mount(args: &[String]) {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
         });
         let master_key = kiseki_crypto::keys::SystemMasterKey::new(
             [0x42; 32],

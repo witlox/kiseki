@@ -272,6 +272,7 @@ async fn given_s3_getobject(w: &mut KisekiWorld, _key: String) {
 
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
         })
         .await
         .expect("S3 write");
@@ -377,6 +378,7 @@ async fn then_gw_write_pipeline(w: &mut KisekiWorld) {
 
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
         })
         .await
         .expect("S3 write");

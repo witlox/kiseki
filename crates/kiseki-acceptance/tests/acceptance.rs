@@ -249,6 +249,7 @@ impl KisekiWorld {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
         });
         self.namespace_ids.insert(name.to_owned(), ns_id);
         ns_id
@@ -276,6 +277,7 @@ impl KisekiWorld {
                 read_only: false,
                 versioning_enabled: false,
                 compliance_tags: Vec::new(),
+                tier_policy: Vec::new(),
             })
             .await;
         ns_id
@@ -343,6 +345,7 @@ impl KisekiWorld {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
         };
         self.legacy.gateway.add_namespace(ns.clone()).await;
 
@@ -405,6 +408,7 @@ impl KisekiWorld {
                 read_only: false,
                 versioning_enabled: false,
                 compliance_tags: Vec::new(),
+                tier_policy: Vec::new(),
             })
             .await;
     }
@@ -573,6 +577,7 @@ impl KisekiWorld {
                     read_only: false,
                     versioning_enabled: false,
                     compliance_tags: Vec::new(),
+                    tier_policy: Vec::new(),
                 })
                 .await;
         }
@@ -590,6 +595,7 @@ impl KisekiWorld {
 
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .map_err(|e| e.to_string())
