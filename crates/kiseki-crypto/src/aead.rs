@@ -58,6 +58,33 @@ impl Aead {
         Ok((in_out, nonce_bytes))
     }
 
+    /// Seal with a **caller-supplied** nonce (ADR-044 convergent
+    /// encryption). The caller MUST guarantee the `(key, nonce)` pair is
+    /// never reused across distinct plaintexts. Kiseki satisfies this by
+    /// deriving BOTH the key and the nonce from the content-addressed
+    /// `chunk_id`, so each key seals exactly one plaintext (the content
+    /// that hashes to that `chunk_id`). Do not use this with a key that
+    /// seals more than one distinct plaintext.
+    pub fn seal_with_nonce(
+        &self,
+        key: &Zeroizing<[u8; 32]>,
+        nonce_bytes: [u8; GCM_NONCE_LEN],
+        plaintext: &[u8],
+        aad: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        let unbound =
+            UnboundKey::new(&AES_256_GCM, key.as_ref()).map_err(|_| CryptoError::HkdfFailed)?;
+        let sealing_key = LessSafeKey::new(unbound);
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+
+        let mut in_out = plaintext.to_vec();
+        sealing_key
+            .seal_in_place_append_tag(nonce, Aad::from(aad), &mut in_out)
+            .map_err(|_| CryptoError::AuthenticationFailed)?;
+
+        Ok(in_out)
+    }
+
     /// Decrypt `ciphertext_with_tag` using `key` and `nonce`.
     ///
     /// Returns the plaintext. Fails if the authentication tag does not
