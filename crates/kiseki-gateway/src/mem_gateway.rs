@@ -143,6 +143,12 @@ pub struct InMemoryGateway {
     // so it is scrubbed from memory on drop — it derives from the system
     // master key and gates content-confirmation, so it is key material.
     tenant_hmac_key: Option<zeroize::Zeroizing<Vec<u8>>>,
+    /// #111: re-issues a write to the shard leader when this node is a
+    /// follower for the target shard (`ForwardToLeader`). When wired,
+    /// distributed-multi-shard writes commit for every ingress (S3 / NFS
+    /// / FUSE / native), not just the native proxy path. `None` →
+    /// single-node / tests → the old `ForwardToLeader` error surfaces.
+    forwarder: Option<Arc<dyn crate::ops::WriteForwarder>>,
     /// `parking_lot::RwLock`: read-mostly (every gateway read takes
     /// a read lock; only the stream processor's 100 ms watermark
     /// advance takes a write lock). `std::sync::Mutex` here was a
@@ -518,6 +524,7 @@ impl InMemoryGateway {
             master_key,
             dedup_policy: DedupPolicy::CrossTenant,
             tenant_hmac_key: None,
+            forwarder: None,
             view_store: None,
             requests_total: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
@@ -1087,6 +1094,15 @@ impl InMemoryGateway {
     #[must_use]
     pub fn with_target_copies(mut self, target_copies: usize) -> Self {
         self.target_copies = target_copies;
+        self
+    }
+
+    /// #111: wire the leader-forwarder. With it set, a write that hits a
+    /// shard this node doesn't lead is transparently re-issued to the
+    /// leader (all ingresses), instead of surfacing `ForwardToLeader`.
+    #[must_use]
+    pub fn with_write_forwarder(mut self, forwarder: Arc<dyn crate::ops::WriteForwarder>) -> Self {
+        self.forwarder = Some(forwarder);
         self
     }
 
@@ -2040,6 +2056,17 @@ impl InMemoryGateway {
         req: WriteRequest,
         with_forwarding: bool,
     ) -> Result<WriteResponse, GatewayError> {
+        // #111: if a leader-forwarder is wired and this request is NOT
+        // itself a forward (loop prevention via `forwarded_from_node`),
+        // keep a clone so we can re-issue to the shard leader if the emit
+        // returns `ForwardToLeader`. The clone (incl. `data`) is only
+        // taken on multi-node gateways; single-node/tests skip it.
+        let forward_copy: Option<WriteRequest> =
+            if self.forwarder.is_some() && req.forwarded_from_node.is_none() {
+                Some(req.clone())
+            } else {
+                None
+            };
         // (B9: dropped "entry" debug — phase histograms cover this.)
         // ADR-021 §3.b / I-WA1: validate the optional workflow_ref
         // header before any storage work. The header is advisory: an
@@ -2416,7 +2443,11 @@ impl InMemoryGateway {
                 new_chunks = new_chunks.len(),
                 "gateway write: emit_chunk_and_delta start",
             );
-            let emit_result = if with_forwarding {
+            // #111: also take the forwarding emit when a forwarder is
+            // wired, so `write()` callers (S3/NFS) get the
+            // `ForwardToLeader` hint — not just `write_with_forwarding`
+            // (native) — and the forward below can fire for every ingress.
+            let emit_result = if with_forwarding || self.forwarder.is_some() {
                 kiseki_composition::log_bridge::emit_chunk_and_delta_with_forwarding(
                     log.as_ref(),
                     shard_id,
@@ -2468,13 +2499,31 @@ impl InMemoryGateway {
                     // outer `write` wrapper post-translates this to
                     // `GatewayError::Upstream` so legacy callers see
                     // unchanged semantics.
+                    // Roll back the provisional local composition — the
+                    // authoritative one is the entry the leader commits,
+                    // which replicates back via the shard's Raft log.
+                    let _ = self.compositions.delete(comp_id).ok();
+                    // #111: transparently re-issue to the leader when a
+                    // forwarder is wired and we kept a copy (origin
+                    // request, not an already-forwarded one). This makes
+                    // S3/NFS/FUSE writes commit on remote-led shards, not
+                    // just the native proxy path. Falls through to the
+                    // legacy `ForwardToLeader` error otherwise.
+                    if let (Some(fwd), Some(orig)) = (self.forwarder.as_ref(), forward_copy) {
+                        tracing::debug!(
+                            comp_id = %comp_id.0,
+                            shard_id = %sid.0,
+                            leader_node_id = %leader_node_id.0,
+                            "gateway write: ForwardToLeader — re-issuing to leader (#111)",
+                        );
+                        return fwd.forward_write(leader_node_id, orig).await;
+                    }
                     tracing::debug!(
                         comp_id = %comp_id.0,
                         shard_id = %sid.0,
                         leader_node_id = %leader_node_id.0,
-                        "gateway write: ForwardToLeader — rolling back composition",
+                        "gateway write: ForwardToLeader — no forwarder, surfacing hint",
                     );
-                    let _ = self.compositions.delete(comp_id).ok();
                     return Err(GatewayError::ForwardToLeader {
                         shard_id: sid,
                         leader_node_id,
