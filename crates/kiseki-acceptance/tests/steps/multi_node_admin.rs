@@ -446,6 +446,264 @@ async fn then_every_shard_has_leader(w: &mut KisekiWorld, secs: u64) {
     );
 }
 
+/// Deterministic bench tenant/namespace UUIDs — must match
+/// `kiseki-client::bench::bench_default_ids` so a no-flag `kiseki-client
+/// bench` writes to the namespace this step creates.
+const BENCH_TENANT_UUID: &str = "179e565c-d506-5c59-8f82-7ae6e13f0aff";
+const BENCH_NAMESPACE_UUID: &str = "6658810a-1c4d-564c-a888-7564b5e9e576";
+
+/// GH #102: create the *bench* namespace (the deterministic UUIDs the
+/// bench client defaults to) with an explicit shard count, so a
+/// subsequent `kiseki-client bench` exercises the multi-shard
+/// native-proxied write/read path that failed 100% on reads in the
+/// 2026-05-27 GCP run.
+#[when(regex = r"^the admin creates the bench namespace with (\d+) shards via admin HTTP$")]
+async fn when_create_bench_namespace(w: &mut KisekiWorld, shards: u32) {
+    let ports: Vec<(u64, u16)> = {
+        let g = cluster(w);
+        g.nodes().map(|n| (n.node_id, n.ports.metrics)).collect()
+    };
+    let body = serde_json::json!({
+        "namespace_id": BENCH_NAMESPACE_UUID,
+        "tenant_id": BENCH_TENANT_UUID,
+        "shards": shards,
+    });
+    let http = reqwest::Client::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut last = String::new();
+    loop {
+        for (node_id, port) in &ports {
+            let url = format!("http://127.0.0.1:{port}/admin/topology/namespaces");
+            if let Ok(resp) = http.post(&url).json(&body).send().await {
+                let status = resp.status();
+                if status.is_success() {
+                    return;
+                }
+                last = format!("node-{node_id} HTTP {status}");
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("bench namespace-create not accepted within 30s (last: {last})");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// Locate the host-built `kiseki-client` binary (native feature) the
+/// bench runs from. Mirrors `find_server_binary` in the harness.
+fn find_kiseki_client() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("KISEKI_CLIENT_BIN") {
+        let path = std::path::PathBuf::from(p);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest
+        .ancestors()
+        .find(|p| p.join("Cargo.lock").exists())?;
+    // Prefer `debug` — the harness spawns `target/debug/kiseki-server`,
+    // so the debug client matches the server's build epoch. A stale
+    // `target/release/kiseki-client` (e.g. days old) speaking an older
+    // native-TCP framing against today's server hangs the bench rather
+    // than failing — checking debug first avoids that trap.
+    for profile in ["debug", "release"] {
+        let cand = workspace.join("target").join(profile).join("kiseki-client");
+        if cand.exists() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// GH #102: drive the exact GCP tool — `kiseki-client bench` over the
+/// TCP-framed native port (`ds_tcp`, ADR-042 §2.2) — against node-1, on
+/// the multi-shard bench namespace. `get-heavy` self-warms (writes
+/// objects, then reads them); on the 2026-05-27 GCP run that returned
+/// 0 ops / all errors ("AEAD authentication failed" after EC decode).
+/// Asserts the shape lands ops with no errors.
+#[then(regex = r"^kiseki-client (put-heavy|get-heavy|mixed) via node-1 lands ops over native TCP$")]
+async fn then_bench_lands_ops(w: &mut KisekiWorld, shape: String) {
+    let port = cluster(w).node(1).ports.ds_tcp;
+    let Some(client) = find_kiseki_client() else {
+        panic!(
+            "kiseki-client binary not found — build with \
+             `cargo build -p kiseki-client --features native --bin kiseki-client` \
+             or set KISEKI_CLIENT_BIN",
+        );
+    };
+    let endpoint = format!("kiseki://127.0.0.1:{port}");
+    let shape_arg = shape.clone();
+    // `std::process` (tokio's `process` feature isn't enabled in this
+    // crate) on a blocking pool so the bench's ~12 s run doesn't stall
+    // the async worker.
+    let client_str = client.to_string_lossy().into_owned();
+    let out = tokio::task::spawn_blocking(move || {
+        // Hard wall-clock cap via coreutils `timeout` — a 5 s bench
+        // that runs longer is wedged (e.g. a binary/protocol mismatch
+        // or a real write/read hang); `timeout` SIGKILLs it at 60 s
+        // (exit 124) so the step fails fast instead of blocking the
+        // whole test run for tens of minutes.
+        std::process::Command::new("timeout")
+            .args([
+                "60",
+                &client_str,
+                "bench",
+                "--endpoint",
+                &endpoint,
+                "--shape",
+                &shape_arg,
+                "--concurrency",
+                "8",
+                "--object-size",
+                "4096",
+                "--duration-secs",
+                "5",
+                "--warmup-objects",
+                "16",
+                "--json",
+            ])
+            .output()
+    })
+    .await
+    .expect("join bench task")
+    .unwrap_or_else(|e| panic!("spawn kiseki-client bench: {e}"));
+    if out.status.code() == Some(124) {
+        panic!(
+            "kiseki-client {shape} bench did NOT finish within 60s (5s bench) — wedged. \
+             stderr={}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .unwrap_or_else(|| {
+            panic!(
+                "bench produced no JSON result. status={:?} stderr={}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr),
+            )
+        });
+    let result: serde_json::Value = serde_json::from_str(line).expect("parse bench JSON result");
+    let ops = result
+        .get("ops")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let errors = result
+        .get("errors")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(u64::MAX);
+    assert!(
+        ops > 0 && errors == 0,
+        "GH #102: `{shape}` on the multi-shard bench namespace must land ops with no errors, \
+         got ops={ops} errors={errors}. Full: {result}",
+    );
+}
+
+/// GH #102 end-to-end guard (adversary Finding 3, ADR-044). N clients
+/// **concurrently** PUT IDENTICAL content (the bench's `0xa5` payload —
+/// the literal #102 trigger) to distinct S3 keys on the 6-node EC-4+2
+/// cluster. Identical content ⇒ one content-addressed `chunk_id`, and
+/// the concurrency races past the dedup-skip so multiple seals hit the
+/// EC fan-out at once. Pre-fix (random nonce) the per-node fragments +
+/// crypto registry tore → AEAD fail on read; convergent encryption
+/// (deterministic nonce) makes every seal byte-identical, so the reads
+/// stay consistent. S3-only — does not need the native proxy (#103).
+#[when(regex = r"^(\d+) clients concurrently PUT identical 1MB content to distinct keys$")]
+async fn when_concurrent_identical_puts(w: &mut KisekiWorld, n: usize) {
+    // Stage 1: discover the leader without holding the cluster borrow
+    // across an await (S3 PUT to a follower 307s; the "default" bucket
+    // is single-shard, led by the bootstrap/control-plane leader).
+    let (n1_info_url, n1_http) = {
+        let n1 = cluster(w).node(1);
+        (n1.admin_url("cluster/info"), n1.http.clone())
+    };
+    let leader_id = match n1_http.get(&n1_info_url).send().await {
+        Ok(r) if r.status().is_success() => r
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|j| j.get("leader_id").and_then(serde_json::Value::as_u64))
+            .unwrap_or(1),
+        _ => 1,
+    };
+    let (s3_base, http) = {
+        let leader = cluster(w).node(leader_id);
+        (leader.s3_base.clone(), leader.http.clone())
+    };
+
+    let payload = vec![0xa5u8; 1024 * 1024];
+    let keys: Vec<String> = (0..n)
+        .map(|i| format!("dedup-{}-{i}", uuid::Uuid::new_v4().simple()))
+        .collect();
+
+    // Fire all PUTs concurrently.
+    let puts = keys.iter().map(|key| {
+        let url = format!("{s3_base}/default/{key}");
+        let http = http.clone();
+        let body = payload.clone();
+        async move { (url.clone(), http.put(&url).body(body).send().await) }
+    });
+    let results = futures::future::join_all(puts).await;
+    for (url, res) in &results {
+        match res {
+            Ok(resp) => assert!(
+                resp.status().is_success(),
+                "concurrent PUT {url} returned {}",
+                resp.status(),
+            ),
+            Err(e) => panic!("concurrent PUT {url} failed: {e}"),
+        }
+    }
+    w.cluster
+        .name_index_state
+        .insert("dedup_keys".into(), keys.join(","));
+}
+
+#[then(regex = r"^S3 GET of each key from node-(\d+) returns the identical 1MB$")]
+async fn then_get_each_dedup_key(w: &mut KisekiWorld, node_id: u64) {
+    let keys: Vec<String> = w
+        .cluster
+        .name_index_state
+        .get("dedup_keys")
+        .map(|s| s.split(',').map(String::from).collect())
+        .expect("the concurrent-PUT step must run first");
+    let (s3_base, http) = {
+        let node = cluster(w).node(node_id);
+        (node.s3_base.clone(), node.http.clone())
+    };
+    let expected = vec![0xa5u8; 1024 * 1024];
+    for key in &keys {
+        let url = format!("{s3_base}/default/{key}");
+        // Followers hydrate the composition via Raft; poll up to 30s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let body = loop {
+            if let Ok(resp) = http.get(&url).send().await {
+                if resp.status().is_success() {
+                    break resp.bytes().await.expect("read body").to_vec();
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("S3 GET {url} from node-{node_id} never succeeded within 30s");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        };
+        assert_eq!(
+            body.len(),
+            expected.len(),
+            "node-{node_id} {key}: length mismatch"
+        );
+        assert_eq!(
+            body, expected,
+            "GH #102: node-{node_id} {key}: dedup'd EC chunk decrypted to wrong bytes \
+             (convergent encryption torn?)",
+        );
+    }
+}
+
 #[then("the MergeShards response merged_shard_id equals the left shard id")]
 async fn then_merge_response_id_matches_left(w: &mut KisekiWorld) {
     let left = w

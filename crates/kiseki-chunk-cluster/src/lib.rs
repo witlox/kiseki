@@ -801,7 +801,11 @@ impl AsyncChunkOps for ClusteredChunkStore {
         }
     }
 
-    async fn read_chunk(&self, chunk_id: &ChunkId) -> Result<Envelope, ChunkError> {
+    async fn read_chunk(
+        &self,
+        chunk_id: &ChunkId,
+        original_len: Option<u64>,
+    ) -> Result<Envelope, ChunkError> {
         // GCP 2026-05-02: in EC mode, the local fast path returns the
         // wrong thing. A peer that received `PutFragment(idx=0, env)`
         // stored the WHOLE envelope (server.rs branches on
@@ -815,7 +819,7 @@ impl AsyncChunkOps for ClusteredChunkStore {
         // ciphertext. Replication mode keeps the local fast-path —
         // there the local store has the WHOLE chunk by construction.
         if !matches!(self.cfg.ec_strategy, crate::ec::EcStrategy::Ec { .. }) {
-            match self.local.read_chunk(chunk_id).await {
+            match self.local.read_chunk(chunk_id, original_len).await {
                 Ok(env) => return Ok(env),
                 Err(ChunkError::NotFound(_)) => {} // fall through to fabric
                 Err(other) => return Err(other),
@@ -844,13 +848,18 @@ impl AsyncChunkOps for ClusteredChunkStore {
             } else {
                 crate::placement::pick_placement(chunk_id, &self.cfg.cluster_nodes, total)
             };
-            // original_len is read from cluster_chunk_state at the
-            // gateway boundary (16d step 3) and could be threaded
-            // through here; for now the read_chunk_ec heuristic
-            // path covers high-entropy ciphertext correctly. Wiring
-            // a LogOps lookup at this seam is a 16e refinement.
+            // GH #107: `original_len` is the chunk's exact ciphertext
+            // length, threaded from the gateway (which reads it from the
+            // Raft-replicated object composition — available on every
+            // node, not just the ~data+parity fragment holders, so this
+            // is correct at 100-node scale where the reader is usually
+            // NOT a holder). When present, `read_chunk_ec` trims the
+            // reassembled stripe to exactly this length instead of the
+            // strip-trailing-zeros heuristic that corrupts ciphertext
+            // ending in 0x00. `None` keeps the heuristic for callers that
+            // don't carry the length (tests).
             return self
-                .read_chunk_ec(chunk_id, &placement, self.cfg.ec_strategy, None)
+                .read_chunk_ec(chunk_id, &placement, self.cfg.ec_strategy, original_len)
                 .await;
         }
 
@@ -1012,7 +1021,13 @@ mod tests {
         /// (`chunk_id`, `fragment_index`). Used by EC tests; the
         /// existing Replication-N tests leave this empty and use
         /// `store` instead.
-        fragments: StdMutex<std::collections::HashMap<(ChunkId, u32), Vec<u8>>>,
+        // Stores the FULL per-fragment envelope (shard bytes +
+        // chunk-level crypto) so `get_fragment` returns the same
+        // auth_tag/nonce the real `ClusterChunkServer` does via its
+        // `chunk_envelope_meta` registry. Storing only `Vec<u8>` (the
+        // pre-#102 shape) returned zeroed crypto and masked the
+        // cross-node read decrypt path entirely.
+        fragments: StdMutex<std::collections::HashMap<(ChunkId, u32), Envelope>>,
         put_calls: AtomicU64,
         delete_calls: AtomicU64,
         /// If set, every put returns this error instead of storing.
@@ -1090,7 +1105,7 @@ mod tests {
                 self.fragments
                     .lock()
                     .unwrap()
-                    .insert((chunk_id, fragment_index), envelope.ciphertext);
+                    .insert((chunk_id, fragment_index), envelope);
             }
             Ok(true)
         }
@@ -1114,22 +1129,16 @@ mod tests {
                     .cloned()
                     .ok_or(FabricPeerError::NotFound)
             } else {
-                let bytes = self
-                    .fragments
+                // Return the stored per-fragment envelope verbatim —
+                // including the chunk-level auth_tag/nonce the writer
+                // supplied — mirroring the real server's
+                // `envelope_from_bytes` registry lookup.
+                self.fragments
                     .lock()
                     .unwrap()
                     .get(&(chunk_id, fragment_index))
                     .cloned()
-                    .ok_or(FabricPeerError::NotFound)?;
-                Ok(Envelope {
-                    chunk_id,
-                    ciphertext: bytes,
-                    auth_tag: [0u8; 16],
-                    nonce: [0u8; 12],
-                    system_epoch: kiseki_common::tenancy::KeyEpoch(1),
-                    tenant_epoch: None,
-                    tenant_wrapped_material: None,
-                })
+                    .ok_or(FabricPeerError::NotFound)
             }
         }
         async fn delete_fragment(
@@ -1283,7 +1292,7 @@ mod tests {
             ],
             ClusterCfg::new(OrgId(uuid::Uuid::nil()), "p"),
         );
-        let got = store.read_chunk(&chunk_id).await.expect("read");
+        let got = store.read_chunk(&chunk_id, None).await.expect("read");
         assert_eq!(got.chunk_id, chunk_id);
         assert_eq!(got.ciphertext, env.ciphertext);
     }
@@ -1304,7 +1313,10 @@ mod tests {
             ClusterCfg::new(OrgId(uuid::Uuid::nil()), "p"),
         );
         let missing = ChunkId([0xEEu8; 32]);
-        let err = store.read_chunk(&missing).await.expect_err("not found");
+        let err = store
+            .read_chunk(&missing, None)
+            .await
+            .expect_err("not found");
         assert!(matches!(err, ChunkError::NotFound(c) if c == missing));
     }
 
@@ -1334,7 +1346,7 @@ mod tests {
             ],
             ClusterCfg::new(OrgId(uuid::Uuid::nil()), "p"),
         );
-        let got = store.read_chunk(&chunk_id).await.expect("read");
+        let got = store.read_chunk(&chunk_id, None).await.expect("read");
         assert_eq!(got.chunk_id, chunk_id);
     }
 
@@ -1554,12 +1566,97 @@ mod tests {
         ];
         let reader = ClusteredChunkStore::new(reader_local, reader_peers, cfg);
         let recovered = reader
-            .read_chunk(&chunk_id)
+            .read_chunk(&chunk_id, Some(payload.len() as u64))
             .await
             .expect("ec read via dispatch");
         assert_eq!(
             recovered.ciphertext, payload,
             "EC dispatch read must reconstruct the exact original payload",
+        );
+    }
+
+    /// GH #107: when a chunk's ciphertext ends in `0x00`, the
+    /// strip-trailing-zeros heuristic (`original_len == None`) truncates
+    /// real bytes, so AES-GCM verify fails on the gateway (~1/256 of
+    /// chunks). Threading the exact `original_len` from the gateway makes
+    /// the EC read trim precisely. This test pins both halves: the
+    /// authoritative-length path reconstructs byte-exactly, and the
+    /// heuristic path is shown to corrupt — which is why the gateway must
+    /// always pass the length (it reads it from the Raft-replicated
+    /// composition, so it's available on every node, not just holders).
+    #[tokio::test]
+    async fn read_chunk_ec_with_original_len_recovers_ciphertext_ending_in_zero() {
+        let writer_local = local_bridge("p");
+        let p1 = MockPeer::new("p1");
+        let p2 = MockPeer::new("p2");
+        let p3 = MockPeer::new("p3");
+        let p4 = MockPeer::new("p4");
+        let p5 = MockPeer::new("p5");
+        let p6 = MockPeer::new("p6");
+        let writer_peers: Vec<Arc<dyn FabricPeer>> = vec![
+            Arc::clone(&p1) as _,
+            Arc::clone(&p2) as _,
+            Arc::clone(&p3) as _,
+            Arc::clone(&p4) as _,
+            Arc::clone(&p5) as _,
+            Arc::clone(&p6) as _,
+        ];
+        let cfg = ClusterCfg::new(OrgId(uuid::Uuid::nil()), "p")
+            .with_ec_strategy(crate::ec::EcStrategy::Ec { data: 4, parity: 2 })
+            .with_cluster_nodes(vec![1, 2, 3, 4, 5, 6]);
+
+        // 256-byte payload (== 4 data shards of 64B, no EC padding) whose
+        // final 6 bytes are 0x00 — the exact shape that defeats the
+        // trailing-zero heuristic.
+        let mut payload: Vec<u8> = (0..256u32)
+            .map(|i| u8::try_from((i & 0xff).max(1)).unwrap_or(1))
+            .collect();
+        for b in payload.iter_mut().skip(250) {
+            *b = 0;
+        }
+        let env = Envelope {
+            chunk_id: ChunkId([0xC7; 32]),
+            ciphertext: payload.clone(),
+            auth_tag: [0u8; 16],
+            nonce: [0u8; 12],
+            system_epoch: kiseki_common::tenancy::KeyEpoch(1),
+            tenant_epoch: None,
+            tenant_wrapped_material: None,
+        };
+        let chunk_id = env.chunk_id;
+        let writer = ClusteredChunkStore::new(writer_local, writer_peers, cfg.clone());
+        writer.write_chunk(env, "p").await.expect("ec write");
+
+        let reader_peers: Vec<Arc<dyn FabricPeer>> = vec![
+            Arc::clone(&p1) as _,
+            Arc::clone(&p2) as _,
+            Arc::clone(&p3) as _,
+            Arc::clone(&p4) as _,
+            Arc::clone(&p5) as _,
+            Arc::clone(&p6) as _,
+        ];
+        let reader = ClusteredChunkStore::new(local_bridge("p"), reader_peers, cfg);
+
+        // Authoritative length → byte-exact reconstruction, trailing
+        // zeros preserved.
+        let exact = reader
+            .read_chunk(&chunk_id, Some(payload.len() as u64))
+            .await
+            .expect("ec read with original_len");
+        assert_eq!(
+            exact.ciphertext, payload,
+            "original_len path must preserve trailing 0x00 bytes",
+        );
+
+        // Heuristic path (None) over-trims — documents the #107 bug the
+        // threaded length fixes.
+        let heuristic = reader
+            .read_chunk(&chunk_id, None)
+            .await
+            .expect("ec read heuristic");
+        assert!(
+            heuristic.ciphertext.len() < payload.len(),
+            "heuristic strips the trailing zeros — this is the GH #107 corruption",
         );
     }
 
@@ -1729,6 +1826,65 @@ mod tests {
             recovered.ciphertext, payload,
             "EC reconstruction must yield the exact original payload",
         );
+    }
+
+    /// GH #102: a REAL sealed envelope written via EC fan-out must
+    /// decrypt after a cross-node read. The reader holds no local
+    /// fragment (`self_node_id=0`), so every fragment + the chunk crypto
+    /// comes from peers — the production multi-shard read shape. Mirrors
+    /// the gateway path, which calls `read_chunk_ec` with
+    /// `original_len=None` (`lib.rs:853`). Several payload sizes,
+    /// including some not divisible by `data_count` (forces shard
+    /// padding) — the `None` heuristic strips trailing zeros, which
+    /// corrupts AES-GCM ciphertext.
+    #[tokio::test]
+    async fn read_chunk_ec_real_envelope_round_trips_and_decrypts() {
+        use kiseki_crypto::aead::Aead;
+        use kiseki_crypto::envelope::{open_envelope, seal_envelope};
+        use kiseki_crypto::keys::SystemMasterKey;
+
+        let aead = Aead::new();
+        // Same shared system master key the runtime hardcodes
+        // (`runtime.rs:1333`) — identical on every node, so this is a
+        // faithful cross-node decrypt (not a key-mismatch artifact).
+        let master = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+
+        let peers: Vec<Arc<dyn FabricPeer>> = (1..=6)
+            .map(|i| {
+                let name: &'static str = Box::leak(format!("p{i}").into_boxed_str());
+                Arc::clone(&MockPeer::new(name)) as Arc<dyn FabricPeer>
+            })
+            .collect();
+        let cfg = ClusterCfg::new(OrgId(uuid::Uuid::nil()), "p");
+        let strategy = crate::ec::EcStrategy::Ec { data: 4, parity: 2 };
+        let placement = [1u64, 2, 3, 4, 5, 6];
+        let writer = ClusteredChunkStore::new(local_bridge("p"), peers.clone(), cfg.clone());
+
+        for (i, &len) in [4096usize, 65536, 4099, 1000, 16385].iter().enumerate() {
+            let plaintext: Vec<u8> = (0..len)
+                .map(|j| u8::try_from((j * 31 + i * 7) & 0xff).unwrap_or(0))
+                .collect();
+            let chunk_id = ChunkId([0xA0 + u8::try_from(i).unwrap_or(0); 32]);
+            let env = seal_envelope(&aead, &master, &chunk_id, &plaintext).expect("seal");
+            writer
+                .write_chunk_ec(env, &placement, strategy)
+                .await
+                .expect("ec write");
+
+            // Reader: empty local store, same peers. Production path
+            // passes original_len = None.
+            let reader = ClusteredChunkStore::new(local_bridge("p"), peers.clone(), cfg.clone());
+            let recovered = reader
+                .read_chunk_ec(&chunk_id, &placement, strategy, None)
+                .await
+                .expect("ec read");
+            let plain = open_envelope(&aead, &master, &recovered)
+                .unwrap_or_else(|e| panic!("len {len}: open_envelope failed: {e}"));
+            assert_eq!(
+                plain, plaintext,
+                "payload len {len} must round-trip + decrypt"
+            );
+        }
     }
 
     /// 1-node cluster degenerates: no peers means nothing to fan

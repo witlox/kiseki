@@ -1342,6 +1342,18 @@ pub async fn run_main(
     let native_signing_keys = std::sync::Arc::new(
         kiseki_gateway::native::signing_keys::SigningKeys::new(&master_key, native_grace_ms),
     );
+    // ADR-044: derive the tenant dedup HMAC key from the master key
+    // BEFORE it is moved into the gateway. Production stores tenant data,
+    // so it MUST use `DedupPolicy::TenantIsolated` —
+    // `chunk_id = HMAC(tenant_dedup_key, plaintext)` — not the
+    // `CrossTenant` SHA-256 default. The HMAC key is a secret function of
+    // the master key (closing the confirmation-of-content oracle for
+    // anyone without it) and is salted on the tenant id (confining dedup
+    // to a single tenant). The constructor default stays `CrossTenant`
+    // for system/non-tenant data; the production data plane opts in here.
+    let tenant_dedup_key =
+        kiseki_crypto::hkdf::derive_tenant_dedup_key(&master_key, bootstrap_tenant.0.as_bytes())?
+            .to_vec();
     // Phase 16b step 2: pass the cluster's node-id list as the
     // placement for every fresh chunk. In a 1-node cluster this is
     // empty (the gateway carries vec![] in NewChunkMeta), matching
@@ -1349,6 +1361,11 @@ pub async fn run_main(
     let cluster_placement: Vec<u64> = cfg.raft_peers.iter().map(|(id, _)| *id).collect();
     let mut gw_builder = kiseki_gateway::InMemoryGateway::new(comp_store, chunk_store, master_key)
         .with_view_store(Arc::clone(&view_store))
+        // ADR-044: tenant-isolated content-addressed dedup.
+        .with_dedup_policy(
+            kiseki_common::tenancy::DedupPolicy::TenantIsolated,
+            Some(tenant_dedup_key),
+        )
         .with_cluster_placement(cluster_placement)
         // Phase 16c step 2: cap per-chunk placement at the
         // size-derived `copies` so a 6-node Replication-3 cluster

@@ -21,6 +21,15 @@ use crate::keys::SystemMasterKey;
 /// HKDF info string — versioned for crypto-agility.
 const HKDF_INFO: &[u8] = b"kiseki-chunk-dek-v1";
 
+/// HKDF info string for the convergent GCM nonce (ADR-044). Distinct
+/// label from `HKDF_INFO` so the nonce and DEK are domain-separated
+/// even though both derive from `(master, chunk_id)`.
+const HKDF_NONCE_INFO: &[u8] = b"kiseki-chunk-nonce-v1";
+
+/// HKDF info string for the per-tenant dedup HMAC key (ADR-044).
+/// Domain-separated from the chunk DEK/nonce labels.
+const HKDF_TENANT_DEDUP_INFO: &[u8] = b"kiseki-tenant-dedup-hmac-v1";
+
 /// Derive a per-chunk system DEK from the master key and chunk ID.
 ///
 /// Deterministic: same `(master_key, chunk_id)` always yields the same
@@ -40,12 +49,74 @@ pub fn derive_system_dek(
     Ok(dek)
 }
 
+/// Derive the **convergent** GCM nonce for a chunk (ADR-044).
+///
+/// Deterministic in `(master, chunk_id)`, like [`derive_system_dek`], but
+/// with a distinct info label. Because `chunk_id` is a content hash,
+/// identical content yields the identical nonce — making AEAD sealing
+/// convergent (identical content ⇒ identical ciphertext), which is the
+/// property content-addressed dedup requires. GCM-safe: the DEK is
+/// already unique per `chunk_id`, so each (key, nonce) pair encrypts
+/// exactly one plaintext (see ADR-044 "Why this is GCM-safe").
+pub fn derive_convergent_nonce(
+    master: &SystemMasterKey,
+    chunk_id: &ChunkId,
+) -> Result<[u8; 12], CryptoError> {
+    let salt = Salt::new(HKDF_SHA256, &chunk_id.0);
+    let prk = salt.extract(master.material());
+
+    let mut nonce = [0u8; 12];
+    prk.expand(&[HKDF_NONCE_INFO], NonceLen)
+        .and_then(|okm| okm.fill(&mut nonce))
+        .map_err(|_| CryptoError::HkdfFailed)?;
+
+    Ok(nonce)
+}
+
+/// Derive a tenant's dedup HMAC key from the master key (ADR-044).
+///
+/// `chunk_id = HMAC-SHA256(tenant_dedup_key, plaintext)` under
+/// `DedupPolicy::TenantIsolated`. Deriving the key from the system master
+/// key (rather than `SHA-256(plaintext)`, the `CrossTenant` default) makes
+/// the chunk ID a *secret* function of the content: an adversary cannot
+/// compute it offline to run the confirmation-of-content oracle without
+/// the master key. Salting on `tenant_id` confines dedup — and the oracle
+/// — to a single tenant: two tenants storing identical content derive
+/// different keys, so their `chunk_id`s differ and cannot cross-dedup.
+///
+/// Deterministic in `(master, tenant_id)`, so the same tenant's identical
+/// content always converges to the same `chunk_id` (the property dedup +
+/// convergent encryption require).
+pub fn derive_tenant_dedup_key(
+    master: &SystemMasterKey,
+    tenant_id: &[u8],
+) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+    let salt = Salt::new(HKDF_SHA256, tenant_id);
+    let prk = salt.extract(master.material());
+
+    let mut key = Zeroizing::new([0u8; 32]);
+    prk.expand(&[HKDF_TENANT_DEDUP_INFO], HkdfLen)
+        .and_then(|okm| okm.fill(&mut *key))
+        .map_err(|_| CryptoError::HkdfFailed)?;
+
+    Ok(key)
+}
+
 /// Helper type for HKDF output length.
 struct HkdfLen;
 
 impl aws_lc_rs::hkdf::KeyType for HkdfLen {
     fn len(&self) -> usize {
         32
+    }
+}
+
+/// Helper type for the 12-byte GCM nonce HKDF output.
+struct NonceLen;
+
+impl aws_lc_rs::hkdf::KeyType for NonceLen {
+    fn len(&self) -> usize {
+        12
     }
 }
 
@@ -92,5 +163,78 @@ mod tests {
         let dek_b = derive_system_dek(&master_b, &chunk_id).unwrap_or_else(|_| unreachable!());
 
         assert_ne!(*dek_a, *dek_b);
+    }
+
+    // ADR-044 convergent nonce.
+
+    #[test]
+    fn convergent_nonce_is_deterministic() {
+        let master = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+        let chunk_id = ChunkId([0xab; 32]);
+        let n1 = derive_convergent_nonce(&master, &chunk_id).unwrap_or_else(|_| unreachable!());
+        let n2 = derive_convergent_nonce(&master, &chunk_id).unwrap_or_else(|_| unreachable!());
+        assert_eq!(n1, n2, "same (master, chunk_id) must yield the same nonce");
+    }
+
+    #[test]
+    fn convergent_nonce_differs_per_chunk_id() {
+        let master = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+        let na = derive_convergent_nonce(&master, &ChunkId([0xaa; 32]))
+            .unwrap_or_else(|_| unreachable!());
+        let nb = derive_convergent_nonce(&master, &ChunkId([0xbb; 32]))
+            .unwrap_or_else(|_| unreachable!());
+        assert_ne!(na, nb, "distinct chunk_ids must yield distinct nonces");
+    }
+
+    #[test]
+    fn convergent_nonce_is_domain_separated_from_dek() {
+        // The nonce derivation must not leak the DEK: deriving a nonce
+        // and a DEK from the same (master, chunk_id) uses distinct info
+        // labels, so the 12-byte nonce must not be a prefix of the DEK.
+        let master = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+        let chunk_id = ChunkId([0xcd; 32]);
+        let nonce = derive_convergent_nonce(&master, &chunk_id).unwrap_or_else(|_| unreachable!());
+        let dek = derive_system_dek(&master, &chunk_id).unwrap_or_else(|_| unreachable!());
+        assert_ne!(
+            &nonce[..],
+            &dek[..12],
+            "nonce must be domain-separated from the DEK"
+        );
+    }
+
+    // ADR-044 tenant dedup HMAC key.
+
+    #[test]
+    fn tenant_dedup_key_is_deterministic() {
+        let master = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+        let tenant = [0x01u8; 16];
+        let k1 = derive_tenant_dedup_key(&master, &tenant).unwrap_or_else(|_| unreachable!());
+        let k2 = derive_tenant_dedup_key(&master, &tenant).unwrap_or_else(|_| unreachable!());
+        assert_eq!(*k1, *k2, "same (master, tenant) must yield the same key");
+    }
+
+    #[test]
+    fn tenant_dedup_key_differs_per_tenant() {
+        let master = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+        let ka = derive_tenant_dedup_key(&master, &[0x01u8; 16]).unwrap_or_else(|_| unreachable!());
+        let kb = derive_tenant_dedup_key(&master, &[0x02u8; 16]).unwrap_or_else(|_| unreachable!());
+        assert_ne!(
+            *ka, *kb,
+            "distinct tenants must derive distinct dedup keys (no cross-tenant dedup)"
+        );
+    }
+
+    #[test]
+    fn tenant_dedup_key_is_domain_separated_from_dek() {
+        // Reusing tenant bytes as a chunk_id salt must not collide the
+        // dedup key with a chunk DEK — distinct info labels guarantee it.
+        let master = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+        let bytes = [0x07u8; 32];
+        let dedup = derive_tenant_dedup_key(&master, &bytes).unwrap_or_else(|_| unreachable!());
+        let dek = derive_system_dek(&master, &ChunkId(bytes)).unwrap_or_else(|_| unreachable!());
+        assert_ne!(
+            *dedup, *dek,
+            "tenant dedup key must be domain-separated from the chunk DEK"
+        );
     }
 }

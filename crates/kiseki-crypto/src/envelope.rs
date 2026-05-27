@@ -14,7 +14,7 @@ use zeroize::Zeroizing;
 
 use crate::aead::{self, Aead, GCM_NONCE_LEN, GCM_TAG_LEN};
 use crate::error::CryptoError;
-use crate::hkdf::derive_system_dek;
+use crate::hkdf::{derive_convergent_nonce, derive_system_dek};
 use crate::keys::{SystemMasterKey, TenantKek};
 
 /// Complete envelope for an encrypted chunk or delta payload.
@@ -52,13 +52,22 @@ pub fn seal_envelope(
         tracing::warn!(error = %e, "seal_envelope: derive_system_dek failed");
     })?;
 
+    // ADR-044 convergent encryption: derive the nonce deterministically
+    // from `(master, chunk_id)` instead of at random, so identical
+    // content (⇒ identical content-addressed `chunk_id`) seals to
+    // identical ciphertext. Without this, content-addressed dedup tears
+    // on the EC cluster path (GH #102). GCM-safe: the DEK is unique per
+    // `chunk_id`, so each (key, nonce) seals exactly one plaintext.
+    let nonce = derive_convergent_nonce(master, chunk_id).inspect_err(|e| {
+        tracing::warn!(error = %e, "seal_envelope: derive_convergent_nonce failed");
+    })?;
+
     // AAD = chunk_id bytes — binds ciphertext to this specific chunk.
-    let (ciphertext_with_tag, nonce) =
-        aead_ctx
-            .seal(&dek, plaintext, &chunk_id.0)
-            .inspect_err(|e| {
-                tracing::warn!(error = %e, "seal_envelope: AEAD seal failed");
-            })?;
+    let ciphertext_with_tag = aead_ctx
+        .seal_with_nonce(&dek, nonce, plaintext, &chunk_id.0)
+        .inspect_err(|e| {
+            tracing::warn!(error = %e, "seal_envelope: AEAD seal failed");
+        })?;
 
     // Split tag from ciphertext. aws-lc-rs appends the tag.
     let tag_start = ciphertext_with_tag.len() - GCM_TAG_LEN;
@@ -251,6 +260,40 @@ mod tests {
         assert_eq!(decrypted.unwrap_or_else(|_| unreachable!()), plaintext);
     }
 
+    /// ADR-044 / GH #102: sealing identical content under the same
+    /// `chunk_id` must be **convergent** — byte-identical ciphertext,
+    /// nonce, and `auth_tag` every time. This is what lets content-
+    /// addressed dedup store/replicate a chunk idempotently without the
+    /// EC reassembly tearing across write generations. Pre-fix the
+    /// random nonce made each seal differ.
+    #[test]
+    fn seal_envelope_is_convergent() {
+        let aead = Aead::new();
+        let master = test_master();
+        let chunk_id = test_chunk_id();
+        let plaintext = b"the same content sealed twice";
+
+        let a =
+            seal_envelope(&aead, &master, &chunk_id, plaintext).unwrap_or_else(|_| unreachable!());
+        let b =
+            seal_envelope(&aead, &master, &chunk_id, plaintext).unwrap_or_else(|_| unreachable!());
+
+        assert_eq!(a.nonce, b.nonce, "convergent: nonce must be identical");
+        assert_eq!(
+            a.auth_tag, b.auth_tag,
+            "convergent: auth_tag must be identical"
+        );
+        assert_eq!(
+            a.ciphertext, b.ciphertext,
+            "convergent: ciphertext must be identical"
+        );
+        // And it still decrypts.
+        assert_eq!(
+            open_envelope(&aead, &master, &a).unwrap_or_else(|_| unreachable!()),
+            plaintext,
+        );
+    }
+
     #[test]
     fn wrong_key_fails_decryption() {
         let aead = Aead::new();
@@ -363,19 +406,26 @@ mod tests {
     }
 
     #[test]
-    fn nonce_uniqueness() {
+    fn nonce_uniqueness_across_distinct_chunks() {
+        // ADR-044: nonces are now CONVERGENT — deterministic per
+        // (master, chunk_id). The GCM safety invariant is therefore
+        // "distinct chunk_ids (which carry distinct, content-unique
+        // DEKs) get distinct nonces", NOT "every seal call gets a fresh
+        // random nonce". (Identical content under the same chunk_id
+        // intentionally yields the SAME nonce — see
+        // `seal_envelope_is_convergent`.)
         let aead = Aead::new();
         let master = test_master();
-        let chunk_id = test_chunk_id();
-        let plaintext = b"same plaintext";
 
-        let env1 =
-            seal_envelope(&aead, &master, &chunk_id, plaintext).unwrap_or_else(|_| unreachable!());
-        let env2 =
-            seal_envelope(&aead, &master, &chunk_id, plaintext).unwrap_or_else(|_| unreachable!());
+        let env_a = seal_envelope(&aead, &master, &ChunkId([0x11; 32]), b"content A")
+            .unwrap_or_else(|_| unreachable!());
+        let env_b = seal_envelope(&aead, &master, &ChunkId([0x22; 32]), b"content B")
+            .unwrap_or_else(|_| unreachable!());
 
-        // Two seals of the same plaintext must produce different nonces.
-        assert_ne!(env1.nonce, env2.nonce, "nonces must differ between seals");
+        assert_ne!(
+            env_a.nonce, env_b.nonce,
+            "distinct chunk_ids must seal under distinct nonces",
+        );
     }
 
     #[test]

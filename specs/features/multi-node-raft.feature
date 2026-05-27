@@ -311,6 +311,32 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     And every follower has received the fragment
     Then S3 GET from any follower in the fresh bucket returns the same 1MB
 
+  # GH #102: on the 6-node EC-4+2 path, the 2026-05-27 GCP run showed
+  # reads failing 100% with "AEAD authentication failed" after EC
+  # decode. The 3-node cross-node read scenarios above only exercise
+  # Replication-3 (whole-envelope, no EC reassembly). This drives the
+  # real EC-4+2 cross-node read: PUT on node-1, GET on node-2 (which
+  # holds only one fragment, so it must collect + decode + decrypt
+  # across the fabric).
+  @integration @multi-node @cross-node
+  Scenario: 6-node EC-4+2 cross-node read round-trips via S3 (GH #102)
+    Given a 6-node kiseki cluster
+    When a client writes 1MB via S3 PUT to node-1
+    Then S3 GET from node-2 returns the same 1MB
+
+  # GH #102 / ADR-044 convergent-encryption guard (adversary Finding 3):
+  # concurrent writes of IDENTICAL content collide on one content-
+  # addressed chunk_id and race past the dedup-skip onto the EC fan-out.
+  # Pre-fix (random nonce) the fragments tore → AEAD fail on read; the
+  # deterministic nonce makes every seal byte-identical so reads stay
+  # consistent. S3-only, so not blocked by the native-proxy harness gap
+  # (#103).
+  @integration @multi-node @cross-node @dedup
+  Scenario: 6-node EC-4+2 concurrent identical-content writes dedup and read back (GH #102)
+    Given a 6-node kiseki cluster
+    When 4 clients concurrently PUT identical 1MB content to distinct keys
+    Then S3 GET of each key from node-2 returns the identical 1MB
+
   @integration @multi-node @cross-node @smoke
   Scenario: Read survives leader failure (D-1)
     Given a 3-node kiseki cluster
@@ -467,3 +493,11 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     Given a 3-node kiseki cluster
     When the admin creates a 6-shard namespace via admin HTTP
     Then every shard of that namespace elects a raft leader distributed across the cluster within 20s
+
+  # GH #102 (multi-shard native read AEAD-fail): not reproducible in this
+  # harness — the native proxy assumes a uniform per-node data port
+  # (`runtime.rs:2203`) but the harness binds random per-node ports, so
+  # proxied writes wedge before reads can be exercised. Pinpointing #102
+  # needs the real environment (uniform ports + real proxy); see the issue
+  # for the GCP+trace plan. A native-proxy peer-list env var would unblock
+  # a localhost multi-node repro — tracked separately.
