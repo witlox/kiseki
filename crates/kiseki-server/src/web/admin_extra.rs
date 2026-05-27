@@ -71,6 +71,16 @@ pub fn admin_extra_routes() -> Router<UiState> {
         // --- Pools tab ---
         .route("/admin/pools", get(api_pools))
         .route("/ui/fragment/pools-table", get(fragment_pools_table))
+        // --- Device / pool resize (ADR-025 StorageAdminService bridge) ---
+        .route("/admin/storage/devices", get(api_list_devices))
+        .route("/admin/storage/devices/add", post(api_add_device))
+        .route("/admin/storage/devices/remove", post(api_remove_device))
+        .route("/admin/storage/devices/evacuate", post(api_evacuate_device))
+        .route("/admin/storage/pools/rebalance", post(api_rebalance_pool))
+        .route(
+            "/admin/storage/pools/thresholds",
+            post(api_set_pool_thresholds),
+        )
         // --- Tenants tab ---
         .route("/admin/tenants/orgs", get(api_list_orgs))
         .route("/admin/tenants/orgs", post(api_create_org))
@@ -824,6 +834,331 @@ async fn fragment_topology_forwarding(State(state): State<UiState>) -> Html<Stri
 // ---------------------------------------------------------------------------
 // Pools
 // ---------------------------------------------------------------------------
+
+/// Parse a JSON body into a `Value` (empty body → empty object).
+fn parse_json_body(
+    body: &str,
+) -> Result<serde_json::Value, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    if body.trim().is_empty() {
+        return Ok(serde_json::Value::Object(serde_json::Map::new()));
+    }
+    serde_json::from_str(body).map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({ "error": format!("invalid JSON body: {e}") })),
+        )
+    })
+}
+
+/// `GET /admin/storage/devices?pool=<name>` — `StorageAdminService.ListDevices`.
+async fn api_list_devices(
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+    use kiseki_proto::v1::storage_admin_service_client::StorageAdminServiceClient;
+    let channel = match dial_local_storage_admin().await {
+        Ok(ch) => ch,
+        Err(err) => return err,
+    };
+    let mut client = StorageAdminServiceClient::new(channel);
+    let pool_name = q.get("pool").cloned().unwrap_or_default();
+    match client
+        .list_devices(kiseki_proto::v1::ListDevicesRequest { pool_name })
+        .await
+    {
+        Ok(resp) => {
+            let devices: Vec<serde_json::Value> = resp
+                .into_inner()
+                .devices
+                .into_iter()
+                .map(|d| {
+                    serde_json::json!({
+                        "device_id": d.device_id,
+                        "pool_name": d.pool_name,
+                        "device_class": d.device_class,
+                        "capacity_bytes": d.capacity_bytes,
+                        "used_bytes": d.used_bytes,
+                        "online": d.online,
+                        "evacuating": d.evacuating,
+                        "evacuation_pct": d.evacuation_pct,
+                    })
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({ "devices": devices })),
+            )
+        }
+        Err(status) => (
+            grpc_status_to_http(&status),
+            axum::Json(serde_json::json!({ "error": status.message() })),
+        ),
+    }
+}
+
+/// `POST /admin/storage/devices/add` — `StorageAdminService.AddDevice`.
+/// Body: `{"pool_name","device_id","capacity_bytes"?,"device_class"?}`.
+async fn api_add_device(body: String) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+    use kiseki_proto::v1::storage_admin_service_client::StorageAdminServiceClient;
+    let parsed = match parse_json_body(&body) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let pool_name = parsed
+        .get("pool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let device_id = parsed
+        .get("device_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if pool_name.is_empty() || device_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({ "error": "pool_name and device_id are required" })),
+        );
+    }
+    let capacity_bytes = parsed
+        .get("capacity_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let device_class = parsed
+        .get("device_class")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let channel = match dial_local_storage_admin().await {
+        Ok(ch) => ch,
+        Err(err) => return err,
+    };
+    let mut client = StorageAdminServiceClient::new(channel);
+    match client
+        .add_device(kiseki_proto::v1::AddDeviceRequest {
+            pool_name: pool_name.clone(),
+            device_id: device_id.clone(),
+            capacity_bytes,
+            device_class,
+        })
+        .await
+    {
+        Ok(resp) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "pool_name": pool_name,
+                "device_id": device_id,
+                "committed_at_log_index": resp.into_inner().committed_at_log_index,
+            })),
+        ),
+        Err(status) => (
+            grpc_status_to_http(&status),
+            axum::Json(serde_json::json!({ "error": status.message() })),
+        ),
+    }
+}
+
+/// `POST /admin/storage/devices/remove` — `StorageAdminService.RemoveDevice`.
+async fn api_remove_device(
+    body: String,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+    use kiseki_proto::v1::storage_admin_service_client::StorageAdminServiceClient;
+    let parsed = match parse_json_body(&body) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let device_id = parsed
+        .get("device_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if device_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({ "error": "device_id is required" })),
+        );
+    }
+    let channel = match dial_local_storage_admin().await {
+        Ok(ch) => ch,
+        Err(err) => return err,
+    };
+    let mut client = StorageAdminServiceClient::new(channel);
+    match client
+        .remove_device(kiseki_proto::v1::RemoveDeviceRequest {
+            device_id: device_id.clone(),
+        })
+        .await
+    {
+        Ok(resp) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "device_id": device_id,
+                "committed_at_log_index": resp.into_inner().committed_at_log_index,
+            })),
+        ),
+        Err(status) => (
+            grpc_status_to_http(&status),
+            axum::Json(serde_json::json!({ "error": status.message() })),
+        ),
+    }
+}
+
+/// `POST /admin/storage/devices/evacuate` — `StorageAdminService.EvacuateDevice`.
+async fn api_evacuate_device(
+    body: String,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+    use kiseki_proto::v1::storage_admin_service_client::StorageAdminServiceClient;
+    let parsed = match parse_json_body(&body) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let device_id = parsed
+        .get("device_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if device_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({ "error": "device_id is required" })),
+        );
+    }
+    let throughput_mb_s = parsed
+        .get("throughput_mb_s")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let channel = match dial_local_storage_admin().await {
+        Ok(ch) => ch,
+        Err(err) => return err,
+    };
+    let mut client = StorageAdminServiceClient::new(channel);
+    match client
+        .evacuate_device(kiseki_proto::v1::EvacuateDeviceRequest {
+            device_id: device_id.clone(),
+            throughput_mb_s,
+        })
+        .await
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({ "device_id": device_id, "evacuating": true })),
+        ),
+        Err(status) => (
+            grpc_status_to_http(&status),
+            axum::Json(serde_json::json!({ "error": status.message() })),
+        ),
+    }
+}
+
+/// `POST /admin/storage/pools/rebalance` — `StorageAdminService.RebalancePool`.
+async fn api_rebalance_pool(
+    body: String,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+    use kiseki_proto::v1::storage_admin_service_client::StorageAdminServiceClient;
+    let parsed = match parse_json_body(&body) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let pool_name = parsed
+        .get("pool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if pool_name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({ "error": "pool_name is required" })),
+        );
+    }
+    let throughput_mb_s = parsed
+        .get("throughput_mb_s")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let channel = match dial_local_storage_admin().await {
+        Ok(ch) => ch,
+        Err(err) => return err,
+    };
+    let mut client = StorageAdminServiceClient::new(channel);
+    match client
+        .rebalance_pool(kiseki_proto::v1::RebalancePoolRequest {
+            pool_name: pool_name.clone(),
+            throughput_mb_s,
+        })
+        .await
+    {
+        Ok(resp) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "pool_name": pool_name,
+                "rebalance_id": resp.into_inner().rebalance_id,
+            })),
+        ),
+        Err(status) => (
+            grpc_status_to_http(&status),
+            axum::Json(serde_json::json!({ "error": status.message() })),
+        ),
+    }
+}
+
+/// `POST /admin/storage/pools/thresholds` — `StorageAdminService.SetPoolThresholds`.
+async fn api_set_pool_thresholds(
+    body: String,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+    use kiseki_proto::v1::storage_admin_service_client::StorageAdminServiceClient;
+    let parsed = match parse_json_body(&body) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let pool_name = parsed
+        .get("pool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if pool_name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({ "error": "pool_name is required" })),
+        );
+    }
+    let u32f = |k: &str| -> u32 {
+        u32::try_from(
+            parsed
+                .get(k)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        )
+        .unwrap_or(0)
+    };
+    let channel = match dial_local_storage_admin().await {
+        Ok(ch) => ch,
+        Err(err) => return err,
+    };
+    let mut client = StorageAdminServiceClient::new(channel);
+    match client
+        .set_pool_thresholds(kiseki_proto::v1::SetPoolThresholdsRequest {
+            pool_name: pool_name.clone(),
+            warning_threshold_pct: u32f("warning_pct"),
+            critical_threshold_pct: u32f("critical_pct"),
+            readonly_threshold_pct: u32f("readonly_pct"),
+            target_fill_pct: u32f("target_fill_pct"),
+        })
+        .await
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({ "pool_name": pool_name, "updated": true })),
+        ),
+        Err(status) => (
+            grpc_status_to_http(&status),
+            axum::Json(serde_json::json!({ "error": status.message() })),
+        ),
+    }
+}
 
 async fn api_pools(State(state): State<UiState>) -> impl IntoResponse {
     let metrics_text = (state.metrics_encode)();

@@ -688,6 +688,39 @@ enum Command {
     },
     /// `forwarding` — proxy + stale-leader counters per node.
     Forwarding,
+    /// `device list [--pool <name>]` — ADR-025 `ListDevices`.
+    DeviceList {
+        pool: Option<String>,
+    },
+    /// `device add <id> --pool <name> [--capacity <size>] [--class <c>]`.
+    DeviceAdd {
+        device_id: String,
+        pool: String,
+        capacity: u64,
+        class: String,
+    },
+    /// `device remove <id>` — ADR-025 `RemoveDevice`.
+    DeviceRemove {
+        device_id: String,
+    },
+    /// `device evacuate <id> [--throughput <mb/s>]` — ADR-025 `EvacuateDevice`.
+    DeviceEvacuate {
+        device_id: String,
+        throughput: u64,
+    },
+    /// `pool rebalance <name> [--throughput <mb/s>]` — ADR-025 `RebalancePool`.
+    PoolRebalance {
+        pool: String,
+        throughput: u64,
+    },
+    /// `pool set-threshold <name> [--warning N] [--critical N] [--readonly N] [--target N]`.
+    PoolSetThreshold {
+        pool: String,
+        warning: u32,
+        critical: u32,
+        readonly: u32,
+        target: u32,
+    },
     /// `audit query [--tenant T] [--type X] [--limit N] [--from S] [--local-only]`
     AuditQuery {
         tenant: Option<String>,
@@ -789,6 +822,12 @@ fn print_usage() {
          \x20 status                         Cluster status summary\n\
          \x20 nodes                          Node list with health and metrics\n\
          \x20 capacity (df)                  Storage capacity, usage + dedup ratio\n\
+         \x20 device list [--pool N]         List storage devices (ADR-025)\n\
+         \x20 device add <id> --pool N [--capacity S] [--class C]\n\
+         \x20 device remove <id>             Remove a device from its pool\n\
+         \x20 device evacuate <id> [--throughput MB]  Drain a device\n\
+         \x20 pool rebalance <name> [--throughput MB]  Rebalance a pool\n\
+         \x20 pool set-threshold <name> [--warning N] [--critical N] [--readonly N]\n\
          \x20 events [--severity S] [--hours N]  Event log\n\
          \x20 history [--hours N]            Metric history time series\n\
          \x20 maintenance on|off             Toggle cluster maintenance mode\n\
@@ -926,6 +965,8 @@ fn parse_subcommand(args: &[String], start: usize) -> Result<Command, String> {
         "shards" => Ok(Command::Shards),
         "shard" => parse_shard(&args[i..]),
         "topology" => parse_topology(&args[i..]),
+        "device" => parse_device(&args[i..]),
+        "pool" => parse_pool(&args[i..]),
         "forwarding" => Ok(Command::Forwarding),
         "audit" => parse_audit(&args[i..]),
         "tenant" => parse_tenant(&args[i..]),
@@ -936,6 +977,137 @@ fn parse_subcommand(args: &[String], start: usize) -> Result<Command, String> {
         "version" | "--version" | "-V" => Ok(Command::Version),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(format!("unknown command: {other}")),
+    }
+}
+
+fn parse_device(rest: &[String]) -> Result<Command, String> {
+    let sub = rest
+        .first()
+        .map(String::as_str)
+        .ok_or("device requires a subcommand (list|add|remove|evacuate)")?;
+    match sub {
+        "list" => {
+            let mut pool = None;
+            let mut i = 1;
+            while i < rest.len() {
+                if rest[i] == "--pool" {
+                    pool = rest.get(i + 1).cloned();
+                    i += 2;
+                } else {
+                    return Err(format!("unknown device list flag: {}", rest[i]));
+                }
+            }
+            Ok(Command::DeviceList { pool })
+        }
+        "add" => {
+            let device_id = rest
+                .get(1)
+                .cloned()
+                .ok_or("device add requires <device-id>")?;
+            let mut pool = None;
+            let mut capacity = 0u64;
+            let mut class = String::new();
+            let mut i = 2;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--pool" => {
+                        pool = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--capacity" => {
+                        capacity =
+                            parse_size(rest.get(i + 1).ok_or("--capacity requires a size")?)?;
+                        i += 2;
+                    }
+                    "--class" => {
+                        class = rest.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    other => return Err(format!("unknown device add flag: {other}")),
+                }
+            }
+            let pool = pool.ok_or("device add requires --pool <name>")?;
+            Ok(Command::DeviceAdd {
+                device_id,
+                pool,
+                capacity,
+                class,
+            })
+        }
+        "remove" => {
+            let device_id = rest
+                .get(1)
+                .cloned()
+                .ok_or("device remove requires <device-id>")?;
+            Ok(Command::DeviceRemove { device_id })
+        }
+        "evacuate" => {
+            let device_id = rest
+                .get(1)
+                .cloned()
+                .ok_or("device evacuate requires <device-id>")?;
+            let mut throughput = 0u64;
+            if let Some(p) = rest.iter().position(|a| a == "--throughput") {
+                throughput = rest
+                    .get(p + 1)
+                    .ok_or("--throughput requires a value (MB/s)")?
+                    .parse()
+                    .map_err(|e| format!("--throughput: {e}"))?;
+            }
+            Ok(Command::DeviceEvacuate {
+                device_id,
+                throughput,
+            })
+        }
+        other => Err(format!("unknown device subcommand: {other}")),
+    }
+}
+
+fn parse_pool(rest: &[String]) -> Result<Command, String> {
+    let sub = rest
+        .first()
+        .map(String::as_str)
+        .ok_or("pool requires a subcommand (rebalance|set-threshold)")?;
+    match sub {
+        "rebalance" => {
+            let pool = rest
+                .get(1)
+                .cloned()
+                .ok_or("pool rebalance requires <pool-name>")?;
+            let mut throughput = 0u64;
+            if let Some(p) = rest.iter().position(|a| a == "--throughput") {
+                throughput = rest
+                    .get(p + 1)
+                    .ok_or("--throughput requires a value (MB/s)")?
+                    .parse()
+                    .map_err(|e| format!("--throughput: {e}"))?;
+            }
+            Ok(Command::PoolRebalance { pool, throughput })
+        }
+        "set-threshold" => {
+            let pool = rest
+                .get(1)
+                .cloned()
+                .ok_or("pool set-threshold requires <pool-name>")?;
+            let pct = |flag: &str| -> Result<u32, String> {
+                match rest.iter().position(|a| a == flag) {
+                    Some(p) => rest
+                        .get(p + 1)
+                        .ok_or_else(|| format!("{flag} requires a percentage"))?
+                        .parse()
+                        .map_err(|e| format!("{flag}: {e}")),
+                    None => Ok(0),
+                }
+            };
+            Ok(Command::PoolSetThreshold {
+                pool,
+                warning: pct("--warning")?,
+                critical: pct("--critical")?,
+                readonly: pct("--readonly")?,
+                target: pct("--target")?,
+            })
+        }
+        other => Err(format!("unknown pool subcommand: {other}")),
     }
 }
 
@@ -1468,6 +1640,61 @@ fn main() {
                 format_forwarding(&b)
             }
         }),
+        Command::DeviceList { pool } => {
+            let path = match pool {
+                Some(p) => format!("/admin/storage/devices?pool={p}"),
+                None => "/admin/storage/devices".to_string(),
+            };
+            http_get(&args.endpoint, &path)
+        }
+        Command::DeviceAdd {
+            device_id,
+            pool,
+            capacity,
+            class,
+        } => {
+            let body = format!(
+                "{{\"device_id\":\"{}\",\"pool_name\":\"{}\",\"capacity_bytes\":{capacity},\"device_class\":\"{}\"}}",
+                json_escape(&device_id),
+                json_escape(&pool),
+                json_escape(&class),
+            );
+            http_post(&args.endpoint, "/admin/storage/devices/add", &body)
+        }
+        Command::DeviceRemove { device_id } => {
+            let body = format!("{{\"device_id\":\"{}\"}}", json_escape(&device_id));
+            http_post(&args.endpoint, "/admin/storage/devices/remove", &body)
+        }
+        Command::DeviceEvacuate {
+            device_id,
+            throughput,
+        } => {
+            let body = format!(
+                "{{\"device_id\":\"{}\",\"throughput_mb_s\":{throughput}}}",
+                json_escape(&device_id),
+            );
+            http_post(&args.endpoint, "/admin/storage/devices/evacuate", &body)
+        }
+        Command::PoolRebalance { pool, throughput } => {
+            let body = format!(
+                "{{\"pool_name\":\"{}\",\"throughput_mb_s\":{throughput}}}",
+                json_escape(&pool),
+            );
+            http_post(&args.endpoint, "/admin/storage/pools/rebalance", &body)
+        }
+        Command::PoolSetThreshold {
+            pool,
+            warning,
+            critical,
+            readonly,
+            target,
+        } => {
+            let body = format!(
+                "{{\"pool_name\":\"{}\",\"warning_pct\":{warning},\"critical_pct\":{critical},\"readonly_pct\":{readonly},\"target_fill_pct\":{target}}}",
+                json_escape(&pool),
+            );
+            http_post(&args.endpoint, "/admin/storage/pools/thresholds", &body)
+        }
         Command::TopologyCreateNamespace {
             namespace_id,
             tenant_id,
