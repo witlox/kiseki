@@ -122,6 +122,24 @@ that node's nearest available tier (logged). The common
 
 ### D6. Per-(namespace, tier) quota accounting + enforcement
 
+> **Status amendment 2026-05-27 — DEFERRED, blocked on IAM.** Quota
+> *enforcement* depends on an authoritative request identity, which does
+> not exist yet: the deployed/default data path attributes every request
+> to the **bootstrap tenant** (`OrgId(1)`) because the SigV4 key store is
+> empty (anonymous S3), and there is **no namespace↔tenant ownership
+> authorization** on the write path. Enforcing a cap against a
+> single-bootstrap-tenant / any-client-can-write-any-namespace identity
+> is bypassable and meaningless. `SetQuota`'s scope is org/workload —
+> those identities only become real once IAM wires *authenticated
+> principal → tenant → namespace authz*. **The design below is retained,
+> reviewed (specs/findings/adr-045-quota-adversary-review.md), and ready
+> to implement once IAM↔tenant/namespace lands.** Until then, the
+> *placement* steering (§D1–D5) + *capacity observability* ship without
+> it — those don't depend on identity (they answer "where does data go"
+> and "how full is the fleet", not "who owns it / who pays"). New
+> dependency note: **§D6 is gated on the IAM milestone** (principal
+> authentication + tenant resolution + namespace-ownership authz).
+
 **Accounting.** A counter per `(namespace_id, tier)` tracks logical bytes
 stored. On write: `effective = payload_bytes × durability_multiplier(tier
 pool)` (EC-4+2 ≈ 1.5×, R-3 = 3×) — the quota is logical but the *check*

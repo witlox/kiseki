@@ -112,7 +112,22 @@ the soft-quota decision (§D6) and with how object stores enforce quotas
 (eventually, not transactionally). A *hard* cluster-wide quota would need
 a consensus round per write — explicitly rejected.
 
-## Net data-model + enforcement shape (for the implementer)
+### F-9 (Critical — gating) — Quota enforcement has no authoritative identity yet (IAM not wired)
+Enforcement keys on tenant/namespace, but the deployed data path
+attributes all requests to the bootstrap tenant (`OrgId(1)`, empty SigV4
+key store → anonymous fallback), and there is no namespace↔tenant
+ownership authz. A cap enforced against that identity is trivially
+bypassable (write to a different `namespace_id`, or be "tenant 1" like
+everyone). Per-tenant (`SetQuota` org/workload) quota is a single-tenant
+no-op until principals authenticate to distinct tenants.
+**Resolution**: **DEFER enforcement until the IAM milestone** wires
+authenticated principal → tenant → namespace authz. The accounting model
+(F-1..F-8) is sound and ready; it must not ship as *enforcement* before
+identity is authoritative, or it becomes security theater. The placement
+steering + capacity observability (identity-independent) ship now. This
+is the gating dependency for §D6.
+
+## Net data-model + enforcement shape (for the implementer, post-IAM)
 
 - Counter: `Mutex<HashMap<(NamespaceId, tier_string), u64>>` (logical
   bytes), seeded in the `chunk_map` build pass (I-TQ5), charged once on
