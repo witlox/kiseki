@@ -1107,7 +1107,10 @@ async fn api_create_org(
         id: org_id.clone(),
         name: body.name,
         compliance_tags: vec![],
-        dedup_policy: kiseki_common::tenancy::DedupPolicy::CrossTenant,
+        // ADR-044: tenant orgs default to tenant-isolated dedup (secret
+        // per-tenant HMAC chunk IDs). `CrossTenant` is reserved for
+        // explicitly non-sensitive / system data.
+        dedup_policy: kiseki_common::tenancy::DedupPolicy::TenantIsolated,
         quota: kiseki_common::tenancy::Quota {
             capacity_bytes: 0,
             iops: 0,

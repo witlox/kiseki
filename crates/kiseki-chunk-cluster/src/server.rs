@@ -628,7 +628,7 @@ impl ClusterChunkService for ClusterChunkServer {
             }
             let env = self
                 .local
-                .read_chunk(&chunk_id)
+                .read_chunk(&chunk_id, None)
                 .await
                 .map_err(|e| chunk_err_to_status(&e))?;
             Ok(Response::new(pb::GetFragmentResponse {
