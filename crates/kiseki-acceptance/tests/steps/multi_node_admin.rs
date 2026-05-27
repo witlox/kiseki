@@ -284,6 +284,168 @@ fn parse_registry_size(body: &str) -> f64 {
     0.0
 }
 
+/// GH #99: drive the multi-shard `topology namespace-create` HTTP
+/// admin endpoint against the real spawned cluster, then assert every
+/// fresh shard elects a real raft leader. Pre-fix the namespace-create
+/// handler submits the `CreateNamespace` control command (apply hook
+/// registers each shard's group on every node) but never initializes
+/// per-shard membership, so the shards sit at `leader_id=null` forever
+/// and the `then` step times out.
+#[when(regex = r"^the admin creates a (\d+)-shard namespace via admin HTTP$")]
+async fn when_admin_create_sharded_ns(w: &mut KisekiWorld, shards: u32) {
+    // Snapshot (node_id, metrics_port) without holding the borrow
+    // across awaits. `submit` is leader-only (openraft `client_write`
+    // errors on followers → HTTP 421), so try every node until one
+    // accepts the create — robust against leadership having rotated in
+    // an earlier @leader-change scenario on this singleton cluster.
+    let ports: Vec<(u64, u16)> = {
+        let g = cluster(w);
+        g.nodes().map(|n| (n.node_id, n.ports.metrics)).collect()
+    };
+    let namespace_id = uuid::Uuid::new_v4().to_string();
+    let tenant_id = uuid::Uuid::new_v4().to_string();
+    let body = serde_json::json!({
+        "namespace_id": namespace_id,
+        "tenant_id": tenant_id,
+        "shards": shards,
+    });
+    let http = reqwest::Client::new();
+
+    // `submit` is leader-only and the HTTP handler does NOT forward to
+    // the leader (unlike the gRPC SplitShard path), so we hit every
+    // node until the control-plane leader accepts. Retry on a deadline
+    // because the control-plane group's own election can still be in
+    // flight right after `Given a 3-node kiseki cluster` (that step
+    // only waits on the bootstrap *shard* leader).
+    let mut created: Option<(u16, Vec<String>)> = None;
+    let mut last_err = String::new();
+    let create_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    'outer: loop {
+        for (node_id, port) in &ports {
+            let url = format!("http://127.0.0.1:{port}/admin/topology/namespaces");
+            match http.post(&url).json(&body).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let json: serde_json::Value = resp.json().await.unwrap_or_default();
+                    if status.is_success() {
+                        let shard_ids: Vec<String> = json
+                            .get("shards")
+                            .and_then(|s| s.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|s| {
+                                        s.get("shard_id").and_then(|v| v.as_str()).map(String::from)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        assert_eq!(
+                            shard_ids.len(),
+                            shards as usize,
+                            "namespace-create returned {} shard ids, expected {shards}",
+                            shard_ids.len(),
+                        );
+                        created = Some((*port, shard_ids));
+                        break 'outer;
+                    }
+                    last_err = format!("node-{node_id} HTTP {status}: {json}");
+                }
+                Err(e) => last_err = format!("node-{node_id} POST failed: {e}"),
+            }
+        }
+        if std::time::Instant::now() >= create_deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
+    let (leader_port, shard_ids) = created.unwrap_or_else(|| {
+        panic!("namespace-create was not accepted by any node within 30s (last: {last_err})")
+    });
+
+    w.cluster
+        .name_index_state
+        .insert("ns99_leader_port".into(), leader_port.to_string());
+    w.cluster
+        .name_index_state
+        .insert("ns99_shard_ids".into(), shard_ids.join(","));
+    w.last_error = None;
+}
+
+#[then(
+    regex = r"^every shard of that namespace elects a raft leader distributed across the cluster within (\d+)s$"
+)]
+async fn then_every_shard_has_leader(w: &mut KisekiWorld, secs: u64) {
+    let port: u16 = w
+        .cluster
+        .name_index_state
+        .get("ns99_leader_port")
+        .and_then(|s| s.parse().ok())
+        .expect("namespace-create step must run first");
+    let shard_ids: Vec<String> = w
+        .cluster
+        .name_index_state
+        .get("ns99_shard_ids")
+        .map(|s| s.split(',').map(String::from).collect())
+        .expect("namespace-create step must run first");
+
+    let http = reqwest::Client::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut without_leader: Vec<String> = Vec::new();
+    // shard_id -> elected leader node id (GH #101 distribution check).
+    let mut leaders: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    loop {
+        without_leader.clear();
+        leaders.clear();
+        for shard_id in &shard_ids {
+            let url = format!("http://127.0.0.1:{port}/cluster/shards/{shard_id}/leader");
+            let leader: Option<u64> = match http.get(&url).send().await {
+                Ok(resp) => resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|j| j.get("leader_id").and_then(serde_json::Value::as_u64)),
+                Err(_) => None,
+            };
+            match leader {
+                Some(id) => {
+                    leaders.insert(shard_id.clone(), id);
+                }
+                None => without_leader.push(shard_id.clone()),
+            }
+        }
+        if without_leader.is_empty() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "GH #99: {} of {} shards never elected a raft leader within {secs}s \
+                 (leader_id stayed null): {without_leader:?}. The control-plane apply \
+                 hook registered each shard's per-shard Raft group on every node, but \
+                 the assigned leader never called initialize_membership — so the groups \
+                 sit as empty-membership learners that can never elect a leader or \
+                 accept a write.",
+                without_leader.len(),
+                shard_ids.len(),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    // GH #101: leadership must distribute across the cluster, not pile
+    // onto the control-plane leader. `compute_shard_ranges` assigns
+    // leader_node round-robin, and each assigned leader initializes its
+    // own shards, so a 6-shard namespace on a 3-node cluster should land
+    // leaders on more than one node.
+    let distinct: std::collections::HashSet<u64> = leaders.values().copied().collect();
+    assert!(
+        distinct.len() > 1,
+        "GH #101: all {} shard leaders landed on a single node {distinct:?} — per-shard \
+         leadership did not distribute across the cluster (expected the assigned \
+         leader_node round-robin to spread leaders over multiple nodes). leaders={leaders:?}",
+        shard_ids.len(),
+    );
+}
+
 #[then("the MergeShards response merged_shard_id equals the left shard id")]
 async fn then_merge_response_id_matches_left(w: &mut KisekiWorld) {
     let left = w

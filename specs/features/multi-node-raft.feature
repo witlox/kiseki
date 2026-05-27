@@ -453,3 +453,17 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     Given a 3-node kiseki cluster
     When the admin calls SplitShard for the bootstrap shard via node-1 admin gRPC
     Then every node logged the apply hook registering the new shard locally
+
+  # GH #99: `topology namespace-create` fans out the per-shard Raft
+  # groups via the control-plane apply hook, but pre-fix NO node called
+  # `initialize_membership` for them — every shard sat at
+  # `leader_id=null` / `raft_members=[]`, so all writes to the namespace
+  # 5xx'd with "leader unavailable". The @library cluster-formation
+  # scenarios only assert the shard-MAP placement metadata (the assigned
+  # `leader_node` field), never real per-shard raft leadership — which
+  # is exactly why this slipped through to the GCP perf run.
+  @integration @multi-node @shard-mgmt @cross-node @smoke
+  Scenario: Multi-shard namespace-create elects a raft leader for every shard, distributed across nodes (GH #99, #101)
+    Given a 3-node kiseki cluster
+    When the admin creates a 6-shard namespace via admin HTTP
+    Then every shard of that namespace elects a raft leader distributed across the cluster within 20s

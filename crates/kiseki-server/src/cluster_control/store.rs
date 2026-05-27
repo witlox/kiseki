@@ -138,6 +138,14 @@ pub struct ShardStoreApplyHook {
     /// registry step (no shards are committed before boot reaches
     /// the attach point in any normal flow).
     hydrator_registry: std::sync::OnceLock<Arc<kiseki_composition::HydratorRegistry>>,
+    /// Raft runtime handle. GH #101: when this node is the assigned
+    /// `leader_node` for a freshly-created shard, the apply hook
+    /// spawns `initialize_shard` for it onto this runtime so per-shard
+    /// leadership distributes across nodes (rather than the control-
+    /// plane leader leading every shard). Spawned, never inline —
+    /// inline `Raft::initialize()` inside `create_shard` deadlocks the
+    /// apply pipeline (see the struct doc above).
+    raft_runtime: tokio::runtime::Handle,
 }
 
 impl ShardStoreApplyHook {
@@ -147,13 +155,56 @@ impl ShardStoreApplyHook {
     /// needs the gateway's `CompositionStore` handle which isn't
     /// constructed until later in `runtime::run`.
     #[must_use]
-    pub fn new(raft_store: Arc<kiseki_log::RaftShardStore>, self_node_id: u64) -> Self {
+    pub fn new(
+        raft_store: Arc<kiseki_log::RaftShardStore>,
+        self_node_id: u64,
+        raft_runtime: tokio::runtime::Handle,
+    ) -> Self {
         Self {
             raft_store,
             self_node_id,
             config: kiseki_log::ShardConfig::default(),
             hydrator_registry: std::sync::OnceLock::new(),
+            raft_runtime,
         }
+    }
+
+    /// GH #101: the assigned `leader_node` initializes a fresh shard's
+    /// Raft membership so leadership distributes across nodes. Spawned
+    /// onto the Raft runtime (never inline — inline init deadlocks the
+    /// apply pipeline) with a bounded retry that absorbs the window
+    /// where peer replicas are still registering their local group.
+    /// Idempotent: a re-fired apply (snapshot install + tail catch-up)
+    /// re-spawns, but `initialize_membership` maps the already-
+    /// initialized `NotAllowed` to `Ok`.
+    fn spawn_initialize_as_leader(&self, shard_id: ShardId) {
+        let store = Arc::clone(&self.raft_store);
+        self.raft_runtime.spawn(async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                match store.initialize_shard_async(shard_id).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            shard_id = %shard_id.0,
+                            "apply hook: initialized per-shard Raft membership as assigned leader (GH #101)",
+                        );
+                        return;
+                    }
+                    Err(e) if std::time::Instant::now() < deadline => {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        let _ = e;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            shard_id = %shard_id.0,
+                            error = %e,
+                            "apply hook: initialize_shard failed after 15s — shard will not accept writes",
+                        );
+                        return;
+                    }
+                }
+            }
+        });
     }
 
     /// Attach the composition-hydrator registry to an existing
@@ -218,9 +269,22 @@ impl ApplyHook for ShardStoreApplyHook {
         _namespace_id: &str,
         tenant_id: OrgId,
         shard_id: ShardId,
-        _leader_node: NodeId,
+        leader_node: NodeId,
     ) {
         self.create_shard_idempotent(shard_id, tenant_id);
+        // GH #101: every node registers the group locally above; the
+        // assigned `leader_node` additionally initializes membership so
+        // it becomes this shard's Raft leader. Distributing the
+        // initialize call across each shard's assigned leader is what
+        // fans leadership out across the cluster — the previous
+        // centralized path (control-plane leader initializes all of a
+        // namespace's shards) left every leader on one node. `on_split`
+        // deliberately does NOT do this: `StorageAdminService::split_shard`
+        // initializes the new shard explicitly on its new leader, so
+        // adding it here would double-init the same group.
+        if leader_node.0 == self.self_node_id {
+            self.spawn_initialize_as_leader(shard_id);
+        }
     }
 
     fn on_split(

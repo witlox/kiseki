@@ -580,6 +580,33 @@ async fn api_create_sharded_namespace(
                 }
             }
 
+            // GH #99/#101: the control-plane apply hook registers each
+            // new shard's per-shard Raft group on every node, and each
+            // shard's assigned `leader_node` initializes its membership
+            // (`ShardStoreApplyHook::on_create_namespace`) so leadership
+            // distributes across nodes. That initialization is
+            // asynchronous, so before returning 201 we wait until every
+            // shard has observed a leader — otherwise a client that
+            // writes immediately after create races the per-shard
+            // election and 5xx's with "leader unavailable". `submit` is
+            // leader-only, so this node hosts a (follower) replica of
+            // every shard and `shard_health` sees each leader once the
+            // assigned leader's `AppendEntries` arrives. 30 s upper
+            // bound matches `ControlPlaneProvisioner::provision`.
+            if let Some(log) = state.log_store.as_ref() {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                for s in &shards {
+                    while std::time::Instant::now() < deadline {
+                        if let Ok(info) = log.shard_health(s.shard_id).await {
+                            if info.leader.is_some() {
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
+
             let shard_json: Vec<serde_json::Value> = shards
                 .iter()
                 .map(|s| {
