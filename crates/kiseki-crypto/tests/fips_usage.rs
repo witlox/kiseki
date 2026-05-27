@@ -78,16 +78,20 @@ fn chunk(byte: u8) -> ChunkId {
 // §NIST SP 800-38D — AES-GCM nonce uniqueness invariant
 // ===========================================================================
 
-/// NIST SP 800-38D §8.2 — "the probability that the authenticated
-/// encryption function ever will be invoked with the same IV and the
-/// same key on two (or more) distinct sets of input data shall be
-/// no greater than 2^{-32}".
+/// ADR-044 convergent encryption. NIST SP 800-38D §8.2 forbids invoking
+/// AEAD with the same `(key, IV)` on **distinct** input data. It does
+/// NOT forbid the same `(key, IV, plaintext)` yielding the same
+/// ciphertext — that is exactly what content-addressed dedup requires.
 ///
-/// In practice for kiseki: two seals with the same `(master_key,
-/// chunk_id)` MUST produce different nonces. The AEAD module uses a
-/// CSPRNG-generated nonce per call (`aws_lc_rs::rand::fill`).
+/// Kiseki derives BOTH the DEK and the nonce from the content-addressed
+/// `chunk_id` (`derive_system_dek` / `derive_convergent_nonce`), so two
+/// seals of identical content under the same `chunk_id` are
+/// **intentionally identical** (idempotent). The §8.2 invariant — no
+/// `(key, IV)` reuse across *distinct* plaintexts — is upheld because
+/// the DEK is unique per `chunk_id` (a content hash); see
+/// `fips_no_key_reuse_across_distinct_plaintexts`.
 #[test]
-fn aead_nonce_uniqueness_two_seals_same_key() {
+fn convergent_same_content_seals_identically() {
     let aead = Aead::new();
     let master = test_master();
     let chunk_id = chunk(0xbb);
@@ -96,56 +100,72 @@ fn aead_nonce_uniqueness_two_seals_same_key() {
     let env1 = seal_envelope(&aead, &master, &chunk_id, plaintext).expect("seal 1");
     let env2 = seal_envelope(&aead, &master, &chunk_id, plaintext).expect("seal 2");
 
-    assert_ne!(
+    assert_eq!(
         env1.nonce, env2.nonce,
-        "NIST SP 800-38D: two seals with same (key, plaintext) MUST produce \
-         different nonces (otherwise GCM is trivially broken)"
+        "convergent: identical content under one chunk_id MUST seal to the same nonce",
     );
-
-    // Defense in depth: two seals also produce different ciphertext
-    // bytes. (A nonce reuse with same plaintext would yield identical
-    // ciphertext — which would be observable by an attacker.)
-    assert_ne!(
+    assert_eq!(
         env1.ciphertext, env2.ciphertext,
-        "NIST SP 800-38D: same plaintext + same key MUST not produce \
-         identical ciphertext (otherwise nonce was reused)"
+        "convergent: identical content under one chunk_id MUST seal to identical ciphertext \
+         (this is the dedup-correctness property — GH #102)",
     );
 }
 
-/// Stronger statistical check: across N seals, all nonces are
-/// distinct. Birthday bound for 96-bit nonces gives a collision
-/// probability ≈ N^2 / 2^97; at N=64 this is ~2^{-85}, well below
-/// FIPS's 2^{-32} requirement.
+/// ADR-044 the FIPS §8.2 invariant that actually matters under
+/// convergent encryption: across N **distinct** plaintexts, no
+/// `(key, nonce)` pair is reused. Because each distinct content yields a
+/// distinct `chunk_id`, which yields a distinct per-chunk DEK, every
+/// distinct plaintext is sealed under its own key — so `(key, nonce)`
+/// reuse across distinct data is impossible by construction. We assert
+/// both the DEKs and the nonces are all distinct across N distinct
+/// contents.
 #[test]
-fn aead_nonce_uniqueness_many_seals() {
-    let aead = Aead::new();
-    let master = test_master();
-    let chunk_id = chunk(0xcc);
-    let plaintext = b"another identical plaintext";
+fn fips_no_key_reuse_across_distinct_plaintexts() {
+    use kiseki_crypto::derive_system_dek;
 
+    let master = test_master();
     const N: usize = 64;
+    let mut deks = Vec::with_capacity(N);
     let mut nonces = Vec::with_capacity(N);
-    for _ in 0..N {
-        let env = seal_envelope(&aead, &master, &chunk_id, plaintext).expect("seal");
+    for i in 0..N {
+        // Distinct content per iteration → distinct content-addressed
+        // chunk_id in production. Here we model that with distinct
+        // chunk_ids (the property under test is per-key uniqueness).
+        let chunk_id = chunk(u8::try_from(i).unwrap_or(0));
+        let aead = Aead::new();
+        let env = seal_envelope(&aead, &master, &chunk_id, b"distinct").expect("seal");
+        deks.push(derive_system_dek(&master, &chunk_id).expect("dek").to_vec());
         nonces.push(env.nonce);
     }
 
-    // All distinct.
-    let mut sorted = nonces.clone();
-    sorted.sort();
-    sorted.dedup();
+    let mut sorted_deks = deks.clone();
+    sorted_deks.sort();
+    sorted_deks.dedup();
     assert_eq!(
-        sorted.len(),
+        sorted_deks.len(),
         N,
-        "NIST SP 800-38D: {N} seals must produce {N} distinct nonces, got {} unique",
-        sorted.len()
+        "NIST SP 800-38D §8.2: each distinct chunk MUST seal under a distinct DEK — \
+         no key reused across distinct plaintexts (got {} unique of {N})",
+        sorted_deks.len(),
+    );
+
+    let mut sorted_nonces = nonces.clone();
+    sorted_nonces.sort();
+    sorted_nonces.dedup();
+    assert_eq!(
+        sorted_nonces.len(),
+        N,
+        "convergent nonces are distinct across distinct chunk_ids ({} unique of {N})",
+        sorted_nonces.len(),
     );
 }
 
-/// Nonce uniqueness must hold across DIFFERENT chunk IDs as well —
-/// even though distinct chunk IDs derive distinct DEKs (so reuse
-/// would be safe under those keys), the AEAD module is agnostic to
-/// the derivation chain. The uniqueness invariant is global.
+/// Distinct chunk IDs MUST seal under distinct nonces. Under ADR-044 the
+/// nonce is derived deterministically from `chunk_id`, so this holds by
+/// the HKDF's collision resistance (distinct salt → distinct output),
+/// which is also what keeps `(key, nonce)` unique across distinct
+/// plaintexts (each distinct content → distinct chunk_id → distinct DEK
+/// AND nonce).
 #[test]
 fn aead_nonce_uniqueness_across_different_chunks() {
     let aead = Aead::new();
@@ -156,7 +176,7 @@ fn aead_nonce_uniqueness_across_different_chunks() {
     let env_b = seal_envelope(&aead, &master, &chunk(0x20), plaintext).expect("seal b");
     assert_ne!(
         env_a.nonce, env_b.nonce,
-        "AES-GCM: nonces independent of chunk_id; both seals draw fresh nonces"
+        "distinct chunk_ids must derive distinct convergent nonces"
     );
 }
 

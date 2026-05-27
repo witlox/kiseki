@@ -99,15 +99,48 @@ pub struct ClusterChunkServer {
 /// to the `ClusteredChunkStore` (client side, populated by the leader's
 /// own local-write path) so reads always see consistent crypto fields
 /// regardless of which node wrote the fragment.
+///
+/// Issue #92 (deeper fix, 2026-05-19) — when constructed via
+/// [`ChunkEnvelopeRegistry::with_data_dir`] the registry persists every
+/// `record` to a fjall keyspace and falls back to disk on memory miss.
+/// Without persistence the in-memory map is lost on restart, and any
+/// EC chunk written before restart has no metadata available on read,
+/// surfacing as `ChunkError::NotFound` from `read_chunk_ec` (after the
+/// PR-1 fix; pre-fix it was a misleading "AEAD verify failed").
+///
+/// `ChunkEnvelopeRegistry::default()` keeps the in-memory-only behavior
+/// for tests and dev compose.
 #[derive(Clone, Default)]
 pub struct ChunkEnvelopeRegistry {
     inner: Arc<std::sync::Mutex<std::collections::HashMap<RustChunkId, EnvelopeMeta>>>,
+    disk: Option<Arc<PersistentEnvelopeStore>>,
 }
 
 impl ChunkEnvelopeRegistry {
+    /// Build a registry backed by both an in-memory cache and a fjall
+    /// keyspace at `data_dir.join("envelope_meta")`. The keyspace is
+    /// opened (or created) immediately so a failure surfaces during
+    /// runtime bootstrap rather than on first write.
+    ///
+    /// Existing entries on disk are NOT eager-loaded into memory; the
+    /// in-memory map starts empty and warms up on lookup. For a
+    /// freshly-started node servicing a steady-state read workload,
+    /// every chunk's metadata fetched once gets cached for subsequent
+    /// reads.
+    pub fn with_data_dir(data_dir: &std::path::Path) -> Result<Self, PersistentEnvelopeError> {
+        let store = PersistentEnvelopeStore::open(data_dir)?;
+        Ok(Self {
+            inner: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            disk: Some(Arc::new(store)),
+        })
+    }
+
     /// Insert envelope crypto for `chunk_id` if not already present.
     /// First write wins — every fragment of the same chunk carries
-    /// identical crypto, so re-recording is a no-op.
+    /// identical crypto, so re-recording is a no-op. When persistence
+    /// is enabled, also writes to disk; a disk-write failure is logged
+    /// but does NOT propagate (the in-memory cache always wins for the
+    /// current process; persistence is for restart recovery only).
     pub fn record(
         &self,
         chunk_id: RustChunkId,
@@ -117,32 +150,186 @@ impl ChunkEnvelopeRegistry {
         tenant_epoch: Option<kiseki_common::tenancy::KeyEpoch>,
         tenant_wrapped_material: Option<Vec<u8>>,
     ) {
-        let mut map = self.inner.lock().lock_or_die("server.inner");
-        map.entry(chunk_id).or_insert(EnvelopeMeta {
+        let meta = EnvelopeMeta {
             auth_tag,
             nonce,
             system_epoch,
             tenant_epoch,
             tenant_wrapped_material,
-        });
+        };
+        let inserted = {
+            let mut map = self.inner.lock().lock_or_die("server.inner");
+            match map.entry(chunk_id) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(meta.clone());
+                    true
+                }
+                std::collections::hash_map::Entry::Occupied(_) => false,
+            }
+        };
+        if inserted {
+            if let Some(disk) = &self.disk {
+                if let Err(e) = disk.put(&chunk_id, &meta) {
+                    tracing::warn!(
+                        ?chunk_id,
+                        error = %e,
+                        "envelope registry: disk write failed — entry cached in memory only",
+                    );
+                }
+            }
+        }
     }
 
-    fn lookup(&self, chunk_id: &RustChunkId) -> Option<EnvelopeMeta> {
-        self.inner
+    pub(crate) fn lookup(&self, chunk_id: &RustChunkId) -> Option<EnvelopeMeta> {
+        // Memory fast path.
+        if let Some(meta) = self
+            .inner
             .lock()
             .lock_or_die("server.inner")
             .get(chunk_id)
             .cloned()
+        {
+            return Some(meta);
+        }
+        // Disk fallback — populates the memory cache on hit so
+        // subsequent lookups don't repeat the disk read.
+        let disk = self.disk.as_ref()?;
+        match disk.get(chunk_id) {
+            Ok(Some(meta)) => {
+                self.inner
+                    .lock()
+                    .lock_or_die("server.inner")
+                    .insert(*chunk_id, meta.clone());
+                Some(meta)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    ?chunk_id,
+                    error = %e,
+                    "envelope registry: disk read failed — treating as cache miss",
+                );
+                None
+            }
+        }
     }
 }
 
-#[derive(Clone)]
+impl EnvelopeMeta {
+    pub(crate) fn auth_tag(&self) -> [u8; 16] {
+        self.auth_tag
+    }
+    pub(crate) fn nonce(&self) -> [u8; 12] {
+        self.nonce
+    }
+    pub(crate) fn system_epoch(&self) -> kiseki_common::tenancy::KeyEpoch {
+        self.system_epoch
+    }
+    pub(crate) fn tenant_epoch(&self) -> Option<kiseki_common::tenancy::KeyEpoch> {
+        self.tenant_epoch
+    }
+    pub(crate) fn tenant_wrapped_material(&self) -> Option<Vec<u8>> {
+        self.tenant_wrapped_material.clone()
+    }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct EnvelopeMeta {
     auth_tag: [u8; 16],
     nonce: [u8; 12],
     system_epoch: kiseki_common::tenancy::KeyEpoch,
     tenant_epoch: Option<kiseki_common::tenancy::KeyEpoch>,
     tenant_wrapped_material: Option<Vec<u8>>,
+}
+
+/// Persistent backing store for [`ChunkEnvelopeRegistry`] (issue #92,
+/// 2026-05-19 deeper fix). One fjall database per node, opened at
+/// `<data_dir>/envelope_meta`. Entries are tiny (~60 B fixed +
+/// optional tenant-wrapped material); even at 1 B chunks per node
+/// (cluster-wide ~67 PB at the 64 MiB chunk cap) the metadata
+/// footprint is ~60 GB — fine on the per-node SSD.
+///
+/// Keys: 32-byte chunk ID raw bytes. Values: postcard-serialized
+/// `EnvelopeMeta`.
+pub struct PersistentEnvelopeStore {
+    // `_db` is kept alive (drops would tear down the keyspace).
+    _db: fjall::Database,
+    keyspace: fjall::Keyspace,
+}
+
+/// Errors from the persistent envelope store.
+#[derive(Debug, thiserror::Error)]
+pub enum PersistentEnvelopeError {
+    /// Opening / creating the underlying fjall database or keyspace
+    /// failed. Surfaces when the data-dir is not writable, the
+    /// database is locked by another process, or the on-disk format
+    /// is incompatible.
+    #[error("envelope store: open failed: {0}")]
+    Open(#[source] fjall::Error),
+    /// `postcard` failed to serialize an `EnvelopeMeta`. Indicates a
+    /// programmer bug — the struct's wire format is fixed-shape so
+    /// encoding should never fail at runtime.
+    #[error("envelope store: encode failed: {0}")]
+    Encode(#[source] postcard::Error),
+    /// `postcard` failed to deserialize an on-disk `EnvelopeMeta`.
+    /// Surfaces on cross-version schema mismatch or on-disk corruption.
+    #[error("envelope store: decode failed: {0}")]
+    Decode(#[source] postcard::Error),
+    /// fjall read/write returned an I/O error.
+    #[error("envelope store: io failed: {0}")]
+    Io(#[source] fjall::Error),
+}
+
+impl PersistentEnvelopeStore {
+    /// Open or create the persistent envelope store at
+    /// `data_dir.join("envelope_meta")`. Idempotent across server
+    /// restarts; the first open creates the database, subsequent
+    /// opens reuse it.
+    pub fn open(data_dir: &std::path::Path) -> Result<Self, PersistentEnvelopeError> {
+        let path = data_dir.join("envelope_meta");
+        std::fs::create_dir_all(&path)
+            .map_err(|e| PersistentEnvelopeError::Open(fjall::Error::from(e)))?;
+        let db = fjall::Database::builder(path)
+            .open()
+            .map_err(PersistentEnvelopeError::Open)?;
+        let keyspace = db
+            .keyspace("envelopes", fjall::KeyspaceCreateOptions::default)
+            .map_err(PersistentEnvelopeError::Open)?;
+        Ok(Self { _db: db, keyspace })
+    }
+
+    fn put(
+        &self,
+        chunk_id: &RustChunkId,
+        meta: &EnvelopeMeta,
+    ) -> Result<(), PersistentEnvelopeError> {
+        let bytes = postcard::to_allocvec(meta).map_err(PersistentEnvelopeError::Encode)?;
+        self.keyspace
+            .insert(chunk_id.0.as_slice(), bytes.as_slice())
+            .map_err(PersistentEnvelopeError::Io)?;
+        // Best-effort durability — fjall buffers writes; the WAL
+        // flushes asynchronously. A hard sync on every record would
+        // crater fragment-write throughput. Restart loses at most
+        // the in-flight WAL window's worth of metadata; fragments
+        // written within that window will surface as ChunkNotFound
+        // post-restart (operator can re-write or trigger a scrub).
+        Ok(())
+    }
+
+    fn get(&self, chunk_id: &RustChunkId) -> Result<Option<EnvelopeMeta>, PersistentEnvelopeError> {
+        match self
+            .keyspace
+            .get(chunk_id.0.as_slice())
+            .map_err(PersistentEnvelopeError::Io)?
+        {
+            None => Ok(None),
+            Some(bytes) => {
+                let meta: EnvelopeMeta = postcard::from_bytes(bytes.as_ref())
+                    .map_err(PersistentEnvelopeError::Decode)?;
+                Ok(Some(meta))
+            }
+        }
+    }
 }
 
 impl ClusterChunkServer {
@@ -684,6 +871,80 @@ mod tests {
     use kiseki_crypto::envelope::Envelope;
 
     use super::*;
+
+    /// Issue #92 deeper fix: envelope metadata recorded on one process
+    /// generation must be readable by the next, simulating server
+    /// restart. The first `with_data_dir` opens the store and records;
+    /// dropping the registry closes fjall; a second `with_data_dir`
+    /// re-opens against the same dir and lookup MUST find the entry
+    /// even though the in-memory cache starts empty (cold-start path).
+    #[test]
+    fn envelope_registry_round_trips_across_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let chunk_id = ChunkId([0xAB; 32]);
+        let auth_tag = [0x11u8; 16];
+        let nonce = [0x22u8; 12];
+        let system_epoch = KeyEpoch(7);
+        let tenant_epoch = Some(KeyEpoch(3));
+        let tenant_wrapped = Some(vec![0xCC, 0xDD, 0xEE, 0xFF]);
+
+        // Process generation 1: record + drop.
+        {
+            let reg = ChunkEnvelopeRegistry::with_data_dir(dir.path()).expect("open");
+            reg.record(
+                chunk_id,
+                auth_tag,
+                nonce,
+                system_epoch,
+                tenant_epoch,
+                tenant_wrapped.clone(),
+            );
+            // Sanity: same-process lookup hits the in-memory cache.
+            let m = reg.lookup(&chunk_id).expect("hot lookup");
+            assert_eq!(m.auth_tag(), auth_tag);
+        } // reg dropped here, _db drop closes fjall
+
+        // Process generation 2: open fresh, lookup must hit disk.
+        let reg = ChunkEnvelopeRegistry::with_data_dir(dir.path()).expect("reopen");
+        // Cache is empty at this point — only disk has the entry.
+        let m = reg
+            .lookup(&chunk_id)
+            .expect("post-restart lookup must find the persisted entry");
+        assert_eq!(m.auth_tag(), auth_tag, "auth_tag round-trips");
+        assert_eq!(m.nonce(), nonce, "nonce round-trips");
+        assert_eq!(m.system_epoch(), system_epoch, "system_epoch round-trips");
+        assert_eq!(m.tenant_epoch(), tenant_epoch, "tenant_epoch round-trips");
+        assert_eq!(
+            m.tenant_wrapped_material(),
+            tenant_wrapped,
+            "tenant_wrapped_material round-trips",
+        );
+
+        // Second lookup is a cache hit (no disk read); verify the
+        // entry is identical.
+        let m2 = reg.lookup(&chunk_id).expect("cached lookup");
+        assert_eq!(m2.auth_tag(), auth_tag);
+    }
+
+    #[test]
+    fn envelope_registry_in_memory_default_works_unchanged() {
+        // The in-memory-only construction path (tests, single-node
+        // compose) must keep working. No data_dir, no disk fallback,
+        // pure in-memory semantics.
+        let reg = ChunkEnvelopeRegistry::default();
+        let chunk_id = ChunkId([0xFE; 32]);
+        reg.record(chunk_id, [0; 16], [0; 12], KeyEpoch(1), None, None);
+        assert!(reg.lookup(&chunk_id).is_some());
+
+        // Cold start (drop and rebuild) — in-memory has no persistence,
+        // so the entry is gone.
+        drop(reg);
+        let reg = ChunkEnvelopeRegistry::default();
+        assert!(
+            reg.lookup(&chunk_id).is_none(),
+            "in-memory registry MUST NOT pretend to persist",
+        );
+    }
 
     fn local_bridge(pool: &str) -> Arc<dyn AsyncChunkOps> {
         let mut store = ChunkStore::new();

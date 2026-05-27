@@ -146,8 +146,9 @@ pub struct CompositionHydrator {
     /// polls don't pay a backend read for the meta key. Refreshed on
     /// apply.
     last_applied_cache: SequenceNumber,
-    /// Cache of the durable (node-global) halt flag so a halted
-    /// hydrator skips the poll without acquiring the storage lock.
+    /// Cache of the durable per-shard halt flag (I-CP5b) for
+    /// `self.shard_id`, so a halted hydrator skips the poll without
+    /// acquiring the storage lock. Was node-global pre-PR-2 of #87.
     halted_cache: bool,
     transient_retry_threshold: u32,
     /// §D10 metrics surface. Optional so unit tests get no-op behavior.
@@ -167,7 +168,9 @@ impl CompositionHydrator {
         let (last_applied_cache, halted_cache) = compositions.with_storage_locked(|s| {
             (
                 s.last_applied_seq(shard_id).unwrap_or(SequenceNumber(0)),
-                s.halted().unwrap_or(false),
+                // Per-shard halt read (I-CP5b, issue #87 PR-2). Was a
+                // node-global flag before the amendment.
+                s.halted(shard_id).unwrap_or(false),
             )
         });
         Self {
@@ -255,22 +258,35 @@ impl CompositionHydrator {
             }
         };
 
-        // §D6.3 gap detection — without `LogOps::earliest_visible_seq`
-        // the rule is: non-empty + first.seq > last+1 means compaction
-        // ate the deltas in between; or empty + tip > last means same.
+        // §D6.3 gap detection (amended for issue #87, 2026-05-19).
+        // Halt only on *positive* evidence of compaction:
+        //   - non-empty response whose first delta's seq > expected
+        //     (we see a delta at S without S-1; S-1 was GC'd), or
+        //   - empty response AND `earliest_visible_seq > from`
+        //     (the log itself reports its lowest visible seq is past
+        //     our expected next).
+        // The pre-amendment rule "empty + tip > last_applied" fired
+        // on benign states (snapshot install, fresh shards on busy
+        // nodes, append-vs-read races) and turned a per-shard
+        // transient into a cluster-wide read 503 via the node-global
+        // halt flag.
         if let Some(first) = deltas.first() {
             if first.header.sequence.0 > from.0 {
                 return self.enter_halt_mode(shard_id, from.0, first.header.sequence.0);
             }
         } else {
-            // Empty: check shard tip via shard_health.
-            if let Ok(info) = log.shard_health(shard_id).await {
-                if info.tip.0 > self.last_applied_cache.0 {
-                    return self.enter_halt_mode(shard_id, from.0, info.tip.0 + 1);
+            // Empty response: only halt if the log actively confirms
+            // a compaction-gap via earliest_visible_seq. `tip` alone
+            // is not sufficient — see test
+            // `hydrator_does_not_halt_on_advanced_tip_without_compaction_evidence`.
+            if let Ok(earliest) = log.earliest_visible_seq(shard_id).await {
+                if earliest.0 > from.0 {
+                    return self.enter_halt_mode(shard_id, from.0, earliest.0);
                 }
             }
-            // Transient `shard_health` failure or genuine no-new-deltas:
-            // both are fine. Sleep until the next poll.
+            // Either `earliest_visible_seq` failed (transient log
+            // error) or the log says nothing has been GC'd past us.
+            // Both are non-halt states; retry on the next poll.
             return 0;
         }
 
@@ -963,6 +979,11 @@ mod tests {
     struct GapInjectingLog {
         deltas: std::sync::Mutex<Vec<Delta>>,
         tip: kiseki_common::ids::SequenceNumber,
+        /// Lowest sequence still in the log's view, after any GC.
+        /// `SequenceNumber(0)` means "no compaction has occurred" —
+        /// fresh shard or all-deltas-still-present states. Issue #87
+        /// rule: halt only fires when this is > `last_applied + 1`.
+        earliest_visible: kiseki_common::ids::SequenceNumber,
         shard_id: ShardId,
         tenant_id: OrgId,
     }
@@ -1013,6 +1034,12 @@ mod tests {
                 range_start: [0u8; 32],
                 range_end: [0xFFu8; 32],
             })
+        }
+        async fn earliest_visible_seq(
+            &self,
+            _shard_id: ShardId,
+        ) -> Result<kiseki_common::ids::SequenceNumber, kiseki_log::error::LogError> {
+            Ok(self.earliest_visible)
         }
         async fn set_maintenance(
             &self,
@@ -1117,6 +1144,12 @@ mod tests {
                 encode_composition_create_payload(comp_id, ns_id, 1024),
             )]),
             tip: kiseki_common::ids::SequenceNumber(10),
+            // The visible delta starts at seq=10, so the log has GC'd
+            // 1..9. earliest_visible matches what an honest log
+            // backend would return — used here just for symmetry; the
+            // halt fires off the non-empty-with-skip branch in this
+            // scenario, not the empty-with-earliest-visible branch.
+            earliest_visible: kiseki_common::ids::SequenceNumber(10),
             shard_id: ShardId(uuid::Uuid::from_u128(1)),
             tenant_id: OrgId(uuid::Uuid::from_u128(1)),
         };
@@ -1129,21 +1162,33 @@ mod tests {
         assert_eq!(applied, 0, "halt mode must not apply anything");
         assert!(hydrator.halted(), "hydrator must enter halt mode");
 
-        // Halt is durable — re-reading the storage's flag confirms
-        // it persisted (I-CP5).
-        assert!(store.with_storage_locked(|s| s.halted().unwrap()));
+        // Halt is durable — re-reading the storage's per-shard flag
+        // confirms it persisted (I-CP5 / I-CP5b).
+        assert!(store.with_storage_locked(|s| s.halted(ShardId(uuid::Uuid::from_u128(1))).unwrap()));
     }
 
+    /// Issue #87 (2026-05-19): the pre-amendment §D6.3 said "empty +
+    /// `tip > last_applied` is a gap → halt." That predicate fires
+    /// on benign states (snapshot install replaces deltas Vec while
+    /// keeping tip, fresh-shard provisioning where sibling shards
+    /// have appended deltas, race between `append_delta_inner`'s
+    /// `tip++` and `deltas.push`). The corrected rule needs
+    /// *positive* evidence that earlier sequences were GC'd —
+    /// `earliest_visible_seq > last_applied + 1`. When the log
+    /// reports `earliest_visible_seq == 0` (no GC, fresh shard),
+    /// the hydrator MUST stay healthy regardless of how high `tip`
+    /// has climbed.
     #[tokio::test]
-    async fn hydrator_halts_when_empty_response_but_tip_advanced() {
-        // §D6.3 second case: read_deltas returns empty AND
-        // shard_health.tip > last_applied → compaction has eaten
-        // everything in [last_applied+1, tip]. Same halt path.
+    async fn hydrator_does_not_halt_on_advanced_tip_without_compaction_evidence() {
         let store = fresh_store_with_default_ns();
 
         let log = GapInjectingLog {
-            deltas: std::sync::Mutex::new(Vec::new()), // nothing visible
-            tip: kiseki_common::ids::SequenceNumber(50), // but tip says 50
+            deltas: std::sync::Mutex::new(Vec::new()), // hydrator's view sees no deltas
+            tip: kiseki_common::ids::SequenceNumber(50), // tip says 50
+            // Critical: log reports no GC has happened. This is the
+            // snapshot-install / fresh-shard / append-race shape that
+            // tripped the pre-amendment predicate in production.
+            earliest_visible: kiseki_common::ids::SequenceNumber(0),
             shard_id: ShardId(uuid::Uuid::from_u128(1)),
             tenant_id: OrgId(uuid::Uuid::from_u128(1)),
         };
@@ -1152,7 +1197,87 @@ mod tests {
             CompositionHydrator::new(Arc::clone(&store), ShardId(uuid::Uuid::from_u128(1)));
         let applied = hydrator.poll(&log).await;
         assert_eq!(applied, 0);
-        assert!(hydrator.halted(), "empty + advanced tip must halt");
+        assert!(
+            !hydrator.halted(),
+            "empty deltas + advanced tip + no compaction evidence MUST NOT halt (issue #87)",
+        );
+        assert!(
+            !store.with_storage_locked(|s| s.halted(ShardId(uuid::Uuid::from_u128(1))).unwrap()),
+            "halt flag MUST NOT have been persisted (issue #87)",
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrator_halts_when_empty_response_and_earliest_visible_past_us() {
+        // Genuine compaction-gap signal: read_deltas returns empty
+        // AND the log's earliest_visible_seq is already past our
+        // expected next — i.e., the log itself reports that the
+        // entries we wanted have been GC'd. This is the corrected
+        // empty-branch halt condition (ADR-040 §D6.3 amended).
+        let store = fresh_store_with_default_ns();
+
+        let log = GapInjectingLog {
+            deltas: std::sync::Mutex::new(Vec::new()),
+            tip: kiseki_common::ids::SequenceNumber(50),
+            // Log says: lowest seq still visible is 30. Hydrator
+            // wanted to read from last_applied+1=1. 30 > 1 → gap.
+            earliest_visible: kiseki_common::ids::SequenceNumber(30),
+            shard_id: ShardId(uuid::Uuid::from_u128(1)),
+            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
+        };
+
+        let mut hydrator =
+            CompositionHydrator::new(Arc::clone(&store), ShardId(uuid::Uuid::from_u128(1)));
+        let applied = hydrator.poll(&log).await;
+        assert_eq!(applied, 0);
+        assert!(
+            hydrator.halted(),
+            "empty + earliest_visible past us is genuine compaction-gap, must halt",
+        );
+    }
+
+    /// Issue #87 PR-2 (I-CP5b): per-shard halt scope. One shard's
+    /// hydrator tripping its compaction-gap MUST NOT propagate the
+    /// halt state to other shards sharing the same `CompositionStore`
+    /// on the same node. Pre-PR-2 the `halted` field was a single
+    /// node-global bool; a single per-shard trip 503'd every read on
+    /// the node.
+    #[tokio::test]
+    async fn shard_halt_does_not_propagate_to_other_shards_on_same_store() {
+        let store = fresh_store_with_default_ns();
+        let shard_a = ShardId(uuid::Uuid::from_u128(1));
+        let shard_b = ShardId(uuid::Uuid::from_u128(2));
+
+        // Trip the halt on shard_a via a genuine compaction-gap.
+        let log_a = GapInjectingLog {
+            deltas: std::sync::Mutex::new(Vec::new()),
+            tip: kiseki_common::ids::SequenceNumber(50),
+            earliest_visible: kiseki_common::ids::SequenceNumber(30),
+            shard_id: shard_a,
+            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
+        };
+        let mut hydrator_a = CompositionHydrator::new(Arc::clone(&store), shard_a);
+        hydrator_a.poll(&log_a).await;
+        assert!(hydrator_a.halted(), "precondition: shard_a halted");
+        assert!(
+            store.with_storage_locked(|s| s.halted(shard_a).unwrap()),
+            "precondition: shard_a halt persisted",
+        );
+
+        // The blast radius assertion: shard_b is unrelated to
+        // shard_a's failure and MUST NOT inherit the halt flag.
+        assert!(
+            !store.with_storage_locked(|s| s.halted(shard_b).unwrap()),
+            "halt on shard_a MUST NOT propagate to shard_b (I-CP5b, issue #87 PR-2)",
+        );
+
+        // And a fresh hydrator for shard_b must observe halted=false
+        // at boot.
+        let hydrator_b = CompositionHydrator::new(Arc::clone(&store), shard_b);
+        assert!(
+            !hydrator_b.halted(),
+            "fresh hydrator on unrelated shard_b MUST boot un-halted (I-CP5b)",
+        );
     }
 
     #[tokio::test]
@@ -1180,6 +1305,7 @@ mod tests {
         let log = GapInjectingLog {
             deltas: std::sync::Mutex::new(Vec::new()),
             tip: kiseki_common::ids::SequenceNumber(5), // we're at tip already
+            earliest_visible: kiseki_common::ids::SequenceNumber(0),
             shard_id: ShardId(uuid::Uuid::from_u128(1)),
             tenant_id: OrgId(uuid::Uuid::from_u128(1)),
         };

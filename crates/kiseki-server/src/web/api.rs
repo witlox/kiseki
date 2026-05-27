@@ -671,11 +671,12 @@ async fn shard_leader(
             axum::Json(serde_json::json!({"error": "log store not initialized"})),
         );
     };
-    // ADR-040 §D6.3 / Phase 17 I-2: surface the composition hydrator's
-    // halt flag so load balancers and clients can route around a node
-    // whose composition state can no longer catch up to the cluster.
+    // ADR-040 §D6.3 / Phase 17 I-2 (amended I-CP5b, issue #87 PR-2):
+    // surface the composition hydrator's per-shard halt flag so load
+    // balancers and clients can route around a halt on this specific
+    // shard without taking the whole node out of rotation.
     let composition_halted = if let Some(ref comps) = state.compositions {
-        comps.with_storage_locked(|s| s.halted().unwrap_or(false))
+        comps.with_storage_locked(|s| s.halted(shard_id).unwrap_or(false))
     } else {
         false
     };

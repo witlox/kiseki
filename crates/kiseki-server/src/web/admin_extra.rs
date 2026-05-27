@@ -517,6 +517,96 @@ async fn api_create_sharded_namespace(
                 }
                 _ => shard_count,
             };
+
+            // Issue #93: the control-plane submit creates per-shard
+            // Raft groups + populates the NamespaceShardMap (via the
+            // apply hooks), but does NOT register the namespace in
+            // the gateway's composition store or emit a
+            // NamespaceCreate delta. Without these two steps, any
+            // gateway write that addresses the namespace by ID (the
+            // native protocol path, FUSE/NFS writes, anything that
+            // bypasses the S3 `ensure_namespace_exists` fallback)
+            // returns "namespace not found".
+            //
+            // Mirror the steps the S3 first-touch path takes in
+            // `mem_gateway::ensure_namespace_exists`:
+            //   1. Add the namespace to the local composition store
+            //      (idempotent — skip if already present).
+            //   2. Emit a `NamespaceCreate` delta on the bootstrap
+            //      shard so followers' hydrators register the
+            //      namespace on their composition stores.
+            //
+            // namespace_id at this layer is a String; the composition
+            // store is keyed by `NamespaceId(Uuid)`. The CLI + bench
+            // pass UUID strings; legacy non-UUID names just skip this
+            // step (the older behavior — admin RPC stays usable for
+            // non-UUID namespace identifiers without surfacing 5xx).
+            if let (Some(comps), Some(log)) =
+                (state.compositions.as_ref(), state.log_store.as_ref())
+            {
+                if let Ok(ns_uuid) = uuid::Uuid::parse_str(&namespace_id) {
+                    let ns_id = kiseki_common::ids::NamespaceId(ns_uuid);
+                    if comps.namespace(ns_id).is_none() {
+                        let shard_id = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
+                        let ns = kiseki_composition::namespace::Namespace {
+                            id: ns_id,
+                            tenant_id,
+                            shard_id,
+                            read_only: false,
+                            versioning_enabled: false,
+                            compliance_tags: Vec::new(),
+                        };
+                        comps.add_namespace(ns.clone());
+                        if let Err(e) = kiseki_composition::log_bridge::emit_namespace_create(
+                            log.as_ref(),
+                            shard_id,
+                            tenant_id,
+                            &ns,
+                        )
+                        .await
+                        {
+                            // Roll back the local add — without
+                            // follower visibility this would be a
+                            // stealth single-node namespace. Same
+                            // contract as `ensure_namespace_exists`.
+                            comps.remove_namespace(ns_id);
+                            tracing::warn!(
+                                namespace_id = %ns_uuid,
+                                error = %e,
+                                "admin namespace-create: NamespaceCreate delta emit failed — rolled back",
+                            );
+                        }
+                    }
+                }
+            }
+
+            // GH #99/#101: the control-plane apply hook registers each
+            // new shard's per-shard Raft group on every node, and each
+            // shard's assigned `leader_node` initializes its membership
+            // (`ShardStoreApplyHook::on_create_namespace`) so leadership
+            // distributes across nodes. That initialization is
+            // asynchronous, so before returning 201 we wait until every
+            // shard has observed a leader — otherwise a client that
+            // writes immediately after create races the per-shard
+            // election and 5xx's with "leader unavailable". `submit` is
+            // leader-only, so this node hosts a (follower) replica of
+            // every shard and `shard_health` sees each leader once the
+            // assigned leader's `AppendEntries` arrives. 30 s upper
+            // bound matches `ControlPlaneProvisioner::provision`.
+            if let Some(log) = state.log_store.as_ref() {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                for s in &shards {
+                    while std::time::Instant::now() < deadline {
+                        if let Ok(info) = log.shard_health(s.shard_id).await {
+                            if info.leader.is_some() {
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
+
             let shard_json: Vec<serde_json::Value> = shards
                 .iter()
                 .map(|s| {
@@ -587,7 +677,7 @@ async fn api_topology_forwarding(State(state): State<UiState>) -> impl IntoRespo
     let proxy_fallback = std::env::var("KISEKI_NATIVE_PROXY_FALLBACK")
         .ok()
         .map(|v| matches!(v.as_str(), "on" | "1" | "true" | "yes"))
-        .unwrap_or(false);
+        .unwrap_or(true);
 
     axum::Json(serde_json::json!({
         "node_id": state.node_info.node_id,
@@ -646,7 +736,7 @@ async fn fragment_topology_forwarding(State(state): State<UiState>) -> Html<Stri
     let proxy_fallback = std::env::var("KISEKI_NATIVE_PROXY_FALLBACK")
         .ok()
         .map(|v| matches!(v.as_str(), "on" | "1" | "true" | "yes"))
-        .unwrap_or(false);
+        .unwrap_or(true);
 
     let mut html = String::new();
     let _ = write!(

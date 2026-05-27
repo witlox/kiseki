@@ -180,12 +180,40 @@ pub trait CompositionStorage: Send + Sync {
         shard_id: ShardId,
     ) -> Result<Option<(SequenceNumber, u32)>, PersistentStoreError>;
 
-    /// Halt-mode flag. When `true`, the gateway returns 503 for
-    /// composition-not-found lookups instead of 404 (I-2). Any
-    /// shard's hydrator can set this when §D6.3's gap-detection
-    /// rule fires; reads on this node fail safe until operator
-    /// intervention.
-    fn halted(&self) -> Result<bool, PersistentStoreError>;
+    /// Halt-mode flag, **per-shard** (I-CP5b, amended 2026-05-19 for
+    /// issue #87 PR-2). When `true` for a given shard, the gateway
+    /// returns 503 for composition lookups whose `composition_id` maps
+    /// to that shard, instead of 404. Halts on other shards are
+    /// independent — reads of unrelated shards' compositions
+    /// continue normally. The hydrator sets it for one shard when
+    /// §D6.3's gap-detection rule fires on that shard.
+    ///
+    /// Before PR-2 this was a single node-global bool. Production
+    /// incident 2026-05-19 (issue #87) demonstrated that the
+    /// node-wide blast amplified a per-shard transient into a
+    /// cluster-wide read 503; per-shard scoping bounds the
+    /// blast-radius to the actually-affected shard.
+    fn halted(&self, shard_id: ShardId) -> Result<bool, PersistentStoreError>;
+
+    /// True iff any shard on this node is currently halted.
+    ///
+    /// Used by the gateway's read-path 503 short-circuit, which fires
+    /// only on lookup-miss (`guard.get(composition_id)` returned
+    /// `NotFound`). At that point the gateway doesn't know which shard
+    /// the missing composition belongs to — composition records are
+    /// keyed by `CompositionId` (a `UUIDv4`, not derived from a routable
+    /// key) and don't carry a `shard_id` field. Per-composition shard
+    /// resolution would require a data-model change (adding `shard_id`
+    /// to `Composition`, snapshot-format bump, migration) whose cost
+    /// exceeds the residual blast-radius savings now that the trip
+    /// predicate (I-CP5) requires positive compaction evidence.
+    ///
+    /// New code that has `shard_id` in scope (the hydrator, the
+    /// per-shard `/cluster/shards/{id}/leader` health endpoint) should
+    /// use the shard-scoped [`halted`] accessor directly. `halted_any`
+    /// is intentionally the gateway's coarse signal; the per-shard
+    /// storage layout (I-CP5b) still bounds the durable halt state.
+    fn halted_any(&self) -> Result<bool, PersistentStoreError>;
 
     /// Apply a hydrator batch atomically. The persistent backend
     /// commits all inserts + removes + meta updates in a single
@@ -288,9 +316,9 @@ pub struct MemoryStorage {
     last_applied_seq: parking_lot::Mutex<HashMap<ShardId, SequenceNumber>>,
     /// Per-shard stuck-delta retry counter.
     stuck_state: parking_lot::Mutex<HashMap<ShardId, Option<(SequenceNumber, u32)>>>,
-    /// Halt flag is node-global: any shard's hydrator halting takes
-    /// the node's read path to 503 fail-safe.
-    halted: parking_lot::Mutex<bool>,
+    /// Halt flag is **per-shard** (I-CP5b, issue #87 PR-2). A shard
+    /// not present in the map is treated as not-halted.
+    halted: parking_lot::Mutex<HashMap<ShardId, bool>>,
 }
 
 impl std::fmt::Debug for MemoryStorage {
@@ -312,7 +340,7 @@ impl MemoryStorage {
             names_reverse: parking_lot::Mutex::new(HashMap::new()),
             last_applied_seq: parking_lot::Mutex::new(HashMap::new()),
             stuck_state: parking_lot::Mutex::new(HashMap::new()),
-            halted: parking_lot::Mutex::new(false),
+            halted: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -449,8 +477,12 @@ impl CompositionStorage for MemoryStorage {
             .unwrap_or(None))
     }
 
-    fn halted(&self) -> Result<bool, PersistentStoreError> {
-        Ok(*self.halted.lock())
+    fn halted(&self, shard_id: ShardId) -> Result<bool, PersistentStoreError> {
+        Ok(self.halted.lock().get(&shard_id).copied().unwrap_or(false))
+    }
+
+    fn halted_any(&self) -> Result<bool, PersistentStoreError> {
+        Ok(self.halted.lock().values().any(|&v| v))
     }
 
     fn apply_hydration_batch(&self, batch: HydrationBatch) -> Result<(), PersistentStoreError> {
@@ -498,7 +530,7 @@ impl CompositionStorage for MemoryStorage {
             self.stuck_state.lock().insert(batch.shard_id, stuck);
         }
         if let Some(halted) = batch.halted {
-            *self.halted.lock() = halted;
+            self.halted.lock().insert(batch.shard_id, halted);
         }
         Ok(())
     }
