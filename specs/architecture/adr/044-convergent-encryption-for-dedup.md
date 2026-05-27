@@ -51,7 +51,9 @@ registry crypto are byte-identical regardless of which write "wins," so the EC
 reassembly can never tear.
 
 `Aead` gains `seal_with_nonce(key, nonce, plaintext, aad)`; `seal` (random nonce)
-is retained for the one non-content-addressed caller, `wrap_for_tenant`. The
+is retained for the non-content-addressed callers — `wrap_for_tenant` and the
+key-manager at-rest store (`kiseki-keymanager`), neither of which is
+content-addressed or deduplicated, so a random nonce is correct there. The
 nonce is still stored in the envelope and `open` still reads it from there — so
 an envelope sealed with a random nonce would still decrypt (a free property of
 the stored-nonce design, not a backward-compat constraint we engineered for —
@@ -84,10 +86,20 @@ plaintexts.
   - Tenant data **MUST** use `DedupPolicy::TenantIsolated`
     (`chunk_id = HMAC(tenant_hmac_key, plaintext)`), which confines confirmation
     **within a single tenant** — an attacker must already hold that tenant's HMAC
-    key. The gateway is wired with `tenant_hmac_key` for this reason.
+    key.
   - `DedupPolicy::CrossTenant` (no tenant key) enables cross-tenant dedup and a
     cross-tenant confirmation oracle; it is **reserved for non-sensitive / system
     data only** and must never be selected for tenant payloads.
+  - **Current wiring gap (pre-GA, tracked):** the gateway DEFAULTS to
+    `DedupPolicy::CrossTenant` with no `tenant_hmac_key`
+    (`MemGateway` constructor); `TenantIsolated` is available via
+    `with_dedup_policy(policy, hmac_key)` but the production server
+    (`kiseki-server`) does not yet select it. This is acceptable **only**
+    while there is no durable tenant data (pre-production). Before GA — and
+    before any tenant payload is stored — the production wiring MUST default
+    to `TenantIsolated` with a per-tenant HMAC key source. Until then the
+    cross-tenant confirmation oracle above is open. Changing the default is a
+    crypto-posture change and requires adversary review.
 - **Nonce secrecy is irrelevant** — GCM nonces are public (stored in the
   envelope). Determinism + per-key uniqueness are the only requirements, both
   met.
