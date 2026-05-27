@@ -291,7 +291,10 @@ pub async fn run(cfg: BenchConfig) -> Result<BenchReport, String> {
                     // Distinct content per (worker, op) so dedup doesn't
                     // collapse the write workload onto one chunk.
                     let seed = (worker_id as u64).wrapping_shl(40) ^ n;
-                    driver.put(&make_payload(object_size, seed)).await.map(|_| 0)
+                    driver
+                        .put(&make_payload(object_size, seed))
+                        .await
+                        .map(|_| 0)
                 } else {
                     let idx = (worker_id + n_usize) % warmup_keys.len();
                     driver.get(&warmup_keys[idx]).await

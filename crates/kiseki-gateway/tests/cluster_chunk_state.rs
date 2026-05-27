@@ -494,8 +494,12 @@ impl AsyncChunkOps for RecordingChunks {
     async fn write_chunk(&self, env: Envelope, pool: &str) -> Result<bool, ChunkError> {
         self.inner.write_chunk(env, pool).await
     }
-    async fn read_chunk(&self, id: &ChunkId) -> Result<Envelope, ChunkError> {
-        self.inner.read_chunk(id).await
+    async fn read_chunk(
+        &self,
+        id: &ChunkId,
+        original_len: Option<u64>,
+    ) -> Result<Envelope, ChunkError> {
+        self.inner.read_chunk(id, original_len).await
     }
     async fn increment_refcount(&self, id: &ChunkId) -> Result<u64, ChunkError> {
         self.inner.increment_refcount(id).await

@@ -1480,7 +1480,13 @@ impl GatewayOps for InMemoryGateway {
         // chunks_to_read: ordered (i, chunk_id, chunk_start_in_file)
         // for every chunk that overlaps `[start, end)`. Built without
         // any I/O so the existing cache/fetch loop below stays the same.
-        let chunks_to_read: Vec<(usize, kiseki_common::ids::ChunkId, usize)> =
+        // 4th tuple element is the chunk's exact plaintext length. Since
+        // this AEAD stores the tag separately, plaintext length ==
+        // ciphertext length == the `original_len` the EC read path needs
+        // to trim the reassembled stripe (GH #107). The composition is
+        // Raft-replicated, so this is known on every reader node, not just
+        // the fragment holders — correct at 100-node scale.
+        let chunks_to_read: Vec<(usize, kiseki_common::ids::ChunkId, usize, usize)> =
             if comp.chunk_plaintext_lens.is_empty() {
                 // Regular grid.
                 let first_chunk = start / MAX_PLAINTEXT_PER_CHUNK;
@@ -1493,7 +1499,16 @@ impl GatewayOps for InMemoryGateway {
                     .enumerate()
                     .skip(first_chunk)
                     .take(last_chunk.saturating_sub(first_chunk).saturating_add(1))
-                    .map(|(i, c)| (i, *c, i.saturating_mul(MAX_PLAINTEXT_PER_CHUNK)))
+                    .map(|(i, c)| {
+                        let chunk_start = i.saturating_mul(MAX_PLAINTEXT_PER_CHUNK);
+                        // Every grid chunk is MAX_PLAINTEXT_PER_CHUNK
+                        // except the last, which holds the remainder.
+                        let chunk_plaintext_len = std::cmp::min(
+                            MAX_PLAINTEXT_PER_CHUNK,
+                            comp_size.saturating_sub(chunk_start),
+                        );
+                        (i, *c, chunk_start, chunk_plaintext_len)
+                    })
                     .collect()
             } else {
                 // Explicit per-chunk lens (multipart). Walk every chunk,
@@ -1505,7 +1520,7 @@ impl GatewayOps for InMemoryGateway {
                         comp.chunk_plaintext_lens.get(i).copied().unwrap_or(0) as usize;
                     let chunk_end_in_file = chunk_start_in_file.saturating_add(chunk_plaintext_len);
                     if chunk_end_in_file > start && chunk_start_in_file < end {
-                        out.push((i, *chunk_id, chunk_start_in_file));
+                        out.push((i, *chunk_id, chunk_start_in_file, chunk_plaintext_len));
                     }
                     chunk_start_in_file = chunk_end_in_file;
                 }
@@ -1514,7 +1529,7 @@ impl GatewayOps for InMemoryGateway {
 
         let mut data = Vec::with_capacity(end - start);
 
-        for (_i, chunk_id, chunk_start_in_file) in chunks_to_read {
+        for (_i, chunk_id, chunk_start_in_file, chunk_plaintext_len) in chunks_to_read {
             let chunk_id = &chunk_id;
 
             // Cache lookup first — `get` returns `Arc<Zeroizing<Vec<u8>>>`,
@@ -1547,8 +1562,12 @@ impl GatewayOps for InMemoryGateway {
             let env = if let Some(env) = inline_hit {
                 env
             } else {
-                // Fall back to chunk store (block device).
-                self.chunks.read_chunk(chunk_id).await.map_err(|e| {
+                // Fall back to chunk store (block device). Pass the exact
+                // chunk length so the EC read path trims the reassembled
+                // stripe precisely instead of stripping trailing zeros
+                // (GH #107 — corrupts ciphertext ending in 0x00).
+                let original_len = u64::try_from(chunk_plaintext_len).ok();
+                self.chunks.read_chunk(chunk_id, original_len).await.map_err(|e| {
                     tracing::warn!(?chunk_id, error = %e, "gateway read: chunks.read_chunk failed");
                     GatewayError::Upstream(e.to_string())
                 })?
