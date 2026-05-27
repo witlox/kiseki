@@ -347,7 +347,11 @@ mod tests {
         async fn write_chunk(&self, _env: Envelope, _pool: &str) -> Result<bool, ChunkError> {
             unreachable!("scheduler test does not write")
         }
-        async fn read_chunk(&self, _id: &ChunkId) -> Result<Envelope, ChunkError> {
+        async fn read_chunk(
+            &self,
+            _id: &ChunkId,
+            _original_len: Option<u64>,
+        ) -> Result<Envelope, ChunkError> {
             unreachable!("scheduler test does not read")
         }
         async fn increment_refcount(&self, _id: &ChunkId) -> Result<u64, ChunkError> {
