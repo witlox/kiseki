@@ -89,6 +89,37 @@ are all-NVMe, so fast-vs-cold routing is only *observable* on a
 all-NVMe cluster the policy is exercised but every tier is `fast`.
 
 ## 4. Drive each protocol BY HAND (distinct payloads, cross-node, check errors)
+
+### 4a. Native bench FIRST — and the full PARALLEL 3-client run
+The `kiseki-client bench` tool is the headline native-throughput driver. Two
+hard-won gotchas:
+
+1. **The bench namespace MUST be created under the bench tenant** — use
+   `infra/gcp/benchmarks/setup-shards.sh` (the canonical method), which creates
+   `namespace 6658810a-…` (`uuid5(DNS,"kiseki-bench")`) under tenant
+   `179e565c-…` (`uuid5(DNS,"kiseki-bench-tenant")`). **Do NOT** hand-create it
+   under the bootstrap tenant: writes succeed (no write-authz yet — see IAM
+   #117) but `get-heavy` then fails with millions of `tenant mismatch /
+   AuthenticationFailed` errors, because the read path resolves the tenant from
+   the **namespace registration**, not the request. If you must hand-create,
+   pass `--tenant 179e565c-d506-5c59-8f82-7ae6e13f0aff`, or create any namespace
+   under that tenant and point the bench at it with `--tenant <id> --namespace <id>`.
+2. **3 client nodes = parallel distributed load** (the whole point of the 3
+   clients). Run the bench on all three concurrently against the cluster:
+   ```bash
+   for c in kiseki-client-1 kiseki-client-2 kiseki-client-3; do
+     gcloud compute ssh "$c" ... --command="kiseki-client bench \
+       --endpoint kiseki://10.0.0.10:9103 --tenant 179e565c-... --namespace <bench-ns> \
+       --shape get-heavy --concurrency 16 --object-size 65536 --duration-secs 30 --json" &
+   done; wait        # then sum ops_per_sec + mib_per_sec across the 3 JSON lines
+   ```
+   Reference (2026-05-27, default profile, 64 KB): **get-heavy ≈ 10.6k ops/s ·
+   662 MiB/s aggregate** (3×~3.5k), p99 ~90 ms, 0 errors. **put-heavy ≈ 264 ops/s
+   · 16.5 MiB/s aggregate** — commit-bound on the distributed multi-shard write
+   path (per-write composition + forward + Raft commit); writes are correct but
+   throughput is low, a known multi-node write characteristic.
+
+### 4b. The other protocols
 S3 is path-style, no auth: `http://<ip>:9000/<bucket>/<key>`.
 - iperf3 baseline (wire ceiling).
 - S3 PUT distinct objects (`head -c <size> /dev/urandom`) to one node; GET from
