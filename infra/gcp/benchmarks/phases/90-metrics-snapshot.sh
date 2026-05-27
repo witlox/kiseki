@@ -49,7 +49,16 @@ for url in "${ENDPOINTS[@]}"; do
     kiseki_chunk_write_bytes_total \
     kiseki_chunk_read_bytes_total \
     kiseki_raft_log_committed \
-    kiseki_transport_connections_active; do
+    kiseki_transport_connections_active \
+    kiseki_storage_device_used_bytes \
+    kiseki_storage_device_total_bytes \
+    kiseki_storage_logical_bytes \
+    kiseki_storage_physical_bytes \
+    kiseki_storage_chunk_count \
+    kiseki_storage_tier_fast_used_bytes \
+    kiseki_storage_tier_fast_total_bytes \
+    kiseki_storage_tier_bulk_used_bytes \
+    kiseki_storage_tier_cold_used_bytes; do
     line=$(grep "^${metric}[[:space:]{]" "$NODE_FILE" 2>/dev/null | head -1)
     [ -n "$line" ] && echo "  $line" | tee -a "$OUT"
   done

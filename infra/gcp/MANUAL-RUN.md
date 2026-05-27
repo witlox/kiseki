@@ -50,7 +50,18 @@ Cluster is ready in ~1-2 min (don't over-wait). Verify:
 # on storage-1:
 kiseki-admin status      # Nodes N/N
 kiseki-admin shards      # leader map
+kiseki-admin capacity    # GH #115 PREFLIGHT GUARD — see below
 ```
+
+**GH #115 capacity preflight (do this BEFORE measuring).** `kiseki-admin
+capacity` (alias `df`) must show each node using its **full provisioned
+NVMe** (the `default` profile = ~1.5 TB/node), not ~4 GiB. A ~4 GiB total
+means `KISEKI_RAW_DEVICES` did not wire and the node fell back to the
+small file — the silent cap that burned the May-2026 run. `phases/00-health.sh`
+now HALTs on this automatically (floor `KISEKI_MIN_DEVICE_GB`, default
+32 GiB); if you skip the phase scripts, eyeball `kiseki-admin capacity`
+yourself. Also note the per-class (fast/bulk/cold) line + dedup ratio —
+those are the new observability you watch through the run.
 
 ## 3. Create the MULTI-SHARD topology (this is the key step)
 Bucket-PUT alone parks every shard's leader on node 1. `shard split` makes an idle
@@ -64,6 +75,19 @@ kiseki-admin --endpoint http://10.0.0.10:9090 topology namespace-create \
 kiseki-admin shards      # confirm 6 shards, leaders on nodes 1..6 (DISTRIBUTED)
 ```
 
+**Tiered placement (ADR-045).** To exercise class-aware placement, add a
+tier policy at create time:
+```bash
+kiseki-admin --endpoint http://10.0.0.10:9090 topology namespace-create \
+  "$NSID" --tenant 00000000-...-001 --shards 6 \
+  --tier fast=10T --tier cold=100T          # spill order: fast → cold
+```
+Writes then land on the declared class; `kiseki-admin capacity` shows the
+per-class fill move. **Caveat:** the `default`/`transport`/`gpu` profiles
+are all-NVMe, so fast-vs-cold routing is only *observable* on a
+**mixed-media** profile (NVMe + HDD) — not yet a defined profile. On an
+all-NVMe cluster the policy is exercised but every tier is `fast`.
+
 ## 4. Drive each protocol BY HAND (distinct payloads, cross-node, check errors)
 S3 is path-style, no auth: `http://<ip>:9000/<bucket>/<key>`.
 - iperf3 baseline (wire ceiling).
@@ -72,9 +96,26 @@ S3 is path-style, no auth: `http://<ip>:9000/<bucket>/<key>`.
   a backgrounded `curl -sf` hides 500s. Allow a few seconds settle before cross-node
   GET (Raft composition replication lag, else false MISMATCH).
 - NFS / pNFS / FUSE: one mount at a time.
-- **Between every step:** `curl http://<ip>:9090/metrics | grep requests_total` and
-  `journalctl -u kiseki-server` on the involved nodes. Those are truth; script
-  summaries are not. Halt on first non-2xx spike or error log.
+- **Between every step:** `curl http://<ip>:9090/metrics | grep requests_total`,
+  `kiseki-admin capacity` (used/free/% + dedup ratio + per-class — watch used
+  climb, dedup hold, and no tier hit Full), and `journalctl -u kiseki-server`
+  on the involved nodes. Those are truth; script summaries are not. Halt on the
+  first non-2xx spike or error log.
+- **ENOSPC signature changed (GH #115):** a full chunk pool now returns a clean
+  S3 **507 Insufficient Storage** (native `resource_exhausted`), NOT the old
+  `device full → quorum lost → 500`. If you see 507, the pool is full
+  (expected), not broken. (Filling 1.5 TB/node for real isn't practical here;
+  the `@integration` "Chunk pool full → 507" scenario covers the path.)
+
+### Operational resize drills (ADR-025, IAM-independent)
+```bash
+kiseki-admin --endpoint http://10.0.0.10:9090 device list
+kiseki-admin --endpoint http://10.0.0.10:9090 pool rebalance fast
+kiseki-admin --endpoint http://10.0.0.10:9090 pool set-threshold fast --warning 75 --critical 85
+kiseki-admin --endpoint http://10.0.0.10:9090 device evacuate <device-id>
+```
+(Per-tenant **quota** enforcement is deferred on the IAM milestone — see
+ADR-045 §D6; these device/pool ops are operator-scoped and need no identity.)
 
 ## 5. Tear down IMMEDIATELY when done (~$13-18/hr)
 ```bash
