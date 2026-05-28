@@ -427,8 +427,10 @@ async fn s3_3_7_write_at_offset_zero_returns_ok_and_count() {
     );
     let committed = r.read_u32().unwrap();
     assert_eq!(
-        committed, 2,
-        "RFC 1813 §3.3.7: stable_how echo MUST be FILE_SYNC (2)"
+        committed, 0,
+        "#130: WRITE MUST reply UNSTABLE (0), not the requested FILE_SYNC — \
+         the data is buffered until COMMIT, so claiming FILE_SYNC makes the \
+         kernel skip COMMIT and the buffer never flushes (silent data loss)"
     );
 }
 
