@@ -17,6 +17,12 @@ This regime is specifically the **small-object op/s** target. Large-object bandw
 
 Introduce **write coalescing**: at a shard leader, accumulate independent `ChunkAndDelta` proposals arriving within a bounded window into a **single Raft log entry**, commit them in one consensus round, and fan the per-item results back to each waiting writer.
 
+### Why this is a new ADR and not ADR-026 / not an implementation detail
+
+ADR-026 already anticipates "batching" — but its **Strategy C** is explicitly a *transport* optimization: "Coalesce heartbeats per node pair… **pure transport change, no protocol change**" (ADR-026 §Transport / §Migration). That coalesces the *heartbeat/AppendEntries RPCs between node pairs* and leaves the log-entry-per-write model untouched.
+
+W1 is the orthogonal, **protocol-level** change: it coalesces *independent client writes into one log entry* — a new `LogCommand` variant, a new apply-atomicity shape (N deltas/entry), a new per-item idempotency/result-fan-out contract, and a new durability/latency window. It is **not** covered by ADR-026 (which disclaims protocol change), and it is **not** a pure implementation detail (it alters the wire command set — a mixed-version-cluster concern — and the commit contract). It therefore needs ADR-level review. It **extends** the `ChunkAndDelta` atomicity contract owned by ADR-040 / `phase-16-cross-node-chunks.md` (D-4/D-10) and composes with ADR-041's many-groups-per-node transport. The two batchings are complementary and could both apply at 100+ nodes (ADR-026-C coalesces the RPCs; ADR-046 coalesces the entries inside them).
+
 ### 1. New command — `LogCommand::BatchChunkAndDelta`
 
 ```rust
