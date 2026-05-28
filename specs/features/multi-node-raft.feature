@@ -406,7 +406,7 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
   Scenario: Write requires 2-of-3 quorum (D-5)
     Given a 3-node kiseki cluster
     And the two non-leader nodes have their incoming fabric denied
-    Then a 1MB S3 PUT to node-1 fails with quorum lost
+    Then a 1MB S3 PUT to the leader fails with quorum lost
     And the leader's fabric_quorum_lost_total ticked at least 1
     And all nodes' incoming fabric is allowed
 

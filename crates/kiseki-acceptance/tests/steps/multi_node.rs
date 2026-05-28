@@ -1189,6 +1189,46 @@ async fn then_put_fails_quorum_lost(w: &mut KisekiWorld, mb: usize, target: u64)
     );
 }
 
+/// D-5: PUT *directly to the Raft leader* so it takes the leader's own
+/// fabric write path (PutFragment to its peers, gated on min_acks). A PUT
+/// to a non-leader instead forwards the ChunkAndDelta to the leader over
+/// the #114 Raft path, which replicates via the Raft log (durable) but
+/// does NOT exercise the fabric quorum this scenario asserts — so it would
+/// succeed (200) with both peers denied. Targeting the leader makes the
+/// fabric quorum loss deterministic regardless of who won the election.
+#[then(regex = r"^a (\d+)MB S3 PUT to the leader fails with quorum lost$")]
+async fn then_put_to_leader_fails_quorum_lost(w: &mut KisekiWorld, mb: usize) {
+    let body = vec![0u8; mb * ONE_MEBIBYTE];
+    let bucket = w
+        .cluster
+        .bucket
+        .clone()
+        .unwrap_or_else(|| "default".to_owned());
+    let key = format!("bdd-quorum-lost-{}", uuid::Uuid::new_v4().simple());
+    let guard = cluster(w);
+    let any = guard.nodes().next().expect("at least one node");
+    let lid = leader_id_via(any)
+        .await
+        .expect("leader_id from /admin/cluster/info");
+    let leader = guard.node(lid);
+    let url = format!("{}/{bucket}/{key}", leader.s3_base);
+    let resp = leader
+        .http
+        .put(&url)
+        .body(body)
+        .send()
+        .await
+        .expect("HTTP PUT to leader failed at transport layer");
+    let status = resp.status();
+    let body_txt = resp.text().await.unwrap_or_default();
+    assert!(
+        !status.is_success() && body_txt.contains("quorum lost"),
+        "direct S3 PUT to the leader (node-{lid}) returned {status} body={body_txt:?}; \
+         wanted 5xx with `quorum lost` — the leader's fabric write quorum (min_acks=2) \
+         must fail when both its peers' incoming fabric is denied",
+    );
+}
+
 #[then(regex = r"^the leader's fabric_quorum_lost_total ticked at least (\d+)$")]
 async fn then_quorum_lost_ticked(w: &mut KisekiWorld, expected_ticks: u64) {
     // Sum the metric across EVERY alive node, not just the Raft
