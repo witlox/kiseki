@@ -281,6 +281,23 @@ pub trait GatewayOps: Send + Sync {
         ))
     }
 
+    /// Drop ONLY a name→composition binding from the name index,
+    /// leaving the composition (and its chunks) intact. Distinct from
+    /// `delete_by_name`, which also deletes the composition. Used by the
+    /// NFS rename path (#127) to retire the old name. Returns `true` if
+    /// a binding existed.
+    ///
+    /// Default: `Ok(false)`.
+    async fn unbind_object_name(
+        &self,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+        name: &str,
+    ) -> Result<bool, GatewayError> {
+        let _ = (tenant_id, namespace_id, name);
+        Ok(false)
+    }
+
     /// Enumerate `(name, composition_id, size)` for objects in a
     /// namespace, optionally filtered by `prefix`. S3 LIST returns
     /// these alphabetically by name.
@@ -440,6 +457,16 @@ impl<G: GatewayOps> GatewayOps for std::sync::Arc<G> {
         name: &str,
     ) -> Result<bool, GatewayError> {
         (**self).delete_by_name(tenant_id, namespace_id, name).await
+    }
+    async fn unbind_object_name(
+        &self,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+        name: &str,
+    ) -> Result<bool, GatewayError> {
+        (**self)
+            .unbind_object_name(tenant_id, namespace_id, name)
+            .await
     }
     async fn list_named(
         &self,

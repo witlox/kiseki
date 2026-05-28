@@ -2050,6 +2050,25 @@ impl GatewayOps for InMemoryGateway {
         Ok(true)
     }
 
+    async fn unbind_object_name(
+        &self,
+        _tenant_id: kiseki_common::ids::OrgId,
+        namespace_id: kiseki_common::ids::NamespaceId,
+        name: &str,
+    ) -> Result<bool, GatewayError> {
+        // Name-only removal: drop the (ns, name) → comp binding, leave
+        // the composition intact. The NFS rename path retires the old
+        // name this way (#127). NOTE: this is a local store mutation —
+        // it is NOT yet emitted as a replicated delta, so on a multi-
+        // node cluster a rename's name change is leader-local until a
+        // dedicated rename delta lands (tracked follow-up).
+        let comps = self.compositions.as_ref();
+        comps.unbind_name(namespace_id, name).map_err(|e| {
+            tracing::warn!(error = %e, "gateway unbind_object_name: unbind_name failed");
+            GatewayError::Upstream(e.to_string())
+        })
+    }
+
     #[tracing::instrument(skip(self, prefix), fields(tenant_id = %tenant_id.0, namespace_id = %namespace_id.0))]
     async fn list_named(
         &self,

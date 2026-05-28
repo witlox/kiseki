@@ -329,6 +329,7 @@ mod nfs_tests {
                 namespace_id: test_namespace(),
                 data: b"nfs file content".to_vec(),
                 comp_id_override: None,
+                name: None,
             })
             .await
             .unwrap();
@@ -419,7 +420,7 @@ mod nfs_tests {
         let ctx = setup_nfs_ctx();
         ctx.write_named("old.txt", b"data".to_vec()).await.unwrap();
 
-        ctx.rename_file("old.txt", "new.txt").unwrap();
+        ctx.rename_file("old.txt", "new.txt").await.unwrap();
         assert!(ctx.lookup_by_name("old.txt").await.is_none());
         assert!(ctx.lookup_by_name("new.txt").await.is_some());
     }

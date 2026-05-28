@@ -2307,7 +2307,7 @@ async fn op_rename<G: GatewayOps>(
     let mut w = XdrWriter::new();
     w.write_u32(op::RENAME);
 
-    let status = match ctx.rename_file(&old_name, &new_name) {
+    let status = match ctx.rename_file(&old_name, &new_name).await {
         Ok(()) => {
             w.write_u32(nfs4_status::NFS4_OK);
             // RENAME4resok: source_cinfo (change_info4) + target_cinfo

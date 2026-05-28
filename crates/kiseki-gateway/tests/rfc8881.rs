@@ -1537,6 +1537,7 @@ async fn s18_15_lookup_composition_uuid_returns_file_handle() {
             namespace_id: test_namespace(),
             data: payload,
             comp_id_override: None,
+            name: None,
         })
         .await
         .expect("seed write")
@@ -1584,6 +1585,7 @@ async fn s18_26_readdir_lists_compositions_in_namespace() {
             namespace_id: test_namespace(),
             data: b"readdir-fixture".to_vec(),
             comp_id_override: None,
+            name: None,
         })
         .await
         .expect("seed write")
@@ -1932,6 +1934,7 @@ async fn s5_8_getattr_after_lookup_returns_actual_composition_size() {
             namespace_id: test_namespace(),
             data: payload,
             comp_id_override: None,
+            name: None,
         })
         .await
         .expect("seed write")
@@ -2043,6 +2046,7 @@ async fn s18_16_4_open_reply_includes_cinfo_attrset_delegation() {
             namespace_id: test_namespace(),
             data: b"open-fixture".to_vec(),
             comp_id_override: None,
+            name: None,
         })
         .await
         .expect("seed write")
@@ -2155,6 +2159,7 @@ async fn open_stateid_seqid_is_one_for_fresh_state() {
             namespace_id: test_namespace(),
             data: b"open-fixture".to_vec(),
             comp_id_override: None,
+            name: None,
         })
         .await
         .expect("seed write")
@@ -2225,6 +2230,7 @@ async fn s18_16_1_open_args_claim_discriminator_is_required() {
             namespace_id: test_namespace(),
             data: b"open-claim-fixture".to_vec(),
             comp_id_override: None,
+            name: None,
         })
         .await
         .expect("seed write")
@@ -2294,6 +2300,7 @@ async fn s18_22_read_after_lookup_returns_seeded_bytes() {
             namespace_id: test_namespace(),
             data: payload.clone(),
             comp_id_override: None,
+            name: None,
         })
         .await
         .expect("seed write")

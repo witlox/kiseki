@@ -471,7 +471,7 @@ async fn reply_rename<G: GatewayOps>(
     let _to_dir = reader.read_opaque().unwrap_or_default();
     let to_name = reader.read_string().unwrap_or_default();
 
-    match ctx.rename_file(&from_name, &to_name) {
+    match ctx.rename_file(&from_name, &to_name).await {
         Ok(()) => {
             w.write_u32(status::NFS3_OK);
             // from dir wcc + to dir wcc (both absent)
