@@ -45,14 +45,23 @@ pub const MAX_PLAINTEXT_PER_CHUNK: usize = 64 * 1024 * 1024;
 /// Map a chunk-store write failure to a gateway error, surfacing an
 /// out-of-space condition as a clean [`GatewayError::InsufficientStorage`]
 /// (HTTP 507 / POSIX `ENOSPC`) rather than a generic 500. A full device
-/// reports `device full` locally and, across the EC fabric, `quorum
-/// lost` / `peer unavailable: ... device full` (the GH #115 chain); we
-/// match those markers on the rendered error.
+/// reports `device full` locally and, across the EC fabric, surfaces a
+/// `quorum lost` wrapper whose chain still carries the underlying
+/// `peer unavailable: ... device full` marker (the GH #115 chain); we
+/// match the out-of-space markers on the rendered error.
+///
+/// We deliberately do NOT treat a *bare* `quorum lost` as out-of-space.
+/// A fabric/replica quorum loss with no space marker (peers denied,
+/// unreachable, or partitioned — e.g. the D-5 `2-of-3 quorum` scenario)
+/// is a durability/availability failure, not a full pool: classifying it
+/// as 507 `InsufficientStorage` tells the client "pool full" when the
+/// pool has space, which is both wrong and un-actionable. Such errors
+/// fall through to [`GatewayError::Upstream`] (HTTP 5xx, message
+/// preserved) so the real `quorum lost` reason reaches the caller.
 fn map_chunk_write_error<E: std::fmt::Display>(e: E) -> GatewayError {
     let rendered = e.to_string();
     let lower = rendered.to_ascii_lowercase();
     if lower.contains("device full")
-        || lower.contains("quorum lost")
         || lower.contains("largest free extent")
         || lower.contains("no space")
         || lower.contains("enospc")

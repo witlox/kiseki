@@ -1537,6 +1537,47 @@ async fn then_node_fabric_allow(w: &mut KisekiWorld, node_id: u64) {
     set_node_fabric_deny(w, node_id, false).await;
 }
 
+/// D-5: deny the incoming fabric of the TWO non-leader nodes, discovered
+/// at run time from the actual Raft leader. Denying a fixed node-2+node-3
+/// pair flaked: when the election put the leader on node-2/3, that leader
+/// self-acked + node-1 acked = 2 = a real 2-of-3 quorum and the write
+/// correctly succeeded. Isolating the actual leader leaves it with only
+/// its own ack (1 < min_acks=2) → genuine quorum loss every run.
+#[given("the two non-leader nodes have their incoming fabric denied")]
+async fn given_non_leader_fabric_denied(w: &mut KisekiWorld) {
+    let followers: Vec<u64> = {
+        let guard = cluster(w);
+        let any = guard.nodes().next().expect("at least one node");
+        let leader = leader_id_via(any)
+            .await
+            .expect("leader_id from /admin/cluster/info");
+        guard
+            .nodes()
+            .map(|n| n.node_id)
+            .filter(|id| *id != leader)
+            .collect()
+    };
+    for id in &followers {
+        set_node_fabric_deny(w, *id, true).await;
+    }
+    // Snapshot quorum-lost baseline so `ticked at least N` measures only
+    // this scenario's PUTs (mirrors given_node_fabric_deny).
+    snapshot_quorum_lost_baseline(w).await;
+}
+
+/// D-5 cleanup: re-allow every node's incoming fabric. Idempotent, so it
+/// doesn't need to know which nodes the leader-relative deny targeted.
+#[then("all nodes' incoming fabric is allowed")]
+async fn then_all_fabric_allowed(w: &mut KisekiWorld) {
+    let ids: Vec<u64> = {
+        let guard = cluster(w);
+        guard.nodes().map(|n| n.node_id).collect()
+    };
+    for id in ids {
+        set_node_fabric_deny(w, id, false).await;
+    }
+}
+
 /// Drops every local fragment of the most-recently-written chunk
 /// on `node_id` via the test-only `DELETE
 /// /admin/test/chunk/{id}/fragment/{idx}` endpoint. Discovers the

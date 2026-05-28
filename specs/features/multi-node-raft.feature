@@ -388,22 +388,27 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
 
   # Promoted to @integration via the test-only fabric-deny knob
   # (POST /admin/test/fabric/deny-incoming/1; gated by
-  # KISEKI_ENABLE_TEST_KNOBS=1). Setting deny on node-2 and node-3
-  # makes their PutFragment handler return Unavailable WITHOUT
-  # touching Raft — so the cluster still has Raft quorum (3 alive,
-  # 3 voters) but only 1 fabric ack reaches the leader. Distinct
-  # failure mode from the EC 4+2 6-node D-5 promotion (which
-  # conflates fabric and Raft loss because killing 3 of 6 also
+  # KISEKI_ENABLE_TEST_KNOBS=1). Denying a node's PutFragment handler
+  # makes it return Unavailable WITHOUT touching Raft — so the cluster
+  # still has Raft quorum (3 alive, 3 voters) but fabric acks fall short.
+  #
+  # Deny the TWO NON-LEADER nodes (discovered at run time), not a fixed
+  # node-2 + node-3: Raft election is non-deterministic, and if the leader
+  # is itself node-2 or node-3 then denying node-2 + node-3 still leaves
+  # the leader's own ack + node-1's ack = 2 = a real 2-of-3 quorum, so the
+  # write correctly succeeds (the old fixed-pair phrasing flaked on exactly
+  # this). Isolating the actual leader leaves it with only its own ack
+  # (1 < min_acks=2) → genuine quorum loss, regardless of who won the
+  # election. Distinct failure mode from the EC 4+2 6-node D-5 promotion
+  # (which conflates fabric and Raft loss because killing 3 of 6 also
   # breaks Raft majority).
   @integration @multi-node @cross-node @smoke
   Scenario: Write requires 2-of-3 quorum (D-5)
     Given a 3-node kiseki cluster
-    And node-2's incoming fabric is denied
-    And node-3's incoming fabric is denied
+    And the two non-leader nodes have their incoming fabric denied
     Then a 1MB S3 PUT to node-1 fails with quorum lost
     And the leader's fabric_quorum_lost_total ticked at least 1
-    And node-2's incoming fabric is allowed
-    And node-3's incoming fabric is allowed
+    And all nodes' incoming fabric is allowed
 
   # Promoted to @integration. Now reproducible: `write_chunk`
   # early-exits on `min_acks` (the slow peer's PutFragment is
