@@ -840,7 +840,7 @@ mod tests {
 
     /// #127 (FUSE half) — the GCP 2026-05-28 run saw a FUSE write then a
     /// post-`drop_caches` read return 0 bytes. `drop_caches` evicts the
-    /// kernel page cache, forcing a real gateway READ (by composition_id)
+    /// kernel page cache, forcing a real gateway READ (by `composition_id`)
     /// rather than a dirty-buffer hit. This drives the same path:
     /// create(empty) → write → flush (which clears the dirty buffer) →
     /// getattr + read. `create_and_read_file` above reads from the dirty
