@@ -399,6 +399,11 @@ impl RaftTestCluster {
 
         match resp.data {
             LogResponse::Appended(seq) => Ok(SequenceNumber(seq)),
+            // This single-append test helper doesn't submit batches;
+            // surface the first item's seq if a batch response ever appears.
+            LogResponse::BatchAppended(seqs) => {
+                Ok(SequenceNumber(seqs.first().copied().unwrap_or(0)))
+            }
             LogResponse::Ok | LogResponse::DecrementOutcome(_) => Ok(SequenceNumber(0)),
         }
     }

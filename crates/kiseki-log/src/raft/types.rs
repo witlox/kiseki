@@ -12,6 +12,10 @@ use crate::raft_store::LogCommand;
 pub enum LogResponse {
     /// Delta appended with this sequence number.
     Appended(u64),
+    /// ADR-046 (W1) — a `BatchChunkAndDelta` applied; one sequence number
+    /// per item, in batch order. The coalescing queue fans these back to
+    /// the per-item waiters.
+    BatchAppended(Vec<u64>),
     /// Command completed.
     Ok,
     /// Phase 16c: a `DecrementChunkRefcount` apply observed a refcount
@@ -25,6 +29,7 @@ impl std::fmt::Display for LogResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Appended(seq) => write!(f, "Appended({seq})"),
+            Self::BatchAppended(seqs) => write!(f, "BatchAppended(n={})", seqs.len()),
             Self::Ok => write!(f, "Ok"),
             Self::DecrementOutcome(tomb) => write!(f, "DecrementOutcome({tomb})"),
         }
