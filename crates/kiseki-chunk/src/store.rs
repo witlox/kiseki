@@ -410,15 +410,19 @@ impl Default for ChunkStore {
 }
 
 impl ChunkOps for ChunkStore {
-    #[tracing::instrument(skip(self, envelope), fields(chunk_id = ?envelope.chunk_id, pool, ciphertext_len = envelope.ciphertext.len()))]
+    // No `#[tracing::instrument]` / per-op `debug!` on this hot path — it
+    // fires per chunk on every PUT. Span machinery + the disabled-callsite
+    // check cost a measurable few % at write rates even at level=warn (no
+    // compile-time level cap is set), and there's no compile-out. Errors
+    // still surface via `warn!`. (S10 deferred the chunk store pending a
+    // flamegraph; this is that follow-up.)
     fn write_chunk(&mut self, envelope: Envelope, pool: &str) -> Result<bool, ChunkError> {
         let chunk_id = envelope.chunk_id;
 
         // Dedup: if chunk already exists, just bump refcount.
         if let Some(entry) = self.chunks.get_mut(&chunk_id) {
             entry.refcount += 1;
-            tracing::debug!(refcount = entry.refcount, "chunk write: dedup hit");
-            return Ok(false); // not a new write
+            return Ok(false); // not a new write (dedup hit)
         }
 
         // Check pool capacity.
@@ -493,11 +497,11 @@ impl ChunkOps for ChunkStore {
             },
         );
 
-        tracing::debug!(storage_size, "chunk write: success");
         Ok(true) // new write
     }
 
-    #[tracing::instrument(skip(self), fields(chunk_id = ?chunk_id))]
+    // Per-chunk read — the GET fast path (no Raft); per-op span machinery
+    // is the heaviest of the disabled-tracing costs here, so it's removed.
     fn read_chunk(&self, chunk_id: &ChunkId) -> Result<Envelope, ChunkError> {
         // Fault injection (ADR-037 explicit unavailability).
         if self.unavailable.contains(chunk_id) {

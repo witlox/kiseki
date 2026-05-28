@@ -276,15 +276,8 @@ impl ClusteredChunkStore {
     /// `placement[i]` receives `fragment_index = i`. Caller chooses
     /// the placement order (typically via [`crate::pick_placement`]).
     #[allow(clippy::too_many_lines)]
-    #[tracing::instrument(
-        skip(self, envelope, placement),
-        fields(
-            chunk_id = ?envelope.chunk_id,
-            ciphertext_len = envelope.ciphertext.len(),
-            placement_size = placement.len(),
-            strategy = ?strategy,
-        ),
-    )]
+    // Hot path (per EC chunk write) — no per-op `#[instrument]`/`debug!`;
+    // errors still surface via `warn!`.
     pub async fn write_chunk_ec(
         &self,
         envelope: Envelope,
@@ -292,16 +285,11 @@ impl ClusteredChunkStore {
         strategy: crate::ec::EcStrategy,
         pool: &str,
     ) -> Result<(), ChunkError> {
-        tracing::debug!("write_chunk_ec: entry");
         let routes = crate::ec::encode_for_placement(strategy, &envelope.ciphertext, placement)
             .map_err(|e| {
                 tracing::warn!(error = %e, "write_chunk_ec: encode_for_placement failed");
                 ChunkError::Io(e.to_string())
             })?;
-        tracing::debug!(
-            routes = routes.len(),
-            "write_chunk_ec: encoded → fanning out PutFragment",
-        );
 
         // Build a peer-id → peer-handle index. Caller-supplied
         // peers may be in a different order than `placement`, so we
@@ -455,16 +443,9 @@ impl ClusteredChunkStore {
     /// function falls back to the trim-trailing-zeros heuristic
     /// (correct for AES-GCM ciphertext, wrong for sparse plaintext);
     /// callers wire `Some` in production.
-    #[tracing::instrument(
-        skip(self, placement),
-        fields(
-            chunk_id = ?chunk_id,
-            placement_size = placement.len(),
-            strategy = ?strategy,
-            original_len,
-        ),
-    )]
     #[allow(clippy::too_many_lines)]
+    // Hot path (per EC chunk READ — the GET fast path); no per-op
+    // `#[instrument]`/`debug!`. Errors still surface via `warn!`.
     pub async fn read_chunk_ec(
         &self,
         chunk_id: &ChunkId,
@@ -472,7 +453,6 @@ impl ClusteredChunkStore {
         strategy: crate::ec::EcStrategy,
         original_len: Option<u64>,
     ) -> Result<Envelope, ChunkError> {
-        tracing::debug!("read_chunk_ec: entry");
         let by_id: std::collections::HashMap<&str, &Arc<dyn FabricPeer>> =
             self.peers.iter().map(|p| (p.name(), p)).collect();
 
@@ -535,10 +515,6 @@ impl ClusteredChunkStore {
             );
             return Err(ChunkError::ChunkLost);
         }
-        tracing::debug!(
-            fragments = responses.len(),
-            "read_chunk_ec: collected fragments → decoding",
-        );
         // Phase 16d step 3: prefer the cluster_chunk_state-stored
         // original_len when the caller supplies it. Heuristic
         // fallback is preserved for tests / 16c-style callers that
