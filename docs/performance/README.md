@@ -11,7 +11,23 @@ files are immutable snapshots, this file moves with HEAD.
 > throughput, and the matrix in that doc spells out the loss
 > windows under each failure mode.
 
-## Latest snapshot — 2026-05-27 (GCP `default`, capacity-management / PR #116)
+## Latest snapshot — 2026-05-28 (GCP `default`, full protocol matrix / PR #116)
+
+6 × `c3-standard-22-lssd` (1.5 TB NVMe each) + 3 × `c3-standard-22` clients, `europe-west1-b`, EC-4+2, rocky9 bins from `feat/115-capacity-tiering` (includes the #124 FUSE fix). Full breakdown in [`specs/performance/2026-05-28-gcp-matrix.md`](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-28-gcp-matrix.md).
+
+| Check / protocol | Number | Status |
+|---|---:|---|
+| **#124 FUSE connect-timeout fix** | mount **attaches** | ✓ verified live (was a silent hang) |
+| native get-heavy (parallel × 3, 64 KB) | **22,668 op/s · 1,417 MiB/s** | ✓ 0 err — 2× the 2026-05-27 run |
+| native put / mixed | 261 / 319 op/s | ✓ 0 err, commit-bound (#126) |
+| S3 PUT + cross-node GET (curl -T) | 8/8 byte-verified | ✓ 0 err, 0 mismatch |
+| dedup ratio | **6.03×** (387 MB → 64 MB) | ✓ |
+| **FUSE + NFSv4 + pNFS read-by-name** | **0 bytes** | ✗ **#127** — POSIX name→composition resolution broken on multi-node (data persists, name index doesn't) |
+| **NFSv3 mount** | fails (`showmount` RPC) | ✗ **#128** |
+
+Findings → #127 is the headline: POSIX name-based reads (FUSE/NFS) return empty after cache-drop even same-node, while native (by composition_id) and S3 (by key) work perfectly — the gateway core is healthy, the POSIX filesystem name/directory layer is broken on multi-node. The #124 fix is what let FUSE mount and expose it. NFS throughput not reported (won't quote numbers while the path is functionally broken).
+
+## Earlier snapshot — 2026-05-27 (GCP `default`, capacity-management / PR #116)
 
 6 × `c3-standard-22-lssd` (1.5 TB NVMe each) + 3 × `c3-standard-22` clients, `europe-west1-b`, EC-4+2, Rocky9 bins from `feat/115-capacity-tiering`. Full breakdown in [`specs/performance/2026-05-27-gcp-capacity.md`](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-27-gcp-capacity.md).
 
