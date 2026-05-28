@@ -246,16 +246,22 @@ config tune). #126 carries this.
 
 ## What "getting there" looks like, in order
 
-1. **Profile the write path first (revised W1)** — the code-audit
-   (above) shows the batching/contention fixes are already in; the
-   180 ms is unexplained at the code level. A pprof CPU + off-CPU
-   profile of a sustained write on the GCP `default` cluster decomposes
-   it; *then* pick the targeted fix (write coalescing into one
-   `LogCommand` batch — ADR-grade — vs apply-path vs config). Do NOT
-   ship a speculative Raft-path change before this. #126.
-2. **W3 hydrator throughput + W4 chunk group-commit** — also
-   profiling-gated (the per-delta staging cost in #133 isn't a missing
-   batch); fix once the profile names the hot frame.
+1. **W1 — write coalescing → [ADR-046](../../specs/architecture/adr/046-write-coalescing-batched-commit.md).**
+   The 2026-05-28 work pin pointed the bottleneck: openraft log-fsync +
+   replication are already batched/pipelined; the gap is the **serial
+   per-shard apply with no coalescing of independent writes into a
+   shared consensus entry**. ADR-046 specifies the fix (a
+   `LogCommand::BatchChunkAndDelta` + per-shard coalescing queue + per-
+   item result fan-out, atomicity/idempotency/I-CP preserved). ~40× per
+   cluster (≈250 → ~10 k op/s); 360 k needs coalescing × heavy sharding
+   (ADR-041). Needs adversary gate-1 before impl. #126. The `raft_commit`
+   put-phase histogram (landed) measures the lift.
+2. **#2 large-object write parallelism + #3 hydrator (#133) — confirmed
+   DOWNSTREAM of W1, deferred.** The chunk loop only bites >64 MB objects
+   and is masked by the per-PUT commit; the hydrator drains 5 k deltas in
+   0.03 s in-memory (~166 k/s) and the GCP "~50/s" is just it keeping
+   pace with the commit-bound write rate. Both become measurable/worth
+   doing only *after* W1 raises the write rate. Re-measure then.
 3. **Re-measure the 6-node matrix** — with W1+W3+W4 the write rows
    become meaningful; reads get an honest high-∥ number.
 4. **R1/R2/R3 read tuning** — close the read bandwidth gap (concurrency,
