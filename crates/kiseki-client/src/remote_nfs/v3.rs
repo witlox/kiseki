@@ -390,6 +390,7 @@ impl GatewayOps for Nfs3Client {
 
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await?;
         Ok(resp.composition_id)

@@ -355,6 +355,7 @@ fn map_gateway_error(e: GatewayError) -> Status {
             Status::out_of_range(format!("key out of range for shard {shard_id:?}"))
         }
         GatewayError::ReadOnlyNamespace => Status::failed_precondition("namespace is read-only"),
+        GatewayError::InsufficientStorage(m) => Status::resource_exhausted(m),
         GatewayError::ServiceUnavailable(m) => Status::unavailable(m),
         GatewayError::PreconditionFailed(m) => Status::failed_precondition(m),
         // Both NotFound (composition missing) and NamespaceNotFound
@@ -517,6 +518,7 @@ impl ServerImpl {
                 idempotency_key: Some(cf.idempotency_key.clone()),
                 forwarded_from_node: cf.forwarded_from_node,
                 comp_id_override: None,
+                tier: None,
             };
             match self.ops.write_with_forwarding(wreq).await {
                 Ok(r) => r,
@@ -582,6 +584,7 @@ impl ServerImpl {
                 idempotency_key: Some(cf.idempotency_key.clone()),
                 forwarded_from_node: cf.forwarded_from_node,
                 comp_id_override: None,
+                tier: None,
             };
             self.ops.write(wreq).await.map_err(map_gateway_error)?
         };
@@ -1330,6 +1333,7 @@ mod tests {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
         })
         .await;
     }

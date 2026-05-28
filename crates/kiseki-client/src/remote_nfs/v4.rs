@@ -396,12 +396,25 @@ impl Nfs4Client {
         &self,
         parts: &[(u64, Vec<u8>)],
     ) -> Result<CompositionId, GatewayError> {
+        let filename = uuid::Uuid::new_v4().to_string();
+        self.write_named_at_offsets(&filename, parts).await
+    }
+
+    /// Like [`Self::write_at_offsets`] but with a caller-chosen POSIX
+    /// `filename`, so a subsequent LOOKUP-by-name — possibly on a
+    /// different cluster node — can resolve it. This is the write half
+    /// of the #127 cross-node read-by-name integration test.
+    #[allow(clippy::unused_async)]
+    pub async fn write_named_at_offsets(
+        &self,
+        filename: &str,
+        parts: &[(u64, Vec<u8>)],
+    ) -> Result<CompositionId, GatewayError> {
         let mut guard = self.ensure_session().await?;
         let sess = guard
             .as_mut()
             .expect("session not initialized — call connect_v41() first");
 
-        let filename = uuid::Uuid::new_v4().to_string();
         let putrootfh = (op::PUTROOTFH, Vec::new());
 
         let mut w = XdrWriter::new();
@@ -415,9 +428,17 @@ impl Nfs4Client {
         w.write_u32(0); // fattr4 bitmap count = 0
         w.write_opaque(&[]); // fattr4 vals
         w.write_u32(0); // CLAIM_NULL
-        w.write_string(&filename);
+        w.write_string(filename);
         let open = (op::OPEN, w.into_bytes());
 
+        // COMPOUND 1: OPEN(CREATE) + WRITE×N + GETFH. We capture the
+        // OPEN stateid + the file handle, then issue a SECOND compound
+        // with CLOSE — because #50 made op_commit a server-side no-op,
+        // the buffered write is flushed to a composition ONLY on CLOSE
+        // (op_close), and CLOSE needs the real OPEN stateid (which isn't
+        // known until the OPEN reply). Without the CLOSE the write never
+        // materializes — the kernel always sends CLOSE; this client used
+        // to rely on COMMIT and so silently never persisted.
         let mut compound: Vec<(u32, Vec<u8>)> = vec![putrootfh, open];
         for (offset, data) in parts {
             let mut w = XdrWriter::new();
@@ -428,10 +449,6 @@ impl Nfs4Client {
             w.write_opaque(data);
             compound.push((op::WRITE, w.into_bytes()));
         }
-        let mut w = XdrWriter::new();
-        w.write_u64(0); // commit offset
-        w.write_u32(0); // commit count (0 = flush all)
-        compound.push((op::COMMIT, w.into_bytes()));
         compound.push((op::GETFH, Vec::new()));
 
         let reply = sess.sequenced_compound(self.minor_version, &compound)?;
@@ -449,10 +466,9 @@ impl Nfs4Client {
         if st != NFS4_OK {
             return Err(GatewayError::ProtocolError(format!("OPEN: {st}")));
         }
-        // stateid + change_info + rflags + attrset + delegation
-        r.read_u32().map_err(|e| xdr_err(&e))?;
-        r.read_opaque_fixed(12).map_err(|e| xdr_err(&e))?;
-        r.read_u32().map_err(|e| xdr_err(&e))?;
+        // stateid (seqid+other = 16 wire bytes) — capture for CLOSE.
+        let open_stateid = r.read_opaque_fixed(16).map_err(|e| xdr_err(&e))?;
+        // change_info + rflags + attrset + delegation
         r.read_u64().map_err(|e| xdr_err(&e))?;
         r.read_u64().map_err(|e| xdr_err(&e))?;
         r.read_u32().map_err(|e| xdr_err(&e))?;
@@ -473,13 +489,6 @@ impl Nfs4Client {
             r.read_u32().map_err(|e| xdr_err(&e))?; // committed
             r.read_opaque_fixed(8).map_err(|e| xdr_err(&e))?; // verifier
         }
-        // COMMIT
-        r.read_u32().map_err(|e| xdr_err(&e))?;
-        let st = r.read_u32().map_err(|e| xdr_err(&e))?;
-        if st != NFS4_OK {
-            return Err(GatewayError::ProtocolError(format!("COMMIT: {st}")));
-        }
-        r.read_opaque_fixed(8).map_err(|e| xdr_err(&e))?;
         // GETFH
         r.read_u32().map_err(|e| xdr_err(&e))?;
         let st = r.read_u32().map_err(|e| xdr_err(&e))?;
@@ -494,7 +503,87 @@ impl Nfs4Client {
         } else {
             CompositionId(uuid::Uuid::new_v4())
         };
+
+        // COMPOUND 2: PUTFH(fh) + CLOSE(open_stateid). op_close flushes
+        // the buffered write for the current fh → materializes the
+        // composition + binds the name in the replicated Create delta.
+        let mut w = XdrWriter::new();
+        w.write_opaque(&fh);
+        let putfh = (op::PUTFH, w.into_bytes());
+        let mut w = XdrWriter::new();
+        w.write_u32(0); // CLOSE seqid
+        w.write_opaque_fixed(&open_stateid); // the OPEN stateid
+        let close = (op::CLOSE, w.into_bytes());
+        let reply2 = sess.sequenced_compound(self.minor_version, &[putfh, close])?;
+        let mut r2 = XdrReader::new(&reply2);
+        // PUTFH
+        r2.read_u32().map_err(|e| xdr_err(&e))?;
+        let st = r2.read_u32().map_err(|e| xdr_err(&e))?;
+        if st != NFS4_OK {
+            return Err(GatewayError::ProtocolError(format!("PUTFH(close): {st}")));
+        }
+        // CLOSE
+        r2.read_u32().map_err(|e| xdr_err(&e))?;
+        let st = r2.read_u32().map_err(|e| xdr_err(&e))?;
+        if st != NFS4_OK {
+            return Err(GatewayError::ProtocolError(format!("CLOSE: {st}")));
+        }
+
         Ok(composition_id)
+    }
+
+    /// Resolve `name` via an `NFSv4` `LOOKUP` + `READ`:
+    /// `PUTROOTFH + LOOKUP(name) + READ`. The server's `op_lookup`
+    /// resolves the name through `ctx.lookup_by_name` (the #127 path —
+    /// local `dir_index`, else the replicated name index) and sets the
+    /// current fh; READ then serves from it. Run against a node that did
+    /// NOT do the write, this exercises cross-node POSIX name
+    /// resolution end-to-end.
+    #[allow(clippy::unused_async)]
+    pub async fn read_by_name(&self, name: &str, length: u32) -> Result<Vec<u8>, GatewayError> {
+        let mut guard = self.ensure_session().await?;
+        let sess = guard
+            .as_mut()
+            .expect("session not initialized — call connect_v41() first");
+
+        let putrootfh = (op::PUTROOTFH, Vec::new());
+        let mut w = XdrWriter::new();
+        w.write_string(name);
+        let lookup = (op::LOOKUP, w.into_bytes());
+        let mut w = XdrWriter::new();
+        w.write_u32(0); // stateid seqid
+        w.write_opaque_fixed(&[0u8; 12]); // anonymous stateid
+        w.write_u64(0); // offset
+        w.write_u32(length); // count
+        let read = (op::READ, w.into_bytes());
+
+        let reply = sess.sequenced_compound(self.minor_version, &[putrootfh, lookup, read])?;
+
+        // Scan for the READ op result (mirrors `read()`). If LOOKUP
+        // returned NFS4ERR_NOENT the COMPOUND halts before READ, so the
+        // op is absent — surfaced as a clear "name not found" error.
+        let read_bytes = op::READ.to_be_bytes();
+        let pos = reply
+            .windows(4)
+            .rposition(|x| x == read_bytes)
+            .ok_or_else(|| {
+                GatewayError::ProtocolError(
+                    "LOOKUP+READ: no READ result — LOOKUP failed (name not resolved?)".into(),
+                )
+            })?;
+        let r = &reply[pos..];
+        if r.len() < 16 {
+            return Err(GatewayError::ProtocolError("READ reply short".into()));
+        }
+        let st = u32::from_be_bytes(r[4..8].try_into().expect("fixed len"));
+        if st != NFS4_OK {
+            return Err(GatewayError::ProtocolError(format!("READ: {st}")));
+        }
+        let data_len = u32::from_be_bytes(r[12..16].try_into().expect("fixed len")) as usize;
+        if r.len() < 16 + data_len {
+            return Err(GatewayError::ProtocolError("READ data truncated".into()));
+        }
+        Ok(r[16..16 + data_len].to_vec())
     }
 }
 
@@ -798,6 +887,7 @@ impl GatewayOps for Nfs4Client {
 
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await?;
         Ok(resp.composition_id)

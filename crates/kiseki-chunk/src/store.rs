@@ -37,6 +37,68 @@ struct ChunkEntry {
     stored_bytes: u64,
 }
 
+/// Storage capacity + dedup statistics for a chunk store.
+///
+/// `device_*` come from the backing [`DeviceBackend`] (for a
+/// `DevicePool` they sum every JBOD member). `logical`/`physical` are
+/// the chunk-level dedup accounting: `logical` is the bytes addressed
+/// by clients (`sum(refcount × payload)`), `physical` is the unique
+/// stored payload bytes (each content-addressed chunk once). The ratio
+/// of the two is the dedup factor.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StorageStats {
+    /// Physical bytes allocated on the backing device(s).
+    pub device_used_bytes: u64,
+    /// Total physical capacity of the backing device(s).
+    pub device_total_bytes: u64,
+    /// Logical bytes addressed by clients (`sum(refcount × payload)`).
+    pub logical_bytes: u64,
+    /// Unique stored payload bytes (each chunk counted once).
+    pub physical_bytes: u64,
+    /// Number of unique chunks held locally.
+    pub chunk_count: u64,
+}
+
+impl StorageStats {
+    /// Dedup ratio = logical / physical (`1.0` = no dedup benefit).
+    #[must_use]
+    pub fn dedup_ratio(&self) -> f64 {
+        if self.physical_bytes == 0 {
+            1.0
+        } else {
+            // Precision loss is acceptable for a display ratio.
+            #[allow(clippy::cast_precision_loss)]
+            let r = self.logical_bytes as f64 / self.physical_bytes as f64;
+            r
+        }
+    }
+
+    /// Free bytes on the backing device(s).
+    #[must_use]
+    pub fn device_free_bytes(&self) -> u64 {
+        self.device_total_bytes
+            .saturating_sub(self.device_used_bytes)
+    }
+}
+
+/// Map a chunk-store pool name to a placement tier (ADR-045 §D3/D4).
+///
+/// The reserved names `fast` / `bulk` / `cold` select a device class;
+/// any other name (including `default`) means "no preference" →
+/// fastest-fit. The pool name rides the existing `write_chunk` /
+/// `PutFragment` seam and propagates to every node, so a tier hint
+/// reaches each node's local placement without changing the EC
+/// durability fan-out.
+#[must_use]
+pub fn tier_for_pool(pool: &str) -> Option<kiseki_block::StorageTier> {
+    match pool {
+        "fast" => Some(kiseki_block::StorageTier::Fast),
+        "bulk" => Some(kiseki_block::StorageTier::Bulk),
+        "cold" => Some(kiseki_block::StorageTier::Cold),
+        _ => None,
+    }
+}
+
 /// Chunk storage operations trait.
 pub trait ChunkOps {
     /// Write a chunk. If the chunk ID already exists (dedup hit),
@@ -84,6 +146,13 @@ pub trait ChunkOps {
     /// Get the refcount for a chunk.
     fn refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError>;
 
+    /// Storage capacity + dedup statistics. Default returns zeroes
+    /// (in-memory / unbounded backends); persistent backends override
+    /// with real device capacity and chunk-level dedup accounting.
+    fn storage_stats(&self) -> StorageStats {
+        StorageStats::default()
+    }
+
     /// Phase 16c step 4: enumerate every chunk currently held
     /// locally. Used by the orphan-fragment scrub to walk the
     /// candidate set. Default empty so existing impls compile;
@@ -105,6 +174,20 @@ pub trait ChunkOps {
         _bytes: Vec<u8>,
     ) -> Result<(), ChunkError> {
         Err(ChunkError::Io("write_fragment not implemented".into()))
+    }
+
+    /// Write a fragment with a placement-tier hint derived from `pool`
+    /// (ADR-045 §D4). Default ignores the pool and delegates to
+    /// [`write_fragment`](Self::write_fragment); the persistent store
+    /// overrides it to place the fragment on the pool's device class.
+    fn write_fragment_in_pool(
+        &mut self,
+        chunk_id: &ChunkId,
+        fragment_index: u32,
+        bytes: Vec<u8>,
+        _pool: &str,
+    ) -> Result<(), ChunkError> {
+        self.write_fragment(chunk_id, fragment_index, bytes)
     }
 
     /// Read a fragment by `(chunk_id, fragment_index)`. Returns

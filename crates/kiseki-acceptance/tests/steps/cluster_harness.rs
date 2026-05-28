@@ -117,6 +117,9 @@ pub struct ClusterHarness {
     /// `MtlsCerts` (and its `TempDir`) alive for the cluster's
     /// lifetime so the cert files survive every spawn / restart.
     mtls_certs: Option<Arc<crate::steps::mtls_certs::MtlsCerts>>,
+    /// Optional chunk-store device-size cap (`KISEKI_CHUNK_DEVICE_BYTES`),
+    /// re-applied on restart. `Some` only for the GH #115 ENOSPC cluster.
+    chunk_device_bytes: Option<u64>,
 }
 
 impl ClusterHarness {
@@ -125,7 +128,17 @@ impl ClusterHarness {
     /// same non-zero `leader_id` (30s deadline) — i.e. an election
     /// has converged.
     pub async fn start(node_count: u64) -> Result<Self, String> {
-        Self::start_inner(node_count, None).await
+        Self::start_inner(node_count, None, None).await
+    }
+
+    /// Variant that caps each node's chunk-store device size
+    /// (`KISEKI_CHUNK_DEVICE_BYTES`) so a test can fill it quickly and
+    /// exercise the real out-of-space path (GH #115 → clean 507).
+    pub async fn start_with_device_cap(
+        node_count: u64,
+        chunk_device_bytes: u64,
+    ) -> Result<Self, String> {
+        Self::start_inner(node_count, None, Some(chunk_device_bytes)).await
     }
 
     /// Variant that wires mTLS for the data-path / fabric layer.
@@ -136,7 +149,7 @@ impl ClusterHarness {
     pub async fn start_mtls(node_count: u64) -> Result<Self, String> {
         let node_ids: Vec<u64> = (1..=node_count).collect();
         let certs = Arc::new(crate::steps::mtls_certs::MtlsCerts::generate(&node_ids));
-        Self::start_inner(node_count, Some(certs)).await
+        Self::start_inner(node_count, Some(certs), None).await
     }
 
     /// Borrow the harness's mTLS certs (if any). The negative
@@ -150,6 +163,7 @@ impl ClusterHarness {
     async fn start_inner(
         node_count: u64,
         mtls_certs: Option<Arc<crate::steps::mtls_certs::MtlsCerts>>,
+        chunk_device_bytes: Option<u64>,
     ) -> Result<Self, String> {
         let binary = find_server_binary()?;
 
@@ -218,6 +232,7 @@ impl ClusterHarness {
             &ds_peers_env,
             true,
             mtls_certs.as_deref(),
+            chunk_device_bytes,
         )?;
         wait_for_admin(&n1, Duration::from_secs(60)).await?;
         nodes.insert(1, n1);
@@ -236,6 +251,7 @@ impl ClusterHarness {
                 &ds_peers_env,
                 false,
                 mtls_certs.as_deref(),
+                chunk_device_bytes,
             )?;
             wait_for_admin(&node, Duration::from_secs(60)).await?;
             nodes.insert(id, node);
@@ -248,6 +264,7 @@ impl ClusterHarness {
             ds_peers_env,
             binary,
             mtls_certs,
+            chunk_device_bytes,
         };
         cluster
             .wait_for_quorum(Duration::from_secs(30))
@@ -327,6 +344,7 @@ impl ClusterHarness {
             false,
             node.data_dir.path(),
             self.mtls_certs.as_deref(),
+            self.chunk_device_bytes,
         )?;
         // Replace in place — Drop on the old Child has already run via
         // `kill`+`wait` above; we just need to swap the field.
@@ -456,6 +474,25 @@ pub async fn acquire_cluster_20() -> Result<Arc<Mutex<ClusterHarness>>, String> 
         .cloned()
 }
 
+static CLUSTER_ENOSPC: OnceCell<Arc<Mutex<ClusterHarness>>> = OnceCell::const_new();
+
+/// Acquire a dedicated single-node cluster whose chunk-store device is
+/// capped to 16 MiB (`KISEKI_CHUNK_DEVICE_BYTES`). Used only by the
+/// GH #115 ENOSPC scenario: a handful of S3 PUTs fills the device and
+/// the gateway must return a clean 507 (not the pre-#115 500 /
+/// `quorum lost`). Distinct singleton so filling it can't starve any
+/// other scenario's cluster.
+pub async fn acquire_cluster_enospc() -> Result<Arc<Mutex<ClusterHarness>>, String> {
+    CLUSTER_ENOSPC
+        .get_or_try_init(|| async {
+            ClusterHarness::start_with_device_cap(1, 16 * 1024 * 1024)
+                .await
+                .map(|c| Arc::new(Mutex::new(c)))
+        })
+        .await
+        .cloned()
+}
+
 // ---------------------------------------------------------------------------
 // Spawn helpers
 // ---------------------------------------------------------------------------
@@ -469,6 +506,7 @@ fn spawn_node(
     ds_peers_env: &str,
     bootstrap: bool,
     mtls_certs: Option<&crate::steps::mtls_certs::MtlsCerts>,
+    chunk_device_bytes: Option<u64>,
 ) -> Result<NodeHandle, String> {
     let data_dir = tempfile::tempdir().map_err(|e| format!("tempdir for node-{node_id}: {e}"))?;
     let child = spawn_with_env(
@@ -481,6 +519,7 @@ fn spawn_node(
         bootstrap,
         data_dir.path(),
         mtls_certs,
+        chunk_device_bytes,
     )?;
     Ok(NodeHandle {
         node_id,
@@ -503,6 +542,7 @@ fn spawn_with_env(
     bootstrap: bool,
     data_dir: &Path,
     mtls_certs: Option<&crate::steps::mtls_certs::MtlsCerts>,
+    chunk_device_bytes: Option<u64>,
 ) -> Result<Child, String> {
     let mut cmd = Command::new(binary);
     cmd.env_clear()
@@ -546,7 +586,16 @@ fn spawn_with_env(
         // server unchanged. Production deployments leave both flags
         // unset and a token must be configured.
         .env("KISEKI_ADMIN_AUTH_DISABLED", "true")
-        .env("KISEKI_CLUSTER_INFO_PUBLIC", "true");
+        .env("KISEKI_CLUSTER_INFO_PUBLIC", "true")
+        // GH #115: refresh the capacity/dedup gauges every 2s (default
+        // 30s) so the capacity-observability scenario can assert shortly
+        // after writing without a long sleep.
+        .env("KISEKI_CAPACITY_REFRESH_INTERVAL_S", "2");
+    if let Some(bytes) = chunk_device_bytes {
+        // GH #115 ENOSPC scenario: cap the file-backed chunk device so
+        // a handful of PUTs fills it and the gateway returns a clean 507.
+        cmd.env("KISEKI_CHUNK_DEVICE_BYTES", bytes.to_string());
+    }
     if let Some(certs) = mtls_certs {
         let node = certs.node(node_id);
         cmd.env("KISEKI_CA_PATH", &node.ca)

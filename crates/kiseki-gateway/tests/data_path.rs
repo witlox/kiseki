@@ -27,6 +27,7 @@ fn setup_gateway() -> InMemoryGateway {
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
     });
 
     let chunks = ChunkStore::new();
@@ -53,6 +54,7 @@ async fn write_then_read_roundtrip() {
 
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
         })
         .await
         .unwrap();
@@ -92,6 +94,7 @@ async fn read_with_offset_and_length() {
 
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
         })
         .await
         .unwrap();
@@ -128,6 +131,7 @@ async fn read_past_eof_returns_empty() {
 
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
         })
         .await
         .unwrap();
@@ -163,6 +167,7 @@ async fn tenant_mismatch_rejected() {
 
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
         })
         .await
         .unwrap();
@@ -202,6 +207,7 @@ async fn bucket_isolation_list_returns_only_own_objects() {
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
     });
     compositions.add_namespace(Namespace {
         id: ns2,
@@ -210,6 +216,7 @@ async fn bucket_isolation_list_returns_only_own_objects() {
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
     });
     let chunks = ChunkStore::new();
     let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
@@ -227,6 +234,7 @@ async fn bucket_isolation_list_returns_only_own_objects() {
 
         forwarded_from_node: None,
         comp_id_override: None,
+        tier: None,
     })
     .await
     .unwrap();
@@ -243,6 +251,7 @@ async fn bucket_isolation_list_returns_only_own_objects() {
 
         forwarded_from_node: None,
         comp_id_override: None,
+        tier: None,
     })
     .await
     .unwrap();
@@ -320,6 +329,7 @@ mod nfs_tests {
                 namespace_id: test_namespace(),
                 data: b"nfs file content".to_vec(),
                 comp_id_override: None,
+                name: None,
             })
             .await
             .unwrap();
@@ -410,7 +420,7 @@ mod nfs_tests {
         let ctx = setup_nfs_ctx();
         ctx.write_named("old.txt", b"data".to_vec()).await.unwrap();
 
-        ctx.rename_file("old.txt", "new.txt").unwrap();
+        ctx.rename_file("old.txt", "new.txt").await.unwrap();
         assert!(ctx.lookup_by_name("old.txt").await.is_none());
         assert!(ctx.lookup_by_name("new.txt").await.is_some());
     }

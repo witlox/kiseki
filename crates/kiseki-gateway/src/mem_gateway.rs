@@ -42,6 +42,36 @@ struct ChunkLanded {
 /// metadata / refcount overhead.
 pub const MAX_PLAINTEXT_PER_CHUNK: usize = 64 * 1024 * 1024;
 
+/// Map a chunk-store write failure to a gateway error, surfacing an
+/// out-of-space condition as a clean [`GatewayError::InsufficientStorage`]
+/// (HTTP 507 / POSIX `ENOSPC`) rather than a generic 500. A full device
+/// reports `device full` locally and, across the EC fabric, surfaces a
+/// `quorum lost` wrapper whose chain still carries the underlying
+/// `peer unavailable: ... device full` marker (the GH #115 chain); we
+/// match the out-of-space markers on the rendered error.
+///
+/// We deliberately do NOT treat a *bare* `quorum lost` as out-of-space.
+/// A fabric/replica quorum loss with no space marker (peers denied,
+/// unreachable, or partitioned — e.g. the D-5 `2-of-3 quorum` scenario)
+/// is a durability/availability failure, not a full pool: classifying it
+/// as 507 `InsufficientStorage` tells the client "pool full" when the
+/// pool has space, which is both wrong and un-actionable. Such errors
+/// fall through to [`GatewayError::Upstream`] (HTTP 5xx, message
+/// preserved) so the real `quorum lost` reason reaches the caller.
+fn map_chunk_write_error<E: std::fmt::Display>(e: E) -> GatewayError {
+    let rendered = e.to_string();
+    let lower = rendered.to_ascii_lowercase();
+    if lower.contains("device full")
+        || lower.contains("largest free extent")
+        || lower.contains("no space")
+        || lower.contains("enospc")
+    {
+        GatewayError::InsufficientStorage(rendered)
+    } else {
+        GatewayError::Upstream(rendered)
+    }
+}
+
 /// Copy the bytes of one chunk's plaintext that fall inside the
 /// requested `[start, end)` range into `out`. Used by the range-aware
 /// read path; pulled out so the cache-hit and cache-miss branches
@@ -1202,6 +1232,7 @@ impl InMemoryGateway {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
         };
         // Phase 1: local mutation + capture log handle. Scope the
         // MutexGuard so it drops before any .await point.
@@ -2028,6 +2059,25 @@ impl GatewayOps for InMemoryGateway {
         Ok(true)
     }
 
+    async fn unbind_object_name(
+        &self,
+        _tenant_id: kiseki_common::ids::OrgId,
+        namespace_id: kiseki_common::ids::NamespaceId,
+        name: &str,
+    ) -> Result<bool, GatewayError> {
+        // Name-only removal: drop the (ns, name) → comp binding, leave
+        // the composition intact. The NFS rename path retires the old
+        // name this way (#127). NOTE: this is a local store mutation —
+        // it is NOT yet emitted as a replicated delta, so on a multi-
+        // node cluster a rename's name change is leader-local until a
+        // dedicated rename delta lands (tracked follow-up).
+        let comps = self.compositions.as_ref();
+        comps.unbind_name(namespace_id, name).map_err(|e| {
+            tracing::warn!(error = %e, "gateway unbind_object_name: unbind_name failed");
+            GatewayError::Upstream(e.to_string())
+        })
+    }
+
     #[tracing::instrument(skip(self, prefix), fields(tenant_id = %tenant_id.0, namespace_id = %namespace_id.0))]
     async fn list_named(
         &self,
@@ -2069,6 +2119,21 @@ impl InMemoryGateway {
         req: WriteRequest,
         with_forwarding: bool,
     ) -> Result<WriteResponse, GatewayError> {
+        // ADR-045 §D4/D5: placement-tier hint rides the chunk-store
+        // `pool` seam. `fast`/`bulk`/`cold` steer onto a device class;
+        // anything else (incl. the default) is fastest-fit. Resolution
+        // order: explicit request hint → the namespace's primary (first)
+        // tier policy → fastest-fit. Bound early (before `req` is
+        // consumed) so the chunk write below can use it.
+        let pool = req
+            .tier
+            .clone()
+            .or_else(|| {
+                self.compositions
+                    .namespace(req.namespace_id)
+                    .and_then(|ns| ns.tier_policy.first().map(|t| t.tier.clone()))
+            })
+            .unwrap_or_else(|| "default".to_string());
         // #111: forwarding now happens inside the forward-aware emit
         // (`emit_chunk_and_delta_forwarding_to`), which re-issues the
         // built append to the leader. The origin request carries
@@ -2238,31 +2303,49 @@ impl InMemoryGateway {
             // fast path so small-object storage is unchanged.
             let mut chunk_was_new = false;
             let chunk_write_started = std::time::Instant::now();
+            // Try the inline (small-tier) path for single small pieces.
+            // ADR-030 spillover: if the small tier can't take it (system
+            // disk over budget / objects.redb full), fall through to the
+            // chunk tier rather than failing the write — the small tier
+            // is an optimization, not the only home for the bytes.
+            let mut took_inline = false;
             if pieces_len == 1 && piece_len <= self.inline_threshold && self.small_store.is_some() {
-                tracing::debug!(
-                    ?chunk_id,
-                    inline_threshold = self.inline_threshold,
-                    "gateway write: inline path",
-                );
                 let env_bytes = serde_json::to_vec(&env).map_err(|e| {
                     tracing::warn!(?chunk_id, error = %e, "gateway write: inline encode failed");
                     GatewayError::Upstream(e.to_string())
                 })?;
                 if let Some(ref store) = self.small_store {
-                    store.put(&chunk_id.0, &env_bytes).map_err(|e| {
-                        tracing::warn!(?chunk_id, error = %e, "gateway write: small_store.put failed");
-                        GatewayError::Upstream(e.to_string())
-                    })?;
+                    match store.put(&chunk_id.0, &env_bytes) {
+                        Ok(_) => {
+                            tracing::debug!(
+                                ?chunk_id,
+                                inline_threshold = self.inline_threshold,
+                                "gateway write: inline path",
+                            );
+                            took_inline = true;
+                        }
+                        Err(e) => {
+                            // Small tier full / over budget → spill to
+                            // the chunk tier (ADR-030 emergency response:
+                            // disable inline, route to data tier).
+                            tracing::warn!(
+                                ?chunk_id,
+                                error = %e,
+                                "gateway write: small tier rejected put — spilling to chunk tier",
+                            );
+                        }
+                    }
                 }
-            } else {
+            }
+            if !took_inline {
                 tracing::debug!(
                     ?chunk_id,
                     ciphertext_len,
                     "gateway write: chunk path → chunks.write_chunk",
                 );
-                let is_new = self.chunks.write_chunk(env, "default").await.map_err(|e| {
+                let is_new = self.chunks.write_chunk(env, &pool).await.map_err(|e| {
                     tracing::warn!(?chunk_id, error = %e, "gateway write: chunks.write_chunk failed");
-                    GatewayError::Upstream(e.to_string())
+                    map_chunk_write_error(e)
                 })?;
                 if is_new {
                     chunk_was_new = true;
@@ -2913,6 +2996,7 @@ mod chunking_tests {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .expect("write must succeed");
@@ -2960,6 +3044,7 @@ mod chunking_tests {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .unwrap();
@@ -3009,6 +3094,7 @@ mod chunking_tests {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .unwrap();
@@ -3057,6 +3143,7 @@ mod chunking_tests {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .unwrap();
@@ -3098,6 +3185,7 @@ mod chunking_tests {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .unwrap();
@@ -3145,6 +3233,7 @@ mod chunking_tests {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .unwrap();
@@ -3181,6 +3270,7 @@ mod chunking_tests {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .unwrap();
@@ -3216,6 +3306,7 @@ mod chunking_tests {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .unwrap();
@@ -3251,6 +3342,7 @@ mod chunking_tests {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .unwrap();
@@ -3412,6 +3504,7 @@ mod phase_duration_tests {
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .expect("write must succeed");

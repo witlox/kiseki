@@ -344,6 +344,107 @@ fn shorten_timestamp(time: &str) -> &str {
     }
 }
 
+fn format_capacity(body: &str) -> String {
+    use std::fmt::Write as _;
+    let total_nodes = json_u64(body, "total_nodes").unwrap_or(0);
+    let healthy = json_u64(body, "healthy_nodes").unwrap_or(0);
+
+    let agg_start = body.find("\"aggregate\"").unwrap_or(0);
+    let agg = &body[agg_start..];
+
+    let used = json_u64(agg, "storage_used_bytes").unwrap_or(0);
+    let total = json_u64(agg, "storage_total_bytes").unwrap_or(0);
+    let logical = json_u64(agg, "storage_logical_bytes").unwrap_or(0);
+    let physical = json_u64(agg, "storage_physical_bytes").unwrap_or(0);
+    let chunks = json_u64(agg, "storage_chunk_count").unwrap_or(0);
+    let free = total.saturating_sub(used);
+    let saved = logical.saturating_sub(physical);
+
+    let meta = json_u64(agg, "storage_meta_bytes").unwrap_or(0);
+    let small = json_u64(agg, "storage_small_bytes").unwrap_or(0);
+    let tiers = [
+        (
+            "fast (NVMe)",
+            "storage_tier_fast_used",
+            "storage_tier_fast_total",
+        ),
+        (
+            "bulk (SSD) ",
+            "storage_tier_bulk_used",
+            "storage_tier_bulk_total",
+        ),
+        (
+            "cold (HDD) ",
+            "storage_tier_cold_used",
+            "storage_tier_cold_total",
+        ),
+    ];
+    let mut tier_lines = String::new();
+    for (label, used_key, total_key) in tiers {
+        let tu = json_u64(agg, used_key).unwrap_or(0);
+        let tt = json_u64(agg, total_key).unwrap_or(0);
+        if tt == 0 {
+            continue; // tier not present in this cluster
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let tp = tu as f64 / tt as f64 * 100.0;
+        let _ = writeln!(
+            tier_lines,
+            "  {label}  {} / {}  ({tp:.1}%)",
+            format_bytes(tu),
+            format_bytes(tt),
+        );
+    }
+
+    #[allow(clippy::cast_precision_loss)] // display ratios; precision loss is fine
+    let pct = if total == 0 {
+        0.0
+    } else {
+        used as f64 / total as f64 * 100.0
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let dedup = if physical == 0 {
+        1.0
+    } else {
+        logical as f64 / physical as f64
+    };
+
+    // ADR-024 capacity thresholds (SSD): warning 75 %, read-only 92 %.
+    let color = if pct >= 92.0 {
+        RED
+    } else if pct >= 75.0 {
+        YELLOW
+    } else {
+        GREEN
+    };
+
+    let by_tier = if tier_lines.is_empty() {
+        String::new()
+    } else {
+        format!("By class (chunk pool):\n{tier_lines}")
+    };
+
+    format!(
+        "\n{BOLD}Storage Capacity{RESET}\n\
+         \u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\n\
+         Nodes:    {healthy}/{total_nodes} reporting\n\
+         Chunk pool: {color}{} / {}{RESET}  ({pct:.1}%)   free {}\n\
+         Dedup:    {dedup:.2}\u{00d7}  (logical {} \u{2192} physical {}, saved {})\n\
+         Chunks:   {}\n\
+         {by_tier}\
+         System disk (last-resort tiers): meta {}  small {}\n",
+        format_bytes(used),
+        format_bytes(total),
+        format_bytes(free),
+        format_bytes(logical),
+        format_bytes(physical),
+        format_bytes(saved),
+        format_number(chunks),
+        format_bytes(meta),
+        format_bytes(small),
+    )
+}
+
 fn format_cluster_status(body: &str) -> String {
     let total = json_u64(body, "total_nodes").unwrap_or(0);
     let healthy = json_u64(body, "healthy_nodes").unwrap_or(0);
@@ -532,6 +633,9 @@ struct Args {
 enum Command {
     Status,
     Nodes,
+    /// `capacity` (alias `df`) — cluster storage capacity + usage +
+    /// dedup ratio, aggregated from per-node `/metrics` (GH #115).
+    Capacity,
     Events {
         severity: Option<String>,
         hours: Option<f64>,
@@ -579,9 +683,44 @@ enum Command {
         namespace_id: String,
         tenant_id: String,
         shards: Option<u32>,
+        /// ADR-045 §D3 tier policy: `(class, quota_bytes)` in spill order.
+        tiers: Vec<(String, u64)>,
     },
     /// `forwarding` — proxy + stale-leader counters per node.
     Forwarding,
+    /// `device list [--pool <name>]` — ADR-025 `ListDevices`.
+    DeviceList {
+        pool: Option<String>,
+    },
+    /// `device add <id> --pool <name> [--capacity <size>] [--class <c>]`.
+    DeviceAdd {
+        device_id: String,
+        pool: String,
+        capacity: u64,
+        class: String,
+    },
+    /// `device remove <id>` — ADR-025 `RemoveDevice`.
+    DeviceRemove {
+        device_id: String,
+    },
+    /// `device evacuate <id> [--throughput <mb/s>]` — ADR-025 `EvacuateDevice`.
+    DeviceEvacuate {
+        device_id: String,
+        throughput: u64,
+    },
+    /// `pool rebalance <name> [--throughput <mb/s>]` — ADR-025 `RebalancePool`.
+    PoolRebalance {
+        pool: String,
+        throughput: u64,
+    },
+    /// `pool set-threshold <name> [--warning N] [--critical N] [--readonly N] [--target N]`.
+    PoolSetThreshold {
+        pool: String,
+        warning: u32,
+        critical: u32,
+        readonly: u32,
+        target: u32,
+    },
     /// `audit query [--tenant T] [--type X] [--limit N] [--from S] [--local-only]`
     AuditQuery {
         tenant: Option<String>,
@@ -650,6 +789,28 @@ enum Command {
     },
 }
 
+/// Parse a byte size with an optional binary suffix (`K`/`M`/`G`/`T`,
+/// case-insensitive; bare number = bytes; `0` = unbounded).
+fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty size".into());
+    }
+    let (num, mult) = match s.chars().last().and_then(|c| c.to_uppercase().next()) {
+        Some('K') => (&s[..s.len() - 1], 1024u64),
+        Some('M') => (&s[..s.len() - 1], 1024 * 1024),
+        Some('G') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        Some('T') => (&s[..s.len() - 1], 1024u64 * 1024 * 1024 * 1024),
+        _ => (s, 1),
+    };
+    let base: u64 = num
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid size '{s}': {e}"))?;
+    base.checked_mul(mult)
+        .ok_or_else(|| format!("size '{s}' overflows u64"))
+}
+
 fn print_usage() {
     eprintln!(
         "kiseki-admin -- remote cluster administration CLI\n\
@@ -660,6 +821,13 @@ fn print_usage() {
          Commands:\n\
          \x20 status                         Cluster status summary\n\
          \x20 nodes                          Node list with health and metrics\n\
+         \x20 capacity (df)                  Storage capacity, usage + dedup ratio\n\
+         \x20 device list [--pool N]         List storage devices (ADR-025)\n\
+         \x20 device add <id> --pool N [--capacity S] [--class C]\n\
+         \x20 device remove <id>             Remove a device from its pool\n\
+         \x20 device evacuate <id> [--throughput MB]  Drain a device\n\
+         \x20 pool rebalance <name> [--throughput MB]  Rebalance a pool\n\
+         \x20 pool set-threshold <name> [--warning N] [--critical N] [--readonly N]\n\
          \x20 events [--severity S] [--hours N]  Event log\n\
          \x20 history [--hours N]            Metric history time series\n\
          \x20 maintenance on|off             Toggle cluster maintenance mode\n\
@@ -736,6 +904,7 @@ fn parse_subcommand(args: &[String], start: usize) -> Result<Command, String> {
     match cmd {
         "status" => Ok(Command::Status),
         "nodes" => Ok(Command::Nodes),
+        "capacity" | "df" => Ok(Command::Capacity),
         "events" => {
             let mut severity = None;
             let mut hours = None;
@@ -796,6 +965,8 @@ fn parse_subcommand(args: &[String], start: usize) -> Result<Command, String> {
         "shards" => Ok(Command::Shards),
         "shard" => parse_shard(&args[i..]),
         "topology" => parse_topology(&args[i..]),
+        "device" => parse_device(&args[i..]),
+        "pool" => parse_pool(&args[i..]),
         "forwarding" => Ok(Command::Forwarding),
         "audit" => parse_audit(&args[i..]),
         "tenant" => parse_tenant(&args[i..]),
@@ -806,6 +977,137 @@ fn parse_subcommand(args: &[String], start: usize) -> Result<Command, String> {
         "version" | "--version" | "-V" => Ok(Command::Version),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(format!("unknown command: {other}")),
+    }
+}
+
+fn parse_device(rest: &[String]) -> Result<Command, String> {
+    let sub = rest
+        .first()
+        .map(String::as_str)
+        .ok_or("device requires a subcommand (list|add|remove|evacuate)")?;
+    match sub {
+        "list" => {
+            let mut pool = None;
+            let mut i = 1;
+            while i < rest.len() {
+                if rest[i] == "--pool" {
+                    pool = rest.get(i + 1).cloned();
+                    i += 2;
+                } else {
+                    return Err(format!("unknown device list flag: {}", rest[i]));
+                }
+            }
+            Ok(Command::DeviceList { pool })
+        }
+        "add" => {
+            let device_id = rest
+                .get(1)
+                .cloned()
+                .ok_or("device add requires <device-id>")?;
+            let mut pool = None;
+            let mut capacity = 0u64;
+            let mut class = String::new();
+            let mut i = 2;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--pool" => {
+                        pool = rest.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--capacity" => {
+                        capacity =
+                            parse_size(rest.get(i + 1).ok_or("--capacity requires a size")?)?;
+                        i += 2;
+                    }
+                    "--class" => {
+                        class = rest.get(i + 1).cloned().unwrap_or_default();
+                        i += 2;
+                    }
+                    other => return Err(format!("unknown device add flag: {other}")),
+                }
+            }
+            let pool = pool.ok_or("device add requires --pool <name>")?;
+            Ok(Command::DeviceAdd {
+                device_id,
+                pool,
+                capacity,
+                class,
+            })
+        }
+        "remove" => {
+            let device_id = rest
+                .get(1)
+                .cloned()
+                .ok_or("device remove requires <device-id>")?;
+            Ok(Command::DeviceRemove { device_id })
+        }
+        "evacuate" => {
+            let device_id = rest
+                .get(1)
+                .cloned()
+                .ok_or("device evacuate requires <device-id>")?;
+            let mut throughput = 0u64;
+            if let Some(p) = rest.iter().position(|a| a == "--throughput") {
+                throughput = rest
+                    .get(p + 1)
+                    .ok_or("--throughput requires a value (MB/s)")?
+                    .parse()
+                    .map_err(|e| format!("--throughput: {e}"))?;
+            }
+            Ok(Command::DeviceEvacuate {
+                device_id,
+                throughput,
+            })
+        }
+        other => Err(format!("unknown device subcommand: {other}")),
+    }
+}
+
+fn parse_pool(rest: &[String]) -> Result<Command, String> {
+    let sub = rest
+        .first()
+        .map(String::as_str)
+        .ok_or("pool requires a subcommand (rebalance|set-threshold)")?;
+    match sub {
+        "rebalance" => {
+            let pool = rest
+                .get(1)
+                .cloned()
+                .ok_or("pool rebalance requires <pool-name>")?;
+            let mut throughput = 0u64;
+            if let Some(p) = rest.iter().position(|a| a == "--throughput") {
+                throughput = rest
+                    .get(p + 1)
+                    .ok_or("--throughput requires a value (MB/s)")?
+                    .parse()
+                    .map_err(|e| format!("--throughput: {e}"))?;
+            }
+            Ok(Command::PoolRebalance { pool, throughput })
+        }
+        "set-threshold" => {
+            let pool = rest
+                .get(1)
+                .cloned()
+                .ok_or("pool set-threshold requires <pool-name>")?;
+            let pct = |flag: &str| -> Result<u32, String> {
+                match rest.iter().position(|a| a == flag) {
+                    Some(p) => rest
+                        .get(p + 1)
+                        .ok_or_else(|| format!("{flag} requires a percentage"))?
+                        .parse()
+                        .map_err(|e| format!("{flag}: {e}")),
+                    None => Ok(0),
+                }
+            };
+            Ok(Command::PoolSetThreshold {
+                pool,
+                warning: pct("--warning")?,
+                critical: pct("--critical")?,
+                readonly: pct("--readonly")?,
+                target: pct("--target")?,
+            })
+        }
+        other => Err(format!("unknown pool subcommand: {other}")),
     }
 }
 
@@ -875,6 +1177,7 @@ fn parse_topology(rest: &[String]) -> Result<Command, String> {
                 .ok_or("topology namespace-create requires <namespace-id>")?;
             let mut tenant_id: Option<String> = None;
             let mut shards: Option<u32> = None;
+            let mut tiers: Vec<(String, u64)> = Vec::new();
             let mut i = 2;
             while i < rest.len() {
                 match rest[i].as_str() {
@@ -893,6 +1196,27 @@ fn parse_topology(rest: &[String]) -> Result<Command, String> {
                         shards = Some(n);
                         i += 1;
                     }
+                    // ADR-045 §D3: --tier <class>=<quota>, repeatable.
+                    // Order is the spill order. <quota> accepts size
+                    // suffixes (10T / 500G / 0 = unbounded).
+                    "--tier" | "--class" => {
+                        i += 1;
+                        let raw = rest
+                            .get(i)
+                            .ok_or("--tier requires <class>=<quota> (e.g. fast=10T)")?;
+                        let (class, quota) = match raw.split_once('=') {
+                            Some((c, q)) => (c.to_owned(), parse_size(q)?),
+                            // `--class fast` sugar = unbounded.
+                            None => (raw.clone(), 0),
+                        };
+                        if !matches!(class.as_str(), "fast" | "bulk" | "cold") {
+                            return Err(format!(
+                                "--tier class must be fast|bulk|cold, got '{class}'"
+                            ));
+                        }
+                        tiers.push((class, quota));
+                        i += 1;
+                    }
                     other => {
                         return Err(format!("unknown topology namespace-create flag: {other}"));
                     }
@@ -904,6 +1228,7 @@ fn parse_topology(rest: &[String]) -> Result<Command, String> {
                 namespace_id,
                 tenant_id,
                 shards,
+                tiers,
             })
         }
         other => Err(format!(
@@ -1213,6 +1538,13 @@ fn main() {
             http_get(&args.endpoint, "/ui/api/nodes")
                 .map(|b| if json { b } else { format_nodes(&b) })
         }
+        Command::Capacity => http_get(&args.endpoint, "/ui/api/cluster").map(|b| {
+            if json {
+                b
+            } else {
+                format_capacity(&b)
+            }
+        }),
         Command::Events { severity, hours } => {
             let mut params = Vec::new();
             if let Some(s) = &severity {
@@ -1308,20 +1640,89 @@ fn main() {
                 format_forwarding(&b)
             }
         }),
+        Command::DeviceList { pool } => {
+            let path = match pool {
+                Some(p) => format!("/admin/storage/devices?pool={p}"),
+                None => "/admin/storage/devices".to_string(),
+            };
+            http_get(&args.endpoint, &path)
+        }
+        Command::DeviceAdd {
+            device_id,
+            pool,
+            capacity,
+            class,
+        } => {
+            let body = format!(
+                "{{\"device_id\":\"{}\",\"pool_name\":\"{}\",\"capacity_bytes\":{capacity},\"device_class\":\"{}\"}}",
+                json_escape(&device_id),
+                json_escape(&pool),
+                json_escape(&class),
+            );
+            http_post(&args.endpoint, "/admin/storage/devices/add", &body)
+        }
+        Command::DeviceRemove { device_id } => {
+            let body = format!("{{\"device_id\":\"{}\"}}", json_escape(&device_id));
+            http_post(&args.endpoint, "/admin/storage/devices/remove", &body)
+        }
+        Command::DeviceEvacuate {
+            device_id,
+            throughput,
+        } => {
+            let body = format!(
+                "{{\"device_id\":\"{}\",\"throughput_mb_s\":{throughput}}}",
+                json_escape(&device_id),
+            );
+            http_post(&args.endpoint, "/admin/storage/devices/evacuate", &body)
+        }
+        Command::PoolRebalance { pool, throughput } => {
+            let body = format!(
+                "{{\"pool_name\":\"{}\",\"throughput_mb_s\":{throughput}}}",
+                json_escape(&pool),
+            );
+            http_post(&args.endpoint, "/admin/storage/pools/rebalance", &body)
+        }
+        Command::PoolSetThreshold {
+            pool,
+            warning,
+            critical,
+            readonly,
+            target,
+        } => {
+            let body = format!(
+                "{{\"pool_name\":\"{}\",\"warning_pct\":{warning},\"critical_pct\":{critical},\"readonly_pct\":{readonly},\"target_fill_pct\":{target}}}",
+                json_escape(&pool),
+            );
+            http_post(&args.endpoint, "/admin/storage/pools/thresholds", &body)
+        }
         Command::TopologyCreateNamespace {
             namespace_id,
             tenant_id,
             shards,
+            tiers,
         } => {
             let shards_field = match shards {
                 Some(n) => format!(",\"shards\":{n}"),
                 None => String::new(),
             };
+            // ADR-045 §D3: tier policy as a JSON array of {tier, quota_bytes}.
+            let tiers_field = if tiers.is_empty() {
+                String::new()
+            } else {
+                let entries: Vec<String> = tiers
+                    .iter()
+                    .map(|(c, q)| {
+                        format!("{{\"tier\":\"{}\",\"quota_bytes\":{q}}}", json_escape(c))
+                    })
+                    .collect();
+                format!(",\"tier_policy\":[{}]", entries.join(","))
+            };
             let body = format!(
-                "{{\"namespace_id\":\"{}\",\"tenant_id\":\"{}\"{}}}",
+                "{{\"namespace_id\":\"{}\",\"tenant_id\":\"{}\"{}{}}}",
                 json_escape(&namespace_id),
                 json_escape(&tenant_id),
-                shards_field
+                shards_field,
+                tiers_field
             );
             http_post(&args.endpoint, "/admin/topology/namespaces", &body).map(|b| {
                 if json {
@@ -2123,6 +2524,7 @@ mod tests {
                 namespace_id,
                 tenant_id,
                 shards,
+                ..
             } => {
                 assert_eq!(namespace_id, "bench-ns-0");
                 assert_eq!(tenant_id, "00000000-0000-0000-0000-000000000001");

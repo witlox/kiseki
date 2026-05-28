@@ -17,6 +17,19 @@ pub enum ComplianceTag {
     Custom(String),
 }
 
+/// One tier of a namespace's placement policy (ADR-045 §D3): a device
+/// class plus an optional logical quota. The class name is the
+/// chunk-store pool string (`fast` / `bulk` / `cold`) that
+/// `kiseki_chunk::tier_for_pool` maps to a `StorageTier`; kept as a
+/// `String` here so `kiseki-composition` needs no `kiseki-block` dep.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TierQuota {
+    /// Device-class tier name (`fast` / `bulk` / `cold`).
+    pub tier: String,
+    /// Logical quota in bytes; `0` = unbounded.
+    pub quota_bytes: u64,
+}
+
 /// A namespace within a shard.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Namespace {
@@ -32,6 +45,11 @@ pub struct Namespace {
     pub versioning_enabled: bool,
     /// Compliance tags applied at the namespace level.
     pub compliance_tags: Vec<ComplianceTag>,
+    /// Placement-tier policy (ADR-045 §D3). Empty = the default
+    /// fastest-fit behavior. When non-empty, the first entry is the
+    /// preferred tier and the order is the spill order; each carries an
+    /// optional per-tier logical quota.
+    pub tier_policy: Vec<TierQuota>,
 }
 
 impl Namespace {

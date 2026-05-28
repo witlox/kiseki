@@ -96,6 +96,7 @@ async fn cap_is_enforced_at_listener_layer() {
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
     })
     .await;
     let signing = Arc::new(SigningKeys::new(

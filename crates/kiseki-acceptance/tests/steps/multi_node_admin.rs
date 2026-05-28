@@ -20,6 +20,7 @@ use kiseki_proto::v1 as pb;
 use kiseki_proto::v1::storage_admin_service_client::StorageAdminServiceClient;
 use tonic::transport::{Channel, Endpoint};
 
+use crate::steps::cluster_harness::acquire_cluster_enospc;
 use crate::steps::multi_node::cluster;
 use crate::KisekiWorld;
 
@@ -908,5 +909,156 @@ async fn then_fwd_reads_back(w: &mut KisekiWorld, node_id: u64) {
         (0, 0),
         "GH #111: every object must read back identically from node-{node_id} \
          (get-failures={gf}, mismatches={mm})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GH #115 — capacity-management @integration steps
+// ---------------------------------------------------------------------------
+
+/// A 256 KiB / 1 MiB distinct payload seeded by `i` (distinct content so
+/// it doesn't dedup away — each object must consume real device space).
+fn distinct_payload(i: u32, size: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; size];
+    for (j, b) in buf.iter_mut().enumerate() {
+        *b = (j as u32)
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add(i.wrapping_mul(40_503))
+            .to_le_bytes()[0];
+    }
+    buf
+}
+
+#[given("a single-node cluster with a capped chunk device")]
+async fn given_capped_cluster(w: &mut KisekiWorld) {
+    let arc = acquire_cluster_enospc()
+        .await
+        .expect("failed to start capped single-node cluster");
+    let guard = arc.lock_owned().await;
+    w.cluster.cluster_guard = Some(guard);
+    w.cluster.bucket = Some("default".to_owned());
+}
+
+#[when("distinct 1MB S3 objects are PUT until the chunk device is full")]
+async fn when_put_until_full(w: &mut KisekiWorld) {
+    let s3_base = cluster(w).node(1).s3_base.clone();
+    let http = reqwest::Client::new();
+    let mut saw_507 = false;
+    let mut saw_500 = false;
+    // 16 MiB device → ~16 × 1 MiB distinct PUTs fill it; cap the loop at
+    // 64 so a non-enforcing build fails loudly instead of looping forever.
+    for i in 0..64u32 {
+        let body = distinct_payload(i, 1024 * 1024);
+        let url = format!("{s3_base}/default/enospc-{i}");
+        match http.put(&url).body(body).send().await {
+            Ok(r) => {
+                let code = r.status().as_u16();
+                if code == 507 {
+                    saw_507 = true;
+                    break;
+                }
+                if code == 500 {
+                    saw_500 = true;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    w.cluster
+        .name_index_state
+        .insert("saw_507".to_owned(), saw_507.to_string());
+    w.cluster
+        .name_index_state
+        .insert("saw_500".to_owned(), saw_500.to_string());
+}
+
+#[then("at least one PUT returns HTTP 507 Insufficient Storage")]
+async fn then_saw_507(w: &mut KisekiWorld) {
+    assert_eq!(
+        w.cluster
+            .name_index_state
+            .get("saw_507")
+            .map(String::as_str),
+        Some("true"),
+        "no 507 seen after filling the 16 MiB device — ENOSPC not mapped to InsufficientStorage",
+    );
+}
+
+#[then("no PUT returns HTTP 500")]
+async fn then_no_500(w: &mut KisekiWorld) {
+    assert_ne!(
+        w.cluster
+            .name_index_state
+            .get("saw_500")
+            .map(String::as_str),
+        Some("true"),
+        "a PUT returned 500 — the device-full path regressed to the pre-#115 opaque 500",
+    );
+}
+
+#[when("20 distinct and 20 identical 256KB S3 objects are written for capacity accounting")]
+async fn when_capacity_writes(w: &mut KisekiWorld) {
+    let s3_base = cluster(w).node(1).s3_base.clone();
+    let http = reqwest::Client::new();
+    const SZ: usize = 256 * 1024;
+    for i in 0..20u32 {
+        let _ = http
+            .put(format!("{s3_base}/default/cap-distinct-{i}"))
+            .body(distinct_payload(i, SZ))
+            .send()
+            .await;
+    }
+    // Identical content across all 20 → must dedup to one physical chunk.
+    let identical = vec![0xABu8; SZ];
+    for i in 0..20u32 {
+        let _ = http
+            .put(format!("{s3_base}/default/cap-ident-{i}"))
+            .body(identical.clone())
+            .send()
+            .await;
+    }
+    // Let the 2s capacity refresher pick up the writes before we query.
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+}
+
+#[then("the cluster capacity report shows non-zero used bytes")]
+async fn then_capacity_used(w: &mut KisekiWorld) {
+    let port = cluster(w).node(1).ports.metrics;
+    let body = reqwest::get(format!("http://127.0.0.1:{port}/ui/api/cluster"))
+        .await
+        .expect("GET /ui/api/cluster")
+        .text()
+        .await
+        .expect("read capacity body");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("parse capacity JSON");
+    let used = v["aggregate"]["storage_used_bytes"].as_u64().unwrap_or(0);
+    assert!(
+        used > 0,
+        "capacity used_bytes is 0 — the storage gauges are not live; body={body}",
+    );
+    w.cluster
+        .name_index_state
+        .insert("cap_body".to_owned(), body);
+}
+
+#[then("the cluster dedup ratio exceeds 1.0")]
+async fn then_dedup_ratio(w: &mut KisekiWorld) {
+    let body = w
+        .cluster
+        .name_index_state
+        .get("cap_body")
+        .cloned()
+        .expect("capacity body must be fetched first");
+    let v: serde_json::Value = serde_json::from_str(&body).expect("parse capacity JSON");
+    let logical = v["aggregate"]["storage_logical_bytes"]
+        .as_u64()
+        .unwrap_or(0);
+    let physical = v["aggregate"]["storage_physical_bytes"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        physical > 0 && logical > physical,
+        "dedup not observable: logical={logical} physical={physical} \
+         (20 identical objects should dedup so logical > physical)",
     );
 }

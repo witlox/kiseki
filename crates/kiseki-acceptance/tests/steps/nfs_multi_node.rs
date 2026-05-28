@@ -60,6 +60,77 @@ async fn when_open_create_and_write(w: &mut KisekiWorld, payload: String, node_i
     }
 }
 
+// ---------------------------------------------------------------------------
+// #127: cross-node POSIX name resolution. A named file written on one
+// node must be resolvable BY NAME (NFSv4 LOOKUP) from another node —
+// the name rides the replicated Create delta (hydrator name_inserts),
+// not the writer's node-local in-memory dir_index. This is the real
+// regression guard the shared-store unit test can't provide (it shares
+// one store, so it can't prove replication).
+// ---------------------------------------------------------------------------
+
+#[when(regex = r#"^a client writes "([^"]*)" to a file named "([^"]*)" via NFSv4 on node-(\d+)$"#)]
+async fn when_write_named(w: &mut KisekiWorld, payload: String, name: String, node_id: u64) {
+    let addr = nfs_addr_for_node(w, node_id);
+    let nfs = kiseki_client::remote_nfs::v4::Nfs4Client::v41(addr);
+    match nfs
+        .write_named_at_offsets(&name, &[(0u64, payload.into_bytes())])
+        .await
+    {
+        Ok(comp_id) => {
+            w.last_composition_id = Some(comp_id);
+            w.last_error = None;
+        }
+        Err(e) => {
+            w.last_composition_id = None;
+            w.last_error = Some(format!("{e}"));
+        }
+    }
+}
+
+#[when(regex = r#"^a client reads the file named "([^"]*)" via NFSv4 LOOKUP on node-(\d+)$"#)]
+async fn when_read_named(w: &mut KisekiWorld, name: String, node_id: u64) {
+    let addr = nfs_addr_for_node(w, node_id);
+    let nfs = kiseki_client::remote_nfs::v4::Nfs4Client::v41(addr);
+    // Tolerate replication lag: the name rides the Create delta and is
+    // resolvable on this node only once its hydrator applies the
+    // name_insert. Retry a few times before giving up.
+    let mut got: Option<Vec<u8>> = None;
+    for _ in 0..10 {
+        match nfs.read_by_name(&name, 1 << 20).await {
+            Ok(data) => {
+                got = Some(data);
+                break;
+            }
+            Err(e) => w.last_error = Some(format!("{e}")),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    if got.is_some() {
+        w.last_error = None;
+    }
+    w.last_read_data = got;
+}
+
+#[then(regex = r#"^the NFSv4 read returns "([^"]*)"$"#)]
+async fn then_nfs_read_returns(w: &mut KisekiWorld, expected: String) {
+    assert!(
+        w.last_error.is_none(),
+        "#127 cross-node read-by-name failed: {:?}",
+        w.last_error,
+    );
+    let data = w
+        .last_read_data
+        .as_ref()
+        .expect("#127: expected read data from cross-node LOOKUP+READ");
+    assert_eq!(
+        data,
+        expected.as_bytes(),
+        "#127 cross-node read-by-name byte mismatch: got {:?}",
+        String::from_utf8_lossy(data),
+    );
+}
+
 #[then("the NFSv4 COMPOUND status is NFS4_OK")]
 async fn then_compound_ok(w: &mut KisekiWorld) {
     // The When-step uses `Nfs4Client::write_at_offsets` which only

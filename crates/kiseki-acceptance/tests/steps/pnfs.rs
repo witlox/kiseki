@@ -194,6 +194,7 @@ async fn given_composition_with_size(
         idempotency_key: None,
         forwarded_from_node: None,
         comp_id_override: None,
+        tier: None,
     };
     let resp = kiseki_gateway::ops::GatewayOps::write(&*world.legacy.gateway, req)
         .await

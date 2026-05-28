@@ -59,4 +59,33 @@ Resolved leader endpoints:
   LEADER_NFS_HOSTPORT = $LEADER_NFS_HOSTPORT
   LEADER_NATIVE_URL = $LEADER_NATIVE_URL
 RESOLVED
+
+# GH #115 regression guard: each node must use its full provisioned
+# chunk device (raw NVMe), not the silent 4 GiB file-backed fallback.
+# `kiseki_storage_device_total_bytes` reports the node's chunk-pool
+# capacity. Anything below KISEKI_MIN_DEVICE_GB (default 32 GiB) means
+# `KISEKI_RAW_DEVICES` was not wired and the node fell back to the small
+# file — the exact failure the May-2026 matrix hit. HALT so the run
+# doesn't silently measure a 4 GiB-capped cluster.
+MIN_DEVICE_GB="${KISEKI_MIN_DEVICE_GB:-32}"
+echo "" | tee -a "$OUT"
+echo "Chunk-store capacity per node (GH #115 guard, floor ${MIN_DEVICE_GB} GiB):" | tee -a "$OUT"
+CAP_OK=1
+for ip in $ALL_STORAGE; do
+  total=$(curl -sf --max-time 3 "http://$ip:9090/metrics" 2>/dev/null \
+    | grep '^kiseki_storage_device_total_bytes ' | awk '{print $2}' | head -1)
+  used=$(curl -sf --max-time 3 "http://$ip:9090/metrics" 2>/dev/null \
+    | grep '^kiseki_storage_device_used_bytes ' | awk '{print $2}' | head -1)
+  total="${total:-0}"; used="${used:-0}"
+  gib=$(awk -v b="$total" 'BEGIN{printf "%.1f", b/1073741824}')
+  ugib=$(awk -v b="$used" 'BEGIN{printf "%.2f", b/1073741824}')
+  echo "  $ip → total=${gib} GiB used=${ugib} GiB" | tee -a "$OUT"
+  below=$(awk -v t="$total" -v m="$MIN_DEVICE_GB" 'BEGIN{print (t < m*1073741824) ? 1 : 0}')
+  [ "$below" = "1" ] && CAP_OK=0
+done
+if [ "$CAP_OK" != "1" ]; then
+  echo "HALT (GH #115): a node's chunk device is below ${MIN_DEVICE_GB} GiB — KISEKI_RAW_DEVICES not wired (4 GiB file fallback). Fix device wiring before measuring." | tee -a "$OUT"
+  exit 2
+fi
+
 echo "OK" | tee -a "$OUT"

@@ -2,7 +2,24 @@
 
 use crate::error::{AllocError, BlockError};
 use crate::extent::Extent;
-use crate::probe::DeviceCharacteristics;
+use crate::probe::{DetectedMedium, DeviceCharacteristics, StorageTier};
+
+/// Per-device capacity snapshot — one physical pool member.
+///
+/// `DevicePool` returns one entry per JBOD member so operators can see
+/// which heterogeneous device (`NVMe` / SSD / HDD) is filling; a single
+/// device returns a one-entry breakdown.
+#[derive(Clone, Debug)]
+pub struct DeviceUsage {
+    /// Superblock device UUID.
+    pub device_id: [u8; 16],
+    /// Detected medium (`NVMe` / `SATA` SSD / HDD / virtual).
+    pub medium: DetectedMedium,
+    /// Bytes currently allocated on this device.
+    pub used_bytes: u64,
+    /// Total allocatable bytes on this device.
+    pub total_bytes: u64,
+}
 
 /// Abstraction over a storage device — raw block or file-backed.
 ///
@@ -12,6 +29,14 @@ pub trait DeviceBackend: Send + Sync {
     /// Allocate a contiguous extent of at least `size` bytes.
     /// Alignment matches the device's physical block size.
     fn alloc(&self, size: u64) -> Result<Extent, AllocError>;
+
+    /// Allocate preferring a cost/performance tier (ADR-045 §D4).
+    /// Default ignores the hint (single-tier backends fall back to
+    /// [`alloc`](Self::alloc)). `DevicePool` places on the hinted tier
+    /// and spills cost-ordered (fast → cold) when it's full.
+    fn alloc_in_tier(&self, size: u64, _tier: Option<StorageTier>) -> Result<Extent, AllocError> {
+        self.alloc(size)
+    }
 
     /// Write data at the given extent. Appends CRC32 trailer.
     fn write(&self, extent: &Extent, data: &[u8]) -> Result<(), BlockError>;
@@ -36,6 +61,19 @@ pub trait DeviceBackend: Send + Sync {
 
     /// Get a copy of the allocation bitmap (for persistence/scrub).
     fn bitmap_bytes(&self) -> Vec<u8>;
+
+    /// Per-device capacity breakdown. Default: one entry derived from
+    /// [`capacity`](Self::capacity) + [`characteristics`](Self::characteristics).
+    /// `DevicePool` overrides to report each heterogeneous member.
+    fn device_breakdown(&self) -> Vec<DeviceUsage> {
+        let (used, total) = self.capacity();
+        vec![DeviceUsage {
+            device_id: self.device_id(),
+            medium: self.characteristics().medium,
+            used_bytes: used,
+            total_bytes: total,
+        }]
+    }
 
     /// Run a consistency scrub: verify bitmap integrity, detect orphan
     /// extents, check CRC32 on sampled blocks. Returns a human-readable

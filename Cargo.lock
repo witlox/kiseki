@@ -2089,6 +2089,7 @@ dependencies = [
  "criterion",
  "io-uring",
  "kiseki-common",
+ "libc",
  "prometheus",
  "serde",
  "serde_json",

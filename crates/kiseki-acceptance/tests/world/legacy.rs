@@ -131,6 +131,7 @@ impl LegacyState {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
         });
 
         let shard_map_store = Arc::new(NamespaceShardMapStore::new());

@@ -290,6 +290,7 @@ impl ClusteredChunkStore {
         envelope: Envelope,
         placement: &[u64],
         strategy: crate::ec::EcStrategy,
+        pool: &str,
     ) -> Result<(), ChunkError> {
         tracing::debug!("write_chunk_ec: entry");
         let routes = crate::ec::encode_for_placement(strategy, &envelope.ciphertext, placement)
@@ -323,7 +324,7 @@ impl ClusteredChunkStore {
                 let bytes = route.bytes;
                 let fragment_index = route.fragment_index;
                 if local
-                    .write_fragment(&chunk_id, fragment_index, bytes)
+                    .write_fragment_in_pool(&chunk_id, fragment_index, bytes, pool)
                     .await
                     .is_ok()
                 {
@@ -367,7 +368,7 @@ impl ClusteredChunkStore {
             let peer = Arc::clone(peer);
             let chunk_id = envelope.chunk_id;
             let tenant = self.cfg.tenant_id;
-            let pool = self.cfg.pool.clone();
+            let pool_id = pool.to_owned();
             let env = Envelope {
                 chunk_id,
                 ciphertext: route.bytes,
@@ -383,7 +384,7 @@ impl ClusteredChunkStore {
             futs.push(tokio::spawn(async move {
                 let result = tokio::time::timeout(
                     put_timeout,
-                    peer.put_fragment(chunk_id, fragment_index, tenant, pool, env),
+                    peer.put_fragment(chunk_id, fragment_index, tenant, pool_id, env),
                 )
                 .await;
                 // Self-log on failure so post-quorum (early-exit'd)
@@ -724,7 +725,7 @@ impl AsyncChunkOps for ClusteredChunkStore {
             } else {
                 crate::placement::pick_placement(&envelope.chunk_id, &self.cfg.cluster_nodes, total)
             };
-            self.write_chunk_ec(envelope, &placement, self.cfg.ec_strategy)
+            self.write_chunk_ec(envelope, &placement, self.cfg.ec_strategy, pool)
                 .await?;
             return Ok(stored);
         }
@@ -739,7 +740,7 @@ impl AsyncChunkOps for ClusteredChunkStore {
             let chunk_id = envelope.chunk_id;
             let tenant_id = self.cfg.tenant_id;
             let put_timeout = self.cfg.put_timeout;
-            let pool_id = self.cfg.pool.clone();
+            let pool_id = pool.to_owned();
 
             let mut futs: FuturesUnordered<tokio::task::JoinHandle<_>> = FuturesUnordered::new();
             for peer in &self.peers {
@@ -1728,7 +1729,7 @@ mod tests {
         let chunk_id = env.chunk_id;
         let strategy = crate::ec::EcStrategy::Ec { data: 4, parity: 2 };
         store
-            .write_chunk_ec(env.clone(), &[1, 2, 3, 4, 5, 6], strategy)
+            .write_chunk_ec(env.clone(), &[1, 2, 3, 4, 5, 6], strategy, "default")
             .await
             .expect("ec write");
 
@@ -1794,7 +1795,7 @@ mod tests {
         let chunk_id = env.chunk_id;
         let strategy = crate::ec::EcStrategy::Ec { data: 4, parity: 2 };
         store_writer
-            .write_chunk_ec(env, &[1, 2, 3, 4, 5, 6], strategy)
+            .write_chunk_ec(env, &[1, 2, 3, 4, 5, 6], strategy, "default")
             .await
             .expect("ec write");
 
@@ -1867,7 +1868,7 @@ mod tests {
             let chunk_id = ChunkId([0xA0 + u8::try_from(i).unwrap_or(0); 32]);
             let env = seal_envelope(&aead, &master, &chunk_id, &plaintext).expect("seal");
             writer
-                .write_chunk_ec(env, &placement, strategy)
+                .write_chunk_ec(env, &placement, strategy, "default")
                 .await
                 .expect("ec write");
 

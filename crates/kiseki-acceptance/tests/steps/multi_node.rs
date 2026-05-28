@@ -1189,6 +1189,46 @@ async fn then_put_fails_quorum_lost(w: &mut KisekiWorld, mb: usize, target: u64)
     );
 }
 
+/// D-5: PUT *directly to the Raft leader* so it takes the leader's own
+/// fabric write path (PutFragment to its peers, gated on min_acks). A PUT
+/// to a non-leader instead forwards the ChunkAndDelta to the leader over
+/// the #114 Raft path, which replicates via the Raft log (durable) but
+/// does NOT exercise the fabric quorum this scenario asserts — so it would
+/// succeed (200) with both peers denied. Targeting the leader makes the
+/// fabric quorum loss deterministic regardless of who won the election.
+#[then(regex = r"^a (\d+)MB S3 PUT to the leader fails with quorum lost$")]
+async fn then_put_to_leader_fails_quorum_lost(w: &mut KisekiWorld, mb: usize) {
+    let body = vec![0u8; mb * ONE_MEBIBYTE];
+    let bucket = w
+        .cluster
+        .bucket
+        .clone()
+        .unwrap_or_else(|| "default".to_owned());
+    let key = format!("bdd-quorum-lost-{}", uuid::Uuid::new_v4().simple());
+    let guard = cluster(w);
+    let any = guard.nodes().next().expect("at least one node");
+    let lid = leader_id_via(any)
+        .await
+        .expect("leader_id from /admin/cluster/info");
+    let leader = guard.node(lid);
+    let url = format!("{}/{bucket}/{key}", leader.s3_base);
+    let resp = leader
+        .http
+        .put(&url)
+        .body(body)
+        .send()
+        .await
+        .expect("HTTP PUT to leader failed at transport layer");
+    let status = resp.status();
+    let body_txt = resp.text().await.unwrap_or_default();
+    assert!(
+        !status.is_success() && body_txt.contains("quorum lost"),
+        "direct S3 PUT to the leader (node-{lid}) returned {status} body={body_txt:?}; \
+         wanted 5xx with `quorum lost` — the leader's fabric write quorum (min_acks=2) \
+         must fail when both its peers' incoming fabric is denied",
+    );
+}
+
 #[then(regex = r"^the leader's fabric_quorum_lost_total ticked at least (\d+)$")]
 async fn then_quorum_lost_ticked(w: &mut KisekiWorld, expected_ticks: u64) {
     // Sum the metric across EVERY alive node, not just the Raft
@@ -1535,6 +1575,47 @@ async fn given_node_fabric_deny(w: &mut KisekiWorld, node_id: u64) {
 #[then(regex = r"^node-(\d+)'s incoming fabric is allowed$")]
 async fn then_node_fabric_allow(w: &mut KisekiWorld, node_id: u64) {
     set_node_fabric_deny(w, node_id, false).await;
+}
+
+/// D-5: deny the incoming fabric of the TWO non-leader nodes, discovered
+/// at run time from the actual Raft leader. Denying a fixed node-2+node-3
+/// pair flaked: when the election put the leader on node-2/3, that leader
+/// self-acked + node-1 acked = 2 = a real 2-of-3 quorum and the write
+/// correctly succeeded. Isolating the actual leader leaves it with only
+/// its own ack (1 < min_acks=2) → genuine quorum loss every run.
+#[given("the two non-leader nodes have their incoming fabric denied")]
+async fn given_non_leader_fabric_denied(w: &mut KisekiWorld) {
+    let followers: Vec<u64> = {
+        let guard = cluster(w);
+        let any = guard.nodes().next().expect("at least one node");
+        let leader = leader_id_via(any)
+            .await
+            .expect("leader_id from /admin/cluster/info");
+        guard
+            .nodes()
+            .map(|n| n.node_id)
+            .filter(|id| *id != leader)
+            .collect()
+    };
+    for id in &followers {
+        set_node_fabric_deny(w, *id, true).await;
+    }
+    // Snapshot quorum-lost baseline so `ticked at least N` measures only
+    // this scenario's PUTs (mirrors given_node_fabric_deny).
+    snapshot_quorum_lost_baseline(w).await;
+}
+
+/// D-5 cleanup: re-allow every node's incoming fabric. Idempotent, so it
+/// doesn't need to know which nodes the leader-relative deny targeted.
+#[then("all nodes' incoming fabric is allowed")]
+async fn then_all_fabric_allowed(w: &mut KisekiWorld) {
+    let ids: Vec<u64> = {
+        let guard = cluster(w);
+        guard.nodes().map(|n| n.node_id).collect()
+    };
+    for id in ids {
+        set_node_fabric_deny(w, id, false).await;
+    }
 }
 
 /// Drops every local fragment of the most-recently-written chunk

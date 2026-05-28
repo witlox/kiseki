@@ -454,14 +454,18 @@ impl PersistentChunkStore {
     /// Returns the list of extents holding the payload, in order. On
     /// any failure, all extents allocated by this call are freed
     /// best-effort so the device doesn't leak space.
-    fn alloc_and_write_chunked(&self, data: &[u8]) -> Result<Vec<Extent>, ChunkError> {
+    fn alloc_and_write_chunked(
+        &self,
+        data: &[u8],
+        tier: Option<kiseki_block::StorageTier>,
+    ) -> Result<Vec<Extent>, ChunkError> {
         #[allow(clippy::cast_possible_truncation)]
         let max_payload = MAX_EXTENT_PAYLOAD_BYTES as usize;
         let mut extents: Vec<Extent> = Vec::new();
         let mut written = 0;
         while written < data.len() {
             let take = (data.len() - written).min(max_payload);
-            let extent = match self.device.alloc(take as u64) {
+            let extent = match self.device.alloc_in_tier(take as u64, tier) {
                 Ok(e) => e,
                 Err(e) => {
                     for ext in &extents {
@@ -481,6 +485,56 @@ impl PersistentChunkStore {
             written += take;
         }
         Ok(extents)
+    }
+
+    /// Fragment-write body, parameterized by a placement tier (ADR-045
+    /// §D4). `write_fragment` calls it with `None` (fastest-fit);
+    /// `write_fragment_in_pool` derives the tier from the pool name.
+    fn write_fragment_tier(
+        &mut self,
+        chunk_id: &ChunkId,
+        fragment_index: u32,
+        bytes: &[u8],
+        tier: Option<kiseki_block::StorageTier>,
+    ) -> Result<(), ChunkError> {
+        let key = (*chunk_id, fragment_index);
+        let data_bytes = bytes.len() as u64;
+
+        // Allocate device space + write before touching the in-memory
+        // index so a write failure leaves no half-state. If a prior
+        // entry exists for this key, free its extent after the new
+        // write succeeds.
+        let extent = self
+            .device
+            .alloc_in_tier(data_bytes, tier)
+            .map_err(|e| ChunkError::Io(e.to_string()))?;
+        self.device
+            .write(&extent, bytes)
+            .map_err(|e| ChunkError::Io(e.to_string()))?;
+
+        let (old_extent, persisted_record) = {
+            let mut fragments = self
+                .fragments
+                .lock()
+                .lock_or_die("persistent_store.fragments");
+            let old = fragments.remove(&key).map(|e| e.extent);
+            let record = FragmentRecord {
+                chunk_id: chunk_id.0,
+                fragment_index,
+                extent_offset: extent.offset,
+                extent_length: extent.length,
+                data_bytes,
+            };
+            fragments.insert(key, FragmentEntry { extent });
+            (old, record)
+        };
+        if let Some(old) = old_extent {
+            // Best-effort — if free fails, we leak an extent (the
+            // periodic scrub will reclaim). Don't fail the write.
+            let _ = self.device.free(&old);
+        }
+        self.meta.put_fragment(&persisted_record)?;
+        Ok(())
     }
 }
 
@@ -524,11 +578,12 @@ impl ChunkOps for PersistentChunkStore {
         // touching the device.
         let data = &envelope.ciphertext;
         let data_bytes = data.len() as u64;
+        let tier = crate::store::tier_for_pool(pool);
         let extent_io_started = std::time::Instant::now();
         let extents: Vec<Extent> = if data.is_empty() {
             Vec::new()
         } else {
-            self.alloc_and_write_chunked(data)?
+            self.alloc_and_write_chunked(data, tier)?
         };
         self.observe_write_phase("extent_io", extent_io_started.elapsed());
         let stored_bytes: u64 = extents.iter().map(|e| e.length).sum();
@@ -603,6 +658,34 @@ impl ChunkOps for PersistentChunkStore {
             .get(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
         self.reconstruct_envelope(&entry.record, &entry.extents)
+    }
+
+    fn storage_stats(&self) -> crate::store::StorageStats {
+        // Device capacity is authoritative for used/total (a DevicePool
+        // sums every JBOD member). Dedup accounting iterates the
+        // in-memory chunk map (the same map already held fully in RAM),
+        // so it can't drift from a missed mutation site. Called at a low
+        // cadence (metric refresh + admin query), not on the hot path.
+        let (device_used_bytes, device_total_bytes) = self.device.capacity();
+        let chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
+        let mut logical_bytes = 0u64;
+        let mut physical_bytes = 0u64;
+        for entry in chunks.values() {
+            physical_bytes = physical_bytes.saturating_add(entry.record.data_bytes);
+            logical_bytes = logical_bytes.saturating_add(
+                entry
+                    .record
+                    .data_bytes
+                    .saturating_mul(entry.record.refcount),
+            );
+        }
+        crate::store::StorageStats {
+            device_used_bytes,
+            device_total_bytes,
+            logical_bytes,
+            physical_bytes,
+            chunk_count: u64::try_from(chunks.len()).unwrap_or(u64::MAX),
+        }
     }
 
     fn increment_refcount(&mut self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
@@ -763,44 +846,18 @@ impl ChunkOps for PersistentChunkStore {
         fragment_index: u32,
         bytes: Vec<u8>,
     ) -> Result<(), ChunkError> {
-        let key = (*chunk_id, fragment_index);
-        let data_bytes = bytes.len() as u64;
+        self.write_fragment_tier(chunk_id, fragment_index, &bytes, None)
+    }
 
-        // Allocate device space + write before touching the in-memory
-        // index so a write failure leaves no half-state. If a prior
-        // entry exists for this key, free its extent after the new
-        // write succeeds.
-        let extent = self
-            .device
-            .alloc(data_bytes)
-            .map_err(|e| ChunkError::Io(e.to_string()))?;
-        self.device
-            .write(&extent, &bytes)
-            .map_err(|e| ChunkError::Io(e.to_string()))?;
-
-        let (old_extent, persisted_record) = {
-            let mut fragments = self
-                .fragments
-                .lock()
-                .lock_or_die("persistent_store.fragments");
-            let old = fragments.remove(&key).map(|e| e.extent);
-            let record = FragmentRecord {
-                chunk_id: chunk_id.0,
-                fragment_index,
-                extent_offset: extent.offset,
-                extent_length: extent.length,
-                data_bytes,
-            };
-            fragments.insert(key, FragmentEntry { extent });
-            (old, record)
-        };
-        if let Some(old) = old_extent {
-            // Best-effort — if free fails, we leak an extent (the
-            // periodic scrub will reclaim). Don't fail the write.
-            let _ = self.device.free(&old);
-        }
-        self.meta.put_fragment(&persisted_record)?;
-        Ok(())
+    fn write_fragment_in_pool(
+        &mut self,
+        chunk_id: &ChunkId,
+        fragment_index: u32,
+        bytes: Vec<u8>,
+        pool: &str,
+    ) -> Result<(), ChunkError> {
+        let tier = crate::store::tier_for_pool(pool);
+        self.write_fragment_tier(chunk_id, fragment_index, &bytes, tier)
     }
 
     fn read_fragment(

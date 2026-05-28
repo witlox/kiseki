@@ -734,6 +734,7 @@ async fn when_client_reads_writes(w: &mut KisekiWorld, _comp: String) {
             idempotency_key: None,
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
         })
         .await
         .expect("data-path write must succeed despite advisory outage");

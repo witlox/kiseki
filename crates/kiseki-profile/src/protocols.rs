@@ -135,6 +135,7 @@ impl Driver for S3Driver {
 
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .map_err(|e| format!("s3 put: {e}"))?;
@@ -196,6 +197,7 @@ impl Driver for Nfs3Driver {
 
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .map_err(|e| format!("nfs3 put: {e}"))?;
@@ -257,6 +259,7 @@ impl Driver for Nfs4Driver {
 
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .map_err(|e| format!("nfs4 put: {e}"))?;
@@ -581,6 +584,7 @@ impl Driver for PnfsDriver {
 
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .map_err(|e| format!("pnfs put: {e}"))?;
@@ -719,6 +723,7 @@ impl Driver for FuseDriver {
 
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .map_err(|e| format!("fuse gateway write: {e}"))?;
@@ -976,6 +981,7 @@ impl InProcessDriver {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
         });
         let chunks = ChunkStore::new();
         let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
@@ -1005,6 +1011,7 @@ impl Driver for InProcessDriver {
 
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .map_err(|e| format!("in-process put: {e}"))?;
@@ -1286,6 +1293,7 @@ impl InProcessPersistentDriver {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
         });
 
         // 4. Build the InMemoryGateway with these persistent stores.
@@ -1316,6 +1324,7 @@ impl Driver for InProcessPersistentDriver {
 
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
             })
             .await
             .map_err(|e| format!("in-process-persistent put: {e}"))?;

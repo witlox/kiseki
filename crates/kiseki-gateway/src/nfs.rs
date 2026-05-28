@@ -47,6 +47,13 @@ pub struct NfsWriteRequest {
     /// composition is stored under that id end-to-end — cross-protocol
     /// readers (S3 GET on `bucket/{uuid}`) can then find it.
     pub comp_id_override: Option<CompositionId>,
+    /// Optional POSIX name (#127). When set, the name rides the Create
+    /// delta's name field so it replicates to every node's name index
+    /// via the hydrator — exactly how S3 PUT binds a key. Without this
+    /// the name lived only in the writer node's in-memory `dir_index`,
+    /// so a LOOKUP on another node (or after restart) couldn't resolve
+    /// it and reads came back empty.
+    pub name: Option<String>,
 }
 
 /// NFS WRITE response.
@@ -98,16 +105,18 @@ impl<G: GatewayOps> NfsGateway<G> {
                 tenant_id: req.tenant_id,
                 namespace_id: req.namespace_id,
                 data: req.data,
-                // NFS path doesn't address files by S3-style key — the
-                // file handle is the addressing token. The dir_index in
-                // NfsContext layers a name on top of the bare composition
-                // for LOOKUP, separate from the gateway's name index.
-                name: None,
+                // #127: ride the name into the Create delta's name field
+                // so it replicates to every node's name index (hydrator
+                // name_inserts), the same path S3 PUT uses. The node-local
+                // `dir_index` in NfsContext stays as a fast local cache;
+                // this is what makes a name resolvable cluster-wide.
+                name: req.name,
                 conditional: None,
                 workflow_ref: None,
                 idempotency_key: None,
                 forwarded_from_node: None,
                 comp_id_override: req.comp_id_override,
+                tier: None,
             })
             .await?;
 
@@ -127,6 +136,47 @@ impl<G: GatewayOps> NfsGateway<G> {
         namespace_id: kiseki_common::ids::NamespaceId,
     ) -> Result<Vec<(kiseki_common::ids::CompositionId, u64)>, GatewayError> {
         self.inner.list(tenant_id, namespace_id).await
+    }
+
+    /// Resolve a POSIX name via the **replicated** name index (#127).
+    /// The cross-node / post-restart LOOKUP fallback when this node's
+    /// in-memory `dir_index` misses — reads the local store the hydrator
+    /// keeps current from Create-delta `name_inserts`. Mirrors
+    /// `GatewayOps::lookup_object_by_name`.
+    pub async fn lookup_name(
+        &self,
+        tenant_id: kiseki_common::ids::OrgId,
+        namespace_id: kiseki_common::ids::NamespaceId,
+        name: &str,
+    ) -> Result<Option<kiseki_common::ids::CompositionId>, GatewayError> {
+        self.inner
+            .lookup_object_by_name(tenant_id, namespace_id, name)
+            .await
+    }
+
+    /// Enumerate replicated `(name, composition_id, size)` bindings for
+    /// READDIR (#127) — named entries every node sees, not just the
+    /// writer's node-local `dir_index`. Mirrors `GatewayOps::list_named`.
+    pub async fn list_names(
+        &self,
+        tenant_id: kiseki_common::ids::OrgId,
+        namespace_id: kiseki_common::ids::NamespaceId,
+    ) -> Result<Vec<(String, kiseki_common::ids::CompositionId, u64)>, GatewayError> {
+        self.inner.list_named(tenant_id, namespace_id, None).await
+    }
+
+    /// Retire ONLY a name binding (leave the composition) — the NFS
+    /// rename path's old-name cleanup (#127). Mirrors
+    /// `GatewayOps::unbind_object_name`.
+    pub async fn unbind_name(
+        &self,
+        tenant_id: kiseki_common::ids::OrgId,
+        namespace_id: kiseki_common::ids::NamespaceId,
+        name: &str,
+    ) -> Result<bool, GatewayError> {
+        self.inner
+            .unbind_object_name(tenant_id, namespace_id, name)
+            .await
     }
 
     /// GH #36: NFS REMOVE delegates here so the composition is

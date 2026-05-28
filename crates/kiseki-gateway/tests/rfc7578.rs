@@ -78,6 +78,7 @@ fn setup_router() -> axum::Router {
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
     });
     let chunks = ChunkStore::new();
     let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));

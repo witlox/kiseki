@@ -866,16 +866,66 @@ pub async fn run_main(
         cfg.data_dir
     {
         std::fs::create_dir_all(dir.join("chunks")).ok();
-        let dev_path = dir.join("chunks").join("data.dev");
         // ADR-022 rev-4: chunk meta moved off JSON to fjall. Path
         // is now a keyspace directory (no extension).
         let meta_path = dir.join("chunks").join("meta");
-        // Resolve the device backend through the selector — emits
-        // the `device backend: io_uring` tracing::info! line when
-        // `KISEKI_IO_URING=1` and the feature is compiled in, so the
-        // deploy path is observable from `/var/log`.
-        let device = kiseki_block::open_or_init_device(&dev_path, 4 * 1024 * 1024 * 1024)
-            .map_err(|e| format!("chunk device backend init: {e}"))?;
+        // ADR-024 + ADR-029: when the operator provisioned raw JBOD
+        // data devices (`KISEKI_RAW_DEVICES`), open each as a
+        // `RawBlockDevice` — probe-driven `O_DIRECT` for SSD/NVMe,
+        // buffered for HDD — and span them into one capacity pool so
+        // the node uses its full provisioned storage. Otherwise fall
+        // back to a single file-backed device on `KISEKI_DATA_DIR`
+        // (VMs / CI / single-node dev), sized from
+        // `KISEKI_CHUNK_DEVICE_BYTES` (default 4 GiB). The hard-coded
+        // 4 GiB file was GH #115 — it capped every node at 4 GiB and
+        // silently ignored the provisioned NVMe.
+        let device: std::sync::Arc<dyn kiseki_block::DeviceBackend> = if cfg.raw_devices.is_empty()
+        {
+            let dev_path = dir.join("chunks").join("data.dev");
+            let size = std::env::var("KISEKI_CHUNK_DEVICE_BYTES")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(4 * 1024 * 1024 * 1024);
+            tracing::info!(
+                path = %dev_path.display(),
+                size_gb = size / (1024 * 1024 * 1024),
+                "chunk store: file-backed device (no KISEKI_RAW_DEVICES configured)",
+            );
+            kiseki_block::open_or_init_device(&dev_path, size)
+                .map_err(|e| format!("chunk device backend init: {e}"))?
+        } else {
+            let mut members: Vec<std::sync::Arc<dyn kiseki_block::DeviceBackend>> = Vec::new();
+            for dev_path in &cfg.raw_devices {
+                match kiseki_block::RawBlockDevice::open_or_init(std::path::Path::new(dev_path)) {
+                    Ok(d) => members.push(std::sync::Arc::new(d)),
+                    Err(e) => {
+                        tracing::error!(
+                            device = dev_path,
+                            error = %e,
+                            "raw device open failed — excluding from pool",
+                        );
+                    }
+                }
+            }
+            if members.is_empty() {
+                return Err(format!(
+                    "KISEKI_RAW_DEVICES set ({} device(s)) but none could be opened",
+                    cfg.raw_devices.len()
+                )
+                .into());
+            }
+            let n_members = members.len();
+            let pool = kiseki_block::DevicePool::new(members)
+                .map_err(|e| format!("device pool init: {e}"))?;
+            let total = kiseki_block::DeviceBackend::capacity(&pool).1;
+            tracing::info!(
+                devices = n_members,
+                configured = cfg.raw_devices.len(),
+                total_gb = total / (1024 * 1024 * 1024),
+                "chunk store: raw block-device pool (KISEKI_RAW_DEVICES)",
+            );
+            std::sync::Arc::new(pool)
+        };
         let store = kiseki_chunk::PersistentChunkStore::from_device(device, &meta_path)
             .map_err(|e| format!("persistent chunk store from_device: {e}"))?;
         // Receiver-side write_chunk phase histogram so /metrics shows
@@ -971,6 +1021,99 @@ pub async fn run_main(
             }
         });
         tracing::info!(gc_interval_s, "chunk store: periodic GC task spawned");
+    }
+
+    // Capacity + dedup metrics refresher (GH #115). Populates the
+    // node-level storage gauges (used to be dead) and the per-device
+    // breakdown gauge from `storage_stats()` + `device_breakdown()`.
+    // These feed the cluster aggregator and `kiseki-admin capacity`.
+    {
+        let stats_store = Arc::clone(&local_chunk_store);
+        let stats_device = chunk_device_for_fsync.clone();
+        let g_used = metrics.storage_device_used_bytes.clone();
+        let g_total = metrics.storage_device_total_bytes.clone();
+        let g_logical = metrics.storage_logical_bytes.clone();
+        let g_physical = metrics.storage_physical_bytes.clone();
+        let g_count = metrics.storage_chunk_count.clone();
+        let g_dev = metrics.pool_device_capacity_bytes.clone();
+        let g_meta = metrics.storage_meta_bytes.clone();
+        let g_small = metrics.storage_small_bytes.clone();
+        let g_tier = [
+            (
+                metrics.storage_tier_fast_used.clone(),
+                metrics.storage_tier_fast_total.clone(),
+            ),
+            (
+                metrics.storage_tier_bulk_used.clone(),
+                metrics.storage_tier_bulk_total.clone(),
+            ),
+            (
+                metrics.storage_tier_cold_used.clone(),
+                metrics.storage_tier_cold_total.clone(),
+            ),
+        ];
+        // System-disk tier dirs (ADR-030 last-resort tier guardrail).
+        let meta_dir = cfg.data_dir.as_ref().map(|d| d.join("metadata"));
+        let small_dir = cfg.data_dir.as_ref().map(|d| d.join("small"));
+        let interval_s = std::env::var("KISEKI_CAPACITY_REFRESH_INTERVAL_S")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(30);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_s));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let s = stats_store.storage_stats().await;
+                let to_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+                g_used.set(to_i64(s.device_used_bytes));
+                g_total.set(to_i64(s.device_total_bytes));
+                g_logical.set(to_i64(s.logical_bytes));
+                g_physical.set(to_i64(s.physical_bytes));
+                g_count.set(to_i64(s.chunk_count));
+                if let Some(ref md) = meta_dir {
+                    g_meta.set(to_i64(dir_size_recursive(md)));
+                }
+                if let Some(ref sd) = small_dir {
+                    g_small.set(to_i64(dir_size_recursive(sd)));
+                }
+                if let Some(dev) = &stats_device {
+                    // Aggregate per-device usage by cost/performance tier
+                    // (ADR-024) for the cluster-wide per-class view.
+                    let mut tier_used = [0u64; 3];
+                    let mut tier_total = [0u64; 3];
+                    for d in dev.device_breakdown() {
+                        let id = uuid::Uuid::from_bytes(d.device_id).to_string();
+                        let free = d.total_bytes.saturating_sub(d.used_bytes);
+                        g_dev
+                            .with_label_values(&["data", &id, "total"])
+                            .set(to_i64(d.total_bytes));
+                        g_dev
+                            .with_label_values(&["data", &id, "used"])
+                            .set(to_i64(d.used_bytes));
+                        g_dev
+                            .with_label_values(&["data", &id, "free"])
+                            .set(to_i64(free));
+                        let t = match kiseki_block::StorageTier::of(d.medium) {
+                            kiseki_block::StorageTier::Fast => 0,
+                            kiseki_block::StorageTier::Bulk => 1,
+                            kiseki_block::StorageTier::Cold => 2,
+                        };
+                        tier_used[t] = tier_used[t].saturating_add(d.used_bytes);
+                        tier_total[t] = tier_total[t].saturating_add(d.total_bytes);
+                    }
+                    for (i, (gu, gt)) in g_tier.iter().enumerate() {
+                        gu.set(to_i64(tier_used[i]));
+                        gt.set(to_i64(tier_total[i]));
+                    }
+                }
+            }
+        });
+        tracing::info!(
+            interval_s,
+            "chunk store: capacity/dedup metrics refresher spawned"
+        );
     }
 
     // Cluster chunk fabric (Phase 16a step 12). For each *other* peer
@@ -1177,23 +1320,11 @@ pub async fn run_main(
             Some(scheduler)
         };
 
-    // Raw device discovery (KISEKI_RAW_DEVICES).
-    // This is the discovery phase — actual device opening via DeviceBackend
-    // is deferred until the RawBlockDevice implementation is wired.
-    if !cfg.raw_devices.is_empty() {
-        tracing::info!(
-            devices = cfg.raw_devices.len(),
-            "raw block devices configured"
-        );
-        for dev_path in &cfg.raw_devices {
-            let path = std::path::Path::new(dev_path);
-            if path.exists() {
-                tracing::info!(device = dev_path, "raw device detected");
-            } else {
-                tracing::warn!(device = dev_path, "raw device not found — skipping");
-            }
-        }
-    }
+    // Raw device discovery (KISEKI_RAW_DEVICES) is no longer a
+    // separate log-only phase: the chunk-store construction above opens
+    // each device as a `RawBlockDevice` and spans them into a
+    // `DevicePool` (GH #115). This block previously only logged and
+    // dropped the devices on the floor.
 
     // Composition: wired to log for delta emission. ADR-040 + ADR-022
     // successor: when KISEKI_DATA_DIR is set we back the comp_id →
@@ -1332,6 +1463,7 @@ pub async fn run_main(
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
     });
     let _ = view_store.write().create_view(kiseki_view::ViewDescriptor {
         view_id: bootstrap_view,

@@ -51,6 +51,7 @@ async fn build_warm_gateway() -> (Arc<InMemoryGateway>, CompositionId) {
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
     });
     let chunks = ChunkStore::new();
     let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
@@ -78,6 +79,7 @@ async fn build_warm_gateway() -> (Arc<InMemoryGateway>, CompositionId) {
 
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
         })
         .await
         .expect("warm-put");

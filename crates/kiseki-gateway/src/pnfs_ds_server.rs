@@ -690,16 +690,27 @@ async fn op_commit_ds<G: GatewayOps + Send + Sync + 'static>(
         return (nfs4_status::NFS4_OK, w.into_bytes());
     };
 
+    // #127 (pNFS half): name the composition we mint with the filename
+    // the MDS stamped onto the layout at OPEN/LAYOUTGET (keyed by the
+    // pre-COMMIT placeholder composition_id, which is `fh.composition_id`
+    // here). Passing it through `WriteRequest::name` rides the Create
+    // delta → hydrator name_insert → replicated to every node, so the
+    // file is resolvable by name (and cross-node), not just by UUID.
+    let bound_name = ctx
+        .mds_layout_manager
+        .as_ref()
+        .and_then(|m| m.composition_name(fh.composition_id));
     let req = crate::ops::WriteRequest {
         tenant_id: entry.tenant_id,
         namespace_id: entry.namespace_id,
         data: entry.data,
-        name: None,
+        name: bound_name,
         conditional: None,
         workflow_ref: None,
         idempotency_key: None,
         forwarded_from_node: None,
         comp_id_override: None,
+        tier: None,
     };
     let status = match ctx.block_gateway(ctx.gateway.write(req)) {
         Ok(resp) => {
@@ -807,6 +818,9 @@ mod tests {
         reads: AtomicU64,
         writes: AtomicU64,
         fixed_response: Vec<u8>,
+        /// Last `WriteRequest::name` seen — lets the #127 pNFS-half test
+        /// assert the DS COMMIT named the composition it minted.
+        last_name: std::sync::Mutex<Option<String>>,
     }
 
     #[async_trait::async_trait]
@@ -827,6 +841,7 @@ mod tests {
             req: crate::ops::WriteRequest,
         ) -> Result<crate::ops::WriteResponse, crate::error::GatewayError> {
             let n = self.writes.fetch_add(1, Ordering::SeqCst);
+            *self.last_name.lock().expect("last_name") = req.name.clone();
             // Derive a deterministic new composition_id from the write
             // counter so round-trip tests can assert on the redirect.
             let mut bytes = [0u8; 16];
@@ -847,6 +862,7 @@ mod tests {
                 reads: AtomicU64::new(0),
                 writes: AtomicU64::new(0),
                 fixed_response: vec![0xee; 4096],
+                last_name: std::sync::Mutex::new(None),
             }),
             mac_key: key.clone(),
             stripe_size_bytes: 1_048_576,
@@ -1193,6 +1209,102 @@ mod tests {
     /// composition — silent data loss. With `snapshot_for_commit` each
     /// COMMIT writes the FULL accumulated buffer; the final composition
     /// contains every byte written through the fh.
+    /// #127 (pNFS half): the kernel writes through the DS, so the
+    /// composition is minted by `op_commit_ds`, not the MDS WRITE path.
+    /// The COMMIT must name that composition with the filename the MDS
+    /// stamped onto the shared layout at LAYOUTGET — otherwise the file
+    /// is unresolvable by name (the live GCP symptom: `ls` shows a UUID,
+    /// read returns empty). Pre-fix this was a hardcoded `name: None`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_names_composition_from_layout() {
+        use kiseki_common::ids::{NamespaceId, OrgId};
+
+        let key = derive_pnfs_fh_mac_key(&[0xab; 32], &[0xcd; 16]);
+        let mgr = Arc::new(crate::pnfs::MdsLayoutManager::new(
+            key.clone(),
+            crate::pnfs::MdsLayoutConfig {
+                stripe_size_bytes: 1_048_576,
+                layout_ttl_ms: 300_000,
+                max_entries: 100,
+                storage_ds_addrs: vec!["n1:2052".into()],
+                max_stripes_per_layout: 64,
+            },
+        ));
+        let gw = Arc::new(TrackingGateway {
+            reads: AtomicU64::new(0),
+            writes: AtomicU64::new(0),
+            fixed_response: vec![0xee; 4096],
+            last_name: std::sync::Mutex::new(None),
+        });
+        let ctx = Arc::new(DsContext {
+            gateway: Arc::clone(&gw),
+            mac_key: key.clone(),
+            stripe_size_bytes: 1_048_576,
+            rt: tokio::runtime::Handle::current(),
+            now_ms: fixed_clock(1_000),
+            mds_layout_manager: Some(Arc::clone(&mgr)),
+            write_buffers: Arc::new(crate::pnfs_write_buffer::DsWriteBuffers::new()),
+        });
+
+        let fh = issue_fh(&key, 9_999_999, 0);
+        let comp = fh.composition_id;
+        // MDS LAYOUTGET caches a layout, then stamps the OPEN filename.
+        let _ = mgr.layout_get(
+            OrgId(uuid::Uuid::from_bytes([0x11; 16])),
+            NamespaceId(uuid::Uuid::from_bytes([0x22; 16])),
+            comp,
+            0,
+            1,
+            crate::pnfs::LayoutIoMode::ReadWrite,
+            1_000,
+        );
+        mgr.set_composition_name(comp, "report.bin".to_owned());
+
+        let state = DsCompoundState {
+            current_fh: Some(fh),
+        };
+        let w = write_args(0, b"payload-127");
+        let mut r = XdrReader::new(&w);
+        let (st, _) = op_write_ds(&mut r, &ctx, &state).await;
+        assert_eq!(st, nfs4_status::NFS4_OK);
+
+        let c = commit_args(0, 0);
+        let mut r = XdrReader::new(&c);
+        let (st, _) = op_commit_ds(&mut r, &ctx, &state).await;
+        assert_eq!(st, nfs4_status::NFS4_OK);
+
+        assert_eq!(
+            gw.last_name.lock().expect("last_name").as_deref(),
+            Some("report.bin"),
+            "DS COMMIT must name the minted composition from the layout"
+        );
+    }
+
+    /// Same path with NO layout name stamped (e.g. the layout was evicted
+    /// before COMMIT): the COMMIT must still succeed, leaving the file
+    /// UUID-named — degraded, not broken.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_without_layout_name_leaves_composition_unnamed() {
+        let (ctx, key) = make_ctx(); // mds_layout_manager: None
+        let fh = issue_fh(&key, 9_999_999, 0);
+        let state = DsCompoundState {
+            current_fh: Some(fh),
+        };
+        let w = write_args(0, b"anon");
+        let mut r = XdrReader::new(&w);
+        let (st, _) = op_write_ds(&mut r, &ctx, &state).await;
+        assert_eq!(st, nfs4_status::NFS4_OK);
+        let c = commit_args(0, 0);
+        let mut r = XdrReader::new(&c);
+        let (st, _) = op_commit_ds(&mut r, &ctx, &state).await;
+        assert_eq!(st, nfs4_status::NFS4_OK);
+        assert_eq!(
+            ctx.gateway.last_name.lock().expect("last_name").as_deref(),
+            None,
+            "no layout name → composition stays UUID-named (degraded, not broken)"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn per_commit_pattern_preserves_all_writes() {
         let (ctx, key) = make_ctx();
