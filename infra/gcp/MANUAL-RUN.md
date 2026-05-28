@@ -126,7 +126,39 @@ S3 is path-style, no auth: `http://<ip>:9000/<bucket>/<key>`.
   ANOTHER node; `cmp` to verify; **capture HTTP codes** (`curl -w "%{http_code}"`) —
   a backgrounded `curl -sf` hides 500s. Allow a few seconds settle before cross-node
   GET (Raft composition replication lag, else false MISMATCH).
-- NFS / pNFS / FUSE: one mount at a time.
+- NFS / pNFS / FUSE: one mount at a time. **Reads need a pre-written file** — the
+  2026-05-27 "NFS read inconclusive" was an `fio --rw=read` over a file that was
+  never written. Pre-write a small file, then read it back with `--direct=1` so the
+  read bypasses the page cache and actually exercises the gateway:
+  ```bash
+  # On a client node. NFSv4.2 write + read (small READ file keeps the
+  # commit-bound pre-write bounded — ~256 MB @ the multi-node write rate).
+  mount -t nfs4 -o vers=4.2,rsize=1048576,wsize=1048576 10.0.0.10:/ /mnt/k-nfs
+  mountpoint -q /mnt/k-nfs || { echo MOUNT-FAILED; }
+  # write throughput (time-bounded)
+  fio --name=w --directory=/mnt/k-nfs --rw=write --bs=1m --size=4G --numjobs=4 \
+      --direct=1 --runtime=60 --time_based --group_reporting | grep -E 'WRITE:'
+  # read: pre-write then O_DIRECT read-back (real read path, not a cache hit)
+  fio --name=rd --directory=/mnt/k-nfs --rw=write --bs=1m --size=256m --numjobs=1 \
+      --direct=1 --end_fsync=1 >/dev/null
+  fio --name=rd --directory=/mnt/k-nfs --rw=read  --bs=1m --size=256m --numjobs=1 \
+      --direct=1 --group_reporting | grep -E 'READ:'
+  rm -f /mnt/k-nfs/w* /mnt/k-nfs/rd* ; umount /mnt/k-nfs
+
+  # pNFS Flex Files: mount vers=4.1 so the kernel does LAYOUTGET → DS reads.
+  mount -t nfs4 -o vers=4.1,rsize=1048576,wsize=1048576 10.0.0.10:/ /mnt/k-pnfs
+  nfsstat -m | grep -iE 'vers=4.1|flexfiles'   # confirm pNFS, not MDS fallback
+  fio --name=p --directory=/mnt/k-pnfs --rw=write --bs=1m --size=256m --numjobs=1 \
+      --direct=1 --end_fsync=1 >/dev/null
+  fio --name=p --directory=/mnt/k-pnfs --rw=read  --bs=1m --size=256m --numjobs=1 \
+      --direct=1 --group_reporting | grep -E 'READ:'
+  rm -f /mnt/k-pnfs/p* ; umount /mnt/k-pnfs
+  ```
+  FUSE: after the #124 connect-timeout fix, `kiseki-client mount` prints
+  `Connecting native gateway pool …` then `Connected; attaching FUSE session …`.
+  If it stalls at *Connecting* the native port (9103) is unreachable/firewalled
+  (now fails in 10 s with a clear error, not a silent hang); if it stalls at
+  *attaching*, the issue is the libfuse session / mountpoint, not the network.
 - **Between every step:** `curl http://<ip>:9090/metrics | grep requests_total`,
   `kiseki-admin capacity` (used/free/% + dedup ratio + per-class — watch used
   climb, dedup hold, and no tier hit Full), and `journalctl -u kiseki-server`

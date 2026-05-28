@@ -1,5 +1,7 @@
 #!/bin/bash
-# Phase 40 — NFSv4.2 write/read with pre/post hydrator snapshots.
+# Phase 40 — NFSv4.2 write + read AND pNFS (vers=4.1) read, with
+# pre/post hydrator snapshots. (Read + pNFS run in gcp mode; the local
+# docker probe path stays write-only — it's a smoke path, not the matrix.)
 #
 # The F-1-risk phase (#50): sustained NFS write saturates the
 # composition hydrator because each NFS WRITE op becomes one Raft
@@ -16,6 +18,11 @@
 #   KISEKI_BENCH_NFS_SIZE_GB     (default: 4)
 #   KISEKI_BENCH_NFS_RUNTIME_SECS (default: 60)  fio --runtime cap
 #   KISEKI_BENCH_NFS_NUMJOBS      (default: 4)
+#   KISEKI_BENCH_NFS_READ_MB      (default: 256)  read-test file size — a
+#                                 bounded pre-write that the O_DIRECT read-back
+#                                 then exercises. Small on purpose: the
+#                                 multi-node write path is commit-bound, so a
+#                                 big pre-write would dominate the phase.
 #   KISEKI_BENCH_NFS_PROBE_IMAGE  (default: kiseki-pnfs-client:test, local mode only)
 
 set -uo pipefail
@@ -29,6 +36,7 @@ leader_endpoints
 SIZE_GB="${KISEKI_BENCH_NFS_SIZE_GB:-4}"
 RUNTIME="${KISEKI_BENCH_NFS_RUNTIME_SECS:-60}"
 NUMJOBS="${KISEKI_BENCH_NFS_NUMJOBS:-4}"
+READ_MB="${KISEKI_BENCH_NFS_READ_MB:-256}"
 PROBE_IMG="${KISEKI_BENCH_NFS_PROBE_IMAGE:-kiseki-pnfs-client:test}"
 
 OUT="$RESULTS/40-nfs.txt"
@@ -121,9 +129,16 @@ PY
     echo "  fio produced no JSON output (mount/fio failed?)" | tee -a "$OUT"
   fi
 elif [ "$MODE" = "gcp" ]; then
+  # Human-readable fio output + grep, NOT --output-format=json piped to a
+  # python -c one-liner: the JSON one-liner's nested f-string quoting is
+  # fragile through the heredoc → client_run → remote-shell layers (it was
+  # never confirmed to emit on a real gcp run; the 2026-05-27 numbers came
+  # from hand-driven fio). `WRITE:` / `READ:` summary lines are stable.
   client_run 0 <<EOF | tee -a "$OUT"
 mkdir -p /mnt/kiseki-nfs
 umount /mnt/kiseki-nfs 2>/dev/null
+
+echo "--- NFSv4.2 (vers=4.2) write ---"
 mount -t nfs4 -o vers=4.2,rsize=1048576,wsize=1048576 $NFS_HOST:/ /mnt/kiseki-nfs
 if ! mountpoint -q /mnt/kiseki-nfs; then
   echo MOUNT-FAILED
@@ -131,11 +146,32 @@ if ! mountpoint -q /mnt/kiseki-nfs; then
 fi
 fio --name=nfs-w --directory=/mnt/kiseki-nfs --rw=write --bs=1m \\
   --size=${SIZE_GB}G --numjobs=$NUMJOBS --direct=1 \\
-  --runtime=$RUNTIME --time_based \\
-  --group_reporting --output-format=json 2>/dev/null \\
-  | python3 -c 'import sys,json;d=json.load(sys.stdin);j=d["jobs"][0]["write"];print(f"write: {j[\"bw\"]/1024:.1f} MB/s ({j[\"iops\"]:.0f} IOPS, p99={j[\"lat_ns\"][\"percentile\"][\"99.000000\"]/1000:.0f}us)")'
-rm -f /mnt/kiseki-nfs/nfs-w* 2>/dev/null
-umount /mnt/kiseki-nfs
+  --runtime=$RUNTIME --time_based --group_reporting 2>/dev/null | grep -E 'WRITE:'
+
+echo "--- NFSv4.2 read (pre-write ${READ_MB}M, then O_DIRECT read-back) ---"
+# O_DIRECT read bypasses the page cache so this is the real gateway read
+# path, not a cache hit. The 2026-05-27 "read inconclusive" was a read of
+# a file that was never written — pre-write it here first.
+fio --name=nfs-rd --directory=/mnt/kiseki-nfs --rw=write --bs=1m \\
+  --size=${READ_MB}m --numjobs=1 --direct=1 --end_fsync=1 >/dev/null 2>&1
+fio --name=nfs-rd --directory=/mnt/kiseki-nfs --rw=read --bs=1m \\
+  --size=${READ_MB}m --numjobs=1 --direct=1 --group_reporting 2>/dev/null | grep -E 'READ:'
+rm -f /mnt/kiseki-nfs/nfs-w* /mnt/kiseki-nfs/nfs-rd* 2>/dev/null
+umount /mnt/kiseki-nfs 2>/dev/null
+
+echo "--- pNFS Flex Files (vers=4.1; kernel LAYOUTGET -> per-DS read) ---"
+mount -t nfs4 -o vers=4.1,rsize=1048576,wsize=1048576 $NFS_HOST:/ /mnt/kiseki-nfs
+if ! mountpoint -q /mnt/kiseki-nfs; then
+  echo PNFS-MOUNT-FAILED
+  exit 1
+fi
+nfsstat -m 2>/dev/null | grep -iE 'vers=4.1|flexfiles' || echo '(no nfsstat layout line — MDS fallback?)'
+fio --name=pnfs-rd --directory=/mnt/kiseki-nfs --rw=write --bs=1m \\
+  --size=${READ_MB}m --numjobs=1 --direct=1 --end_fsync=1 >/dev/null 2>&1
+fio --name=pnfs-rd --directory=/mnt/kiseki-nfs --rw=read --bs=1m \\
+  --size=${READ_MB}m --numjobs=1 --direct=1 --group_reporting 2>/dev/null | grep -E 'READ:'
+rm -f /mnt/kiseki-nfs/pnfs-rd* 2>/dev/null
+umount /mnt/kiseki-nfs 2>/dev/null
 EOF
 fi
 
