@@ -177,6 +177,7 @@ pub struct FuseDaemon<G: GatewayOps> {
 #[cfg(feature = "fuse")]
 impl<G: GatewayOps> FuseDaemon<G> {
     /// Create a new FUSE daemon wrapping a `KisekiFuse` instance.
+    #[must_use]
     pub fn new(fs: KisekiFuse<G>) -> Self {
         Self {
             inner: RwLock::new(fs),
@@ -768,7 +769,11 @@ mod read_perf_caps_tests {
     /// ~128 KiB readahead (forces N round trips for an N×128 KiB
     /// read) and `keep_cache = false` on open (defeats the page cache
     /// between opens). Pin both fixes here.
+    // These two assert on compile-time constants on purpose — they are
+    // regression pins that fail the build if someone changes the cache
+    // flag or readahead constant, with the rationale in the message.
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn open_flags_set_keep_cache_so_repeat_reads_hit_page_cache() {
         assert!(
             FILE_OPEN_OPTIONS.keep_cache,
@@ -781,6 +786,7 @@ mod read_perf_caps_tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn max_readahead_is_at_least_one_mib_so_large_reads_dont_chunk_to_default() {
         const MIN: u32 = 1024 * 1024;
         assert!(
@@ -799,7 +805,7 @@ mod attr_time_tests {
     use crate::fuse_fs::{FileAttr, FileKind};
 
     /// Bug 7 (GCP 2026-05-04): FUSE getattr returned `mtime = Jan 1 1970`
-    /// because `to_*_attr` hard-coded UNIX_EPOCH for every time field.
+    /// because `to_*_attr` hard-coded `UNIX_EPOCH` for every time field.
     /// The fix uses `SystemTime::now()` as a placeholder.
     #[test]
     fn to_kiseki_fuse_attr_does_not_return_unix_epoch() {
