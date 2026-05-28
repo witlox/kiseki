@@ -1497,6 +1497,16 @@ async fn op_layoutget_ff<G: GatewayOps>(
         now_ms,
     );
 
+    // #127 (pNFS half): the kernel writes through the DS, whose COMMIT
+    // mints the composition. Carry the filename the MDS bound at OPEN
+    // (in `dir_index`) onto the cached layout so `op_commit_ds` can name
+    // that composition — otherwise the file is unresolvable by name.
+    // `fh` is `[u8; 32]` == `FileHandle`; re-stamped on every LAYOUTGET
+    // so a cache-rebuilt (nameless) layout self-heals before COMMIT.
+    if let Some(fname) = ctx.dir_index.name_for(ctx.namespace_id, fh) {
+        mgr.set_composition_name(comp_id, fname);
+    }
+
     w.write_u32(nfs4_status::NFS4_OK);
     w.write_bool(true); // return_on_close
     w.write_opaque_fixed(&layout.stateid);

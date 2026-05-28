@@ -783,43 +783,45 @@ impl<G: GatewayOps> NfsContext<G> {
         // `dir_index`. The index alone doesn't carry type info — we
         // ask the handle registry whether the resolved handle is a
         // directory and pick the right mode + nlink + size shape.
+        // A `dir_index` hit is authoritative for directories, symlinks,
+        // and non-empty regular files. A *size-0 regular* hit is
+        // ambiguous: it's either a genuinely empty file OR a pNFS
+        // placeholder (`create_pending_named`) whose real bytes + name
+        // were committed through the DS COMMIT into the replicated index
+        // and never written back to this stale entry (#127 pNFS half).
+        // Defer those to the replicated lookup (1b) below; only fall back
+        // to the empty placeholder if that misses too.
+        let mut pending_placeholder: Option<(FileHandle, u64)> = None;
         if let Some(entry) = self.dir_index.lookup(self.namespace_id, name) {
             let fileid = u64::from_le_bytes(entry.file_handle[..8].try_into().unwrap_or([0; 8]));
-            let attrs = if self.handles.is_directory(&entry.file_handle) {
-                NfsAttrs {
-                    file_type: FileType::Directory,
-                    size: 4096,
-                    mode: 0o755,
-                    nlink: 2,
+            let is_dir = self.handles.is_directory(&entry.file_handle);
+            // #53: report Symlink so the kernel's GETATTR sees ftype=NF4LNK
+            // and calls READLINK after `ln -s target lnk`.
+            let is_lnk = self.handles.is_symlink(&entry.file_handle);
+            // A size-0 *regular* entry is a pNFS placeholder candidate —
+            // defer it (don't return) so the replicated lookup below can
+            // surface the DS-COMMIT'd bytes + name. Dirs, symlinks, and
+            // non-empty files are authoritative here.
+            if is_dir || is_lnk || entry.size > 0 {
+                let (file_type, size, mode, nlink) = if is_dir {
+                    (FileType::Directory, 4096, 0o755, 2)
+                } else if is_lnk {
+                    (FileType::Symlink, entry.size, 0o777, 1)
+                } else {
+                    (FileType::Regular, entry.size, 0o644, 1)
+                };
+                let attrs = NfsAttrs {
+                    file_type,
+                    size,
+                    mode,
+                    nlink,
                     uid: 0,
                     gid: 0,
                     fileid,
-                }
-            } else if self.handles.is_symlink(&entry.file_handle) {
-                // #53: LOOKUP("lnk") after `ln -s target lnk` resolves
-                // here. Report Symlink so the kernel's subsequent
-                // GETATTR sees ftype=NF4LNK and calls READLINK.
-                NfsAttrs {
-                    file_type: FileType::Symlink,
-                    size: entry.size,
-                    mode: 0o777,
-                    nlink: 1,
-                    uid: 0,
-                    gid: 0,
-                    fileid,
-                }
-            } else {
-                NfsAttrs {
-                    file_type: FileType::Regular,
-                    size: entry.size,
-                    mode: 0o644,
-                    nlink: 1,
-                    uid: 0,
-                    gid: 0,
-                    fileid,
-                }
-            };
-            return Some((entry.file_handle, attrs));
+                };
+                return Some((entry.file_handle, attrs));
+            }
+            pending_placeholder = Some((entry.file_handle, fileid));
         }
 
         // 1b) #127: replicated name index. Resolves a name written on
@@ -867,29 +869,47 @@ impl<G: GatewayOps> NfsContext<G> {
         // objects are named by their composition UUID; the kernel
         // sends `LOOKUP("<uuid>")` for `dd /mnt/pnfs/<uuid>`. Parse
         // the name as a UUID and consult the gateway list.
-        let uuid = uuid::Uuid::parse_str(name).ok()?;
-        let comp_id = CompositionId(uuid);
-        let entries = self
-            .gateway
-            .list(self.tenant_id, self.namespace_id)
-            .await
-            .ok()?;
-        let (_, size) = entries.iter().find(|(cid, _)| *cid == comp_id).copied()?;
-        // Materialize a file handle for the composition; future
-        // PUTFH/READ requests will resolve through the registry.
-        let fh = self
-            .handles
-            .file_handle(self.namespace_id, self.tenant_id, comp_id);
-        let attrs = NfsAttrs {
-            file_type: FileType::Regular,
-            size,
-            mode: 0o644,
-            nlink: 1,
-            uid: 0,
-            gid: 0,
-            fileid: u64::from_le_bytes(comp_id.0.as_bytes()[..8].try_into().unwrap_or([0; 8])),
-        };
-        Some((fh, attrs))
+        if let Ok(uuid) = uuid::Uuid::parse_str(name) {
+            let comp_id = CompositionId(uuid);
+            if let Ok(entries) = self.gateway.list(self.tenant_id, self.namespace_id).await {
+                if let Some((_, size)) = entries.iter().find(|(cid, _)| *cid == comp_id).copied() {
+                    // Materialize a file handle for the composition; future
+                    // PUTFH/READ requests will resolve through the registry.
+                    let fh = self
+                        .handles
+                        .file_handle(self.namespace_id, self.tenant_id, comp_id);
+                    let attrs = NfsAttrs {
+                        file_type: FileType::Regular,
+                        size,
+                        mode: 0o644,
+                        nlink: 1,
+                        uid: 0,
+                        gid: 0,
+                        fileid: u64::from_le_bytes(
+                            comp_id.0.as_bytes()[..8].try_into().unwrap_or([0; 8]),
+                        ),
+                    };
+                    return Some((fh, attrs));
+                }
+            }
+        }
+
+        // Nothing committed under this name — fall back to the deferred
+        // size-0 placeholder (a genuinely empty `create`d/`touch`ed file).
+        pending_placeholder.map(|(fh, fileid)| {
+            (
+                fh,
+                NfsAttrs {
+                    file_type: FileType::Regular,
+                    size: 0,
+                    mode: 0o644,
+                    nlink: 1,
+                    uid: 0,
+                    gid: 0,
+                    fileid,
+                },
+            )
+        })
     }
 
     /// List directory entries for READDIR.
@@ -1262,6 +1282,60 @@ mod tests {
         );
         let nfs_gw = NfsGateway::new(gw);
         NfsContext::new(nfs_gw, tenant, ns)
+    }
+
+    /// #127 (pNFS half) read-side guard. The kernel pNFS write path leaves
+    /// a size-0 placeholder in `dir_index` (from `create_pending_named` at
+    /// OPEN) while the real bytes + name are committed into the replicated
+    /// store by the DS COMMIT (never written back to that entry). A
+    /// `lookup_by_name` that returned the stale placeholder reported size 0
+    /// → the kernel saw an empty file and never read. The fix defers a
+    /// size-0 regular `dir_index` hit to the replicated name index.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn size0_placeholder_lookup_defers_to_committed_comp() {
+        let ctx = ctx();
+
+        // OPEN(CREATE,"pf.txt"): size-0 placeholder in dir_index, nothing
+        // committed yet. lookup sees a genuinely-empty file.
+        let _ = ctx.create_pending_named("pf.txt").expect("create_pending");
+        let before = ctx
+            .lookup_by_name("pf.txt")
+            .await
+            .expect("placeholder lookup");
+        assert_eq!(before.1.size, 0, "uncommitted file reads as empty");
+        assert_eq!(before.1.file_type, FileType::Regular);
+
+        // Simulate the DS COMMIT: a NAMED composition minted in the store
+        // via the Create-delta name path, WITHOUT touching dir_index —
+        // exactly what op_commit_ds now does (name carried on the layout).
+        let data = vec![b'Z'; 4096];
+        let resp = ctx
+            .gateway
+            .write(crate::nfs::NfsWriteRequest {
+                tenant_id: ctx.tenant_id,
+                namespace_id: ctx.namespace_id,
+                data: data.clone(),
+                comp_id_override: None,
+                name: Some("pf.txt".to_owned()),
+            })
+            .await
+            .expect("named write");
+
+        // lookup_by_name MUST now resolve the committed comp (real size +
+        // its file handle), not the stale size-0 placeholder.
+        let after = ctx
+            .lookup_by_name("pf.txt")
+            .await
+            .expect("committed lookup");
+        assert_eq!(
+            after.1.size,
+            data.len() as u64,
+            "resolves committed bytes, not the size-0 placeholder"
+        );
+        let want_fh = ctx
+            .handles
+            .file_handle(ctx.namespace_id, ctx.tenant_id, resp.composition_id);
+        assert_eq!(after.0, want_fh, "fh points at the committed composition");
     }
 
     /// Three sequential writes to the same fh, each followed by a
