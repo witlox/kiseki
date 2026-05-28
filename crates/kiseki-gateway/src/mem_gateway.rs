@@ -258,9 +258,11 @@ pub struct InMemoryGateway {
     /// `None` in tests + library callers that don't wire metrics.
     get_phase_duration_metric: std::sync::RwLock<Option<Arc<prometheus::HistogramVec>>>,
     /// Optional histogram for `kiseki_gateway_put_phase_duration_
-    /// seconds{phase}` (phases: `encrypt`, `chunk_write`,
-    /// `composition_record`). Symmetric to `get_phase_duration_metric`
-    /// for the write path.
+    /// seconds{phase}` (phases: `encrypt`, `chunk_write`, `raft_commit`,
+    /// `composition_record`). `raft_commit` is a sub-span of
+    /// `composition_record` — the Raft/forward commit latency, split out
+    /// (#126) so the multi-node write bottleneck decomposes from metrics.
+    /// Symmetric to `get_phase_duration_metric` for the write path.
     put_phase_duration_metric: std::sync::RwLock<Option<Arc<prometheus::HistogramVec>>>,
     /// Candidate cluster nodes used by the placement function
     /// (Phase 16b step 2). The full set of node ids; the actual
@@ -2538,6 +2540,14 @@ impl InMemoryGateway {
             // S3/NFS/FUSE/native) when this node is a follower. The
             // actual forward only fires when an `AppendForwarder` is
             // wired; otherwise the `ForwardToLeader` hint surfaces below.
+            // #126 W1 (profile-first): time the Raft commit — the
+            // suspected ~180 ms write bottleneck — as its own put-phase.
+            // It was previously folded into `composition_record`; splitting
+            // it lets the next cluster run decompose the latency from
+            // metrics (`raft_commit` vs `composition_record` minus
+            // `raft_commit`) without a pprof pass. Observability only — no
+            // behaviour change.
+            let raft_commit_started = std::time::Instant::now();
             let emit_result = kiseki_composition::log_bridge::emit_chunk_and_delta_forwarding_to(
                 log.as_ref(),
                 self.forwarder.as_deref(),
@@ -2550,6 +2560,7 @@ impl InMemoryGateway {
                 new_chunks,
             )
             .await;
+            self.observe_put_phase("raft_commit", raft_commit_started.elapsed());
             match emit_result {
                 Ok(seq) => {
                     tracing::debug!(

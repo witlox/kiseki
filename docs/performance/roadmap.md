@@ -105,8 +105,11 @@ the whole batch instead of one write.
   serially.
 - **Effort:** ADR-grade (changes the write→commit contract; interacts
   with idempotency_key and the I-CP invariants). **Risk:** Medium-High.
-- **Status:** root cause for #126 — see that issue for the fix-design
-  discussion.
+- **Status: profile-first.** The 2026-05-28 code audit (below) found the
+  consensus-layer batching/fsync are *already* in place, so coalescing
+  is the *likely* fix but must be confirmed by a pprof decomposition of
+  the 180 ms before it's worth the ADR. Not landed this pass —
+  deliberately, to avoid a speculative durability-path change. #126.
 
 ### W2 — Distributed shard leaders · #99 / #111 / #114 (landed)
 Spreading leaders across all 6 nodes (`namespace-create --shards 6`)
@@ -194,13 +197,65 @@ work is throughput, dominated by W1.
 
 ---
 
+## Code-audit findings (2026-05-28) — the roadmap above was written from
+## numbers; the code says most "fixes" are already in or need profiling
+
+A deep read of the write path (gateway → log → raft → state machine)
+before attempting to land the fixes turned up that **the optimisations
+the gap analysis assumed were missing are largely already implemented**:
+
+- **Raft log fsync is already batched per AppendEntries**, not per entry
+  (`kiseki-raft/src/fjall_raft_log_store.rs:127` — "fjall's `commit` is
+  all-or-nothing on the batch… [vs] `inner.append` per entry, burning N
+  fsyncs per replication round"). The W1-as-"no batching" framing was
+  wrong at the consensus-durability layer.
+- **openraft batching is on** — `max_payload_entries: 300`
+  (`kiseki-raft/src/config.rs:22`); it coalesces up to 300 entries into
+  one AppendEntries round and pipelines replication.
+- **The hydrator already batches at commit** — one `HydrationBatch` per
+  poll (up to 1000 deltas staged, one atomic storage commit), not
+  per-delta (`hydrator.rs:304-422`). #133's ~50 deltas/s is a *per-delta
+  staging* cost, not a missing-batch — needs profiling to localise.
+- **B1 (CompositionStore HashMap → DashMap) is effectively already done**
+  — the store has sharded `name_locks` + `id_locks`
+  (`composition.rs:573-581`), an `RwLock` namespace map, and an LRU
+  read-cache. The remaining serialisation is the **I-CP1**-mandated
+  single redb transaction (`last_applied_seq` + state changes atomic),
+  which can't be sharded away without breaking crash-consistency.
+- **B4 (pre-alloc) is a no-op** — `landed.iter().map().collect()`
+  (`mem_gateway.rs:2366`) already pre-sizes via `size_hint`.
+- No gateway-side lock is held across `client_write`
+  (`openraft_store.rs:539`); concurrent writes are *not* serialised by us.
+
+**So the ~180 ms write latency is not explained by a missing
+code-level batching/contention fix.** It is a genuine consensus-path
+cost (replication RTT + per-shard serial apply + fsync + possible
+hydrator feedback) whose decomposition **requires cluster profiling
+(pprof on the GCP `default` cluster), not a blind code change.** The
+honest conclusion of "try to land the fixes": the landable code-level
+fixes are already in; W1/W3 are **profiling-blocked**, and shipping a
+speculative change to the Raft commit/durability path would violate the
+correctness-over-velocity posture for no measured gain.
+
+**Revised W1** is therefore *profile-first*: run a CPU + off-CPU
+(blocking) profile of a sustained write under the matrix, decompose the
+180 ms into {replication RTT, log fsync, apply, hydrator wait, lock},
+and *then* pick the targeted fix (application-level write coalescing
+into one `LogCommand` batch — ADR-grade — vs an apply-path change vs a
+config tune). #126 carries this.
+
 ## What "getting there" looks like, in order
 
-1. **W1 batched Raft commit** — the one change that moves writes from
-   ~250 op/s into the ~10 k op/s order. Everything else is noise until
-   this lands. (ADR-grade; design on #126.)
-2. **W3 hydrator throughput + W4 chunk group-commit** — sustain W1 under
-   load, fix p99.
+1. **Profile the write path first (revised W1)** — the code-audit
+   (above) shows the batching/contention fixes are already in; the
+   180 ms is unexplained at the code level. A pprof CPU + off-CPU
+   profile of a sustained write on the GCP `default` cluster decomposes
+   it; *then* pick the targeted fix (write coalescing into one
+   `LogCommand` batch — ADR-grade — vs apply-path vs config). Do NOT
+   ship a speculative Raft-path change before this. #126.
+2. **W3 hydrator throughput + W4 chunk group-commit** — also
+   profiling-gated (the per-delta staging cost in #133 isn't a missing
+   batch); fix once the profile names the hot frame.
 3. **Re-measure the 6-node matrix** — with W1+W3+W4 the write rows
    become meaningful; reads get an honest high-∥ number.
 4. **R1/R2/R3 read tuning** — close the read bandwidth gap (concurrency,
