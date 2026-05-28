@@ -134,6 +134,26 @@ impl LogOps for InstrumentedLogOps {
         result
     }
 
+    /// ADR-046 (W1) — delegate to the inner store's coalesced batch
+    /// (NOT the trait default, which would un-coalesce into per-item
+    /// appends). One append-metric sample per batch, labeled by shard.
+    async fn append_batch_chunk_and_delta(
+        &self,
+        reqs: Vec<AppendChunkAndDeltaRequest>,
+    ) -> Result<Vec<SequenceNumber>, LogError> {
+        let shard = reqs
+            .first()
+            .map_or_else(|| "none".to_owned(), |r| r.delta.shard_id.0.to_string());
+        let started = Instant::now();
+        let result = self.inner.append_batch_chunk_and_delta(reqs).await;
+        let label = match &result {
+            Ok(_) => outcome::OK,
+            Err(e) => outcome_for(e),
+        };
+        self.metrics.record_append(&shard, label, started.elapsed());
+        result
+    }
+
     async fn increment_chunk_refcount(
         &self,
         shard_id: ShardId,

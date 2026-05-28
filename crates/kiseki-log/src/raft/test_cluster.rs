@@ -672,4 +672,58 @@ mod tests {
 
         cluster.shutdown().await;
     }
+
+    /// ADR-046 (W1): a `BatchChunkAndDelta` commits N items in ONE Raft
+    /// entry through real consensus, returns one seq per item, and
+    /// replicates so every follower materializes all N deltas.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn batch_chunk_and_delta_commits_one_entry_and_replicates() {
+        let shard = ShardId(uuid::Uuid::from_u128(3));
+        let tenant = OrgId(uuid::Uuid::from_u128(300));
+        let cluster = RaftTestCluster::new(3, shard, tenant).await;
+        let leader_id = cluster
+            .wait_for_leader(Duration::from_secs(10))
+            .await
+            .unwrap();
+        let leader = &cluster.nodes[&leader_id];
+
+        let items: Vec<_> = (0..3u8)
+            .map(|i| crate::raft_store::ChunkAndDeltaItem {
+                tenant_id_bytes: *tenant.0.as_bytes(),
+                operation: 0, // Create
+                hashed_key: [0x10 + i; 32],
+                chunk_refs: vec![],
+                payload: vec![0xcd; 32],
+                has_inline_data: false,
+                new_chunks: vec![],
+            })
+            .collect();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            leader.raft.client_write(LogCommand::BatchChunkAndDelta { items }),
+        )
+        .await
+        .expect("client_write timed out")
+        .expect("client_write");
+
+        match resp.data {
+            LogResponse::BatchAppended(seqs) => {
+                assert_eq!(seqs.len(), 3, "one sequence number per batch item");
+            }
+            other => panic!("expected BatchAppended, got {other}"),
+        }
+
+        // One entry → 3 deltas; replicates to every follower.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for node_id in 1..=3 {
+            let deltas = cluster.read_from(node_id).await;
+            assert_eq!(
+                deltas.len(),
+                3,
+                "node {node_id} should materialize all 3 batched deltas"
+            );
+        }
+
+        cluster.shutdown().await;
+    }
 }

@@ -460,6 +460,35 @@ impl LogOps for RaftShardStore {
             })
     }
 
+    /// ADR-046 (W1) — commit a batch of `ChunkAndDelta` proposals as ONE
+    /// Raft entry. The coalescing queue is per-shard, so every item
+    /// targets the same shard; look it up once and submit a single
+    /// `BatchChunkAndDelta`.
+    async fn append_batch_chunk_and_delta(
+        &self,
+        reqs: Vec<AppendChunkAndDeltaRequest>,
+    ) -> Result<Vec<SequenceNumber>, LogError> {
+        let Some(first) = reqs.first() else {
+            return Ok(Vec::new());
+        };
+        let shard_id = first.delta.shard_id;
+        debug_assert!(
+            reqs.iter().all(|r| r.delta.shard_id == shard_id),
+            "append_batch_chunk_and_delta: all items must target one shard \
+             (the coalescing queue is per-shard)",
+        );
+        let store = self.get_shard(shard_id).inspect_err(|e| {
+            tracing::warn!(error = %e, "log append_batch_chunk_and_delta: shard lookup failed");
+        })?;
+        let items = reqs.into_iter().map(|r| (r.delta, r.new_chunks)).collect();
+        store
+            .append_batch_chunk_and_delta(items)
+            .await
+            .inspect_err(|e| {
+                tracing::warn!(error = %e, "log append_batch_chunk_and_delta: shard append failed");
+            })
+    }
+
     async fn increment_chunk_refcount(
         &self,
         shard_id: ShardId,
