@@ -131,8 +131,23 @@ S3 is path-style, no auth: `http://<ip>:9000/<bucket>/<key>`.
   never written. Pre-write a small file, then read it back with `--direct=1` so the
   read bypasses the page cache and actually exercises the gateway:
   ```bash
-  # On a client node. NFSv4.2 write + read (small READ file keeps the
-  # commit-bound pre-write bounded — ~256 MB @ the multi-node write rate).
+  # On a client node. Three NFS axes: v3, v4(.2), pNFS(4.1). The small
+  # READ file keeps the commit-bound pre-write bounded (~256 MB @ the
+  # multi-node write rate). O_DIRECT read-back = real gateway read path.
+
+  # --- NFSv3 (gateway serves MOUNT on 2049, no rpcbind; nolock) ---
+  mount -t nfs -o vers=3,proto=tcp,port=2049,mountport=2049,mountproto=tcp,nolock,rsize=1048576,wsize=1048576 \
+        10.0.0.10:/ /mnt/k-nfs3
+  mountpoint -q /mnt/k-nfs3 || echo NFS3-MOUNT-FAILED
+  fio --name=w --directory=/mnt/k-nfs3 --rw=write --bs=1m --size=4G --numjobs=4 \
+      --direct=1 --runtime=60 --time_based --group_reporting | grep -E 'WRITE:'
+  fio --name=rd --directory=/mnt/k-nfs3 --rw=write --bs=1m --size=256m --numjobs=1 \
+      --direct=1 --end_fsync=1 >/dev/null
+  fio --name=rd --directory=/mnt/k-nfs3 --rw=read  --bs=1m --size=256m --numjobs=1 \
+      --direct=1 --group_reporting | grep -E 'READ:'
+  rm -f /mnt/k-nfs3/* ; umount /mnt/k-nfs3
+
+  # --- NFSv4.2 write + read ---
   mount -t nfs4 -o vers=4.2,rsize=1048576,wsize=1048576 10.0.0.10:/ /mnt/k-nfs
   mountpoint -q /mnt/k-nfs || { echo MOUNT-FAILED; }
   # write throughput (time-bounded)

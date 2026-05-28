@@ -1,7 +1,8 @@
 #!/bin/bash
-# Phase 40 — NFSv4.2 write + read AND pNFS (vers=4.1) read, with
-# pre/post hydrator snapshots. (Read + pNFS run in gcp mode; the local
-# docker probe path stays write-only — it's a smoke path, not the matrix.)
+# Phase 40 — all three NFS axes: NFSv3, NFSv4.2 (write + read each), and
+# pNFS Flex Files (vers=4.1 read), with pre/post hydrator snapshots.
+# (v3 + read + pNFS run in gcp mode; the local docker probe path stays
+# NFSv4.2-write-only — it's a smoke path, not the matrix.)
 #
 # The F-1-risk phase (#50): sustained NFS write saturates the
 # composition hydrator because each NFS WRITE op becomes one Raft
@@ -136,6 +137,23 @@ elif [ "$MODE" = "gcp" ]; then
   # from hand-driven fio). `WRITE:` / `READ:` summary lines are stable.
   client_run 0 <<EOF | tee -a "$OUT"
 mkdir -p /mnt/kiseki-nfs
+umount /mnt/kiseki-nfs 2>/dev/null
+
+echo "--- NFSv3 (vers=3) write + read ---"
+# Gateway serves MOUNT on the same 2049 (no rpcbind), nolock (no NLM).
+mount -t nfs -o vers=3,proto=tcp,port=2049,mountport=2049,mountproto=tcp,nolock,rsize=1048576,wsize=1048576 $NFS_HOST:/ /mnt/kiseki-nfs
+if ! mountpoint -q /mnt/kiseki-nfs; then
+  echo NFS3-MOUNT-FAILED
+  exit 1
+fi
+fio --name=nfs3-w --directory=/mnt/kiseki-nfs --rw=write --bs=1m \\
+  --size=${SIZE_GB}G --numjobs=$NUMJOBS --direct=1 \\
+  --runtime=$RUNTIME --time_based --group_reporting 2>/dev/null | grep -E 'WRITE:'
+fio --name=nfs3-rd --directory=/mnt/kiseki-nfs --rw=write --bs=1m \\
+  --size=${READ_MB}m --numjobs=1 --direct=1 --end_fsync=1 >/dev/null 2>&1
+fio --name=nfs3-rd --directory=/mnt/kiseki-nfs --rw=read --bs=1m \\
+  --size=${READ_MB}m --numjobs=1 --direct=1 --group_reporting 2>/dev/null | grep -E 'READ:'
+rm -f /mnt/kiseki-nfs/nfs3-* 2>/dev/null
 umount /mnt/kiseki-nfs 2>/dev/null
 
 echo "--- NFSv4.2 (vers=4.2) write ---"
