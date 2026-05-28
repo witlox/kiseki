@@ -32,6 +32,7 @@ pub mod split;
 pub mod store;
 pub mod traits;
 pub mod watermark;
+pub mod write_coalesce;
 
 pub use delta::{Delta, DeltaHeader, DeltaPayload, OperationType};
 pub use error::LogError;

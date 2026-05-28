@@ -421,3 +421,112 @@ fn logops_set_shard_state_persists_change() {
          working."
     );
 }
+
+/// ADR-046 (W1) R+1: with coalescing ENABLED, a burst of concurrent
+/// `append_chunk_and_delta` calls must all commit, each receive a
+/// DISTINCT sequence number, and every delta must be replayable. This
+/// exercises the full emission path the env gate turns on in production:
+/// routing → `ShardMapAppender` → `BatchChunkAndDelta` apply on the real
+/// Raft store. (Batch-size efficiency is covered by the queue's unit
+/// tests; here we assert end-to-end correctness — no lost or aliased
+/// writes when N proposals collapse into fewer Raft entries.)
+#[test]
+fn coalesced_concurrent_appends_all_commit_with_distinct_seqs() {
+    use kiseki_common::ids::{ChunkId, SequenceNumber};
+    use kiseki_common::time::{ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime};
+    use kiseki_log::traits::{AppendChunkAndDeltaRequest, AppendDeltaRequest, ReadDeltasRequest};
+    use kiseki_log::write_coalesce::CoalesceConfig;
+    use kiseki_log::OperationType;
+    use std::sync::Arc;
+
+    let rt = make_runtime();
+    let port = find_port();
+    let mut peers = BTreeMap::new();
+    peers.insert(1u64, format!("127.0.0.1:{port}"));
+
+    let cfg = CoalesceConfig {
+        max_batch: 32,
+        flush_interval: Duration::from_millis(5),
+        ..CoalesceConfig::default()
+    };
+    let store = Arc::new(RaftShardStore::new(1, peers, None).with_coalescing(cfg));
+    let shard_id = make_shard_id(70);
+    store.create_shard(
+        shard_id,
+        test_tenant(),
+        NodeId(1),
+        ShardConfig::default(),
+        Some(&format!("127.0.0.1:{port}")),
+    );
+    store.initialize_shard(shard_id).expect("initialize");
+    rt.block_on(async { tokio::time::sleep(Duration::from_secs(2)).await });
+
+    let make_req = move |key: u8| AppendChunkAndDeltaRequest {
+        delta: AppendDeltaRequest {
+            shard_id,
+            tenant_id: test_tenant(),
+            operation: OperationType::Create,
+            timestamp: DeltaTimestamp {
+                hlc: HybridLogicalClock {
+                    physical_ms: 1000,
+                    logical: 0,
+                    node_id: NodeId(1),
+                },
+                wall: WallTime {
+                    millis_since_epoch: 1000,
+                    timezone: "UTC".into(),
+                },
+                quality: ClockQuality::Ntp,
+            },
+            hashed_key: [key; 32],
+            chunk_refs: vec![ChunkId([key; 32])],
+            payload: vec![0xcd; 48],
+            has_inline_data: false,
+        },
+        new_chunks: vec![],
+    };
+
+    let n: u8 = 16;
+    let seqs = rt.block_on(async {
+        let mut handles = Vec::new();
+        for i in 1..=n {
+            let store = Arc::clone(&store);
+            let req = make_req(i);
+            handles.push(tokio::spawn(async move {
+                LogOps::append_chunk_and_delta(&*store, req).await
+            }));
+        }
+        let mut seqs = Vec::new();
+        for h in handles {
+            seqs.push(h.await.unwrap().expect("coalesced append must commit"));
+        }
+        seqs
+    });
+
+    let mut distinct: Vec<u64> = seqs.iter().map(|s| s.0).collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        n as usize,
+        "every coalesced write must get a distinct sequence number; got {seqs:?}",
+    );
+
+    let health = rt.block_on(store.shard_health(shard_id)).expect("health");
+    let deltas = rt
+        .block_on(LogOps::read_deltas(
+            &*store,
+            ReadDeltasRequest {
+                shard_id,
+                from: SequenceNumber(1),
+                to: health.tip,
+            },
+        ))
+        .expect("read coalesced deltas");
+    for i in 1..=n {
+        assert!(
+            deltas.iter().any(|d| d.header.hashed_key == [i; 32]),
+            "coalesced delta key {i} missing after commit — a batched write was lost",
+        );
+    }
+}

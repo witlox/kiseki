@@ -700,7 +700,9 @@ mod tests {
             .collect();
         let resp = tokio::time::timeout(
             Duration::from_secs(5),
-            leader.raft.client_write(LogCommand::BatchChunkAndDelta { items }),
+            leader
+                .raft
+                .client_write(LogCommand::BatchChunkAndDelta { items }),
         )
         .await
         .expect("client_write timed out")

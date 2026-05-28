@@ -1,32 +1,29 @@
 //! ADR-046 (W1) — per-shard write-coalescing queue.
 //!
-//! Batches independent `ChunkAndDelta` writes that arrive within a small
+//! Batches independent `ChunkAndDelta` writes arriving within a small
 //! window into ONE `BatchChunkAndDelta` Raft entry, amortizing the
 //! consensus round across the batch (the small-object write lever — #126).
+//! Lives in `kiseki-log` (not the gateway) because forwarded writes (#114)
+//! reach the leader via `LogService.AppendChunkAndDelta` and converge with
+//! local writes at `RaftShardStore` — so coalescing must happen there to
+//! catch both paths.
 //!
-//! **Release R (this code): present + unit-tested, but NOT wired into the
-//! gateway write path.** Emission is authorized only in R+1 by the
-//! committed cluster-wide `WriteCoalesceEnabled` capability (ADR-046 rev-2
-//! C1 — every replica must ship the `BatchChunkAndDelta` decoder before any
-//! leader emits one). Idempotency stays upstream (gateway-side, as today —
-//! rev-2 H2); the queue is a pure batcher.
-//!
-//! Flush triggers (whichever trips first, ADR-046 §3 + rev-2 H3):
-//! `MAX_BATCH` items, `MAX_BATCH_BYTES` accumulated payload, or
-//! `FLUSH_INTERVAL` since the first queued item. Adaptive (rev-2 L1): a
-//! lone write (queue depth < 2) flushes immediately and never waits the
-//! window. Liveness (rev-2 M1): bounded queue → backpressure; a dropped
-//! waiter is ignored; the flush task exits cleanly when all senders drop.
+//! Emission is gated (`KISEKI_WRITE_COALESCE`, default off) — see ADR-046
+//! rev-2 C1 (a new `LogCommand` variant is a durable log-format change;
+//! every replica must decode it before any leader emits one). Idempotency
+//! stays upstream (gateway-side, rev-2 H2); the queue is a pure batcher.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use kiseki_common::ids::{SequenceNumber, ShardId};
-use kiseki_log::error::LogError;
-use kiseki_log::traits::{AppendChunkAndDeltaRequest, LogOps};
+use kiseki_common::locks::LockOrDie;
 use tokio::sync::{mpsc, oneshot};
+
+use crate::error::LogError;
+use crate::traits::{AppendChunkAndDeltaRequest, LogOps};
 
 /// The narrow append surface the coalescer needs — one method, so tests
 /// can supply a trivial mock instead of a full `LogOps`. Blanket-impl'd for
@@ -49,6 +46,29 @@ impl<T: LogOps + ?Sized> BatchAppend for T {
         reqs: Vec<AppendChunkAndDeltaRequest>,
     ) -> Result<Vec<SequenceNumber>, LogError> {
         self.append_batch_chunk_and_delta(reqs).await
+    }
+}
+
+/// Reconstruct a `LogError` for per-waiter fan-out (it isn't `Clone`).
+/// CRITICAL: the per-shard, leader-routing variants — especially
+/// `ForwardToLeader` — MUST survive so a write submitted on a follower
+/// still surfaces the forward hint and the gateway re-issues to the leader
+/// (#114). Everything else collapses to a retryable `Unavailable`.
+fn fan_error(e: &LogError) -> LogError {
+    match e {
+        LogError::ForwardToLeader {
+            shard_id,
+            leader_node_id,
+        } => LogError::ForwardToLeader {
+            shard_id: *shard_id,
+            leader_node_id: *leader_node_id,
+        },
+        LogError::LeaderUnavailable(s) => LogError::LeaderUnavailable(*s),
+        LogError::MaintenanceMode(s) => LogError::MaintenanceMode(*s),
+        LogError::ShardSplitting(s) => LogError::ShardSplitting(*s),
+        LogError::QuorumLost(s) => LogError::QuorumLost(*s),
+        LogError::ShardNotFound(s) => LogError::ShardNotFound(*s),
+        _ => LogError::Unavailable,
     }
 }
 
@@ -88,10 +108,21 @@ impl CoalesceConfig {
                 .max(1),
             flush_interval: Duration::from_micros(env_usize(
                 "KISEKI_WRITE_COALESCE_FLUSH_US",
-                u64_to_usize(d.flush_interval.as_micros()),
+                usize::try_from(d.flush_interval.as_micros()).unwrap_or(usize::MAX),
             ) as u64),
             queue_depth: env_usize("KISEKI_WRITE_COALESCE_QUEUE_DEPTH", d.queue_depth).max(1),
         }
+    }
+
+    /// Whether emission is enabled (`KISEKI_WRITE_COALESCE` truthy). Default
+    /// OFF — the mixed-version safety gate (rev-2 C1). Operators enable it
+    /// only after every node runs a binary that decodes `BatchChunkAndDelta`.
+    #[must_use]
+    pub fn enabled() -> bool {
+        std::env::var("KISEKI_WRITE_COALESCE").is_ok_and(|v| {
+            let v = v.to_ascii_lowercase();
+            v == "1" || v == "on" || v == "true" || v == "yes"
+        })
     }
 }
 
@@ -102,11 +133,6 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-#[allow(clippy::cast_possible_truncation)]
-fn u64_to_usize(v: u128) -> usize {
-    v as usize
-}
-
 /// One queued write plus its result channel.
 struct Pending {
     req: AppendChunkAndDeltaRequest,
@@ -115,12 +141,13 @@ struct Pending {
 }
 
 /// Per-shard write coalescer (ADR-046 W1). Generic over the append surface
-/// so it's testable with a mock; in production `L = dyn LogOps`.
+/// so it's testable with a mock; in production `L` is the Raft-backed store
+/// adapter that commits one `BatchChunkAndDelta` per flush.
 pub struct WriteCoalescer<L: BatchAppend + ?Sized + 'static> {
     log: Arc<L>,
     cfg: CoalesceConfig,
     /// One bounded sender + flush task per shard, created lazily.
-    shards: parking_lot::Mutex<HashMap<ShardId, mpsc::Sender<Pending>>>,
+    shards: Mutex<HashMap<ShardId, mpsc::Sender<Pending>>>,
 }
 
 impl<L: BatchAppend + ?Sized + 'static> WriteCoalescer<L> {
@@ -131,13 +158,13 @@ impl<L: BatchAppend + ?Sized + 'static> WriteCoalescer<L> {
         Arc::new(Self {
             log,
             cfg,
-            shards: parking_lot::Mutex::new(HashMap::new()),
+            shards: Mutex::new(HashMap::new()),
         })
     }
 
     /// Submit a write. Resolves with the delta's sequence number once the
-    /// batch it lands in commits, or a retryable error if the commit fails
-    /// (the caller retries — idempotency upstream makes that safe).
+    /// batch it lands in commits, or with the (reconstructed) commit error —
+    /// `ForwardToLeader` is preserved so the gateway re-routes (#114).
     pub async fn submit(
         self: &Arc<Self>,
         req: AppendChunkAndDeltaRequest,
@@ -146,18 +173,14 @@ impl<L: BatchAppend + ?Sized + 'static> WriteCoalescer<L> {
         let bytes = req.delta.payload.len();
         let (tx, rx) = oneshot::channel();
         let sender = self.sender_for(shard_id);
-        // Backpressure: a full bounded queue blocks here until the flush
-        // task drains. If the flush task is gone, the send errors.
         if sender.send(Pending { req, bytes, tx }).await.is_err() {
             return Err(LogError::Unavailable);
         }
-        // The flush task fans the per-item result back here. A dropped
-        // sender (flush task exited mid-flight) → retryable error.
         rx.await.unwrap_or(Err(LogError::Unavailable))
     }
 
     fn sender_for(self: &Arc<Self>, shard_id: ShardId) -> mpsc::Sender<Pending> {
-        let mut shards = self.shards.lock();
+        let mut shards = self.shards.lock().lock_or_die("write_coalesce.shards");
         if let Some(s) = shards.get(&shard_id) {
             return s.clone();
         }
@@ -169,7 +192,6 @@ impl<L: BatchAppend + ?Sized + 'static> WriteCoalescer<L> {
     }
 
     async fn flush_loop(self: Arc<Self>, shard_id: ShardId, mut rx: mpsc::Receiver<Pending>) {
-        // Exit when every sender has dropped (recv → None).
         while let Some(first) = rx.recv().await {
             let mut batch_bytes = first.bytes;
             let mut batch = vec![first];
@@ -193,7 +215,6 @@ impl<L: BatchAppend + ?Sized + 'static> WriteCoalescer<L> {
                                 batch_bytes += p.bytes;
                                 batch.push(p);
                             }
-                            // window elapsed, or all senders dropped
                             Ok(None) | Err(_) => break,
                         }
                     }
@@ -215,7 +236,6 @@ impl<L: BatchAppend + ?Sized + 'static> WriteCoalescer<L> {
         match self.log.append_batch(reqs).await {
             Ok(seqs) if seqs.len() == txs.len() => {
                 for (tx, seq) in txs.into_iter().zip(seqs) {
-                    // Dropped receiver (caller gave up) is fine — ignore.
                     let _ = tx.send(Ok(seq));
                 }
             }
@@ -232,21 +252,23 @@ impl<L: BatchAppend + ?Sized + 'static> WriteCoalescer<L> {
             }
             Err(e) => {
                 // Whole-batch failure (leader change, maintenance, …).
-                // Every waiter gets a retryable error and the caller
-                // retries (rev-2 M2/M3). R+1: preserve a ForwardToLeader
-                // hint per waiter so the ingress re-routes to the new
-                // leader directly instead of a blind retry.
+                // Reconstruct the error per waiter so ForwardToLeader
+                // survives and the gateway re-routes (rev-2 M2/M3).
                 tracing::warn!(
                     shard = %shard_id.0,
                     error = %e,
                     n = txs.len(),
-                    "write-coalesce: batch commit failed; failing waiters (retryable)",
+                    "write-coalesce: batch commit failed; fanning error to waiters",
                 );
                 for tx in txs {
-                    let _ = tx.send(Err(LogError::Unavailable));
+                    let _ = tx.send(Err(fan_error(&e)));
                 }
             }
         }
+        // ADR-046 rev-2 L2: batch fan-out is trace-level for now (the
+        // throughput lift is measured via the existing `raft_commit`
+        // put-phase histogram). Promote to a registered `LogMetrics`
+        // histogram once the coalescer is plumbed with the metrics handle.
         tracing::trace!(shard = %shard_id.0, batch_size, "write-coalesce: flushed batch");
     }
 }
@@ -254,26 +276,33 @@ impl<L: BatchAppend + ?Sized + 'static> WriteCoalescer<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delta::OperationType;
+    use crate::traits::AppendDeltaRequest;
     use kiseki_common::ids::{NodeId, OrgId};
     use kiseki_common::time::{ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime};
-    use kiseki_log::delta::OperationType;
-    use kiseki_log::traits::AppendDeltaRequest;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Mock append surface: records each batch's size and assigns
-    /// monotonic sequence numbers (one per item, like the real apply).
+    /// Mock append surface: records each batch's size and assigns monotonic
+    /// sequence numbers (one per item, like the real apply).
     struct MockLog {
         next_seq: AtomicU64,
-        batch_sizes: parking_lot::Mutex<Vec<usize>>,
-        fail: bool,
+        batch_sizes: Mutex<Vec<usize>>,
+        err: Option<fn() -> LogError>,
     }
 
     impl MockLog {
-        fn new(fail: bool) -> Self {
+        fn ok() -> Self {
             Self {
                 next_seq: AtomicU64::new(1),
-                batch_sizes: parking_lot::Mutex::new(Vec::new()),
-                fail,
+                batch_sizes: Mutex::new(Vec::new()),
+                err: None,
+            }
+        }
+        fn failing(f: fn() -> LogError) -> Self {
+            Self {
+                next_seq: AtomicU64::new(1),
+                batch_sizes: Mutex::new(Vec::new()),
+                err: Some(f),
             }
         }
     }
@@ -284,15 +313,17 @@ mod tests {
             &self,
             reqs: Vec<AppendChunkAndDeltaRequest>,
         ) -> Result<Vec<SequenceNumber>, LogError> {
-            if self.fail {
-                return Err(LogError::Unavailable);
+            if let Some(f) = self.err {
+                return Err(f());
             }
-            self.batch_sizes.lock().push(reqs.len());
-            let seqs = reqs
+            self.batch_sizes
+                .lock()
+                .lock_or_die("mock.batch_sizes")
+                .push(reqs.len());
+            Ok(reqs
                 .iter()
                 .map(|_| SequenceNumber(self.next_seq.fetch_add(1, Ordering::SeqCst)))
-                .collect();
-            Ok(seqs)
+                .collect())
         }
     }
 
@@ -323,24 +354,23 @@ mod tests {
         }
     }
 
-    /// A lone write flushes immediately (depth-1 fast path, rev-2 L1) and
-    /// gets a sequence number — never waits the window.
     #[tokio::test(flavor = "multi_thread")]
     async fn single_write_flushes_immediately() {
-        let mock = Arc::new(MockLog::new(false));
+        let mock = Arc::new(MockLog::ok());
         let q = WriteCoalescer::new(Arc::clone(&mock), CoalesceConfig::default());
         let shard = ShardId(uuid::Uuid::from_u128(7));
         let seq = q.submit(req(shard, 1)).await.expect("submit");
         assert_eq!(seq.0, 1);
-        assert_eq!(*mock.batch_sizes.lock(), vec![1], "lone write → one 1-item batch");
+        assert_eq!(
+            *mock.batch_sizes.lock().lock_or_die("t"),
+            vec![1],
+            "lone write → one 1-item batch"
+        );
     }
 
-    /// Concurrent writes to one shard coalesce into fewer, larger batches,
-    /// and every writer gets a distinct, correct sequence number.
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_writes_coalesce_and_each_gets_a_seq() {
-        let mock = Arc::new(MockLog::new(false));
-        // Wide window so the burst forms a batch deterministically.
+        let mock = Arc::new(MockLog::ok());
         let cfg = CoalesceConfig {
             flush_interval: Duration::from_millis(50),
             ..CoalesceConfig::default()
@@ -357,26 +387,25 @@ mod tests {
         for h in handles {
             seqs.push(h.await.unwrap().expect("submit"));
         }
-
-        // All 16 distinct seqs in 1..=16.
         let mut got: Vec<u64> = seqs.iter().map(|s| s.0).collect();
         got.sort_unstable();
         assert_eq!(got, (1..=16).collect::<Vec<_>>());
 
-        // Coalescing actually happened: fewer batches than items, and the
-        // total batched equals 16.
-        let sizes = mock.batch_sizes.lock().clone();
-        assert_eq!(sizes.iter().sum::<usize>(), 16, "every write committed once");
+        let sizes = mock.batch_sizes.lock().lock_or_die("t").clone();
+        assert_eq!(
+            sizes.iter().sum::<usize>(),
+            16,
+            "every write committed once"
+        );
         assert!(
             sizes.len() < 16,
             "16 concurrent writes should coalesce into <16 batches, got {sizes:?}"
         );
     }
 
-    /// `max_batch` caps a batch even with more queued.
     #[tokio::test(flavor = "multi_thread")]
     async fn max_batch_caps_batch_size() {
-        let mock = Arc::new(MockLog::new(false));
+        let mock = Arc::new(MockLog::ok());
         let cfg = CoalesceConfig {
             max_batch: 4,
             flush_interval: Duration::from_millis(50),
@@ -392,7 +421,7 @@ mod tests {
         for h in handles {
             h.await.unwrap().expect("submit");
         }
-        let sizes = mock.batch_sizes.lock().clone();
+        let sizes = mock.batch_sizes.lock().lock_or_die("t").clone();
         assert!(
             sizes.iter().all(|&n| n <= 4),
             "no batch may exceed max_batch=4, got {sizes:?}"
@@ -400,13 +429,25 @@ mod tests {
         assert_eq!(sizes.iter().sum::<usize>(), 12);
     }
 
-    /// A commit failure fans a retryable error to every waiter (rev-2 M2).
+    /// A commit failure fans the error to every waiter, and a
+    /// `ForwardToLeader` survives so the gateway re-routes (rev-2 M3).
     #[tokio::test(flavor = "multi_thread")]
-    async fn commit_failure_fans_error_to_all_waiters() {
-        let mock = Arc::new(MockLog::new(true)); // every append fails
+    async fn commit_failure_preserves_forward_to_leader() {
+        let mock = Arc::new(MockLog::failing(|| LogError::ForwardToLeader {
+            shard_id: ShardId(uuid::Uuid::from_u128(10)),
+            leader_node_id: NodeId(42),
+        }));
         let q = WriteCoalescer::new(Arc::clone(&mock), CoalesceConfig::default());
         let shard = ShardId(uuid::Uuid::from_u128(10));
-        let r = q.submit(req(shard, 1)).await;
-        assert!(matches!(r, Err(LogError::Unavailable)), "got {r:?}");
+        match q.submit(req(shard, 1)).await {
+            Err(LogError::ForwardToLeader { leader_node_id, .. }) => {
+                assert_eq!(
+                    leader_node_id,
+                    NodeId(42),
+                    "forward hint must survive fan-out"
+                );
+            }
+            other => panic!("expected ForwardToLeader, got {other:?}"),
+        }
     }
 }

@@ -42,7 +42,9 @@ use kiseki_common::locks::LockOrDie;
 /// `spawn_rpc_server` on its own — the second call hit `EADDRINUSE`
 /// silently and that shard's cross-node messages never arrived.
 pub struct RaftShardStore {
-    shards: Mutex<HashMap<ShardId, Arc<OpenRaftLogStore>>>,
+    /// `Arc` so the ADR-046 (W1) coalescing appender can share the same
+    /// live shard map (lazily-created shards become visible to it).
+    shards: Arc<Mutex<HashMap<ShardId, Arc<OpenRaftLogStore>>>>,
     node_id: u64,
     peers: BTreeMap<u64, String>,
     /// Dedicated runtime for Raft async operations. Kept separate from
@@ -59,6 +61,42 @@ pub struct RaftShardStore {
     /// `with_transport_metrics`, the lazy listener init wires them
     /// in via `RaftRpcListener::with_metrics(...)`.
     transport_metrics: Mutex<Option<Arc<kiseki_raft::transport_metrics::RaftTransportMetrics>>>,
+    /// ADR-046 (W1) — per-shard write-coalescing queue. `Some` only when
+    /// `KISEKI_WRITE_COALESCE` is enabled (rev-2 C1 mixed-version gate,
+    /// default OFF). When set, `append_chunk_and_delta[_with_forwarding]`
+    /// route through it so independent small writes — local AND
+    /// #114-forwarded (both converge here) — batch into one Raft entry.
+    coalescer: Option<Arc<crate::write_coalesce::WriteCoalescer<ShardMapAppender>>>,
+}
+
+/// ADR-046 (W1) `BatchAppend` surface for the coalescing queue. Holds the
+/// shared shard map — NOT the whole `RaftShardStore`, which would form an
+/// `Arc` cycle — and commits each coalesced batch as one
+/// `BatchChunkAndDelta` against the target shard's `OpenRaftLogStore`.
+struct ShardMapAppender {
+    shards: Arc<Mutex<HashMap<ShardId, Arc<OpenRaftLogStore>>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::write_coalesce::BatchAppend for ShardMapAppender {
+    async fn append_batch(
+        &self,
+        reqs: Vec<AppendChunkAndDeltaRequest>,
+    ) -> Result<Vec<SequenceNumber>, LogError> {
+        let Some(first) = reqs.first() else {
+            return Ok(Vec::new());
+        };
+        let shard_id = first.delta.shard_id;
+        let store = {
+            let shards = self.shards.lock().lock_or_die("shard_map_appender.shards");
+            shards
+                .get(&shard_id)
+                .cloned()
+                .ok_or(LogError::ShardNotFound(shard_id))?
+        };
+        let items = reqs.into_iter().map(|r| (r.delta, r.new_chunks)).collect();
+        store.append_batch_chunk_and_delta(items).await
+    }
 }
 
 impl RaftShardStore {
@@ -93,8 +131,29 @@ impl RaftShardStore {
         })
         .join()
         .expect("Raft runtime thread panicked");
+        let shards: Arc<Mutex<HashMap<ShardId, Arc<OpenRaftLogStore>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        // ADR-046 (W1) rev-2 C1: emission is gated OFF by default. Build the
+        // coalescer only when an operator opts in (after every node runs a
+        // binary that decodes `BatchChunkAndDelta`). The appender shares the
+        // live shard map so shards created after this point are reachable.
+        let coalescer = if crate::write_coalesce::CoalesceConfig::enabled() {
+            let cfg = crate::write_coalesce::CoalesceConfig::from_env();
+            tracing::info!(
+                max_batch = cfg.max_batch,
+                max_batch_bytes = cfg.max_batch_bytes,
+                flush_us = cfg.flush_interval.as_micros(),
+                "ADR-046 W1 write-coalescing ENABLED (KISEKI_WRITE_COALESCE)"
+            );
+            let appender = Arc::new(ShardMapAppender {
+                shards: Arc::clone(&shards),
+            });
+            Some(crate::write_coalesce::WriteCoalescer::new(appender, cfg))
+        } else {
+            None
+        };
         Self {
-            shards: Mutex::new(HashMap::new()),
+            shards,
             node_id,
             peers,
             rt,
@@ -102,6 +161,7 @@ impl RaftShardStore {
             inline_store: None,
             listener_registry: Mutex::new(None),
             transport_metrics: Mutex::new(None),
+            coalescer,
         }
     }
 
@@ -127,6 +187,20 @@ impl RaftShardStore {
         store: Arc<dyn kiseki_common::inline_store::InlineStore>,
     ) -> Self {
         self.inline_store = Some(store);
+        self
+    }
+
+    /// Force-enable ADR-046 (W1) write-coalescing with explicit `cfg`,
+    /// bypassing the `KISEKI_WRITE_COALESCE` env gate. For tests and
+    /// programmatic opt-in; production enables it via the env gate in
+    /// [`Self::new`]. The appender shares this store's live shard map, so
+    /// shards created after this call are still reachable.
+    #[must_use]
+    pub fn with_coalescing(mut self, cfg: crate::write_coalesce::CoalesceConfig) -> Self {
+        let appender = Arc::new(ShardMapAppender {
+            shards: Arc::clone(&self.shards),
+        });
+        self.coalescer = Some(crate::write_coalesce::WriteCoalescer::new(appender, cfg));
         self
     }
 
@@ -425,6 +499,24 @@ impl LogOps for RaftShardStore {
         &self,
         req: AppendChunkAndDeltaRequest,
     ) -> Result<SequenceNumber, LogError> {
+        // ADR-046 (W1): when coalescing is enabled, route through the
+        // per-shard queue (which surfaces `ForwardToLeader`), then collapse
+        // it onto `LeaderUnavailable` to preserve this legacy method's
+        // contract (see `LogError::ForwardToLeader` docs + ADR-042 §4).
+        if let Some(c) = &self.coalescer {
+            return c
+                .submit(req)
+                .await
+                .map_err(|e| match e {
+                    LogError::ForwardToLeader { shard_id, .. } => {
+                        LogError::LeaderUnavailable(shard_id)
+                    }
+                    other => other,
+                })
+                .inspect_err(|e| {
+                    tracing::warn!(error = %e, "log append_chunk_and_delta (coalesced): failed");
+                });
+        }
         let store = self.get_shard(req.delta.shard_id).inspect_err(|e| {
             tracing::warn!(error = %e, "log append_chunk_and_delta: shard lookup failed");
         })?;
@@ -443,6 +535,17 @@ impl LogOps for RaftShardStore {
         &self,
         req: AppendChunkAndDeltaRequest,
     ) -> Result<SequenceNumber, LogError> {
+        // ADR-046 (W1): the coalescer's batch commit also goes through
+        // `map_raft_error_with_forwarding`, so `ForwardToLeader` survives the
+        // fan-out and the gateway/native proxy still re-routes (#114).
+        if let Some(c) = &self.coalescer {
+            return c.submit(req).await.inspect_err(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "log append_chunk_and_delta_with_forwarding (coalesced): failed",
+                );
+            });
+        }
         let store = self.get_shard(req.delta.shard_id).inspect_err(|e| {
             tracing::warn!(
                 error = %e,

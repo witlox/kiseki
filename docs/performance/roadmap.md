@@ -105,11 +105,20 @@ the whole batch instead of one write.
   serially.
 - **Effort:** ADR-grade (changes the write→commit contract; interacts
   with idempotency_key and the I-CP invariants). **Risk:** Medium-High.
-- **Status: profile-first.** The 2026-05-28 code audit (below) found the
-  consensus-layer batching/fsync are *already* in place, so coalescing
-  is the *likely* fix but must be confirmed by a pprof decomposition of
-  the 180 ms before it's worth the ADR. Not landed this pass —
-  deliberately, to avoid a speculative durability-path change. #126.
+- **Status: LANDED (gated off) — ADR-046.** Release R (decode + atomic
+  apply + queue) and **Release R+1 (emission wired)** both landed
+  2026-05-28 on `perf/2026-05-28-roadmap`. The `WriteCoalescer` sits in
+  `kiseki-log` and routes `RaftShardStore::append_chunk_and_delta
+  [_with_forwarding]` — the convergence point for local **and**
+  #114-forwarded writes — through a per-shard micro-batch when enabled.
+  Idempotency stays gateway-side (rev-2 H2); `ForwardToLeader` survives
+  the batch fan-out (rev-2 M3). Integration-tested on real Raft.
+- **Enable:** set `KISEKI_WRITE_COALESCE=on` on **every** node (default
+  OFF — mixed-version gate, ADR-046 §C1). Tunables:
+  `KISEKI_WRITE_COALESCE_{MAX_BATCH,MAX_BATCH_BYTES,FLUSH_US,QUEUE_DEPTH}`.
+  **Measure** the lift via the `raft_commit` put-phase histogram on the
+  next GCP run; the ~40× projection below is still a projection until
+  that real-hardware number lands.
 
 ### W2 — Distributed shard leaders · #99 / #111 / #114 (landed)
 Spreading leaders across all 6 nodes (`namespace-create --shards 6`)
