@@ -34,6 +34,20 @@ Feature: NFSv4 protocol behavior on multi-node clusters
     Then the NFSv4 COMPOUND status is NFS4_OK
     And a composition id is returned in the GETFH reply
 
+  # #127 regression guard (2026-05-28 GCP): a NAMED file written on one
+  # node must resolve BY NAME (NFSv4 LOOKUP) from a DIFFERENT node. The
+  # name rides the replicated Create delta (hydrator name_inserts), not
+  # the writer's node-local in-memory dir_index. Pre-fix, the read node's
+  # LOOKUP missed and the read returned 0 bytes even though the
+  # composition was replicated. This is the cross-node verification the
+  # shared-store unit test cannot give (it shares one store).
+  @integration @multi-node @nfs
+  Scenario: 6-node cluster — a named file written on node-1 is read by name from node-3
+    Given a 6-node kiseki cluster
+    When a client writes "hello-xnode-127" to a file named "xnode-127.txt" via NFSv4 on node-1
+    And a client reads the file named "xnode-127.txt" via NFSv4 LOOKUP on node-3
+    Then the NFSv4 read returns "hello-xnode-127"
+
   # pNFS wire-protocol coverage. The GCP 2026-05-02 perf-cluster
   # mount attempt failed with `nfs4: Unknown parameter 'pnfs'` from
   # the kernel — that's a kernel-side mount-option problem, not a
