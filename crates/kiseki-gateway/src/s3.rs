@@ -140,6 +140,9 @@ impl<G: GatewayOps> S3Gateway<G> {
                 // S3 x-amz-storage-class → tier mapping is a thin
                 // per-protocol adapter (ADR-045 §D5); not yet wired.
                 tier: None,
+                // ADR-047: S3 PutObject is async-ack-eligible (object
+                // semantics, bounded-stale per ADR-014).
+                surface: crate::ops::WriteSurface::S3,
             })
             .await?;
 

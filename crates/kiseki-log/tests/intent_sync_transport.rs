@@ -138,7 +138,7 @@ fn assert_append_eq(a: &AppendChunkAndDeltaRequest, b: &AppendChunkAndDeltaReque
 fn spawn_node(node_id: u64, addr: &str) -> RaftShardStore {
     let mut peers = BTreeMap::new();
     peers.insert(node_id, addr.to_string());
-    let store = RaftShardStore::new(node_id, peers, None);
+    let store = RaftShardStore::new(node_id, peers, None, false);
     store.create_shard(
         test_shard(),
         test_tenant(),

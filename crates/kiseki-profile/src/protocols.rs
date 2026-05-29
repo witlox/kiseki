@@ -136,6 +136,7 @@ impl Driver for S3Driver {
                 forwarded_from_node: None,
                 comp_id_override: None,
                 tier: None,
+                surface: kiseki_gateway::ops::WriteSurface::S3,
             })
             .await
             .map_err(|e| format!("s3 put: {e}"))?;
@@ -198,6 +199,7 @@ impl Driver for Nfs3Driver {
                 forwarded_from_node: None,
                 comp_id_override: None,
                 tier: None,
+                surface: kiseki_gateway::ops::WriteSurface::Nfs,
             })
             .await
             .map_err(|e| format!("nfs3 put: {e}"))?;
@@ -260,6 +262,7 @@ impl Driver for Nfs4Driver {
                 forwarded_from_node: None,
                 comp_id_override: None,
                 tier: None,
+                surface: kiseki_gateway::ops::WriteSurface::Nfs,
             })
             .await
             .map_err(|e| format!("nfs4 put: {e}"))?;
@@ -585,6 +588,7 @@ impl Driver for PnfsDriver {
                 forwarded_from_node: None,
                 comp_id_override: None,
                 tier: None,
+                surface: kiseki_gateway::ops::WriteSurface::Nfs,
             })
             .await
             .map_err(|e| format!("pnfs put: {e}"))?;
@@ -724,6 +728,7 @@ impl Driver for FuseDriver {
                 forwarded_from_node: None,
                 comp_id_override: None,
                 tier: None,
+                surface: kiseki_gateway::ops::WriteSurface::Fuse,
             })
             .await
             .map_err(|e| format!("fuse gateway write: {e}"))?;
@@ -1012,6 +1017,7 @@ impl Driver for InProcessDriver {
                 forwarded_from_node: None,
                 comp_id_override: None,
                 tier: None,
+                surface: kiseki_gateway::ops::WriteSurface::Native,
             })
             .await
             .map_err(|e| format!("in-process put: {e}"))?;
@@ -1325,6 +1331,7 @@ impl Driver for InProcessPersistentDriver {
                 forwarded_from_node: None,
                 comp_id_override: None,
                 tier: None,
+                surface: kiseki_gateway::ops::WriteSurface::Native,
             })
             .await
             .map_err(|e| format!("in-process-persistent put: {e}"))?;

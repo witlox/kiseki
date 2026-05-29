@@ -8,22 +8,74 @@
 //! Phase I2: multi-node Raft consensus with in-memory Raft log
 //! (`MemLogStore`). Durability via Raft replication to majority.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use kiseki_common::ids::{ChunkId, NodeId, OrgId, SequenceNumber, ShardId};
 
 use crate::delta::Delta;
 use crate::error::LogError;
-use crate::intent::{FjallIntentStore, InMemIntentStore, IntentStore};
-use crate::intent_sync::{build_intent_dispatcher, TransportIntentGatherer};
+use crate::intent::{FjallIntentStore, InMemIntentStore, IntentStore, WriteIntent};
+use crate::intent_sync::{
+    build_intent_dispatcher, TransportIntentGatherer, WireIntent, INTENT_PUT_TAG,
+};
 use crate::raft::state_machine::ClusterChunkStateEntry;
 use crate::raft::OpenRaftLogStore;
+use crate::raft_intent_sink::RaftLogIncorporationSink;
 use crate::shard::{ShardConfig, ShardInfo, ShardState};
+use crate::shard_committer::{run_committer_loop, ShardCommitter};
 use crate::traits::{AppendChunkAndDeltaRequest, AppendDeltaRequest, LogOps, ReadDeltasRequest};
 use kiseki_common::locks::LockOrDie;
+use kiseki_raft::tcp_transport::rpc_call;
+
+/// Default min durable copies for an acked decoupled write when
+/// `KISEKI_MIN_ACKS` is unset — mirrors the chunk D-5 default (2-of-N).
+const DEFAULT_MIN_ACKS: usize = 2;
+
+/// Per-tick interval for a shard's async committer loop (ADR-047 §3).
+const COMMITTER_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Per-peer timeout for the `intent_put` fan — bounded like the chunk
+/// fan-out so a single slow/dead peer cannot stall the producer's fast-ack.
+const INTENT_FAN_PEER_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// A spawned per-shard committer task: its shutdown signal + join handle, so
+/// [`RaftShardStore::shutdown`] / `Drop` can stop it cleanly. The loop runs on
+/// a dedicated `std::thread` holding the Raft runtime handle (the
+/// `raft_intent_sink` threading contract — never a tokio worker).
+struct ShardCommitterHandle {
+    shutdown: tokio::sync::watch::Sender<bool>,
+    join: std::thread::JoinHandle<()>,
+}
+
+/// Holds an `Arc<OpenRaftLogStore>` so it can be passed BY VALUE as the
+/// committer sink's [`IntentLogAppender`].
+///
+/// `RaftLogIncorporationSink::new` takes the appender by value, but the shard's
+/// `OpenRaftLogStore` lives behind an `Arc` (shared with the `shards` map). The
+/// inherent `IntentLogAppender for OpenRaftLogStore` impl in `raft_intent_sink`
+/// can't be moved out of the `Arc`; this thin wrapper forwards through the
+/// clone instead.
+struct OpenRaftAppender {
+    store: Arc<OpenRaftLogStore>,
+}
+
+impl crate::raft_intent_sink::IntentLogAppender for OpenRaftAppender {
+    async fn append_intent(
+        &self,
+        req: AppendChunkAndDeltaRequest,
+        seq: crate::intent::PerspectiveSeq,
+    ) -> Result<(), LogError> {
+        crate::raft_intent_sink::IntentLogAppender::append_intent(&*self.store, req, seq).await
+    }
+
+    async fn max_incorporated_seq(&self) -> Option<kiseki_common::time::HybridLogicalClock> {
+        crate::raft_intent_sink::IntentLogAppender::max_incorporated_seq(&*self.store).await
+    }
+}
 
 /// Raft-backed shard store for multi-node clusters.
 ///
@@ -54,6 +106,26 @@ pub struct RaftShardStore {
     /// [`InMemIntentStore`], mirroring the shard log store's persistence
     /// choice.
     intent_stores: Mutex<HashMap<ShardId, Arc<dyn IntentStore>>>,
+    /// Shards whose per-shard [`IntentStore`] opened DURABLY (a
+    /// [`FjallIntentStore`], not the [`InMemIntentStore`] degrade). The
+    /// decoupled-ack path (`put_intent_and_fan` + the committer spawn) runs
+    /// ONLY for a shard in this set — acking on a non-durable intent loses
+    /// data on crash (the F-P5b-rpc-1 obligation). A shard with `data_dir =
+    /// None` (in-memory test cluster) is NOT durable and so is absent here.
+    durable_intent_shards: Mutex<HashSet<ShardId>>,
+    /// ADR-047 decoupled-ack capability gate. When `false` (the default),
+    /// `create_shard` spawns no committer and the sync write path is
+    /// unchanged. Set in [`Self::new`] from the `decoupled_ack` param (the
+    /// runtime derives it from `KISEKI_DECOUPLED_ACK`).
+    decoupled_ack: bool,
+    /// Minimum durable copies (local + remote acks) for an acked decoupled
+    /// write. From `KISEKI_MIN_ACKS`, else [`DEFAULT_MIN_ACKS`]. Mirrors the
+    /// chunk D-5 quorum default.
+    min_acks: usize,
+    /// Per-shard async committer tasks spawned when `decoupled_ack` is on and
+    /// the shard's intent store is durable. Stopped in [`Self::shutdown`] /
+    /// `Drop`.
+    committers: Mutex<HashMap<ShardId, ShardCommitterHandle>>,
     node_id: u64,
     peers: BTreeMap<u64, String>,
     /// Dedicated runtime for Raft async operations. Kept separate from
@@ -79,8 +151,26 @@ impl RaftShardStore {
     /// When `data_dir` is `Some`, Raft log state is persisted to the
     /// fjall keyspace and survives restart. When `None`, uses
     /// in-memory log (volatile).
+    ///
+    /// `decoupled_ack` arms the ADR-047 decoupled-ack capability gate: when
+    /// `true`, `create_shard` spawns a per-shard async committer (for each
+    /// shard whose intent store is durable) and `put_intent_and_fan` performs
+    /// the quorum intent-write. When `false` (the runtime default unless
+    /// `KISEKI_DECOUPLED_ACK` is set), the synchronous write path is unchanged
+    /// and nothing extra is spawned. `min_acks` is read from `KISEKI_MIN_ACKS`
+    /// (else [`DEFAULT_MIN_ACKS`]).
     #[must_use]
-    pub fn new(node_id: u64, peers: BTreeMap<u64, String>, data_dir: Option<PathBuf>) -> Self {
+    pub fn new(
+        node_id: u64,
+        peers: BTreeMap<u64, String>,
+        data_dir: Option<PathBuf>,
+        decoupled_ack: bool,
+    ) -> Self {
+        let min_acks = std::env::var("KISEKI_MIN_ACKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(DEFAULT_MIN_ACKS);
         // Build the Raft runtime on a background thread to avoid
         // "cannot start a runtime from within a runtime" when called
         // from an async context (e.g., run_main on the server's tokio runtime).
@@ -107,6 +197,10 @@ impl RaftShardStore {
         Self {
             shards: Mutex::new(HashMap::new()),
             intent_stores: Mutex::new(HashMap::new()),
+            durable_intent_shards: Mutex::new(HashSet::new()),
+            decoupled_ack,
+            min_acks,
+            committers: Mutex::new(HashMap::new()),
             node_id,
             peers,
             rt,
@@ -249,18 +343,162 @@ impl RaftShardStore {
     /// 5c/5d committer task that spawns behind the `DecoupledAckEnabled` gate.
     #[must_use]
     pub fn intent_gatherer(&self, shard_id: ShardId) -> Option<TransportIntentGatherer> {
-        let store = self.get_shard(shard_id).ok()?;
-        let local = self.node_id;
-        let peers: Vec<(NodeId, String)> = store
-            .voter_ids()
-            .into_iter()
-            .filter(|id| *id != local)
-            .filter_map(|id| self.peers.get(&id).map(|addr| (NodeId(id), addr.clone())))
-            .collect();
+        let peers = self.resolve_voter_peers(shard_id)?;
         // TLS is not plumbed into kiseki-log's transport yet (the Raft network
         // uses plaintext `TcpNetworkFactory::new`); pass `None`. The field is
         // here for the mTLS seam when TLS lands.
         Some(TransportIntentGatherer::new(shard_id, peers, None))
+    }
+
+    /// Resolve a shard's voter peers (live Raft voters minus the local node,
+    /// each mapped to its transport addr). Shared by [`Self::intent_gatherer`]
+    /// (the read-side gather) and [`Self::put_intent_and_fan`] (the write-side
+    /// fan), so both fan to exactly the same voter set.
+    ///
+    /// A voter with no addr in the `peers` map is dropped — it cannot be
+    /// reached. Returns `None` for a shard this node does not host.
+    fn resolve_voter_peers(&self, shard_id: ShardId) -> Option<Vec<(NodeId, String)>> {
+        let store = self.get_shard(shard_id).ok()?;
+        let local = self.node_id;
+        Some(
+            store
+                .voter_ids()
+                .into_iter()
+                .filter(|id| *id != local)
+                .filter_map(|id| self.peers.get(&id).map(|addr| (NodeId(id), addr.clone())))
+                .collect(),
+        )
+    }
+
+    /// ADR-047 decoupled-ack — the quorum intent-write (NO-LOSS CRITICAL).
+    ///
+    /// Durably records `intent` on a quorum so the gateway can fast-ack a write
+    /// BEFORE the synchronous Raft round. Writes the LOCAL per-shard
+    /// [`IntentStore`] (one durable copy) and fans the intent to the shard's
+    /// voter peers via [`INTENT_PUT_TAG`] in PARALLEL; returns `Ok` ONLY once
+    /// total durable copies (`1 local + remote acks`) reach `self.min_acks`.
+    /// Otherwise `Err` — the caller MUST NOT ack (an acked write is guaranteed
+    /// on `≥ min_acks` replicas, I-L2/I-CS1).
+    ///
+    /// # Non-durable-store guard (F-P5b-rpc-1)
+    /// If the shard's intent store is the [`InMemIntentStore`] degrade (its
+    /// durable open failed — see `create_shard`), this returns
+    /// [`LogError::Unavailable`] WITHOUT writing. Decoupled-ack MUST NOT run on
+    /// a non-durable intent store: acking on a non-durable intent loses the
+    /// write on crash. Fail closed — the caller falls back to the sync path.
+    ///
+    /// # Errors
+    /// [`LogError::ShardNotFound`] for a shard not hosted here;
+    /// [`LogError::Unavailable`] on a non-durable intent store or a local-store
+    /// write failure; [`LogError::QuorumLost`] when the durable copies fall
+    /// short of `min_acks`.
+    pub async fn put_intent_and_fan(
+        &self,
+        shard_id: ShardId,
+        intent: WriteIntent,
+    ) -> Result<(), LogError> {
+        use futures::StreamExt;
+
+        // Non-durable guard FIRST: refuse before any write so an in-memory
+        // degrade can never produce an acked-but-volatile intent.
+        let is_durable = self
+            .durable_intent_shards
+            .lock()
+            .lock_or_die("raft_shard_store.durable_intent_shards")
+            .contains(&shard_id);
+        if !is_durable {
+            tracing::warn!(
+                shard_id = %shard_id.0,
+                "put_intent_and_fan refused: intent store is non-durable (decoupled-ack would lose data on crash)",
+            );
+            return Err(LogError::Unavailable);
+        }
+
+        let store = self
+            .intent_store(shard_id)
+            .ok_or(LogError::ShardNotFound(shard_id))?;
+
+        // Local put first — one durable copy. A local failure is fatal: with
+        // the local copy missing we can never reach min_acks safely.
+        store.put(intent.clone()).map_err(|e| {
+            tracing::warn!(shard_id = %shard_id.0, error = %e, "put_intent_and_fan: local intent store write failed");
+            LogError::Unavailable
+        })?;
+        let mut acks: usize = 1;
+
+        // Fast path: a single-copy quorum (1-node cluster / min_acks=1) is
+        // satisfied by the local write alone — no fan needed.
+        if acks >= self.min_acks {
+            return Ok(());
+        }
+
+        // Fan to the shard's voter peers (minus self) in PARALLEL. Reuse the
+        // gatherer's voter/addr resolution so the fan targets exactly the
+        // committer's voter set. A peer with no addr / no listener is simply a
+        // non-ack — never fabricated.
+        let peers = self.resolve_voter_peers(shard_id).unwrap_or_default();
+        let wire = WireIntent::from(&intent);
+        let mut fan = futures::stream::FuturesUnordered::new();
+        for (node_id, addr) in peers {
+            let wire_ref = &wire;
+            fan.push(async move {
+                // postcard(()) reply on success; bounded per-peer timeout so a
+                // slow/dead peer cannot stall the fast-ack.
+                let call = rpc_call::<_, ()>(&addr, shard_id, INTENT_PUT_TAG, None, wire_ref);
+                match tokio::time::timeout(INTENT_FAN_PEER_TIMEOUT, call).await {
+                    Ok(Ok(())) => true,
+                    Ok(Err(e)) => {
+                        tracing::debug!(node = node_id.0, addr = %addr, error = %e, "intent_put fan: peer non-ack");
+                        false
+                    }
+                    Err(_) => {
+                        tracing::debug!(node = node_id.0, addr = %addr, "intent_put fan: peer timed out");
+                        false
+                    }
+                }
+            });
+        }
+        while let Some(acked) = fan.next().await {
+            if acked {
+                acks += 1;
+                if acks >= self.min_acks {
+                    // Quorum reached — return as soon as enough peers ack
+                    // (the remaining fan futures are dropped/cancelled).
+                    return Ok(());
+                }
+            }
+        }
+
+        // Shortfall: durable copies < min_acks. The caller MUST NOT ack.
+        tracing::warn!(
+            shard_id = %shard_id.0,
+            acks,
+            min_acks = self.min_acks,
+            "put_intent_and_fan: quorum shortfall — refusing to ack",
+        );
+        Err(LogError::QuorumLost(shard_id))
+    }
+
+    /// Stop every spawned per-shard committer task cleanly: signal shutdown on
+    /// each watch channel, then join the dedicated thread. Idempotent — a
+    /// second call finds the map empty. Called by `Drop` and available for an
+    /// explicit graceful shutdown.
+    pub fn shutdown(&self) {
+        let handles: Vec<(ShardId, ShardCommitterHandle)> = {
+            let mut guard = self
+                .committers
+                .lock()
+                .lock_or_die("raft_shard_store.committers");
+            guard.drain().collect()
+        };
+        for (shard_id, handle) in handles {
+            // Best-effort: a closed channel (receiver already gone) just means
+            // the loop already exited.
+            let _ = handle.shutdown.send(true);
+            if handle.join.join().is_err() {
+                tracing::warn!(shard_id = %shard_id.0, "shard committer thread panicked on shutdown");
+            }
+        }
     }
 
     /// Create a shard's Raft group on this node.
@@ -346,28 +584,37 @@ impl RaftShardStore {
         // shard whose durable intent store failed to open (fail closed: keep
         // that shard on the synchronous path, or fail shard creation). Do NOT
         // let this silent fallback survive into the acked path.
-        let intent_store: Arc<dyn IntentStore> = match &self.data_dir {
-            Some(dir) => {
-                let path = dir.join(shard_id.0.to_string()).join("intents");
-                match FjallIntentStore::open(&path) {
-                    Ok(s) => Arc::new(s),
-                    Err(e) => {
-                        tracing::error!(
-                            shard_id = %shard_id.0,
-                            error = %e,
-                            "durable IntentStore open failed; using in-memory (INERT now, but \
-                             decoupled-ack MUST stay disabled on this shard — see 5c/5d obligation)",
-                        );
-                        Arc::new(InMemIntentStore::new())
+        let (intent_store, intent_store_durable): (Arc<dyn IntentStore>, bool) =
+            match &self.data_dir {
+                Some(dir) => {
+                    let path = dir.join(shard_id.0.to_string()).join("intents");
+                    match FjallIntentStore::open(&path) {
+                        Ok(s) => (Arc::new(s), true),
+                        Err(e) => {
+                            tracing::error!(
+                                shard_id = %shard_id.0,
+                                error = %e,
+                                "durable IntentStore open failed; using in-memory \
+                                 (decoupled-ack DISABLED on this shard — F-P5b-rpc-1)",
+                            );
+                            (Arc::new(InMemIntentStore::new()), false)
+                        }
                     }
                 }
-            }
-            None => Arc::new(InMemIntentStore::new()),
-        };
+                // `data_dir = None` (in-memory test cluster) is volatile, so it is
+                // NOT durable for decoupled-ack purposes.
+                None => (Arc::new(InMemIntentStore::new()), false),
+            };
         self.intent_stores
             .lock()
             .lock_or_die("raft_shard_store.intent_stores")
             .insert(shard_id, Arc::clone(&intent_store));
+        if intent_store_durable {
+            self.durable_intent_shards
+                .lock()
+                .lock_or_die("raft_shard_store.durable_intent_shards")
+                .insert(shard_id);
+        }
 
         // Register this shard's Raft handle with the listener so
         // inbound multiplexed RPCs route here.
@@ -375,15 +622,98 @@ impl RaftShardStore {
             reg.register_shard(shard_id, store.raft_handle());
             // ADR-047 aux dispatcher: register the IntentSync handler on the
             // SAME shard so a peer's committer can read this node's intent
-            // state over the multiplexed transport. The listener consults it
-            // only after the Raft dispatcher returns `UnknownTag`, so the
-            // consensus path is untouched.
-            reg.register_aux(shard_id, build_intent_dispatcher(intent_store));
+            // state over the multiplexed transport (and now also receive a
+            // fanned `intent_put`). The listener consults it only after the
+            // Raft dispatcher returns `UnknownTag`, so the consensus path is
+            // untouched.
+            reg.register_aux(shard_id, build_intent_dispatcher(Arc::clone(&intent_store)));
             tracing::info!(shard_id = %shard_id.0, "shard registered with Raft RPC listener");
         }
 
-        let mut shards = self.shards.lock().lock_or_die("raft_shard_store.shards");
-        shards.insert(shard_id, store);
+        {
+            let mut shards = self.shards.lock().lock_or_die("raft_shard_store.shards");
+            shards.insert(shard_id, Arc::clone(&store));
+        }
+
+        // ADR-047 decoupled-ack: spawn this shard's async committer ONLY when
+        // the capability gate is on AND the intent store is durable. The
+        // durable gate is the F-P5b-rpc-1 obligation — a committer that drains
+        // a non-durable store could incorporate an intent that a crash would
+        // lose. If the gate is off, spawn nothing (sync behavior unchanged).
+        if self.decoupled_ack && intent_store_durable {
+            self.spawn_committer(shard_id, &store, intent_store);
+        }
+    }
+
+    /// Spawn the per-shard async committer (ADR-047 phase 5c) on a DEDICATED
+    /// `std::thread` holding the Raft runtime handle. The committer drives the
+    /// synchronous [`RaftLogIncorporationSink`], whose
+    /// [`Handle::block_on`](tokio::runtime::Handle::block_on) MUST NOT run on a
+    /// tokio worker (the `raft_intent_sink` threading contract) — hence the
+    /// dedicated thread. Its shutdown sender + join handle are kept in
+    /// `committers` so [`Self::shutdown`] / `Drop` can stop it cleanly.
+    ///
+    /// `cluster_size` is the configured voter count (`self.peers.len()`, incl.
+    /// self): the authoritative membership size at construction, stable even
+    /// before the shard's Raft membership is initialized.
+    fn spawn_committer(
+        &self,
+        shard_id: ShardId,
+        store: &Arc<OpenRaftLogStore>,
+        intent_store: Arc<dyn IntentStore>,
+    ) {
+        let cluster_size = self.peers.len().max(1);
+        // The committer spawns at create_shard time — BEFORE membership is
+        // initialized — so a static peer snapshot would be empty forever. Build
+        // a LIVE-resolving gatherer: each gather re-reads the shard's voter set
+        // (minus self) from the live Raft membership, mapped through `peers`.
+        let resolver_store = Arc::clone(store);
+        let resolver_peers = self.peers.clone();
+        let local = self.node_id;
+        let resolver: Arc<dyn Fn() -> Vec<(NodeId, String)> + Send + Sync> = Arc::new(move || {
+            resolver_store
+                .voter_ids()
+                .into_iter()
+                .filter(|id| *id != local)
+                .filter_map(|id| {
+                    resolver_peers
+                        .get(&id)
+                        .map(|addr| (NodeId(id), addr.clone()))
+                })
+                .collect()
+        });
+        let gatherer = TransportIntentGatherer::with_resolver(shard_id, resolver, None);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let raft_handle = self.rt.handle().clone();
+        let appender = Arc::clone(store);
+        let join = std::thread::Builder::new()
+            .name(format!("kiseki-committer-{}", shard_id.0))
+            .spawn(move || {
+                raft_handle.clone().block_on(async move {
+                    // The sink bridges the sync committer to the async Raft log;
+                    // `new` seeds the F-2 recovery floor via block_on, which is
+                    // safe here because this is a dedicated std::thread, not a
+                    // tokio worker (the threading contract).
+                    let sink = RaftLogIncorporationSink::new(
+                        OpenRaftAppender { store: appender },
+                        raft_handle.clone(),
+                    );
+                    let committer = ShardCommitter::new(intent_store, sink, cluster_size);
+                    run_committer_loop(committer, gatherer, COMMITTER_INTERVAL, shutdown_rx).await;
+                });
+            })
+            .expect("failed to spawn decoupled-ack committer thread");
+        self.committers
+            .lock()
+            .lock_or_die("raft_shard_store.committers")
+            .insert(
+                shard_id,
+                ShardCommitterHandle {
+                    shutdown: shutdown_tx,
+                    join,
+                },
+            );
+        tracing::info!(shard_id = %shard_id.0, cluster_size, "decoupled-ack committer spawned (ADR-047)");
     }
 
     /// Initialize the Raft membership for a shard's group. Must be
@@ -489,8 +819,26 @@ impl RaftShardStore {
     }
 }
 
+impl Drop for RaftShardStore {
+    /// Stop every spawned per-shard committer on drop so no dedicated thread
+    /// outlives the store. `shutdown` is idempotent with an explicit call.
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 #[async_trait::async_trait]
 impl LogOps for RaftShardStore {
+    /// ADR-047 decoupled-ack — the real quorum intent-write. Delegates to the
+    /// inherent [`RaftShardStore::put_intent_and_fan`].
+    async fn put_intent_and_fan(
+        &self,
+        shard_id: ShardId,
+        intent: WriteIntent,
+    ) -> Result<(), LogError> {
+        RaftShardStore::put_intent_and_fan(self, shard_id, intent).await
+    }
+
     #[tracing::instrument(skip(self, req), fields(shard_id = %req.shard_id.0, tenant_id = %req.tenant_id.0, op = ?req.operation))]
     async fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
         let store = self.get_shard(req.shard_id).inspect_err(|e| {

@@ -596,6 +596,7 @@ impl KisekiWorld {
                 forwarded_from_node: None,
                 comp_id_override: None,
                 tier: None,
+                surface: kiseki_gateway::ops::WriteSurface::S3,
             })
             .await
             .map_err(|e| e.to_string())

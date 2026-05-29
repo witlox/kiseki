@@ -180,6 +180,33 @@ pub trait LogOps: Send + Sync {
         Ok(false)
     }
 
+    /// ADR-047 decoupled-ack: durably record `intent` on a quorum so the
+    /// gateway can fast-ack a write BEFORE the synchronous Raft round.
+    ///
+    /// Records the local per-shard intent store (one durable copy) and fans the
+    /// intent to the shard's voter peers in parallel, returning `Ok` ONLY once
+    /// the total durable copies reach `min_acks`. On a shortfall it returns
+    /// `Err` and the caller MUST NOT ack — an acked write is guaranteed on
+    /// `≥ min_acks` replicas (no-loss, I-L2/I-CS1).
+    ///
+    /// Multi-node only. The default impl returns [`LogError::Unavailable`] so
+    /// the single-node stores ([`crate::MemShardStore`],
+    /// [`crate::PersistentShardStore`]) signal "no decoupled-ack here" and the
+    /// gateway falls back to the synchronous append path. Only the Raft-backed
+    /// [`crate::RaftShardStore`] overrides with the real quorum intent-write.
+    ///
+    /// # Errors
+    /// [`LogError::Unavailable`] when this store does not support decoupled-ack
+    /// (the default) or the shard's intent store is non-durable; otherwise a
+    /// quorum-shortfall / shard-lookup error from the real implementation.
+    async fn put_intent_and_fan(
+        &self,
+        _shard_id: ShardId,
+        _intent: crate::intent::WriteIntent,
+    ) -> Result<(), LogError> {
+        Err(LogError::Unavailable)
+    }
+
     /// Read deltas in `[from, to]` inclusive from a shard.
     async fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError>;
 

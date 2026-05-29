@@ -38,7 +38,7 @@ use kiseki_proto::v1::native as np;
 use tonic::Status;
 
 use crate::error::GatewayError;
-use crate::ops::{GatewayOps, ReadRequest, WriteConditional, WriteRequest};
+use crate::ops::{GatewayOps, ReadRequest, WriteConditional, WriteRequest, WriteSurface};
 
 use super::lease_store::{AcquireOutcome, LeaseStore, ReleaseOutcome, RenewOutcome};
 use super::proxy_client::ProxyClient;
@@ -519,6 +519,9 @@ impl ServerImpl {
                 forwarded_from_node: cf.forwarded_from_node,
                 comp_id_override: None,
                 tier: None,
+                // ADR-047: native gRPC write is async-ack-eligible (object
+                // semantics, bounded-stale per ADR-014).
+                surface: WriteSurface::Native,
             };
             match self.ops.write_with_forwarding(wreq).await {
                 Ok(r) => r,
@@ -585,6 +588,9 @@ impl ServerImpl {
                 forwarded_from_node: cf.forwarded_from_node,
                 comp_id_override: None,
                 tier: None,
+                // ADR-047: native gRPC write is async-ack-eligible (object
+                // semantics, bounded-stale per ADR-014).
+                surface: WriteSurface::Native,
             };
             self.ops.write(wreq).await.map_err(map_gateway_error)?
         };

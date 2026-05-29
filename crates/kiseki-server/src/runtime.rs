@@ -580,8 +580,19 @@ pub async fn run_main(
         let raft_addr_str = cfg
             .raft_addr
             .map_or_else(|| "0.0.0.0:9300".to_owned(), |a| a.to_string());
-        let mut store =
-            kiseki_log::RaftShardStore::new(cfg.node_id, peers.clone(), cfg.data_dir.clone());
+        // ADR-047 decoupled-ack capability gate: off unless KISEKI_DECOUPLED_ACK
+        // is truthy. When off, create_shard spawns no committer and
+        // put_intent_and_fan is never reached (the gateway stays on the sync
+        // write path) — current behavior is unchanged.
+        let decoupled_ack = std::env::var("KISEKI_DECOUPLED_ACK")
+            .ok()
+            .is_some_and(|v| matches!(v.as_str(), "1" | "on" | "true" | "yes"));
+        let mut store = kiseki_log::RaftShardStore::new(
+            cfg.node_id,
+            peers.clone(),
+            cfg.data_dir.clone(),
+            decoupled_ack,
+        );
         if let Some(ref ss) = small_store {
             store = store.with_inline_store(std::sync::Arc::clone(ss)
                 as std::sync::Arc<dyn kiseki_common::inline_store::InlineStore>);
@@ -1551,6 +1562,11 @@ pub async fn run_main(
         }
     }
     let mut gw_builder = kiseki_gateway::InMemoryGateway::new(comp_store, chunk_store, master_key)
+        // ADR-047: this node's id seeds the per-node perspective clock
+        // (the PerspectiveSeq tie-breaker) and the capability gate selects
+        // the decoupled fast-ack path for async-eligible surfaces.
+        .with_node_id(cfg.node_id)
+        .with_decoupled_ack(cfg.decoupled_ack)
         .with_view_store(Arc::clone(&view_store))
         // ADR-044: tenant-isolated content-addressed dedup.
         .with_dedup_policy(

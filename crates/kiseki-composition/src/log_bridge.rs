@@ -142,6 +142,45 @@ pub async fn emit_chunk_and_delta_with_forwarding<L: LogOps + ?Sized>(
     }
 }
 
+/// Build the exact [`AppendChunkAndDeltaRequest`] that
+/// [`emit_chunk_and_delta_forwarding_to`] would commit, stamping a fresh
+/// HLC timestamp via [`now_timestamp`].
+///
+/// ADR-047 decoupled-ack: the gateway producer calls this to construct the
+/// `append` field of a [`kiseki_log::intent::WriteIntent`] so the intent
+/// carries byte-for-byte the same delta + `new_chunks` the synchronous
+/// emit would — guaranteeing the async committer incorporates an identical
+/// append. The `delta.timestamp` HLC here is independent of the intent's
+/// `perspective_seq` (that ingress order is minted by the gateway's
+/// per-node clock); this timestamp is the delta's own event time, exactly
+/// as the synchronous path stamps it.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn build_chunk_and_delta_request(
+    shard_id: ShardId,
+    tenant_id: OrgId,
+    operation: OperationType,
+    hashed_key: [u8; 32],
+    chunk_refs: Vec<ChunkId>,
+    payload: Vec<u8>,
+    new_chunks: Vec<NewChunkMeta>,
+) -> AppendChunkAndDeltaRequest {
+    let timestamp = now_timestamp();
+    AppendChunkAndDeltaRequest {
+        delta: AppendDeltaRequest {
+            shard_id,
+            tenant_id,
+            operation,
+            timestamp,
+            hashed_key,
+            chunk_refs,
+            payload,
+            has_inline_data: false,
+        },
+        new_chunks,
+    }
+}
+
 /// #111: forward-aware emit. Builds the append, attempts the local
 /// commit, and on `ForwardToLeader` re-issues the **same** built append
 /// to the leader via `forwarder` (if present), so the write commits on

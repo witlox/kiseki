@@ -156,6 +156,19 @@ impl LogOps for InstrumentedLogOps {
             .await
     }
 
+    /// ADR-047 decoupled-ack quorum intent-write — delegate to the inner
+    /// store so a wrapped [`crate::RaftShardStore`] still reaches its real
+    /// implementation (the trait default would otherwise mask it as
+    /// `Unavailable`). Not metered: the quorum-write is on the gateway's
+    /// fast-ack path, which the gateway times separately.
+    async fn put_intent_and_fan(
+        &self,
+        shard_id: ShardId,
+        intent: crate::intent::WriteIntent,
+    ) -> Result<(), LogError> {
+        self.inner.put_intent_and_fan(shard_id, intent).await
+    }
+
     #[tracing::instrument(level = "debug", skip(self, req), fields(shard_id = %req.shard_id.0, from = req.from.0, to = req.to.0))]
     async fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError> {
         let shard = req.shard_id.0.to_string();

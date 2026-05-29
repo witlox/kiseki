@@ -32,6 +32,40 @@ pub struct ReadResponse {
     pub content_type: Option<String>,
 }
 
+/// Which protocol surface a [`WriteRequest`] entered through (ADR-047).
+///
+/// Selects the ack discipline: object surfaces (`S3`, `Native`) carry
+/// bounded-stale, read-your-writes object semantics (ADR-014) and are
+/// eligible for the decoupled fast-ack path; POSIX surfaces (`Nfs`,
+/// `Fuse`) require close-to-open consistency (ADR-013) and are NEVER
+/// decoupled — they always await the synchronous Raft commit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WriteSurface {
+    /// S3 HTTP gateway (`PutObject` / multipart). Async-eligible.
+    #[default]
+    S3,
+    /// Native gRPC data-path write. Async-eligible.
+    Native,
+    /// NFS (v3 / v4 / pNFS DS) data path. Always synchronous (POSIX).
+    Nfs,
+    /// FUSE client write-back. Always synchronous (POSIX).
+    Fuse,
+}
+
+impl WriteSurface {
+    /// Whether this surface may take the ADR-047 decoupled fast-ack path.
+    ///
+    /// Only object surfaces (`S3`, `Native`) qualify: their bounded-stale
+    /// object semantics (ADR-014) tolerate the brief window between the
+    /// quorum-durable intent and the eventual Raft incorporation. POSIX
+    /// surfaces (`Nfs`, `Fuse`) demand close-to-open consistency
+    /// (ADR-013) and must never fast-ack ahead of the commit.
+    #[must_use]
+    pub const fn is_async_ack_eligible(self) -> bool {
+        matches!(self, WriteSurface::S3 | WriteSurface::Native)
+    }
+}
+
 /// A write request from a protocol client.
 #[derive(Clone, Debug, Default)]
 pub struct WriteRequest {
@@ -105,6 +139,13 @@ pub struct WriteRequest {
     /// (S3 `x-amz-storage-class`, a native field, or a namespace default
     /// once namespace metadata is replicated — Phase 18 / ADR-045 §D3).
     pub tier: Option<String>,
+    /// ADR-047 — the protocol surface this write entered through. Selects
+    /// the ack discipline: object surfaces (`S3`, `Native`) are eligible
+    /// for the decoupled fast-ack path; POSIX surfaces (`Nfs`, `Fuse`)
+    /// always take the synchronous commit path. Every production
+    /// construction site sets this explicitly; `Default` is `S3` for the
+    /// few literal-with-default test sites.
+    pub surface: WriteSurface,
 }
 
 /// HTTP-derived conditional check applied to a `WriteRequest` against
@@ -482,6 +523,18 @@ impl<G: GatewayOps> GatewayOps for std::sync::Arc<G> {
 mod tests {
     use super::*;
 
+    /// ADR-047: only object surfaces (S3, native) may decouple the ack;
+    /// POSIX surfaces (NFS, FUSE) must always await the synchronous commit.
+    #[test]
+    fn write_surface_async_ack_eligibility() {
+        assert!(WriteSurface::S3.is_async_ack_eligible());
+        assert!(WriteSurface::Native.is_async_ack_eligible());
+        assert!(!WriteSurface::Nfs.is_async_ack_eligible());
+        assert!(!WriteSurface::Fuse.is_async_ack_eligible());
+        // The Default surface is the conservative object surface, S3.
+        assert_eq!(WriteSurface::default(), WriteSurface::S3);
+    }
+
     /// RED-first: I-NG5 (idempotency dedup byte-preserve through proxy)
     /// requires `WriteRequest` to carry the request's
     /// `ControlFields.idempotency_key`. Audit finding `I-NG5` in
@@ -503,6 +556,7 @@ mod tests {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: WriteSurface::S3,
         };
         let cloned = req.clone();
         assert_eq!(
@@ -531,6 +585,7 @@ mod tests {
             forwarded_from_node: Some(7),
             comp_id_override: None,
             tier: None,
+            surface: WriteSurface::S3,
         };
         assert_eq!(req.clone().forwarded_from_node, Some(7));
     }

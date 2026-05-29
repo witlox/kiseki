@@ -329,6 +329,23 @@ pub struct InMemoryGateway {
     /// PUTs land on a single primary shard and PUT throughput
     /// collapses to one Raft leader.
     namespace_provisioner: std::sync::RwLock<Option<Arc<dyn NamespaceProvisioner>>>,
+    /// This node's Raft id — the tie-breaker baked into every
+    /// `PerspectiveSeq` so two writes ingressed on different nodes in
+    /// the same physical millisecond still totally order (ADR-047 §1).
+    node_id: kiseki_common::ids::NodeId,
+    /// ADR-047 decoupled-ack capability gate (per-node). When `true` AND
+    /// the write's surface is async-ack-eligible, `write_impl` /
+    /// `complete_multipart_internal` mint a perspective-seq, record the
+    /// intent on a quorum via `put_intent_and_fan`, and FAST-ACK instead
+    /// of awaiting the Raft commit — falling back to the synchronous emit
+    /// on any error so no write is ever lost. Wired from
+    /// `ServerConfig.decoupled_ack`. Default `false` (synchronous path).
+    decoupled_ack: bool,
+    /// Per-node hybrid logical clock — the ingress total-order source
+    /// (ADR-047 §1). `next_perspective_seq` ticks it with the current
+    /// wall-ms and returns the assigned [`kiseki_log::intent::PerspectiveSeq`].
+    /// Initialized `HybridLogicalClock::zero(node_id)`.
+    perspective_clock: std::sync::Mutex<kiseki_common::time::HybridLogicalClock>,
 }
 
 /// Lock-free snapshot of the namespace metadata fields the write hot
@@ -580,7 +597,56 @@ impl InMemoryGateway {
             decrypt_cache: parking_lot::Mutex::new(DecryptCache::new(read_decrypt_cache_ttl())),
             namespace_meta: std::sync::Arc::new(parking_lot::RwLock::new(namespace_meta_init)),
             namespace_provisioner: std::sync::RwLock::new(None),
+            // ADR-047: default to node 0 + synchronous acks. The runtime
+            // calls `with_node_id` / `with_decoupled_ack` to wire the real
+            // node id and the capability gate; single-node / in-memory
+            // tests keep node 0 and the synchronous path.
+            node_id: kiseki_common::ids::NodeId(0),
+            decoupled_ack: false,
+            perspective_clock: std::sync::Mutex::new(
+                kiseki_common::time::HybridLogicalClock::zero(kiseki_common::ids::NodeId(0)),
+            ),
         }
+    }
+
+    /// ADR-047 — set this node's Raft id, the tie-breaker for every minted
+    /// `PerspectiveSeq`. Re-seeds the per-node perspective clock so the HLC
+    /// carries the right `node_id` from t=0. Call BEFORE any write.
+    #[must_use]
+    pub fn with_node_id(mut self, node_id: u64) -> Self {
+        let nid = kiseki_common::ids::NodeId(node_id);
+        self.node_id = nid;
+        self.perspective_clock =
+            std::sync::Mutex::new(kiseki_common::time::HybridLogicalClock::zero(nid));
+        self
+    }
+
+    /// ADR-047 — enable the decoupled fast-ack path. When `true`, an
+    /// async-ack-eligible surface (S3 / native) records the write intent on
+    /// a quorum and acks before the Raft commit. Wired from
+    /// `ServerConfig.decoupled_ack`.
+    #[must_use]
+    pub fn with_decoupled_ack(mut self, enabled: bool) -> Self {
+        self.decoupled_ack = enabled;
+        self
+    }
+
+    /// Mint the next ingress total-order [`kiseki_log::intent::PerspectiveSeq`]
+    /// (ADR-047 §1). Ticks the per-node HLC with the current wall-ms; on the
+    /// (practically unreachable) HLC-exhaustion edge it pins to the current
+    /// clock value rather than failing the write — the seq stays unique per
+    /// node because the logical counter has already advanced on prior ticks.
+    fn next_perspective_seq(&self) -> kiseki_log::intent::PerspectiveSeq {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let mut clock = self
+            .perspective_clock
+            .lock()
+            .lock_or_die("mem_gateway.perspective_clock");
+        let ticked = clock.tick(now_ms).unwrap_or(*clock);
+        *clock = ticked;
+        kiseki_log::intent::PerspectiveSeq(ticked)
     }
 
     /// Attach a shared workflow table (ADR-021 §3.b). The data-path
@@ -1044,6 +1110,56 @@ impl InMemoryGateway {
                 shard_id = %shard_id.0,
                 "complete_multipart: emit_chunk_and_delta start",
             );
+
+            // ADR-047 decoupled-ack: multipart-complete is an S3-surface
+            // write (always async-ack-eligible), so the gate is just the
+            // capability flag. Mint a perspective-seq, record the intent on
+            // a quorum, and FAST-ACK. The parts' chunks are already
+            // `min_acks`-durable (uploaded BEFORE finalize — I-L5) and the
+            // composition + local name binding are already installed
+            // (read-your-writes holds on this node); the committer replays
+            // the Create delta + `cluster_chunk_state` asynchronously. On
+            // ANY error we fall through to the synchronous emit — no loss.
+            if self.decoupled_ack {
+                let append = kiseki_composition::log_bridge::build_chunk_and_delta_request(
+                    shard_id,
+                    emit_params.1,
+                    kiseki_log::delta::OperationType::Create,
+                    hashed_key,
+                    emit_params.3.clone(),
+                    comp_payload.clone(),
+                    new_chunks.clone(),
+                );
+                let seq = self.next_perspective_seq();
+                // No idempotency context on the multipart-complete seam
+                // today (the upload_id is the client's retry token, not a
+                // 16-byte intent key) — at-least-once; the committer dedups
+                // on Raft apply. TODO(ADR-047 §5): derive a stable key.
+                let intent = kiseki_log::intent::WriteIntent {
+                    perspective_seq: seq,
+                    idempotency_key: None,
+                    append,
+                };
+                match log.put_intent_and_fan(shard_id, intent).await {
+                    Ok(()) => {
+                        tracing::debug!(
+                            comp_id = %comp_id.0,
+                            shard_id = %shard_id.0,
+                            "complete_multipart: decoupled fast-ack (intent durable)",
+                        );
+                        return Ok(comp_id);
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            comp_id = %comp_id.0,
+                            shard_id = %shard_id.0,
+                            error = %e,
+                            "complete_multipart: decoupled-ack unavailable — synchronous fallback",
+                        );
+                    }
+                }
+            }
+
             // #111: forward-aware so multipart-complete on a remote-led
             // shard commits on the leader (the built append carries the
             // parts' new_chunks, so the leader needs no local upload state).
@@ -2535,6 +2651,90 @@ impl InMemoryGateway {
                 new_chunks = new_chunks.len(),
                 "gateway write: emit_chunk_and_delta start",
             );
+
+            // ADR-047 decoupled-ack: when enabled AND the surface carries
+            // bounded-stale object semantics (S3 / native), mint a
+            // perspective-seq, record the intent on a quorum, and FAST-ACK
+            // — skipping the synchronous Raft await below. The chunks are
+            // already `min_acks`-durable (write_chunk happened above,
+            // BEFORE the intent — I-L5) and the composition is already
+            // created locally (read-your-writes holds on this node), so
+            // the committer task can incorporate the delta +
+            // `cluster_chunk_state` asynchronously. On ANY shortfall /
+            // non-durable / single-node error we fall through to the
+            // synchronous emit so no write is ever lost.
+            if self.decoupled_ack && req.surface.is_async_ack_eligible() {
+                // Build byte-for-byte the SAME append the synchronous emit
+                // would commit, so the committer incorporates an identical
+                // delta. Clone the consumable params (cheap — `payload`/
+                // `new_chunks` are metadata, not the file body).
+                let append = kiseki_composition::log_bridge::build_chunk_and_delta_request(
+                    shard_id,
+                    emit_params.1,
+                    kiseki_log::delta::OperationType::Create,
+                    hashed_key,
+                    emit_params.3.clone(),
+                    comp_payload.clone(),
+                    new_chunks.clone(),
+                );
+                let seq = self.next_perspective_seq();
+                // Idempotency: reuse the request-supplied key when it is
+                // exactly 16 bytes (the intent key width); otherwise `None`
+                // (at-least-once — the committer dedups on the Raft apply).
+                // TODO(ADR-047 §5/O3): the `WriteRequest.idempotency_key`
+                // is a variable-length opaque token (1..=64 B); a stable
+                // 16-byte derivation (e.g. a domain-separated hash) would
+                // give exactly-once across re-ingress. Left as a follow-up.
+                let idempotency_key: Option<[u8; 16]> = req
+                    .idempotency_key
+                    .as_deref()
+                    .and_then(|k| <[u8; 16]>::try_from(k).ok());
+                let intent = kiseki_log::intent::WriteIntent {
+                    perspective_seq: seq,
+                    idempotency_key,
+                    append,
+                };
+                let intent_started = std::time::Instant::now();
+                match log.put_intent_and_fan(shard_id, intent).await {
+                    Ok(()) => {
+                        // Intent is `min_acks`-durable: fast-ack now. Do NOT
+                        // roll back the composition — it is the authoritative
+                        // local copy and the committer replicates the delta.
+                        // Record the quorum-intent latency under the same
+                        // `raft_commit` phase the synchronous path uses, so
+                        // the decoupled vs synchronous commit cost is
+                        // directly comparable from metrics.
+                        self.observe_put_phase("raft_commit", intent_started.elapsed());
+                        self.observe_put_phase(
+                            "composition_record",
+                            composition_record_started.elapsed(),
+                        );
+                        tracing::debug!(
+                            comp_id = %comp_id.0,
+                            shard_id = %shard_id.0,
+                            "gateway write: decoupled fast-ack (intent durable)",
+                        );
+                        return Ok(WriteResponse {
+                            composition_id: comp_id,
+                            bytes_written,
+                        });
+                    }
+                    Err(e) => {
+                        // Shortfall / non-durable / single-node — fall back
+                        // to the synchronous emit below. NEVER lose the
+                        // write. The composition stays created; the sync
+                        // path commits it normally (or rolls back on its
+                        // own error, preserving existing semantics).
+                        tracing::debug!(
+                            comp_id = %comp_id.0,
+                            shard_id = %shard_id.0,
+                            error = %e,
+                            "gateway write: decoupled-ack unavailable — synchronous fallback",
+                        );
+                    }
+                }
+            }
+
             // #111: forward-aware emit — commits locally, or re-issues
             // the built append to the shard leader (for EVERY ingress —
             // S3/NFS/FUSE/native) when this node is a follower. The
@@ -2962,7 +3162,7 @@ mod halt_mode_tests {
 #[cfg(test)]
 mod chunking_tests {
     use super::*;
-    use crate::ops::WriteRequest;
+    use crate::ops::{WriteRequest, WriteSurface};
     use kiseki_chunk::store::ChunkStore;
     use kiseki_common::ids::{NamespaceId, OrgId};
     use kiseki_common::tenancy::KeyEpoch;
@@ -3008,6 +3208,7 @@ mod chunking_tests {
                 forwarded_from_node: None,
                 comp_id_override: None,
                 tier: None,
+                surface: WriteSurface::S3,
             })
             .await
             .expect("write must succeed");
@@ -3056,6 +3257,7 @@ mod chunking_tests {
                 forwarded_from_node: None,
                 comp_id_override: None,
                 tier: None,
+                surface: WriteSurface::S3,
             })
             .await
             .unwrap();
@@ -3106,6 +3308,7 @@ mod chunking_tests {
                 forwarded_from_node: None,
                 comp_id_override: None,
                 tier: None,
+                surface: WriteSurface::S3,
             })
             .await
             .unwrap();
@@ -3155,6 +3358,7 @@ mod chunking_tests {
                 forwarded_from_node: None,
                 comp_id_override: None,
                 tier: None,
+                surface: WriteSurface::S3,
             })
             .await
             .unwrap();
@@ -3197,6 +3401,7 @@ mod chunking_tests {
                 forwarded_from_node: None,
                 comp_id_override: None,
                 tier: None,
+                surface: WriteSurface::S3,
             })
             .await
             .unwrap();
@@ -3245,6 +3450,7 @@ mod chunking_tests {
                 forwarded_from_node: None,
                 comp_id_override: None,
                 tier: None,
+                surface: WriteSurface::S3,
             })
             .await
             .unwrap();
@@ -3282,6 +3488,7 @@ mod chunking_tests {
                 forwarded_from_node: None,
                 comp_id_override: None,
                 tier: None,
+                surface: WriteSurface::S3,
             })
             .await
             .unwrap();
@@ -3318,6 +3525,7 @@ mod chunking_tests {
                 forwarded_from_node: None,
                 comp_id_override: None,
                 tier: None,
+                surface: WriteSurface::S3,
             })
             .await
             .unwrap();
@@ -3354,6 +3562,7 @@ mod chunking_tests {
                 forwarded_from_node: None,
                 comp_id_override: None,
                 tier: None,
+                surface: WriteSurface::S3,
             })
             .await
             .unwrap();
@@ -3464,7 +3673,7 @@ mod chunking_tests {
 #[cfg(test)]
 mod phase_duration_tests {
     use super::*;
-    use crate::ops::{ReadRequest, WriteRequest};
+    use crate::ops::{ReadRequest, WriteRequest, WriteSurface};
     use kiseki_chunk::store::ChunkStore;
     use kiseki_common::ids::{NamespaceId, OrgId};
     use kiseki_common::tenancy::KeyEpoch;
@@ -3516,6 +3725,7 @@ mod phase_duration_tests {
                 forwarded_from_node: None,
                 comp_id_override: None,
                 tier: None,
+                surface: WriteSurface::S3,
             })
             .await
             .expect("write must succeed");

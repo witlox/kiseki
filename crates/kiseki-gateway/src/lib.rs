@@ -155,4 +155,4 @@ pub mod native;
 
 pub use error::GatewayError;
 pub use mem_gateway::InMemoryGateway;
-pub use ops::{GatewayOps, ReadRequest, ReadResponse, WriteRequest, WriteResponse};
+pub use ops::{GatewayOps, ReadRequest, ReadResponse, WriteRequest, WriteResponse, WriteSurface};

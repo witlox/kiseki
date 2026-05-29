@@ -64,10 +64,24 @@ pub trait IntentLogAppender: Send + Sync {
 /// # THREADING CONTRACT
 /// The per-shard committer task that drives this sink **MUST** run on its own
 /// dedicated thread — a `std::thread` holding a runtime [`Handle`] — **NOT** a
-/// tokio worker thread. [`Handle::block_on`] on a worker would block that
-/// worker inside the runtime it is trying to drive, deadlocking or starving the
-/// async log append (ADR-032). Wiring that dedicated-thread committer is phase
-/// 5b/5c; phase 5a delivers the sink + its tests.
+/// shared tokio worker thread. Wiring that dedicated-thread committer is phase
+/// 5c (`RaftShardStore::spawn_committer`).
+///
+/// The sink bridges sync → async by blocking that dedicated thread on the Raft
+/// log append. Two call shapes are supported, picked at runtime:
+///
+/// - **Outside any runtime context** (a bare `std::thread`, or a `#[test]`
+///   thread): a plain [`Handle::block_on`].
+/// - **Inside a runtime context** (the phase-5c committer thread drives
+///   [`run_committer_loop`](crate::shard_committer::run_committer_loop) via
+///   `Handle::block_on`, so the sync `tick` → `incorporate` runs *while* a
+///   `block_on` is active): [`tokio::task::block_in_place`] wraps the inner
+///   `block_on`, telling tokio this worker is about to block so it can move
+///   other tasks off it. `block_in_place` requires the multi-threaded Raft
+///   runtime (it is — `RaftShardStore::new` builds `new_multi_thread`).
+///
+/// A plain nested `Handle::block_on` would panic ("Cannot start a runtime from
+/// within a runtime"); the [`block_on_maybe_in_place`] helper avoids that.
 pub struct RaftLogIncorporationSink<A: IntentLogAppender> {
     appender: A,
     handle: Handle,
@@ -78,21 +92,35 @@ impl<A: IntentLogAppender> RaftLogIncorporationSink<A> {
     /// Build a sink over `appender`, blocking on `handle` to seed the recovery
     /// cache from the log's recorded `max_incorporated_seq`.
     ///
-    /// # Panics
-    /// Panics if called from inside a tokio runtime worker thread:
-    /// [`Handle::block_on`] cannot block the current thread when it is itself a
-    /// runtime worker. Per the type's threading contract, construct (and drive)
-    /// the sink from a dedicated `std::thread`, never a tokio task.
+    /// Safe whether or not the caller is inside a runtime context (see the
+    /// type's threading contract): uses [`block_on_maybe_in_place`].
     #[must_use]
     pub fn new(appender: A, handle: Handle) -> Self {
-        let max_incorporated = handle
-            .block_on(appender.max_incorporated_seq())
-            .map(PerspectiveSeq);
+        let max_incorporated =
+            block_on_maybe_in_place(&handle, appender.max_incorporated_seq()).map(PerspectiveSeq);
         Self {
             appender,
             handle,
             max_incorporated,
         }
+    }
+}
+
+/// `block_on` `fut` on `handle`, choosing the call shape by whether the current
+/// thread is already inside a runtime context:
+///
+/// - inside a runtime → [`tokio::task::block_in_place`] + `handle.block_on`
+///   (the phase-5c committer thread, which drives the loop via `block_on`);
+/// - outside → a plain `handle.block_on` (a bare `std::thread` / `#[test]`).
+///
+/// This is the one seam that lets the sync committer drive the async log append
+/// from a thread that may itself be inside a `block_on` without the nested-
+/// runtime panic. `block_in_place` requires the multi-threaded Raft runtime.
+fn block_on_maybe_in_place<F: std::future::Future>(handle: &Handle, fut: F) -> F::Output {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(|| handle.block_on(fut))
+    } else {
+        handle.block_on(fut)
     }
 }
 
@@ -104,18 +132,17 @@ impl<A: IntentLogAppender> IncorporationSink for RaftLogIncorporationSink<A> {
     /// Append `ordered` (already ascending, every element strictly above the
     /// current floor) into the Raft log, advancing the cached floor after each.
     ///
-    /// # Panics
-    /// Panics if called from a tokio runtime worker thread — see
-    /// [`RaftLogIncorporationSink::new`]. Drive this only from the dedicated
-    /// committer thread (the threading contract).
+    /// Blocks the dedicated committer thread on each append via
+    /// [`block_on_maybe_in_place`] — safe whether or not that thread is itself
+    /// inside a `block_on` (the threading contract).
     fn incorporate(&mut self, ordered: &[crate::intent::WriteIntent]) -> Result<(), IntentError> {
         for intent in ordered {
-            self.handle
-                .block_on(
-                    self.appender
-                        .append_intent(intent.append.clone(), intent.perspective_seq),
-                )
-                .map_err(|e| IntentError::Incorporate(e.to_string()))?;
+            block_on_maybe_in_place(
+                &self.handle,
+                self.appender
+                    .append_intent(intent.append.clone(), intent.perspective_seq),
+            )
+            .map_err(|e| IntentError::Incorporate(e.to_string()))?;
             self.max_incorporated = Some(intent.perspective_seq);
         }
         Ok(())

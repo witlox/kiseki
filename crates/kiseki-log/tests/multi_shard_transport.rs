@@ -192,7 +192,7 @@ fn split_shard_creates_new_raft_group_via_multiplexed_listener() {
     let mut peers = BTreeMap::new();
     peers.insert(1u64, format!("127.0.0.1:{port}"));
 
-    let store = RaftShardStore::new(1, peers, None);
+    let store = RaftShardStore::new(1, peers, None, false);
     let original = ShardId(uuid::Uuid::from_u128(0x5d11_0001_u128));
     store.create_shard(
         original,
@@ -463,8 +463,8 @@ fn measure_round_latency_raftshardstore() {
     let a0 = peers[&1].clone();
     let a1 = peers[&2].clone();
 
-    let n1 = RaftShardStore::new(1, peers.clone(), None);
-    let n2 = RaftShardStore::new(2, peers.clone(), None);
+    let n1 = RaftShardStore::new(1, peers.clone(), None, false);
+    let n2 = RaftShardStore::new(2, peers.clone(), None, false);
     n1.create_shard(
         shard,
         test_tenant(),
@@ -755,8 +755,8 @@ fn measure_forward_fanthrough() {
     let a0 = peers[&1].clone();
     let a1 = peers[&2].clone();
 
-    let n1 = Arc::new(RaftShardStore::new(1, peers.clone(), None));
-    let n2 = Arc::new(RaftShardStore::new(2, peers.clone(), None));
+    let n1 = Arc::new(RaftShardStore::new(1, peers.clone(), None, false));
+    let n2 = Arc::new(RaftShardStore::new(2, peers.clone(), None, false));
     n1.create_shard(
         shard,
         test_tenant(),
