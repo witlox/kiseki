@@ -525,3 +525,144 @@ fn measure_round_latency_raftshardstore() {
         );
     });
 }
+
+/// PERF ROOT-CAUSE TEST (2026-05-29, #126+#133): the per-shard SM mutex is
+/// shared by the write APPLY and the hydrator's `read_deltas`, and
+/// read_deltas is O(total deltas) (iterate-all + clone-range) held UNDER
+/// that lock. So a hydrator reading a large log stalls every write's
+/// apply. This reproduces it without the full server: grow the log, then
+/// time writes WITH vs WITHOUT a concurrent read_deltas hammer. If
+/// "contended" >> "baseline", the SM-mutex / O(N)-read_deltas contention
+/// is the shared-layer write bottleneck. `#[ignore]` — manual probe.
+#[test]
+#[ignore = "perf probe: write-apply vs hydrator read_deltas SM-mutex contention"]
+fn measure_sm_mutex_contention() {
+    use kiseki_common::ids::SequenceNumber;
+    use kiseki_common::time::{ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime};
+    use kiseki_log::delta::OperationType;
+    use kiseki_log::traits::{AppendDeltaRequest, ReadDeltasRequest};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let rt = make_runtime();
+    let ports = find_ports(2);
+    let peers = peers_map(&ports);
+    let n1 = rt.block_on(async {
+        let l1 = RaftRpcListener::new(format!("127.0.0.1:{}", ports[0]), None);
+        let r1 = l1.registry();
+        tokio::spawn(async move {
+            let _ = l1.run().await;
+        });
+        let l2 = RaftRpcListener::new(format!("127.0.0.1:{}", ports[1]), None);
+        let r2 = l2.registry();
+        tokio::spawn(async move {
+            let _ = l2.run().await;
+        });
+        let n1 = OpenRaftLogStore::new(1, shard_a(), test_tenant(), &peers, None, None)
+            .await
+            .unwrap();
+        r1.register_shard(shard_a(), n1.raft_handle());
+        let n2 = OpenRaftLogStore::new(2, shard_a(), test_tenant(), &peers, None, None)
+            .await
+            .unwrap();
+        r2.register_shard(shard_a(), n2.raft_handle());
+        n1.initialize_membership(&peers).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        Arc::new(n1)
+    });
+
+    let mk = |i: u64| AppendDeltaRequest {
+        shard_id: shard_a(),
+        tenant_id: test_tenant(),
+        operation: OperationType::Create,
+        timestamp: DeltaTimestamp {
+            hlc: HybridLogicalClock {
+                physical_ms: 1000,
+                logical: 0,
+                node_id: NodeId(1),
+            },
+            wall: WallTime {
+                millis_since_epoch: 1000,
+                timezone: "UTC".into(),
+            },
+            quality: ClockQuality::Ntp,
+        },
+        hashed_key: [(i % 251) as u8; 32],
+        chunk_refs: vec![],
+        payload: vec![0xab; 32],
+        has_inline_data: false,
+    };
+    let stats = |mut v: Vec<Duration>| {
+        v.sort_unstable();
+        let n = v.len();
+        (
+            v.iter().sum::<Duration>() / u32::try_from(n).unwrap_or(1),
+            v[n / 2],
+            v[n - 1],
+        )
+    };
+
+    // Grow the log to ~1500 deltas so read_deltas([1,tip]) is a big O(N) scan.
+    rt.block_on(async {
+        for i in 0..1500 {
+            n1.append_chunk_and_delta(mk(i), vec![])
+                .await
+                .expect("grow");
+        }
+    });
+
+    // BASELINE: writes with no concurrent reader.
+    let base = rt.block_on(async {
+        let mut v = Vec::new();
+        for i in 1500..1560 {
+            let t = std::time::Instant::now();
+            n1.append_chunk_and_delta(mk(i), vec![])
+                .await
+                .expect("base");
+            v.push(t.elapsed());
+        }
+        v
+    });
+
+    // CONTENDED: a tight read_deltas([1, tip]) hammer (what the hydrator does)
+    // running concurrently while we time the same writes.
+    let stop = Arc::new(AtomicBool::new(false));
+    let hammer = {
+        let store = Arc::clone(&n1);
+        let stop = Arc::clone(&stop);
+        rt.spawn(async move {
+            let mut reads = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let _ = store
+                    .read_deltas(ReadDeltasRequest {
+                        shard_id: shard_a(),
+                        from: SequenceNumber(1),
+                        to: SequenceNumber(5000),
+                    })
+                    .await;
+                reads += 1;
+            }
+            reads
+        })
+    };
+    let cont = rt.block_on(async {
+        let mut v = Vec::new();
+        for i in 1560..1620 {
+            let t = std::time::Instant::now();
+            n1.append_chunk_and_delta(mk(i), vec![])
+                .await
+                .expect("cont");
+            v.push(t.elapsed());
+        }
+        v
+    });
+    stop.store(true, Ordering::Relaxed);
+    let reads = rt.block_on(hammer).unwrap_or(0);
+
+    let (bm, bp, bx) = stats(base);
+    let (cm, cp, cx) = stats(cont);
+    println!(
+        "SM-MUTEX-CONTENTION (log~1500 deltas):\n  BASELINE  (no reader): mean={bm:?} p50={bp:?} max={bx:?}\n  CONTENDED (read_deltas hammer, {reads} reads): mean={cm:?} p50={cp:?} max={cx:?}\n  => write slowdown under hydrator-style read: {:.1}x",
+        cm.as_secs_f64() / bm.as_secs_f64().max(1e-9)
+    );
+}
