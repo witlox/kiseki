@@ -70,3 +70,14 @@ S3 clients may send SSE headers. Kiseki always encrypts (I-K1).
 - S3-compatible tooling (aws cli, boto3, rclone) works for supported operations
 - Unsupported operations return 501 Not Implemented
 - SSE headers are handled gracefully without breaking encryption model
+
+## Write-ack consistency (ADR-047 amendment, 2026-05-29)
+
+S3 / object is an **async-apply** surface: PutObject / CompleteMultipartUpload
+ack on the **quorum-durable intent** (data + metadata on `min_acks`; no loss),
+with global ordering applied asynchronously (ADR-047). A GET that races a
+just-acked PUT may be **bounded-stale within I-CS2** (e.g. a brief 404 / prior
+version) — consistent with the S3 contract, which does not promise
+synchronous read-after-write across nodes. Read-your-writes is available by
+routing on the client-held perspective-seq. This is the relaxation POSIX/NFS
+(ADR-013) does *not* get; the per-surface split + rationale: ADR-047 §F-3.

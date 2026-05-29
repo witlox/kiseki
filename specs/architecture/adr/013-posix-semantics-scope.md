@@ -50,3 +50,16 @@ POSIX support via FUSE with explicit compatibility matrix.
 - Read-only mmap works (useful for model loading)
 - Writable mmap requires application changes (use write() instead)
 - No POSIX ACLs simplifies the permission model
+
+## Write-ack consistency (ADR-047 amendment, 2026-05-29)
+
+POSIX / NFS / FUSE are **synchronous-apply** surfaces: `close()` / `fsync()` /
+the streaming CommitStream block until the write's intent is *applied*
+(visible) on the owning shard — preserving **close-to-open** consistency (a
+subsequent `open()` on any node sees the closed file's data). The ADR-047
+decoupled-write-ack relaxation (ack on quorum-durable intent, ordering
+applied asynchronously) does **NOT** apply to these surfaces; they keep the
+strict path. They still benefit from #137 (parallel chunk store) + EC/Raft
+parallelization — just not the async ack. The relaxation is granted only to
+surfaces whose own contract tolerates bounded-stale visibility
+(S3/object/native — ADR-014). Rationale + the per-surface split: ADR-047 §F-3.
