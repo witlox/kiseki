@@ -632,10 +632,20 @@ impl OpenRaftLogStore {
         }
 
         let inner = self.state.lock().await;
-        let deltas: Vec<Delta> = inner
+        // `deltas` is appended in strictly increasing sequence order
+        // (tip += 1, then push) and the snapshot-install path preserves
+        // that order, so it is sorted ascending by `header.sequence`.
+        // Binary-search to the range start and stop at `to` instead of
+        // scanning the whole vec — O(log N + range), not O(total log).
+        // The old O(total) scan ran on every hydrator poll, so hydration
+        // degraded as the log grew (the root of #133's ~50 deltas/s) and
+        // held the shared SM mutex for the whole scan.
+        let start = inner
             .deltas
+            .partition_point(|d| d.header.sequence < req.from);
+        let deltas: Vec<Delta> = inner.deltas[start..]
             .iter()
-            .filter(|d| d.header.sequence >= req.from && d.header.sequence <= req.to)
+            .take_while(|d| d.header.sequence <= req.to)
             .map(|d| {
                 // Reconstruct inline payload from store if needed.
                 // Key = hashed_key with sequence mixed into last 8 bytes
