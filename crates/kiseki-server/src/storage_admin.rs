@@ -1874,7 +1874,7 @@ mod tests {
     /// Build a `StorageAdminGrpc` with a populated chunk store and
     /// 3-node cluster membership. Used by the W2 read-only tests.
     fn fixture_with_pools() -> (StorageAdminGrpc, Arc<RepairTracker>) {
-        let mut store = ChunkStore::new();
+        let store = ChunkStore::new();
         store.add_pool(AffinityPool {
             name: "fast-nvme".into(),
             durability: DurabilityStrategy::ErasureCoding {
@@ -2591,7 +2591,7 @@ mod tests {
         Arc<dyn kiseki_chunk::AsyncChunkOps>,
         Arc<EvacuationRegistry>,
     ) {
-        let mut store = ChunkStore::new();
+        let store = ChunkStore::new();
         store.add_pool(AffinityPool {
             name: "primary".into(),
             durability: DurabilityStrategy::Replication { copies: 3 },

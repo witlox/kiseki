@@ -5,6 +5,18 @@ Time-series record of every matrix run lives in
 [`specs/performance/`](https://github.com/witlox/kiseki/blob/main/specs/performance/INDEX.md) — those
 files are immutable snapshots, this file moves with HEAD.
 
+> **Gap + plan:** [`roadmap.md`](roadmap.md) is the gap-analysis layer —
+> where each protocol sits vs [`targets.md`](targets.md) on the 6-node
+> `default` profile and the prioritised work to close it. TL;DR: writes
+> are commit-bound (~250 op/s, one Raft round per write — #126);
+> batched commit (W1) is the one lever that matters. Reads scale.
+>
+> **Post-#116 correction:** the 2026-05-28 snapshot below predates the
+> #116 merge. #127 (FUSE/NFS/pNFS read-by-name) and #130 (NFSv3 write)
+> are now **fixed + verified live**; #128 (NFSv3 mount) fixed. The
+> functional blockers in that table are resolved — see the matrix
+> snapshot RUN 3 and `roadmap.md`.
+
 > Operators tuning a deployment for throughput should also read
 > [`docs/operations/durability.md`](../operations/durability.md) —
 > the group-commit flags described there trade durability for

@@ -69,7 +69,7 @@ const CONCURRENT_PER_PEER: usize = 32;
 const DEADLINE: Duration = Duration::from_secs(120);
 
 fn local_bridge(pool: &str) -> Arc<dyn AsyncChunkOps> {
-    let mut store = ChunkStore::new();
+    let store = ChunkStore::new();
     store.add_pool(AffinityPool {
         name: pool.to_owned(),
         device_class: DeviceClass::NvmeSsd,

@@ -198,6 +198,15 @@ impl<C: RaftTypeConfig> TcpNetworkFactory<C> {
     }
 }
 
+/// A reusable connection to a Raft peer (the connection-pooling fix).
+/// Held across RPCs by `TcpNetwork` so each AppendEntries no longer pays
+/// a full TCP (re)dial — the dominant per-write commit cost on the
+/// multi-node write path.
+enum RaftConn {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
 /// A TCP connection to a single Raft peer for ONE shard's group. The
 /// `shard_id` is sent in every frame so the peer's listener routes
 /// correctly (ADR-041).
@@ -206,6 +215,10 @@ pub struct TcpNetwork {
     shard_id: ShardId,
     /// TLS client config for mTLS-secured connections (ADV-S2).
     tls_config: Option<Arc<rustls::ClientConfig>>,
+    /// Persistent connection reused across `append_entries` RPCs. Lazily
+    /// established; dropped + reconnected on any I/O error (the peer may
+    /// close a half-open connection). `None` until the first RPC.
+    conn: Option<RaftConn>,
 }
 
 impl<C: RaftTypeConfig<Node = KisekiNode, SnapshotData = Cursor<Vec<u8>>>> RaftNetworkFactory<C>
@@ -218,6 +231,7 @@ impl<C: RaftTypeConfig<Node = KisekiNode, SnapshotData = Cursor<Vec<u8>>>> RaftN
             addr: node.addr.clone(),
             shard_id: self.shard_id,
             tls_config: self.tls_config.clone(),
+            conn: None,
         }
     }
 }
@@ -400,6 +414,67 @@ fn to_rpc_error<C: RaftTypeConfig>(e: io::Error) -> RPCError<C> {
     RPCError::Unreachable(Unreachable::new(&e))
 }
 
+impl TcpNetwork {
+    /// Open a fresh connection (plain TCP, or TLS when configured), with
+    /// `TCP_NODELAY` so small Raft frames aren't delayed by Nagle.
+    async fn connect(&self) -> io::Result<RaftConn> {
+        let tcp = TcpStream::connect(&self.addr).await?;
+        let _ = tcp.set_nodelay(true);
+        match &self.tls_config {
+            None => Ok(RaftConn::Plain(tcp)),
+            Some(tls_config) => {
+                let connector = tokio_rustls::TlsConnector::from(Arc::clone(tls_config));
+                let ip: std::net::IpAddr = self
+                    .addr
+                    .split(':')
+                    .next()
+                    .and_then(|h| h.parse().ok())
+                    .ok_or_else(|| {
+                        network_error(NetworkErrorKind::Transport, "invalid Raft peer address")
+                    })?;
+                let server_name = ServerName::IpAddress(ip.into());
+                let tls_stream = connector
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(|e| network_error(NetworkErrorKind::Transport, e))?;
+                Ok(RaftConn::Tls(Box::new(tls_stream)))
+            }
+        }
+    }
+
+    /// Send an RPC over the persistent connection, reconnecting ONCE if
+    /// the held connection is stale/half-open. On a second failure the
+    /// error propagates — openraft treats it as `Unreachable` and retries
+    /// replication later, so no entry is silently dropped.
+    async fn rpc_pooled<Req: Serialize, Resp: DeserializeOwned>(
+        &mut self,
+        tag: &str,
+        req: &Req,
+    ) -> io::Result<Resp> {
+        let shard_id = self.shard_id;
+        let mut last_err: Option<io::Error> = None;
+        for _ in 0..2 {
+            if self.conn.is_none() {
+                self.conn = Some(self.connect().await?);
+            }
+            let res = match self.conn.as_mut().expect("conn set above") {
+                RaftConn::Plain(s) => rpc_exchange(s, shard_id, tag, req).await,
+                RaftConn::Tls(s) => rpc_exchange(&mut **s, shard_id, tag, req).await,
+            };
+            match res {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    // Drop the (possibly half-open) connection and retry once.
+                    self.conn = None;
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| network_error(NetworkErrorKind::Transport, "rpc_pooled failed")))
+    }
+}
+
 impl<C: RaftTypeConfig<SnapshotData = Cursor<Vec<u8>>>> RaftNetworkV2<C> for TcpNetwork
 where
     C::D: Serialize + DeserializeOwned + Send,
@@ -410,15 +485,9 @@ where
         rpc: openraft::raft::AppendEntriesRequest<C>,
         _option: openraft::network::RPCOption,
     ) -> Result<openraft::raft::AppendEntriesResponse<C>, RPCError<C>> {
-        rpc_call(
-            &self.addr,
-            self.shard_id,
-            "append_entries",
-            self.tls_config.as_ref(),
-            &rpc,
-        )
-        .await
-        .map_err(to_rpc_error::<C>)
+        self.rpc_pooled("append_entries", &rpc)
+            .await
+            .map_err(to_rpc_error::<C>)
     }
 
     async fn full_snapshot(
@@ -700,6 +769,12 @@ impl RaftRpcListener {
 
         loop {
             let (tcp_stream, peer_addr) = listener.accept().await?;
+            // TCP_NODELAY on the accepted socket: with persistent
+            // connection reuse, small Raft response frames would
+            // otherwise sit in the kernel under Nagle (~40ms delayed-ACK
+            // stall) instead of going out immediately. Connect-per-call
+            // hid this because the socket close forced a flush.
+            let _ = tcp_stream.set_nodelay(true);
             let registry = self.registry.clone();
             let acceptor = self.tls_acceptor.load_full();
             let per_peer = Arc::clone(&self.active_per_peer);
@@ -813,10 +888,16 @@ async fn handle_one_connection(
             .await
             .map_err(|e| network_error(NetworkErrorKind::Transport, e))?;
         let mut s = tls;
-        serve_one_request(&mut s, registry, metrics).await
+        // Connection reuse: serve requests on this stream until the peer
+        // closes it (Ok(false)) or an I/O error occurs. The client side
+        // keeps one persistent connection per (peer, shard) and pipelines
+        // sequential RPCs over it instead of re-dialing per call.
+        while serve_one_request(&mut s, registry, metrics).await? {}
+        Ok(())
     } else {
         let mut s = tcp_stream;
-        serve_one_request(&mut s, registry, metrics).await
+        while serve_one_request(&mut s, registry, metrics).await? {}
+        Ok(())
     }
 }
 
@@ -824,14 +905,18 @@ async fn serve_one_request<S>(
     stream: &mut S,
     registry: &RegistryHandle,
     metrics: Option<&crate::transport_metrics::RaftTransportMetrics>,
-) -> io::Result<()>
+) -> io::Result<bool>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
+    // Returns Ok(true) when a request was served and the connection is
+    // still frame-synced (the caller may keep it alive for the next
+    // request — connection reuse, the pooling fix); Ok(false) when the
+    // peer closed or the stream desynced and the connection must close.
     let started = std::time::Instant::now();
     let mut len_buf = [0u8; 4];
     if stream.read_exact(&mut len_buf).await.is_err() {
-        return Ok(()); // peer closed
+        return Ok(false); // peer closed
     }
     let req_len = u32::from_be_bytes(len_buf) as usize;
     if req_len > MAX_RAFT_RPC_SIZE {
@@ -845,11 +930,13 @@ where
                 started.elapsed(),
             );
         }
-        return Ok(());
+        // We did NOT drain the oversized body — the stream is desynced;
+        // close rather than keep-alive.
+        return Ok(false);
     }
     let mut req_buf = vec![0u8; req_len];
     if stream.read_exact(&mut req_buf).await.is_err() {
-        return Ok(());
+        return Ok(false); // peer closed mid-frame
     }
 
     let Some((shard_id, tag, payload_value)) = decode_request_body(&req_buf) else {
@@ -862,7 +949,7 @@ where
                 started.elapsed(),
             );
         }
-        return Ok(());
+        return Ok(true); // frame fully consumed — connection stays synced
     };
 
     let Some(dispatch) = registry.inner.get(&shard_id).map(|e| Arc::clone(&*e)) else {
@@ -881,7 +968,7 @@ where
             tag = %tag,
             "Raft RPC: unknown_shard (peer cache stale or shard retired)",
         );
-        return Ok(());
+        return Ok(true); // frame fully consumed — connection stays synced
     };
 
     // The dispatcher closure takes a `&[u8]` payload (the typed
@@ -920,7 +1007,8 @@ where
             );
         }
     }
-    write_response(stream, status, body).await
+    write_response(stream, status, body).await?;
+    Ok(true)
 }
 
 /// Map a free-form tag string to the bounded label set used by the

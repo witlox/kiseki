@@ -44,7 +44,7 @@ const H2_STREAM_WINDOW: u32 = 16 * 1024 * 1024;
 const H2_CONN_WINDOW: u32 = 32 * 1024 * 1024;
 
 fn local_bridge(pool: &str) -> Arc<dyn AsyncChunkOps> {
-    let mut store = ChunkStore::new();
+    let store = ChunkStore::new();
     store.add_pool(AffinityPool {
         name: pool.to_owned(),
         device_class: DeviceClass::NvmeSsd,

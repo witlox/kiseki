@@ -59,6 +59,13 @@ use kiseki_chunk::{AsyncChunkOps, ChunkError};
 use kiseki_common::ids::{ChunkId, OrgId};
 use kiseki_crypto::envelope::Envelope;
 
+/// One fragment-fetch result on the EC read path:
+/// `(fragment_index, Some((ciphertext, crypto_template)))` on success,
+/// `(fragment_index, None)` on miss/timeout. `crypto_template` is `Some`
+/// only for peer responses (the local store returns bytes without the
+/// chunk-level crypto fields).
+type FragmentFetch = (u32, Option<(Vec<u8>, Option<Envelope>)>);
+
 pub mod auth;
 pub mod defaults;
 pub mod ec;
@@ -276,15 +283,8 @@ impl ClusteredChunkStore {
     /// `placement[i]` receives `fragment_index = i`. Caller chooses
     /// the placement order (typically via [`crate::pick_placement`]).
     #[allow(clippy::too_many_lines)]
-    #[tracing::instrument(
-        skip(self, envelope, placement),
-        fields(
-            chunk_id = ?envelope.chunk_id,
-            ciphertext_len = envelope.ciphertext.len(),
-            placement_size = placement.len(),
-            strategy = ?strategy,
-        ),
-    )]
+    // Hot path (per EC chunk write) — no per-op `#[instrument]`/`debug!`;
+    // errors still surface via `warn!`.
     pub async fn write_chunk_ec(
         &self,
         envelope: Envelope,
@@ -292,16 +292,11 @@ impl ClusteredChunkStore {
         strategy: crate::ec::EcStrategy,
         pool: &str,
     ) -> Result<(), ChunkError> {
-        tracing::debug!("write_chunk_ec: entry");
         let routes = crate::ec::encode_for_placement(strategy, &envelope.ciphertext, placement)
             .map_err(|e| {
                 tracing::warn!(error = %e, "write_chunk_ec: encode_for_placement failed");
                 ChunkError::Io(e.to_string())
             })?;
-        tracing::debug!(
-            routes = routes.len(),
-            "write_chunk_ec: encoded → fanning out PutFragment",
-        );
 
         // Build a peer-id → peer-handle index. Caller-supplied
         // peers may be in a different order than `placement`, so we
@@ -455,16 +450,9 @@ impl ClusteredChunkStore {
     /// function falls back to the trim-trailing-zeros heuristic
     /// (correct for AES-GCM ciphertext, wrong for sparse plaintext);
     /// callers wire `Some` in production.
-    #[tracing::instrument(
-        skip(self, placement),
-        fields(
-            chunk_id = ?chunk_id,
-            placement_size = placement.len(),
-            strategy = ?strategy,
-            original_len,
-        ),
-    )]
     #[allow(clippy::too_many_lines)]
+    // Hot path (per EC chunk READ — the GET fast path); no per-op
+    // `#[instrument]`/`debug!`. Errors still surface via `warn!`.
     pub async fn read_chunk_ec(
         &self,
         chunk_id: &ChunkId,
@@ -472,31 +460,37 @@ impl ClusteredChunkStore {
         strategy: crate::ec::EcStrategy,
         original_len: Option<u64>,
     ) -> Result<Envelope, ChunkError> {
-        tracing::debug!("read_chunk_ec: entry");
         let by_id: std::collections::HashMap<&str, &Arc<dyn FabricPeer>> =
             self.peers.iter().map(|p| (p.name(), p)).collect();
 
         let mut responses: Vec<crate::ec::FragmentResponse> = Vec::new();
-        // Capture chunk-level crypto fields (auth_tag, nonce, epochs,
-        // tenant-wrapped material) from the first peer response. Every
-        // peer's GetFragment carries the same fields (server-side
-        // captured them via `chunk_envelope_meta` on the corresponding
-        // PutFragment). Without these, the assembled envelope below
-        // would have zeroed crypto fields and AES-GCM verify on the
-        // gateway side fails with "AEAD authentication failed".
+        // Chunk-level crypto fields (auth_tag, nonce, epochs, tenant-
+        // wrapped material). Only peer GetFragment responses carry them
+        // (the local store returns bytes only); the assembled envelope
+        // below would otherwise have zeroed crypto and AES-GCM verify
+        // would fail "AEAD authentication failed". Captured from the first
+        // peer response WITHOUT cloning its (~ chunk/data_count) ciphertext
+        // — pre-fix did `env.clone()` (a ~16 MiB copy per read just for a
+        // few crypto bytes); now we keep only the crypto fields.
         let mut crypto: Option<Envelope> = None;
+        let cid = *chunk_id;
+        // Fetch every fragment CONCURRENTLY. The old loop awaited one
+        // GetFragment at a time — up to 6 sequential network RTTs for
+        // EC-4+2, the single-stream bulk-read bottleneck. Launching them
+        // together makes read latency ≈ the slowest fragment, not the sum.
+        // We still collect all responses (decode robustness; unchanged).
+        let mut futs: FuturesUnordered<tokio::task::JoinHandle<FragmentFetch>> =
+            FuturesUnordered::new();
         for (i, peer_id) in placement.iter().enumerate() {
             let fragment_index = u32::try_from(i).unwrap_or(u32::MAX);
-            // Local-fragment path: if a placement slot targets this
-            // node, read from local store. Pre-Phase-16e skipped self,
-            // missing one fragment per chunk on every read.
+            // Local-fragment path: a placement slot on this node reads from
+            // the local store (Phase-16e: don't skip self).
             if self.cfg.self_node_id != 0 && *peer_id == self.cfg.self_node_id {
-                if let Ok(bytes) = self.local.read_fragment(chunk_id, fragment_index).await {
-                    responses.push(crate::ec::FragmentResponse {
-                        fragment_index,
-                        bytes,
-                    });
-                }
+                let local = Arc::clone(&self.local);
+                futs.push(tokio::spawn(async move {
+                    let bytes = local.read_fragment(&cid, fragment_index).await.ok();
+                    (fragment_index, bytes.map(|b| (b, None)))
+                }));
                 continue;
             }
             let label = format!("node-{peer_id}");
@@ -507,25 +501,53 @@ impl ClusteredChunkStore {
             else {
                 continue;
             };
-            if let Ok(Ok(env)) = tokio::time::timeout(
-                self.cfg.get_timeout,
-                peer.get_fragment(*chunk_id, fragment_index),
-            )
-            .await
-            {
-                if crypto.is_none() {
-                    crypto = Some(env.clone());
-                }
-                responses.push(crate::ec::FragmentResponse {
-                    fragment_index,
-                    bytes: env.ciphertext,
+            let peer = Arc::clone(peer);
+            let timeout = self.cfg.get_timeout;
+            futs.push(tokio::spawn(async move {
+                let env = tokio::time::timeout(timeout, peer.get_fragment(cid, fragment_index))
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                let slot = env.map(|e| {
+                    // Move the ciphertext into the response; keep only the
+                    // crypto fields for the assembled envelope (no clone).
+                    let Envelope {
+                        ciphertext,
+                        auth_tag,
+                        nonce,
+                        system_epoch,
+                        tenant_epoch,
+                        tenant_wrapped_material,
+                        ..
+                    } = e;
+                    let crypto = Envelope {
+                        chunk_id: cid,
+                        ciphertext: Vec::new(),
+                        auth_tag,
+                        nonce,
+                        system_epoch,
+                        tenant_epoch,
+                        tenant_wrapped_material,
+                    };
+                    (ciphertext, Some(crypto))
                 });
-                // Could short-circuit once `responses.len() >=
-                // strategy.min_fragments_for_read()`, but keep
-                // collecting — extra fragments make decode
-                // unconditionally faster + give us spare data on
-                // any single-fragment corruption (16d concern).
+                (fragment_index, slot)
+            }));
+        }
+        while let Some(joined) = futs.next().await {
+            // JoinError (panicked fetch task) → skip that fragment.
+            let Ok((fragment_index, Some((bytes, crypto_opt)))) = joined else {
+                continue;
+            };
+            if crypto.is_none() {
+                if let Some(c) = crypto_opt {
+                    crypto = Some(c);
+                }
             }
+            responses.push(crate::ec::FragmentResponse {
+                fragment_index,
+                bytes,
+            });
         }
         if responses.len() < strategy.min_fragments_for_read() {
             tracing::warn!(
@@ -535,10 +557,6 @@ impl ClusteredChunkStore {
             );
             return Err(ChunkError::ChunkLost);
         }
-        tracing::debug!(
-            fragments = responses.len(),
-            "read_chunk_ec: collected fragments → decoding",
-        );
         // Phase 16d step 3: prefer the cluster_chunk_state-stored
         // original_len when the caller supplies it. Heuristic
         // fallback is preserved for tests / 16c-style callers that
@@ -999,7 +1017,7 @@ mod tests {
     }
 
     fn local_bridge(pool: &str) -> Arc<dyn AsyncChunkOps> {
-        let mut store = ChunkStore::new();
+        let store = ChunkStore::new();
         store.add_pool(AffinityPool {
             name: pool.to_owned(),
             device_class: DeviceClass::NvmeSsd,

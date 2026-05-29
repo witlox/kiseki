@@ -291,7 +291,7 @@ mod tests {
     }
 
     fn local() -> Arc<dyn AsyncChunkOps> {
-        let mut store = ChunkStore::new();
+        let store = ChunkStore::new();
         store.add_pool(AffinityPool {
             name: "p".into(),
             device_class: DeviceClass::NvmeSsd,

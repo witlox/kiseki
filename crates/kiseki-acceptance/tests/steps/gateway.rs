@@ -1356,7 +1356,7 @@ async fn then_repair_fails_error(w: &mut KisekiWorld) {
     // Take three devices offline — exceeds parity count (2), reconstruction
     // is mathematically impossible, so EC read must fail.
     {
-        let pool = w.legacy.chunk_store.pool_mut(EC_POOL).expect("pool exists");
+        let mut pool = w.legacy.chunk_store.pool_mut(EC_POOL).expect("pool exists");
         pool.set_device_online("d3", false);
         pool.set_device_online("d5", false);
         pool.set_device_online("d6", false);

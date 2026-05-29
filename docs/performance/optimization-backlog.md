@@ -92,7 +92,7 @@ The `crossbeam-utils::CachePadded` wrapper is the canonical fix.
 
 ### B3 — `#[tracing::instrument]` on hot-path methods ✅ **Picked up 2026-05-05** (S10 above)
 
-Removed from `write` / `read` / `delete` on `InMemoryGateway`. Multipart and admin methods retain instrumentation since their per-op cost dominates the span overhead. Persistent-store methods deferred — measure first if a future flamegraph shows them hot.
+Removed from `write` / `read` / `delete` on `InMemoryGateway`. Multipart and admin methods retain instrumentation since their per-op cost dominates the span overhead. **Persistent-store methods cleared 2026-05-28** — `ChunkStore::{read_chunk,write_chunk}` and `ClusteredChunkStore::{read_chunk_ec,write_chunk_ec}` carried `#[instrument]` + per-op `debug!` on the per-chunk read/write path *every protocol funnels through* (the GET fast path especially). Since no `release_max_level_*` cap is set, disabled callsites still cost the runtime level-check + icache footprint; span machinery is the heaviest. `warn!`/`error!` preserved.
 
 ### B4 — Pre-allocate Vec capacities on the write path
 
