@@ -2,7 +2,10 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::doc_markdown,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    clippy::similar_names,
+    clippy::items_after_statements,
+    clippy::cast_precision_loss
 )]
 //! Multi-shard transport integration test — ADR-041.
 //!
@@ -670,4 +673,258 @@ fn measure_sm_mutex_contention() {
         "SM-MUTEX-CONTENTION (log~1500 deltas):\n  BASELINE  (no reader): mean={bm:?} p50={bp:?} max={bx:?}\n  CONTENDED (read_deltas hammer, {reads} reads): mean={cm:?} p50={cp:?} max={cx:?}\n  => write slowdown under hydrator-style read: {:.1}x",
         cm.as_secs_f64() / bm.as_secs_f64().max(1e-9)
     );
+}
+
+/// Build a `ChunkAndDelta` append for the fan-through probe (free fn so it
+/// captures nothing and can be called from spawned tasks).
+fn mk_ca(i: u64) -> kiseki_log::traits::AppendChunkAndDeltaRequest {
+    use kiseki_common::time::{ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime};
+    use kiseki_log::delta::OperationType;
+    use kiseki_log::traits::{AppendChunkAndDeltaRequest, AppendDeltaRequest};
+    AppendChunkAndDeltaRequest {
+        delta: AppendDeltaRequest {
+            shard_id: shard_a(),
+            tenant_id: test_tenant(),
+            operation: OperationType::Create,
+            timestamp: DeltaTimestamp {
+                hlc: HybridLogicalClock {
+                    physical_ms: 1000,
+                    logical: 0,
+                    node_id: NodeId(1),
+                },
+                wall: WallTime {
+                    millis_since_epoch: 1000,
+                    timezone: "UTC".into(),
+                },
+                quality: ClockQuality::Ntp,
+            },
+            hashed_key: [(i % 251) as u8; 32],
+            chunk_refs: vec![],
+            payload: vec![0xab; 32],
+            has_inline_data: false,
+        },
+        new_chunks: vec![],
+    }
+}
+
+/// PERF PROBE (2026-05-29, #135/#126): is the multi-shard write FORWARD tax
+/// the single-ingress fan-through, or the commit round itself? On GCP the
+/// forwarded `raft_commit` tier is 50-100ms vs the local tier 1-5ms; since
+/// the leader's commit alone ≈ a local commit, the gap should live in the
+/// forward path. This drives N concurrent appends AT THE LEADER three ways:
+///   DIRECT     — in-process `LogOps::append_chunk_and_delta` (no gRPC) =
+///                the bare commit round under concurrency C.
+///   GRPC-1CHAN — N concurrent gRPC calls over ONE shared `LogService`
+///                channel = single-ingress: one node fans every forward
+///                through its one pooled channel to this leader.
+///   GRPC-NCHAN — N concurrent gRPC calls, each its OWN channel =
+///                distributed ingress / route-to-leader (forwards spread).
+///
+/// Reading the result:
+///   GRPC-1CHAN >> DIRECT && GRPC-NCHAN ≈ DIRECT
+///       → single-channel fan-through is the tax → #135 (route-to-leader /
+///         distributed ingress) fixes it, durability untouched.
+///   GRPC-1CHAN ≈ GRPC-NCHAN >> DIRECT
+///       → the gRPC LogService hop itself stacks (not the single channel) →
+///         deeper handler/serialization issue.
+///   all three ≈
+///       → no fan-through cost; the 50-100ms is the commit round under REAL
+///         concurrency (loopback too fast to show it) → #126 core, not #135.
+/// `#[ignore]` — manual probe, not CI.
+#[test]
+#[ignore = "perf probe: forward fan-through (1 vs N gRPC channels) vs direct commit"]
+fn measure_forward_fanthrough() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    use kiseki_log::grpc::{append_chunk_and_delta_request_to_proto, LogGrpc};
+    use kiseki_proto::v1::log_service_client::LogServiceClient;
+    use kiseki_proto::v1::log_service_server::LogServiceServer;
+    use tonic::transport::Server;
+
+    #[derive(Clone, Copy)]
+    enum Mode {
+        Direct,
+        Grpc1,
+        GrpcN,
+    }
+
+    let ports = find_ports(2);
+    let peers = peers_map(&ports);
+    let shard = shard_a();
+    let a0 = peers[&1].clone();
+    let a1 = peers[&2].clone();
+
+    let n1 = Arc::new(RaftShardStore::new(1, peers.clone(), None));
+    let n2 = Arc::new(RaftShardStore::new(2, peers.clone(), None));
+    n1.create_shard(
+        shard,
+        test_tenant(),
+        NodeId(1),
+        ShardConfig::default(),
+        Some(&a0),
+    );
+    n2.create_shard(
+        shard,
+        test_tenant(),
+        NodeId(1),
+        ShardConfig::default(),
+        Some(&a1),
+    );
+    n1.initialize_shard(shard).expect("init");
+    std::thread::sleep(Duration::from_secs(4)); // election → n1 leads
+
+    const ITERS: usize = 25;
+    let ctr = Arc::new(AtomicU64::new(0));
+
+    let stats = |mut v: Vec<Duration>| -> (Duration, Duration, Duration) {
+        if v.is_empty() {
+            return (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        }
+        v.sort_unstable();
+        let n = v.len();
+        let mean = v.iter().sum::<Duration>() / u32::try_from(n).unwrap_or(1);
+        (mean, v[n / 2], v[(n * 99 / 100).min(n - 1)])
+    };
+
+    let rt = make_runtime();
+    rt.block_on(async {
+        // Serve the LEADER's LogService on an ephemeral port.
+        let log_grpc = LogGrpc::new(Arc::clone(&n1) as Arc<dyn LogOps + Send + Sync>);
+        // Production serves the data plane via `serve_with_shutdown(addr)`
+        // — tonic owns the listener, so TCP_NODELAY defaults ON (tonic
+        // 0.14.5 mod.rs:132/656). The proxy client `Channel` is also
+        // nodelay-on by default. Match production here so the probe is
+        // representative. Set KISEKI_PROBE_NAGLE=1 to DELIBERATELY serve via
+        // `serve_with_incoming` on a raw listener — tonic IGNORES tcp_nodelay
+        // there (mod.rs:701), reproducing the ~40ms Nagle/delayed-ACK stall.
+        // That toggle proves the mechanism; the default path proves prod is
+        // not affected.
+        let demo_nagle = std::env::var("KISEKI_PROBE_NAGLE").as_deref() == Ok("1");
+        let std_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = std_l.local_addr().unwrap();
+        drop(std_l); // free the port; tonic / tokio rebinds it below
+        let svc = LogServiceServer::new(log_grpc);
+        let (sd_tx, sd_rx) = tokio::sync::oneshot::channel::<()>();
+        let srv = if demo_nagle {
+            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            tokio::spawn(async move {
+                Server::builder()
+                    .add_service(svc)
+                    .serve_with_incoming_shutdown(incoming, async {
+                        sd_rx.await.ok();
+                    })
+                    .await
+                    .unwrap();
+            })
+        } else {
+            tokio::spawn(async move {
+                Server::builder()
+                    .add_service(svc)
+                    .serve_with_shutdown(addr, async {
+                        sd_rx.await.ok();
+                    })
+                    .await
+                    .unwrap();
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let url = format!("http://{addr}");
+
+        // Drive `conc` workers × ITERS ops in `mode`; return (wall, latencies).
+        let run = |mode: Mode, conc: usize| {
+            let n1 = Arc::clone(&n1);
+            let ctr = Arc::clone(&ctr);
+            let url = url.clone();
+            async move {
+                // GRPC-1CHAN: one shared channel, cloned into each worker.
+                let shared = match mode {
+                    Mode::Grpc1 => Some(LogServiceClient::connect(url.clone()).await.unwrap()),
+                    _ => None,
+                };
+                let start = std::time::Instant::now();
+                let mut handles = Vec::with_capacity(conc);
+                for _ in 0..conc {
+                    let n1 = Arc::clone(&n1);
+                    let ctr = Arc::clone(&ctr);
+                    let url = url.clone();
+                    let shared = shared.clone();
+                    handles.push(tokio::spawn(async move {
+                        // GRPC-NCHAN: each worker dials its own channel.
+                        let mut own = match mode {
+                            Mode::GrpcN => {
+                                Some(LogServiceClient::connect(url).await.unwrap())
+                            }
+                            _ => None,
+                        };
+                        let mut client = match mode {
+                            Mode::Grpc1 => shared,
+                            _ => None,
+                        };
+                        let mut lat = Vec::with_capacity(ITERS);
+                        for _ in 0..ITERS {
+                            let i = ctr.fetch_add(1, Ordering::Relaxed);
+                            let t = std::time::Instant::now();
+                            match mode {
+                                Mode::Direct => {
+                                    LogOps::append_chunk_and_delta(n1.as_ref(), mk_ca(i))
+                                        .await
+                                        .expect("direct append");
+                                }
+                                Mode::Grpc1 => {
+                                    let proto = append_chunk_and_delta_request_to_proto(&mk_ca(i));
+                                    client
+                                        .as_mut()
+                                        .unwrap()
+                                        .append_chunk_and_delta(proto)
+                                        .await
+                                        .expect("grpc-1chan append");
+                                }
+                                Mode::GrpcN => {
+                                    let proto = append_chunk_and_delta_request_to_proto(&mk_ca(i));
+                                    own.as_mut()
+                                        .unwrap()
+                                        .append_chunk_and_delta(proto)
+                                        .await
+                                        .expect("grpc-nchan append");
+                                }
+                            }
+                            lat.push(t.elapsed());
+                        }
+                        lat
+                    }));
+                }
+                let mut all = Vec::new();
+                for h in handles {
+                    all.extend(h.await.unwrap());
+                }
+                (start.elapsed(), all)
+            }
+        };
+
+        // warmup the leader / connection setup
+        let _ = run(Mode::Direct, 4).await;
+
+        println!("FORWARD-FAN-THROUGH (#135) — 2-node loopback, leader serves LogService:");
+        for &conc in &[1usize, 16, 48] {
+            for (label, mode) in [
+                ("DIRECT    ", Mode::Direct),
+                ("GRPC-1CHAN", Mode::Grpc1),
+                ("GRPC-NCHAN", Mode::GrpcN),
+            ] {
+                let (wall, lat) = run(mode, conc).await;
+                let ops = (conc * ITERS) as f64;
+                let thru = ops / wall.as_secs_f64().max(1e-9);
+                let (mean, p50, p99) = stats(lat);
+                println!(
+                    "  conc={conc:>2} {label}: {thru:>8.0} op/s  mean={mean:?} p50={p50:?} p99={p99:?}",
+                );
+            }
+        }
+
+        // Clean teardown (avoid h2 stream-abort debug_assert).
+        let _ = sd_tx.send(());
+        let _ = srv.await;
+    });
 }
