@@ -48,6 +48,19 @@ pub enum IntentError {
     /// version (the F-4 forward-compat guard).
     #[error("intent codec: {0}")]
     Codec(String),
+
+    /// Election intent-recovery (gate-1 O2) was handed fewer than a
+    /// majority of replica intent stores to gather from. Only a majority
+    /// gather is guaranteed to overlap every acked intent's `min_acks`
+    /// quorum by ≥1, so a sub-majority gather cannot reconstruct the
+    /// complete pending set — recovery refuses rather than lose an intent.
+    #[error("intent recovery gathered {have} stores, needs a majority of {need}")]
+    InsufficientQuorum {
+        /// Number of replica intent stores actually gathered.
+        have: usize,
+        /// Majority threshold required (`cluster_size / 2 + 1`).
+        need: usize,
+    },
 }
 
 impl From<fjall::Error> for IntentError {

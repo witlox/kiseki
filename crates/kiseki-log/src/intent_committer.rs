@@ -22,6 +22,8 @@
 //! sink and the gossip that gathers peer `next_pending_seq` values arrive in
 //! later phases.
 
+use std::collections::BTreeMap;
+
 use crate::intent::{IntentError, IntentStore, PerspectiveSeq, WriteIntent};
 
 /// Majority threshold for a cluster of `cluster_size` replicas: a strict
@@ -289,6 +291,110 @@ impl Committer {
 
         Ok(selected.len())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Election intent-recovery (ADR-047 phase 4 / gate-1 O2)
+// ---------------------------------------------------------------------------
+
+/// Reconstruct the complete pending set on a new leader by unioning the
+/// pending intents across a gathered quorum of replica intent stores, deduped
+/// by perspective-seq, ascending. Requires `>= majority(cluster_size)` stores
+/// (else [`IntentError::InsufficientQuorum`]) — only a majority gather is
+/// guaranteed to overlap every acked intent's `min_acks` quorum (gate-1 **O2**).
+///
+/// The O2 overlap argument: an intent acked on `min_acks` replicas survives
+/// because any majority the new leader gathers from intersects that intent's
+/// `min_acks` durability quorum by ≥1 (RF-3 / `min_acks`=2: any 2-of-3 gather ∩
+/// any 2-of-3 durability ≠ ∅). So at least one gathered store still holds every
+/// acked intent, and the union over a majority gather is complete. (Pruning is
+/// advisory and never outpaces the log's incorporated high-water-mark, so a
+/// still-pending acked intent has not yet been pruned anywhere it survives.)
+///
+/// **At-least-once for un-acked writes (gate-1 phase-4 finding F-P4-1).** The
+/// union includes *every* pending intent on the gathered replicas — including a
+/// write that reached only one replica and was never `min_acks`-acked (an
+/// interrupted fan-out). Such an intent may therefore be incorporated: the
+/// no-ack write still lands. This is **at-least-once**, and it is I-L5-safe
+/// **only because** the write protocol fans the chunks to `min_acks` *before*
+/// the metadata intent is written anywhere (data-before-metadata ordering), so
+/// the chunks are durable even for a partial intent — **phase 5 MUST preserve
+/// that ordering** or a partial intent could surface a composition over
+/// non-durable chunks. Clients get exactly-once by supplying an idempotency key
+/// (ADR-047 §5). Callers MUST also pass *distinct* replica stores: the quorum
+/// guard counts entries and cannot detect the same store passed twice
+/// (F-P4-2 — a wiring obligation).
+///
+/// This is purely additive and **unwired**: it abstracts over the
+/// [`IntentStore`] trait and touches neither the Raft state machine, the
+/// gateway, nor any runtime wiring. The cross-node RPC gather that populates
+/// `replica_stores` and the election trigger are phase 5.
+///
+/// # Errors
+/// [`IntentError::InsufficientQuorum`] if `replica_stores.len()` is below
+/// `majority(cluster_size)`; otherwise propagates [`IntentError`] from
+/// [`IntentStore::pending`].
+pub fn recover_pending(
+    replica_stores: &[&dyn IntentStore],
+    cluster_size: usize,
+) -> Result<Vec<WriteIntent>, IntentError> {
+    let need = majority(cluster_size);
+    let have = replica_stores.len();
+    if have < need {
+        return Err(IntentError::InsufficientQuorum { have, need });
+    }
+
+    // Union by perspective-seq. The BTreeMap dedups (identical seq from
+    // multiple replicas collapses to one — perspective-seqs are globally
+    // unique so there is no real value conflict) and keeps the result
+    // ascending by seq with no separate sort.
+    let mut by_seq: BTreeMap<PerspectiveSeq, WriteIntent> = BTreeMap::new();
+    for store in replica_stores {
+        for intent in store.pending()? {
+            by_seq.entry(intent.perspective_seq).or_insert(intent);
+        }
+    }
+    Ok(by_seq.into_values().collect())
+}
+
+/// Load recovered intents into the new leader's local store so the committer
+/// can incorporate them. Idempotent: re-running with the same set is a no-op
+/// (the store keys by perspective-seq). Returns the number newly inserted.
+///
+/// Recovery only rebuilds the pending set; it does **not** filter against the
+/// log. The committer's F-2 `seq > max_incorporated` floor — not recovery — is
+/// what drops anything already in the Raft log on the next [`Committer::run`].
+///
+/// "Newly inserted" is measured by perspective-seq, not by
+/// [`PutOutcome`]: a keyless re-restore of the same seq returns
+/// [`PutOutcome::Recorded`] (the store overwrites the row in place) yet adds
+/// nothing, so the count is taken against the pre-existing seq set. This keeps
+/// the return honest for both keyed and keyless intents.
+///
+/// # Errors
+/// Propagates [`IntentError`] from [`IntentStore::pending`] or
+/// [`IntentStore::put`].
+pub fn restore_into(
+    target: &dyn IntentStore,
+    recovered: &[WriteIntent],
+) -> Result<usize, IntentError> {
+    // Snapshot the seqs already present so the count reflects genuine first
+    // insertions (the store keys by perspective-seq; a keyless put of an
+    // existing seq overwrites in place and still reports `Recorded`).
+    let existing: std::collections::BTreeSet<PerspectiveSeq> = target
+        .pending()?
+        .into_iter()
+        .map(|i| i.perspective_seq)
+        .collect();
+    let mut inserted = 0;
+    for intent in recovered {
+        let is_new = !existing.contains(&intent.perspective_seq);
+        let _ = target.put(intent.clone())?;
+        if is_new {
+            inserted += 1;
+        }
+    }
+    Ok(inserted)
 }
 
 #[cfg(test)]
@@ -659,5 +765,167 @@ mod tests {
         let n = Committer::run(&store, &reports, 3, &mut sink).unwrap();
         assert_eq!(n, 2);
         assert_eq!(sink.incorporated, vec![seq(3, 0, 1), seq(4, 0, 1)]);
+    }
+
+    // ---- recover_pending (election intent-recovery / gate-1 O2) -----------
+
+    /// Collect the recovered perspective-seqs (ascending) for a gather.
+    fn recovered_seqs(stores: &[&dyn IntentStore], n: usize) -> Vec<PerspectiveSeq> {
+        recover_pending(stores, n)
+            .unwrap()
+            .iter()
+            .map(|i| i.perspective_seq)
+            .collect()
+    }
+
+    #[test]
+    fn recover_o2_overlap_every_majority_recovers_acked_intent() {
+        // The core O2 property. N=3, min_acks=2. An intent `I` is acked on the
+        // durability quorum {A,B} only. For EVERY majority gather the new
+        // leader could form — {A,B}, {A,C}, {B,C} — `recover_pending` must
+        // include `I`, because any 2-of-3 gather intersects the 2-of-3
+        // durability quorum {A,B} by ≥1, so at least one gathered store holds I.
+        let a = InMemIntentStore::new();
+        let b = InMemIntentStore::new();
+        let c = InMemIntentStore::new();
+        let acked = seq(7, 0, 1);
+        // `I` is durable on {A,B} only — C never received it (e.g. it was the
+        // replica left out of the min_acks quorum).
+        assert_eq!(a.put(intent(acked, None)).unwrap(), PutOutcome::Recorded);
+        assert_eq!(b.put(intent(acked, None)).unwrap(), PutOutcome::Recorded);
+
+        let ar: &dyn IntentStore = &a;
+        let br: &dyn IntentStore = &b;
+        let cr: &dyn IntentStore = &c;
+
+        // All three 2-of-3 majority gathers must recover the acked intent.
+        for (label, gather) in [
+            ("{A,B}", [ar, br]),
+            ("{A,C}", [ar, cr]),
+            ("{B,C}", [br, cr]),
+        ] {
+            let recovered = recovered_seqs(&gather, 3);
+            assert!(
+                recovered.contains(&acked),
+                "majority gather {label} must recover acked intent I"
+            );
+        }
+    }
+
+    #[test]
+    fn recover_dedups_same_intent_in_two_stores() {
+        // The same intent present in two gathered stores appears once in the
+        // union (BTreeMap keyed by perspective-seq).
+        let a = InMemIntentStore::new();
+        let b = InMemIntentStore::new();
+        let s = seq(3, 0, 1);
+        a.put(intent(s, None)).unwrap();
+        b.put(intent(s, None)).unwrap();
+        let ar: &dyn IntentStore = &a;
+        let br: &dyn IntentStore = &b;
+        let recovered = recover_pending(&[ar, br], 3).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].perspective_seq, s);
+    }
+
+    #[test]
+    fn recover_unions_ascending() {
+        // Stores holding disjoint, out-of-order seqs union into one ascending
+        // sequence regardless of per-store insertion order.
+        let a = InMemIntentStore::new();
+        let b = InMemIntentStore::new();
+        // A holds the high+low, B holds the middle ones — none in global order.
+        fill(&a, &[seq(5, 0, 1), seq(1, 0, 1)]);
+        fill(&b, &[seq(3, 0, 1), seq(2, 0, 1)]);
+        let ar: &dyn IntentStore = &a;
+        let br: &dyn IntentStore = &b;
+        assert_eq!(
+            recovered_seqs(&[ar, br], 3),
+            vec![seq(1, 0, 1), seq(2, 0, 1), seq(3, 0, 1), seq(5, 0, 1)]
+        );
+    }
+
+    #[test]
+    fn recover_insufficient_quorum_below_majority() {
+        // 1 of 3 stores is below majority(3)=2 → InsufficientQuorum, refusing
+        // to reconstruct an incomplete (possibly intent-losing) pending set.
+        let a = InMemIntentStore::new();
+        let ar: &dyn IntentStore = &a;
+        match recover_pending(&[ar], 3) {
+            Err(IntentError::InsufficientQuorum { have, need }) => {
+                assert_eq!(have, 1);
+                assert_eq!(need, 2);
+            }
+            other => panic!("expected InsufficientQuorum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_into_is_idempotent() {
+        // Restoring a recovered set into an empty store inserts all of it; a
+        // second restore of the same set inserts nothing new and leaves the
+        // pending set unchanged (the store keys by perspective-seq).
+        let recovered = vec![
+            intent(seq(1, 0, 1), None),
+            intent(seq(2, 0, 1), None),
+            intent(seq(3, 0, 1), None),
+        ];
+        let target = InMemIntentStore::new();
+        let first = restore_into(&target, &recovered).unwrap();
+        assert_eq!(first, 3, "all three newly inserted on first restore");
+        assert_eq!(target.pending_len().unwrap(), 3);
+
+        let second = restore_into(&target, &recovered).unwrap();
+        assert_eq!(second, 0, "re-restore inserts nothing new (idempotent)");
+        assert_eq!(target.pending_len().unwrap(), 3);
+        // Pending matches the recovered set, ascending.
+        let pending: Vec<_> = target
+            .pending()
+            .unwrap()
+            .iter()
+            .map(|i| i.perspective_seq)
+            .collect();
+        assert_eq!(pending, vec![seq(1, 0, 1), seq(2, 0, 1), seq(3, 0, 1)]);
+    }
+
+    #[test]
+    fn recover_then_commit_drops_already_incorporated() {
+        // recovery + F-2 compose: recover a union of seq(1),seq(2),seq(3) from
+        // a majority gather, restore into a fresh leader store, then run the
+        // committer against a log that already incorporated up to seq(2)
+        // (max_incorporated). With all-`None` reports (FullyClosed → no upper
+        // bound), only seq(3) is incorporated — the recovered seq(1),seq(2) are
+        // dropped by the committer's F-2 floor, NOT by recovery. This proves
+        // recovery rebuilds the full pending set and the committer's floor (not
+        // recovery) is what de-duplicates against the log.
+        let a = InMemIntentStore::new();
+        let b = InMemIntentStore::new();
+        // Spread the acked intents across the durability quorum {A,B}.
+        fill(&a, &[seq(1, 0, 1), seq(3, 0, 1)]);
+        fill(&b, &[seq(2, 0, 1), seq(3, 0, 1)]);
+        let ar: &dyn IntentStore = &a;
+        let br: &dyn IntentStore = &b;
+
+        let recovered = recover_pending(&[ar, br], 3).unwrap();
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|i| i.perspective_seq)
+                .collect::<Vec<_>>(),
+            vec![seq(1, 0, 1), seq(2, 0, 1), seq(3, 0, 1)],
+        );
+
+        // A fresh new-leader store, populated only by recovery.
+        let leader = InMemIntentStore::new();
+        assert_eq!(restore_into(&leader, &recovered).unwrap(), 3);
+
+        // The log already incorporated up to seq(2); FullyClosed watermark.
+        let mut sink = RecordingSink::new().with_max_incorporated(seq(2, 0, 1));
+        let n = Committer::run(&leader, &[None, None, None], 3, &mut sink).unwrap();
+        assert_eq!(n, 1, "only seq(3) is above the F-2 floor");
+        assert_eq!(sink.incorporated, vec![seq(3, 0, 1)]);
+        // The leader store is pruned up to seq(3), clearing the dropped lower
+        // recovered intents too.
+        assert_eq!(leader.pending_len().unwrap(), 0);
     }
 }
