@@ -321,7 +321,7 @@ fn measure_openraft_round_latency() {
         }
         lat.sort_unstable();
         let n = lat.len();
-        let mean = lat.iter().sum::<Duration>() / n as u32;
+        let mean = lat.iter().sum::<Duration>() / u32::try_from(n).unwrap_or(1);
         println!(
             "OPENRAFT-ROUND-LATENCY (2-node loopback TCP, no gateway/chunk/fjall load): \
              n={n} mean={:?} p50={:?} min={:?} max={:?}",
