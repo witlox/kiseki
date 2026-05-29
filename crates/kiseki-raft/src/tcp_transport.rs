@@ -397,7 +397,20 @@ async fn rpc_call_tls<Req: Serialize, Resp: DeserializeOwned>(
     rpc_exchange(&mut tls_stream, shard_id, tag, req).await
 }
 
-async fn rpc_call<Req: Serialize, Resp: DeserializeOwned>(
+/// Send one request/response RPC to `addr` for `shard_id` under `tag`,
+/// connecting fresh (no pooling). Plaintext when `tls_config` is `None`,
+/// otherwise mTLS. The request is postcard-encoded and the `Ok` response
+/// body is postcard-decoded against `Resp`.
+///
+/// This is the call seam ADR-047's `TransportIntentGatherer` uses to
+/// reach a peer's auxiliary (non-Raft) `IntentSync` dispatcher — the same
+/// wire path the Raft `vote` / `full_snapshot` calls take.
+///
+/// # Errors
+/// Returns an `io::Error` on connect/transport failure or when the peer
+/// answers with a non-`Ok` status (`UnknownShard` / `ParseError` /
+/// `DispatcherPanic`); classify it with [`classify_network_error`].
+pub async fn rpc_call<Req: Serialize, Resp: DeserializeOwned>(
     addr: &str,
     shard_id: ShardId,
     tag: &str,
