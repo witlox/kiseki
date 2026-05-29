@@ -22,6 +22,7 @@ pub mod error;
 pub mod grpc;
 pub mod instrumented;
 pub mod intent;
+pub mod intent_committer;
 pub mod merge;
 pub mod metrics;
 pub mod persistent_store;
