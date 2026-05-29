@@ -239,3 +239,78 @@ fn split_shard_creates_new_raft_group_via_multiplexed_listener() {
         "original shard lost its leader during split",
     );
 }
+
+/// PERF PROBE (2026-05-29, #259): measure the openraft `client_write`
+/// round latency in ISOLATION — 2 real nodes over loopback TCP, single
+/// shard, but NONE of the gateway/chunk/fjall/composition load that the
+/// full kiseki-server carries. Single-node full path = 240µs; 3-node
+/// full path = ~15ms. The only thing added is this replication round.
+/// If THIS prints ~sub-ms, the full-path 15ms is co-location/load on the
+/// 3 heavy servers; if it prints ~15ms, the openraft round is inherently
+/// that slow on loopback. `#[ignore]` — manual probe, not CI.
+#[test]
+#[ignore = "perf probe: openraft single-round latency"]
+fn measure_openraft_round_latency() {
+    use kiseki_common::time::{ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime};
+    use kiseki_log::delta::OperationType;
+    use kiseki_log::traits::AppendDeltaRequest;
+
+    let rt = make_runtime();
+    let ports = find_ports(2);
+    let peers = peers_map(&ports);
+    let (n1, _n2) = rt.block_on(async {
+        let l1 = RaftRpcListener::new(format!("127.0.0.1:{}", ports[0]), None);
+        let r1 = l1.registry();
+        tokio::spawn(async move { let _ = l1.run().await; });
+        let l2 = RaftRpcListener::new(format!("127.0.0.1:{}", ports[1]), None);
+        let r2 = l2.registry();
+        tokio::spawn(async move { let _ = l2.run().await; });
+        let n1 = OpenRaftLogStore::new(1, shard_a(), test_tenant(), &peers, None, None)
+            .await
+            .unwrap();
+        r1.register_shard(shard_a(), n1.raft_handle());
+        let n2 = OpenRaftLogStore::new(2, shard_a(), test_tenant(), &peers, None, None)
+            .await
+            .unwrap();
+        r2.register_shard(shard_a(), n2.raft_handle());
+        n1.initialize_membership(&peers).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        (n1, n2)
+    });
+
+    let mk = |i: u64| AppendDeltaRequest {
+        shard_id: shard_a(),
+        tenant_id: test_tenant(),
+        operation: OperationType::Create,
+        timestamp: DeltaTimestamp {
+            hlc: HybridLogicalClock { physical_ms: 1000, logical: 0, node_id: NodeId(1) },
+            wall: WallTime { millis_since_epoch: 1000, timezone: "UTC".into() },
+            quality: ClockQuality::Ntp,
+        },
+        hashed_key: [(i % 251) as u8; 32],
+        chunk_refs: vec![],
+        payload: vec![0xab; 32],
+        has_inline_data: false,
+    };
+
+    rt.block_on(async {
+        // warmup
+        for i in 0..10 {
+            n1.append_chunk_and_delta(mk(i), vec![]).await.expect("warmup append");
+        }
+        let mut lat: Vec<Duration> = Vec::new();
+        for i in 10..110 {
+            let t = std::time::Instant::now();
+            n1.append_chunk_and_delta(mk(i), vec![]).await.expect("timed append");
+            lat.push(t.elapsed());
+        }
+        lat.sort_unstable();
+        let n = lat.len();
+        let mean = lat.iter().sum::<Duration>() / n as u32;
+        println!(
+            "OPENRAFT-ROUND-LATENCY (2-node loopback TCP, no gateway/chunk/fjall load): \
+             n={n} mean={:?} p50={:?} min={:?} max={:?}",
+            mean, lat[n / 2], lat[0], lat[n - 1]
+        );
+    });
+}
