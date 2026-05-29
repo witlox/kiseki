@@ -1,36 +1,34 @@
-//! ADR-047 phase 5b-rpc — the `IntentSync` auxiliary RPC.
+//! ADR-047 `LeaderSink` — the `IntentSync` auxiliary RPC.
 //!
-//! The phase 5b *core* ([`crate::shard_committer`]) defines the abstract
+//! The committer core ([`crate::shard_committer`]) defines the abstract
 //! [`PeerIntentGatherer`](crate::shard_committer::PeerIntentGatherer) seam: a
-//! shard's committer fans the peers' intent-store reports over the wire to
-//! advance the stability watermark, and gathers each peer's full pending set
-//! for election intent-recovery. This module is the *RPC* half — the concrete
+//! new leader gathers each peer's full pending set for **election
+//! intent-recovery** (gate-1 O2). This module is the *RPC* half — the concrete
 //! transport that rides the ADR-041 multiplexed Raft listener's auxiliary
 //! tag mechanism (`RegistryHandle::register_aux` /
 //! [`DispatchOutcome::UnknownTag`](kiseki_raft::tcp_transport::DispatchOutcome)):
 //!
 //! - The **server** side ([`build_intent_dispatcher`]) is an aux
 //!   [`ShardDispatch`](kiseki_raft::tcp_transport::ShardDispatch) closure over
-//!   a shard's [`IntentStore`]. It answers the two intent tags and falls
-//!   through (`UnknownTag`) for everything else, so a peer can SERVE its
-//!   intent state without the Raft path ever touching it.
+//!   a shard's [`IntentStore`]. It answers the two intent tags
+//!   ([`INTENT_GATHER_PENDING_TAG`] for recovery, [`INTENT_PUT_TAG`] for the
+//!   producer fan) and falls through (`UnknownTag`) for everything else, so a
+//!   peer can serve its intent state without the Raft path ever touching it.
 //! - The **client** side ([`TransportIntentGatherer`]) implements
 //!   [`PeerIntentGatherer`](crate::shard_committer::PeerIntentGatherer) by
-//!   fanning the two tags out to the shard's voter peers over
+//!   fanning [`INTENT_GATHER_PENDING_TAG`] out to the shard's voter peers over
 //!   [`rpc_call`](kiseki_raft::tcp_transport::rpc_call).
 //!
-//! **Inert in production after this phase.** `create_shard` wires the
-//! dispatcher + an (empty) per-shard [`IntentStore`] so peers *can* serve, but
-//! no producer writes intents and no committer task queries — the gatherer is
-//! only invoked by the 5c/5d committer task. The synchronous write path,
-//! gateway, and startup wiring are untouched (ADR-047 "Follow-ups" / #140).
+//! **`LeaderSink`: no steady-state gossip.** The old `next_pending` watermark
+//! gather is GONE — under `LeaderSink` the leader incorporates from its own store
+//! (the fan includes the leader) with no peer consultation. Only the recovery
+//! gather and the producer fan survive.
 //!
 //! # Wire encoding
-//! Both tags ride postcard (the transport's codec). `next_pending` is a bare
-//! `postcard(Option<HybridLogicalClock>)`. `gather_pending` cannot postcard a
-//! [`WriteIntent`] directly — its `append` is not serde — so each intent is
-//! reshaped into a [`WireIntent`] whose `append` is carried as its prost proto
-//! bytes (`append_chunk_and_delta_request_to_proto(..).encode_to_vec()`),
+//! Both tags ride postcard (the transport's codec). `gather_pending` cannot
+//! postcard a [`WriteIntent`] directly — its `append` is not serde — so each
+//! intent is reshaped into a [`WireIntent`] whose `append` is carried as its
+//! prost proto bytes (`append_chunk_and_delta_request_to_proto(..).encode_to_vec()`),
 //! exactly the byte form [`crate::intent::FjallIntentStore`] persists. The
 //! response is `postcard(Vec<WireIntent>)`. The proto round-trip preserves the
 //! append exactly (`chunk_refs` / payload / operation / `new_chunks`), pinned
@@ -51,14 +49,9 @@ use crate::grpc::{append_chunk_and_delta_request_to_proto, proto_to_append_chunk
 use crate::intent::{IntentError, IntentStore, PerspectiveSeq, WriteIntent};
 use crate::shard_committer::PeerIntentGatherer;
 
-/// Aux tag: "your lowest pending perspective seq for this shard" — one
-/// replica's contribution to the majority stability watermark (ADR-047 §3).
-/// MUST NOT collide with the Raft tags
-/// (`append_entries` / `vote` / `full_snapshot`).
-pub const INTENT_NEXT_PENDING_TAG: &str = "intent_next_pending";
-
 /// Aux tag: "your full pending intent set for this shard" — for election
-/// intent-recovery (gate-1 O2). MUST NOT collide with the Raft tags.
+/// intent-recovery (gate-1 O2). MUST NOT collide with the Raft tags
+/// (`append_entries` / `vote` / `full_snapshot`).
 pub const INTENT_GATHER_PENDING_TAG: &str = "intent_gather_pending";
 
 /// Aux tag: "durably record this fanned intent on your local store" — the
@@ -78,7 +71,7 @@ pub const INTENT_PUT_TAG: &str = "intent_put";
 ///
 /// `pub(crate)` so [`crate::RaftShardStore::put_intent_and_fan`] can encode it
 /// for the `intent_put` fan; the fields stay private to this module.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct WireIntent {
     /// The ingress-assigned perspective seq (the order).
     seq: HybridLogicalClock,
@@ -128,26 +121,24 @@ impl WireIntent {
 /// Registered via `RegistryHandle::register_aux(shard_id, dispatch)`. The
 /// listener routes a tag here only after the shard's Raft dispatcher returns
 /// `UnknownTag`, so the consensus-critical path never touches this. The
-/// closure answers the three intent tags from `store` and returns `UnknownTag`
+/// closure answers the two intent tags from `store` and returns `UnknownTag`
 /// for anything else (which the listener maps to the `ParseError` wire status,
 /// indistinguishable from "no aux").
 ///
-/// The two read tags ([`INTENT_NEXT_PENDING_TAG`], [`INTENT_GATHER_PENDING_TAG`])
-/// SERVE this replica's intent state to a peer's committer. The write tag
+/// The read tag ([`INTENT_GATHER_PENDING_TAG`]) SERVES this replica's full
+/// pending intent set to a new leader's recovery gather. The write tag
 /// ([`INTENT_PUT_TAG`]) is the *server* side of the producer's quorum
-/// intent-write (ADR-047 phase 5c): a peer fans a [`WireIntent`] here, this node
-/// decodes it and durably records it in `store`, and the `Ok` reply counts as
-/// one durable copy toward the producer's `min_acks`.
+/// intent-write: a peer fans a [`WireIntent`] here, this node decodes it and
+/// durably records it in `store`, and the `Ok` reply counts as one durable copy
+/// toward the producer's `min_acks`.
 ///
 /// A store [`IntentError`] is logged and mapped to
-/// [`DispatchOutcome::ParseError`]. For the read tags the *client* treats any
-/// non-`Ok` peer as absent (a conservative pad in the watermark), so a store
-/// fault never fabricates a report; for [`INTENT_PUT_TAG`] the producer counts
-/// a non-`Ok` reply as a non-ack (it does NOT credit a durable copy), so a
-/// failed store write can never inflate the ack count. A payload decode fault
-/// likewise degrades to `ParseError` (a non-ack). Response encoding is wrapped
-/// so an encode fault also degrades to `ParseError` rather than escaping as a
-/// panic.
+/// [`DispatchOutcome::ParseError`]. For the read tag a non-`Ok` peer is skipped
+/// by the client gatherer; for [`INTENT_PUT_TAG`] the producer counts a non-`Ok`
+/// reply as a non-ack (it does NOT credit a durable copy), so a failed store
+/// write can never inflate the ack count. A payload decode fault likewise
+/// degrades to `ParseError` (a non-ack). Response encoding is wrapped so an
+/// encode fault also degrades to `ParseError` rather than escaping as a panic.
 #[must_use]
 pub fn build_intent_dispatcher(store: Arc<dyn IntentStore>) -> ShardDispatch {
     Arc::new(
@@ -157,17 +148,6 @@ pub fn build_intent_dispatcher(store: Arc<dyn IntentStore>) -> ShardDispatch {
             let payload = payload.to_vec();
             Box::pin(async move {
                 match tag.as_str() {
-                    INTENT_NEXT_PENDING_TAG => match store.next_pending_seq() {
-                        Ok(opt) => {
-                            // Wire form: postcard(Option<HybridLogicalClock>).
-                            let hlc: Option<HybridLogicalClock> = opt.map(|s| s.0);
-                            encode_ok(&hlc)
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, tag = %tag, "IntentSync next_pending failed");
-                            DispatchOutcome::ParseError
-                        }
-                    },
                     INTENT_GATHER_PENDING_TAG => match store.pending() {
                         Ok(intents) => {
                             let wire: Vec<WireIntent> =
@@ -242,15 +222,15 @@ struct Peer {
     addr: String,
 }
 
-/// The client half of `IntentSync` (ADR-047 phase 5b-rpc).
+/// The client half of `IntentSync` (ADR-047 `LeaderSink` — recovery gather).
 ///
-/// Implements [`PeerIntentGatherer`] by fanning the two intent tags out to a
-/// shard's voter peers (minus the local node) over the multiplexed Raft
-/// transport. An unreachable peer (connect/transport failure or a non-`Ok`
-/// status) is **skipped**, never an error and never a fabricated report:
-/// [`compute_stability_watermark`](crate::intent_committer::compute_stability_watermark)
-/// pads an absent member conservatively, so a partial gather can only lower
-/// the watermark, never raise it past what the membership permits.
+/// Implements [`PeerIntentGatherer`] by fanning [`INTENT_GATHER_PENDING_TAG`]
+/// out to a shard's voter peers (minus the local node) over the multiplexed
+/// Raft transport. An unreachable peer (connect/transport failure or a non-`Ok`
+/// status) is **skipped** — the new leader's recovery threshold guard
+/// ([`ShardCommitter::recover`](crate::shard_committer::ShardCommitter::recover))
+/// refuses if too few distinct peers answer, so a partial gather can never
+/// silently restore an incomplete set.
 ///
 /// Each entry in the result is keyed by the peer's [`NodeId`], and each voter
 /// appears at most once (the peer set is built from a deduped voter list).
@@ -343,38 +323,6 @@ impl TransportIntentGatherer {
 }
 
 impl PeerIntentGatherer for TransportIntentGatherer {
-    async fn gather_next_pending_seqs(
-        &self,
-    ) -> Result<Vec<(NodeId, Option<PerspectiveSeq>)>, IntentError> {
-        let peers = self.current_peers();
-        let mut out = Vec::with_capacity(peers.len());
-        for peer in &peers {
-            // postcard(Option<HybridLogicalClock>) on the wire.
-            let resp: Result<Option<HybridLogicalClock>, _> = rpc_call(
-                &peer.addr,
-                self.shard_id,
-                INTENT_NEXT_PENDING_TAG,
-                self.tls_config.as_ref(),
-                &(),
-            )
-            .await;
-            match resp {
-                Ok(opt) => out.push((peer.node_id, opt.map(PerspectiveSeq))),
-                // Skip an unreachable / non-Ok peer: absent is the conservative
-                // pad. Never fabricate a report.
-                Err(e) => {
-                    tracing::debug!(
-                        node = peer.node_id.0,
-                        addr = %peer.addr,
-                        error = %e,
-                        "IntentSync gather_next_pending: peer unreachable, skipping",
-                    );
-                }
-            }
-        }
-        Ok(out)
-    }
-
     async fn gather_pending(&self) -> Result<Vec<(NodeId, Vec<WriteIntent>)>, IntentError> {
         let peers = self.current_peers();
         let mut out = Vec::with_capacity(peers.len());
@@ -504,36 +452,6 @@ mod tests {
         assert_append_eq(&decoded.append, &original.append);
     }
 
-    /// The aux dispatcher answers `next_pending` from a populated store, and
-    /// the postcard bytes decode to that seq's HLC.
-    #[tokio::test]
-    async fn dispatcher_next_pending_returns_lowest_seq() {
-        let store = Arc::new(InMemIntentStore::new());
-        store.put(rich_intent(seq(5, 0, 1), None)).unwrap();
-        store.put(rich_intent(seq(2, 0, 1), None)).unwrap();
-        let dispatch = build_intent_dispatcher(store);
-
-        let outcome = dispatch(INTENT_NEXT_PENDING_TAG, &[]).await;
-        let DispatchOutcome::Ok(bytes) = outcome else {
-            panic!("expected Ok");
-        };
-        let decoded: Option<HybridLogicalClock> = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded, Some(seq(2, 0, 1).0), "lowest pending seq");
-    }
-
-    /// An empty store's `next_pending` answers `None`.
-    #[tokio::test]
-    async fn dispatcher_next_pending_empty_is_none() {
-        let store = Arc::new(InMemIntentStore::new());
-        let dispatch = build_intent_dispatcher(store);
-        let outcome = dispatch(INTENT_NEXT_PENDING_TAG, &[]).await;
-        let DispatchOutcome::Ok(bytes) = outcome else {
-            panic!("expected Ok");
-        };
-        let decoded: Option<HybridLogicalClock> = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded, None);
-    }
-
     /// The aux dispatcher answers `gather_pending` and the decoded intents
     /// (via the proto round-trip) equal the stored ones — append fidelity.
     #[tokio::test]
@@ -612,20 +530,16 @@ mod tests {
         assert!(matches!(outcome, DispatchOutcome::UnknownTag));
     }
 
-    /// The three intent tags do not collide with the Raft tags or each other.
+    /// The two intent tags do not collide with the Raft tags or each other.
     #[test]
     fn intent_tags_distinct_from_raft_tags() {
-        let intent_tags = [
-            INTENT_NEXT_PENDING_TAG,
-            INTENT_GATHER_PENDING_TAG,
-            INTENT_PUT_TAG,
-        ];
+        let intent_tags = [INTENT_GATHER_PENDING_TAG, INTENT_PUT_TAG];
         for raft_tag in ["append_entries", "vote", "full_snapshot"] {
             for it in intent_tags {
                 assert_ne!(it, raft_tag);
             }
         }
-        // All three intent tags are pairwise distinct.
+        // The intent tags are pairwise distinct.
         for i in 0..intent_tags.len() {
             for j in (i + 1)..intent_tags.len() {
                 assert_ne!(intent_tags[i], intent_tags[j]);

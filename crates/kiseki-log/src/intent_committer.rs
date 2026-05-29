@@ -1,126 +1,47 @@
-//! ADR-047 §3 — the async committer: the majority stability watermark, the
-//! seam to the Raft log, and the incorporation algorithm.
+//! ADR-047 `LeaderSink` — the leader-only incorporator: the seam to the Raft
+//! log and the drain-all incorporation algorithm.
 //!
 //! Phases 1–2 ([`crate::intent`]) own the perspective sequence, the durable
 //! intent record, and the per-replica [`IntentStore`]. This module is the
 //! **consensus logic** that drains those intents into the Raft log *after*
-//! the client has already been acked (the ADR-047 decoupling):
+//! the client has already been acked (the ADR-047 decoupling).
 //!
-//! 1. [`compute_stability_watermark`] — the exclusive upper bound `W` below
-//!    which a *majority* of replicas have closed (gate-1 **F-1**: a single
-//!    laggard with the smallest `next_pending` is ignored, so it never stalls
-//!    the committer).
-//! 2. [`IncorporationSink`] — the abstract seam to the real Raft log; its
-//!    `max_incorporated_seq` is the **source of truth** for what has already
-//!    been applied. The fjall/Raft-backed implementation lands in phase 5.
-//! 3. [`Committer::run`] — selects the pending intents below `W` that are not
-//!    already in the log (gate-1 **F-2**: the `seq > max_incorporated`
-//!    re-incorporation guard), appends them as one ordered batch, then prunes.
+//! **`LeaderSink` (the redesign).** The stability watermark is gone. The shard
+//! LEADER is the sole incorporator: the durability fan *includes the leader*
+//! (so the leader holds every acked intent locally), and the leader's committer
+//! simply drains its OWN store ascending-by-perspective-seq into the Raft log —
+//! no peer gossip, no majority watermark. There is exactly one writer (the Raft
+//! leader) appending in perspective-seq order, so the Raft log order is a
+//! per-key-LWW-correct total order with zero steady-state coordination.
 //!
-//! This module is **additive and UNWIRED**: it touches neither the Raft state
-//! machine, the synchronous write path, nor any runtime wiring. The real log
-//! sink and the gossip that gathers peer `next_pending_seq` values arrive in
-//! later phases.
+//! 1. [`IncorporationSink`] — the abstract seam to the real Raft log; its
+//!    `max_incorporated_seq` is the **F-2 floor** for what has already been
+//!    applied (the authoritative gate is the state-machine append-gate, MF-6;
+//!    this is a perf pre-filter).
+//! 2. [`Committer::run`] — drains ALL local pending intents, dropping any
+//!    `seq <= max_incorporated` (the F-2 floor), appends the rest as one
+//!    ascending batch, then prunes.
+//! 3. [`recover_pending`] / [`restore_into`] — election recovery (gate-1 O2):
+//!    a new leader unions the pending sets across a `cluster_size − min_acks + 1`
+//!    gather before resuming, so it holds every acked intent.
 
 use std::collections::BTreeMap;
 
 use crate::intent::{IntentError, IntentStore, PerspectiveSeq, WriteIntent};
 
-/// Majority threshold for a cluster of `cluster_size` replicas: a strict
-/// majority, `cluster_size / 2 + 1`.
-#[must_use]
-fn majority(cluster_size: usize) -> usize {
-    cluster_size / 2 + 1
-}
-
-/// The result of [`compute_stability_watermark`] — an explicit 3-state so the
-/// committer never conflates "no majority closure" (apply nothing) with "a
-/// majority has fully closed" (apply everything). The earlier `Option` form
-/// collapsed both to `None`, which `run` then treated as *no upper bound* —
-/// applying unstable intents under a sub-majority gather (the phase-3 gate
-/// finding). These are now distinct.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Watermark {
-    /// A majority has closed everything below this seq — incorporate intents
-    /// with `seq < W`.
-    UpTo(PerspectiveSeq),
-    /// A majority has nothing pending at all — no upper bound; incorporate
-    /// every gathered intent above the log high-water-mark.
-    FullyClosed,
-    /// Fewer than a majority of the *membership* have closed a common point —
-    /// nothing is stable; incorporate nothing this pass.
-    NotStable,
-}
-
-/// Compute the majority stability watermark (ADR-047 §3 / gate-1 F-1 + the
-/// phase-3 partial-gather fix).
+/// The recovery-gather threshold (MF-7 / gate-1 O2): the number of *distinct*
+/// replica stores a new leader must union before resuming incorporation, so the
+/// gather intersects every `min_acks`-durable intent's durability set.
 ///
-/// Each entry of `next_pendings` is one replica's
-/// [`IntentStore::next_pending_seq`]: `Some(s)` = nothing pending below `s`
-/// (closed `< s`); `None` = nothing pending at all (closed up to +∞).
-/// **Non-reporting** members are NOT in the slice — they are padded in as a
-/// conservative [`Bound::Unknown`] (sorts below every real report), so a
-/// partial gather can never set `W` higher than the full membership permits
-/// (a non-reporter might still hold a low pending intent on a `min_acks`
-/// quorum that overlaps the majority the leader gathered from).
-///
-/// `W` is the highest value a **majority** (`cluster_size / 2 + 1`) of the
-/// *membership* has closed below: pad to `cluster_size` with `Unknown`, sort
-/// ascending, take the element at index `cluster_size - majority` (it has
-/// exactly `majority` elements at-or-after it). `Unknown` there → fewer than a
-/// majority reported → [`Watermark::NotStable`]; a real seq → [`Watermark::UpTo`];
-/// the +∞ sentinel → [`Watermark::FullyClosed`]. The single-laggard case (F-1)
-/// still holds — a lone low report sits near the front, excluded from the
-/// majority position.
+/// `RF − min_acks + 1`, where `RF = cluster_size` (the voter count). `min_acks`
+/// is clamped to `1..=cluster_size` so the result is always in
+/// `1..=cluster_size`. For `RF=3`/`min_acks=2` → 2 (bare majority); for
+/// `RF=6`/`min_acks=2` → 5. See [`recover_pending`] for the overlap proof.
 #[must_use]
-pub fn compute_stability_watermark(
-    next_pendings: &[Option<PerspectiveSeq>],
-    cluster_size: usize,
-) -> Watermark {
-    if cluster_size == 0 {
-        return Watermark::NotStable;
-    }
-    let maj = majority(cluster_size);
-
-    // Map each report to a sortable lower bound. `None` (nothing pending)
-    // closes to +∞ (the `Inf` sentinel); `Some(s)` closes to `s`.
-    let mut bounds: Vec<Bound> = next_pendings
-        .iter()
-        .map(|p| p.map_or(Bound::Inf, Bound::Seq))
-        .collect();
-    // Pad non-reporting members with `Unknown` (sorts first) so the majority
-    // index reflects the whole membership, not just who answered. Never
-    // truncate (a longer-than-membership slice only makes `W` more
-    // conservative, never less safe).
-    if bounds.len() < cluster_size {
-        bounds.resize(cluster_size, Bound::Unknown);
-    }
-    bounds.sort();
-
-    // The element with exactly `maj` members at-or-after it (it and every
-    // larger element). `idx` is always in range: `1 <= maj <= cluster_size`,
-    // so `0 <= idx < cluster_size <= bounds.len()`.
-    let idx = cluster_size - maj;
-    match bounds.get(idx) {
-        Some(Bound::Seq(s)) => Watermark::UpTo(*s),
-        Some(Bound::Inf) => Watermark::FullyClosed,
-        // `Unknown` at the majority position → sub-majority reported.
-        Some(Bound::Unknown) | None => Watermark::NotStable,
-    }
-}
-
-/// A per-replica closure bound for watermark computation, ordered
-/// `Unknown < Seq(_) < Inf`. `Unknown` = a member that did not report (padded
-/// in — treated as possibly holding an arbitrarily-low pending intent, the
-/// conservative assumption); `Seq(s)` = closed everything below `s`; `Inf` =
-/// closed everything (nothing pending). The derived `Ord` follows the variant
-/// declaration order, then the inner seq for `Seq` — exactly the
-/// `-∞ < s < +∞` semantics the watermark needs.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-enum Bound {
-    Unknown,
-    Seq(PerspectiveSeq),
-    Inf,
+fn gather_threshold(cluster_size: usize, min_acks: usize) -> usize {
+    let rf = cluster_size.max(1);
+    let acks = min_acks.clamp(1, rf);
+    rf - acks + 1
 }
 
 /// The seam between the async committer and the Raft log (ADR-047 §3).
@@ -197,80 +118,69 @@ impl IncorporationSink for RecordingSink {
     }
 }
 
-/// The async committer (ADR-047 §3): drains an [`IntentStore`] into the Raft
-/// log behind an [`IncorporationSink`], up to the majority stability
-/// watermark, idempotently.
+/// The async committer (ADR-047 `LeaderSink`): drains the LEADER's own
+/// [`IntentStore`] into the Raft log behind an [`IncorporationSink`],
+/// idempotently. No watermark, no peer reports — the single-incorporator model.
+///
+/// TODO(ADR-047 MF-4): the client `idempotency_key` dedup index is not yet
+/// built. For now the F-2 perspective-seq floor IS the dedup — it collapses a
+/// re-gathered / re-fanned / replayed intent (same seq) to one incorporation,
+/// but a re-ingressed client retry minting a FRESH seq + same `idempotency_key`
+/// would incorporate twice (LWW collapses the visible binding, but refcount /
+/// chunk-state double-counts). Closing that is a separate change: thread
+/// `idempotency_key` into `IncorporateIntent` + a replicated, snapshot-included
+/// `idempotency_key → seq` dedup map gating the state-machine append.
 pub struct Committer;
 
 impl Committer {
-    /// Run one committer pass.
+    /// Run one drain-all committer pass (`LeaderSink` steady state).
     ///
-    /// 1. Compute the majority stability watermark `W` from `next_pendings`
-    ///    (this replica's report plus the peer reports gathered by gossip —
-    ///    gossip itself is phase 5) and `cluster_size`.
-    /// 2. Read the log's `max_incorporated_seq` — the **source of truth** for
-    ///    what is already applied.
-    /// 3. From the store's pending intents, select those with
-    ///    `seq > max_incorporated` (the F-2 re-incorporation guard) **and**
-    ///    (`W` is `None` — no upper bound — OR `seq < W`).
-    /// 4. Sort the selection ascending by perspective-seq, append it as one
-    ///    ordered batch via [`IncorporationSink::incorporate`], then
-    ///    [`IntentStore::prune`] up to the last selected seq (inclusive).
+    /// The caller MUST be the shard leader (the leader-only supervisor enforces
+    /// this — see `RaftShardStore`). The leader holds every acked intent in its
+    /// own store (the durability fan includes the leader), so it incorporates
+    /// purely from `store`, with no peer consultation:
+    ///
+    /// 1. Read the log's `max_incorporated_seq` — the **F-2 floor**.
+    /// 2. Select ALL pending intents with `seq > max_incorporated` (drop the
+    ///    re-gathered / replayed prefix already in the log).
+    /// 3. Sort ascending by perspective-seq, append as one ordered batch via
+    ///    [`IncorporationSink::incorporate`], then [`IntentStore::prune`] up to
+    ///    the last incorporated seq (inclusive).
+    ///
+    /// There is no upper bound: the entire pending tail drains every pass, so a
+    /// single intent on an otherwise-idle shard is incorporated on the next tick
+    /// (this is what kills the old watermark's idle-stall, B3).
     ///
     /// Pruning is **advisory**: the log's `max_incorporated_seq` is the truth,
     /// so a pruned-but-unrecorded intent (crash between incorporate and prune)
-    /// is harmless — the next run re-gathers it and the `seq > max_incorporated`
-    /// filter drops it. We never re-apply based on prune state alone.
-    ///
-    /// # Precondition (phase-5 wiring obligation — gate-1 F-P3-2)
-    /// `store` must already hold every intent with `seq < W` for this replica:
-    /// the leader's local intent store is completed below the watermark by the
-    /// quorum-write + gather. This algorithm reads only the local `store`,
-    /// never peers' intents, so it trusts that completeness. The watermark's
-    /// majority semantics guarantee any durable intent `< W` is on a `min_acks`
-    /// quorum overlapping the majority the leader gathered from — so a complete
-    /// leader has it — but the *gather that populates the local store* is the
-    /// wiring's job, not this function's.
+    /// is harmless — the next run re-reads it and the floor drops it. The
+    /// authoritative idempotency gate is the state-machine append-gate (MF-6);
+    /// this filter is only a perf pre-filter and we never re-apply on prune
+    /// state alone.
     ///
     /// # Returns
-    /// The number of intents incorporated (`0` if none were selectable).
+    /// The number of intents incorporated (`0` if none were above the floor).
     ///
     /// # Errors
     /// Propagates [`IntentError`] from [`IntentStore::pending`],
     /// [`IncorporationSink::incorporate`], or [`IntentStore::prune`].
     pub fn run(
         store: &dyn IntentStore,
-        next_pendings: &[Option<PerspectiveSeq>],
-        cluster_size: usize,
         sink: &mut dyn IncorporationSink,
     ) -> Result<usize, IntentError> {
-        let watermark = compute_stability_watermark(next_pendings, cluster_size);
-        // No majority has closed a common point → nothing is stable; this pass
-        // incorporates nothing (the phase-3 fix — never apply under a
-        // sub-majority gather).
-        if watermark == Watermark::NotStable {
-            return Ok(0);
-        }
         let max_inc = sink.max_incorporated_seq();
 
         let mut selected: Vec<WriteIntent> = store
             .pending()?
             .into_iter()
             .filter(|intent| {
-                let seq = intent.perspective_seq;
-                // F-2: drop anything already in the log (re-gathered / replayed).
-                let above_floor = match max_inc {
-                    Some(m) => seq > m,
+                // F-2: drop anything already in the log (re-gathered / replayed
+                // / re-fanned). The state-machine append-gate is the authority;
+                // this is the perf pre-filter.
+                match max_inc {
+                    Some(m) => intent.perspective_seq > m,
                     None => true,
-                };
-                // `FullyClosed` = a majority has nothing pending → no upper
-                // bound. `NotStable` was handled by the early return above.
-                let below_watermark = match watermark {
-                    Watermark::UpTo(w) => seq < w,
-                    Watermark::FullyClosed => true,
-                    Watermark::NotStable => false,
-                };
-                above_floor && below_watermark
+                }
             })
             .collect();
 
@@ -278,13 +188,14 @@ impl Committer {
             return Ok(0);
         }
 
-        // Perspective-seq ascending: the order the log must apply them.
+        // Perspective-seq ascending: the order the log must apply them (the LWW
+        // order for same-name writes).
         selected.sort_by_key(|intent| intent.perspective_seq);
 
         sink.incorporate(&selected)?;
 
         // `prune` is `<=` inclusive (phase 2), so prune up to the last
-        // selected seq. Advisory only — see the run-level docs.
+        // incorporated seq. Advisory only — see the run-level docs.
         if let Some(last) = selected.last() {
             store.prune(last.perspective_seq)?;
         }
@@ -299,46 +210,55 @@ impl Committer {
 
 /// Reconstruct the complete pending set on a new leader by unioning the
 /// pending intents across a gathered quorum of replica intent stores, deduped
-/// by perspective-seq, ascending. Requires `>= majority(cluster_size)` stores
-/// (else [`IntentError::InsufficientQuorum`]) — only a majority gather is
-/// guaranteed to overlap every acked intent's `min_acks` quorum (gate-1 **O2**).
+/// by perspective-seq, ascending. Requires `>= cluster_size − min_acks + 1`
+/// distinct stores (else [`IntentError::InsufficientQuorum`]).
 ///
-/// The O2 overlap argument: an intent acked on `min_acks` replicas survives
-/// because any majority the new leader gathers from intersects that intent's
-/// `min_acks` durability quorum by ≥1 (RF-3 / `min_acks`=2: any 2-of-3 gather ∩
-/// any 2-of-3 durability ≠ ∅). So at least one gathered store still holds every
-/// acked intent, and the union over a majority gather is complete. (Pruning is
-/// advisory and never outpaces the log's incorporated high-water-mark, so a
-/// still-pending acked intent has not yet been pruned anywhere it survives.)
+/// **The overlap threshold (MF-7 / gate-1 O2).** An acked intent is durable on
+/// a set `D` of `min_acks` replicas. The gather collects a set `G`. For `G` to
+/// intersect *every* possible `D` (so the union misses no acked intent) we need
+/// `|D ∩ G| ≥ |D| + |G| − RF ≥ 1`, i.e. `|G| ≥ RF − min_acks + 1`. Here `RF` is
+/// the voter count, passed as `cluster_size`. So:
 ///
-/// **At-least-once for un-acked writes (gate-1 phase-4 finding F-P4-1).** The
-/// union includes *every* pending intent on the gathered replicas — including a
-/// write that reached only one replica and was never `min_acks`-acked (an
-/// interrupted fan-out). Such an intent may therefore be incorporated: the
-/// no-ack write still lands. This is **at-least-once**, and it is I-L5-safe
-/// **only because** the write protocol fans the chunks to `min_acks` *before*
-/// the metadata intent is written anywhere (data-before-metadata ordering), so
-/// the chunks are durable even for a partial intent — **phase 5 MUST preserve
-/// that ordering** or a partial intent could surface a composition over
-/// non-durable chunks. Clients get exactly-once by supplying an idempotency key
-/// (ADR-047 §5). Callers MUST also pass *distinct* replica stores: the quorum
-/// guard counts entries and cannot detect the same store passed twice
-/// (F-P4-2 — a wiring obligation).
+/// ```text
+/// |D ∩ G| ≥ min_acks + (cluster_size − min_acks + 1) − cluster_size = 1 > 0 ✓
+/// ```
 ///
-/// This is purely additive and **unwired**: it abstracts over the
-/// [`IntentStore`] trait and touches neither the Raft state machine, the
-/// gateway, nor any runtime wiring. The cross-node RPC gather that populates
-/// `replica_stores` and the election trigger are phase 5.
+/// For `RF=3`/`min_acks=2` this is `2` (a bare majority — matches the common case).
+/// For `RF=6`/`min_acks=2` this is `5`. **A bare `majority(RF)` is UNSAFE for
+/// `RF=6`/`min_acks=2`** (a 4-of-6 gather and a 2-of-6 durability set can be
+/// disjoint: 4+2=6), which is why this threshold — not `majority` — is the guard.
+///
+/// **Liveness tradeoff (documented, owned).** Requiring `RF − min_acks + 1`
+/// reachable means recovery STALLS under a wide-shard double-fault: on
+/// `RF=6`/`min_acks=2` it needs 5 of 6 voters, so a 2-node-down election cannot
+/// resume incorporation (new-write visibility on the new leader) until a 5th
+/// returns. Already-visible reads continue. Safety is never traded for liveness:
+/// we refuse + retry rather than resume on an under-gathered set that could miss
+/// an acked intent. The pain is specifically *wide shards with tiny `min_acks`*;
+/// narrow `RF=3`/`min_acks=2` only needs 2-of-3.
+///
+/// **At-least-once for un-acked writes (gate-1 F-P4-1).** The union includes
+/// *every* pending intent on the gathered replicas — including a write that
+/// reached only one replica and was never `min_acks`-acked (an interrupted
+/// fan-out). It is I-L5-safe **only because** the producer fans chunks to
+/// `min_acks` *before* the metadata intent (data-before-metadata), so even a
+/// partial intent composes over durable chunks. Callers MUST pass *distinct*
+/// replica stores: the guard counts entries and cannot detect a store passed
+/// twice (the node-dedup is the caller's job — see [`ShardCommitter::recover`]).
+///
+/// `min_acks` is clamped to `1..=cluster_size` so the threshold stays in
+/// `1..=cluster_size` (a `min_acks` larger than RF, or 0, is nonsensical).
 ///
 /// # Errors
 /// [`IntentError::InsufficientQuorum`] if `replica_stores.len()` is below
-/// `majority(cluster_size)`; otherwise propagates [`IntentError`] from
+/// `cluster_size − min_acks + 1`; otherwise propagates [`IntentError`] from
 /// [`IntentStore::pending`].
 pub fn recover_pending(
     replica_stores: &[&dyn IntentStore],
     cluster_size: usize,
+    min_acks: usize,
 ) -> Result<Vec<WriteIntent>, IntentError> {
-    let need = majority(cluster_size);
+    let need = gather_threshold(cluster_size, min_acks);
     let have = replica_stores.len();
     if have < need {
         return Err(IntentError::InsufficientQuorum { have, need });
@@ -444,157 +364,30 @@ mod tests {
         }
     }
 
-    // ---- compute_stability_watermark --------------------------------------
+    // ---- gather_threshold (MF-7) ------------------------------------------
 
     #[test]
-    fn watermark_n1_single_replica_is_its_own_report() {
-        // n=1, maj=1, idx=0. A lone replica's report is the watermark.
-        assert_eq!(
-            compute_stability_watermark(&[Some(seq(5, 0, 1))], 1),
-            Watermark::UpTo(seq(5, 0, 1))
-        );
-        // Nothing pending -> fully closed.
-        assert_eq!(
-            compute_stability_watermark(&[None], 1),
-            Watermark::FullyClosed
-        );
+    fn gather_threshold_rf3_min2_is_bare_majority() {
+        // RF=3, min_acks=2 → 3 - 2 + 1 = 2 (the common-case bare majority).
+        assert_eq!(gather_threshold(3, 2), 2);
     }
 
     #[test]
-    fn watermark_n3_is_the_median() {
-        // n=3, maj=2, idx=1. Sorted [1,2,3] -> element 1 = seq(2).
-        let reports = [Some(seq(1, 0, 1)), Some(seq(3, 0, 1)), Some(seq(2, 0, 1))];
-        assert_eq!(
-            compute_stability_watermark(&reports, 3),
-            Watermark::UpTo(seq(2, 0, 1))
-        );
+    fn gather_threshold_rf6_min2_is_five() {
+        // RF=6, min_acks=2 → 6 - 2 + 1 = 5 (NOT majority(6)=4 — the safety fix).
+        assert_eq!(gather_threshold(6, 2), 5);
     }
 
     #[test]
-    fn watermark_n3_minority_laggard_does_not_drag_w_down() {
-        // The F-1 fix: a single very-low laggard sits at idx 0 and is ignored.
-        // Two replicas have closed everything below seq(100); the laggard at
-        // seq(1) must NOT pin the watermark to 1.
-        let reports = [
-            Some(seq(1, 0, 1)), // laggard — smallest next_pending
-            Some(seq(100, 0, 2)),
-            Some(seq(100, 0, 3)),
-        ];
-        // Sorted [1, 100@2, 100@3] -> idx 1 = seq(100,0,2).
-        assert_eq!(
-            compute_stability_watermark(&reports, 3),
-            Watermark::UpTo(seq(100, 0, 2))
-        );
+    fn gather_threshold_clamps_degenerate_inputs() {
+        // min_acks=0 clamps to 1 → full RF. min_acks > RF clamps to RF → 1.
+        assert_eq!(gather_threshold(3, 0), 3);
+        assert_eq!(gather_threshold(3, 9), 1);
+        // RF=1 (single node) always needs 1 view.
+        assert_eq!(gather_threshold(1, 2), 1);
     }
 
-    #[test]
-    fn watermark_sub_majority_reports_not_stable() {
-        // n=3, maj=2: only one of three reports. Padding the two silent members
-        // with `Unknown` puts an `Unknown` at the majority index -> NotStable
-        // (the phase-3 fix: never advance under a sub-majority gather).
-        assert_eq!(
-            compute_stability_watermark(&[Some(seq(5, 0, 1))], 3),
-            Watermark::NotStable
-        );
-        assert_eq!(compute_stability_watermark(&[], 3), Watermark::NotStable);
-    }
-
-    #[test]
-    fn watermark_partial_gather_pads_unknown_and_is_conservative() {
-        // n=5, maj=3, idx=2, but only 4 members reported (one silent). The
-        // silent member pads as `Unknown` (sorts first); sorted
-        // [Unknown, 10, 20, 30, 40] -> idx 2 = seq(20). A naive impl over the
-        // 4-element slice would pick idx 2 = seq(30) — too high, applying
-        // intents only 2 of 5 have closed below. The pad keeps W safe.
-        let reports = [
-            Some(seq(10, 0, 1)),
-            Some(seq(40, 0, 4)),
-            Some(seq(20, 0, 2)),
-            Some(seq(30, 0, 3)),
-        ];
-        assert_eq!(
-            compute_stability_watermark(&reports, 5),
-            Watermark::UpTo(seq(20, 0, 2))
-        );
-    }
-
-    #[test]
-    fn watermark_all_none_is_fully_closed() {
-        // Every replica has nothing pending: a majority has closed +inf.
-        assert_eq!(
-            compute_stability_watermark(&[None, None, None], 3),
-            Watermark::FullyClosed
-        );
-        assert_eq!(
-            compute_stability_watermark(&[None], 1),
-            Watermark::FullyClosed
-        );
-    }
-
-    #[test]
-    fn watermark_majority_none_with_minority_seq() {
-        // n=3, maj=2: two replicas fully closed (None=+inf), one still pending.
-        // Sorted [Seq(2), Inf, Inf] -> idx 1 = Inf -> FullyClosed (the single
-        // pending laggard does not cap the majority).
-        let reports = [Some(seq(2, 0, 1)), None, None];
-        assert_eq!(
-            compute_stability_watermark(&reports, 3),
-            Watermark::FullyClosed
-        );
-    }
-
-    #[test]
-    fn watermark_n5_is_the_median() {
-        // n=5, maj=3, idx=2. Sorted [1,2,3,4,5] -> element 2 = seq(3).
-        let reports = [
-            Some(seq(5, 0, 1)),
-            Some(seq(1, 0, 1)),
-            Some(seq(3, 0, 1)),
-            Some(seq(2, 0, 1)),
-            Some(seq(4, 0, 1)),
-        ];
-        assert_eq!(
-            compute_stability_watermark(&reports, 5),
-            Watermark::UpTo(seq(3, 0, 1))
-        );
-    }
-
-    #[test]
-    fn watermark_n5_two_laggards_ignored() {
-        // n=5, maj=3, idx=2: two laggards at idx 0,1 are ignored; the third-
-        // lowest (the majority boundary) sets W.
-        let reports = [
-            Some(seq(1, 0, 1)),
-            Some(seq(2, 0, 1)),
-            Some(seq(100, 0, 3)),
-            Some(seq(100, 0, 4)),
-            Some(seq(100, 0, 5)),
-        ];
-        assert_eq!(
-            compute_stability_watermark(&reports, 5),
-            Watermark::UpTo(seq(100, 0, 3))
-        );
-    }
-
-    #[test]
-    fn watermark_n6_even_boundary() {
-        // n=6, maj=4, idx=2. Element at idx 2 has 4 reports at-or-after it.
-        // Sorted [1,2,3,4,5,6] -> element 2 = seq(3).
-        let reports = [
-            Some(seq(6, 0, 1)),
-            Some(seq(3, 0, 1)),
-            Some(seq(1, 0, 1)),
-            Some(seq(5, 0, 1)),
-            Some(seq(2, 0, 1)),
-            Some(seq(4, 0, 1)),
-        ];
-        assert_eq!(
-            compute_stability_watermark(&reports, 6),
-            Watermark::UpTo(seq(3, 0, 1))
-        );
-    }
-
-    // ---- Committer::run ---------------------------------------------------
+    // ---- Committer::run (`LeaderSink` drain-all) ----------------------------
 
     fn fill(store: &InMemIntentStore, seqs: &[PerspectiveSeq]) {
         for s in seqs {
@@ -603,48 +396,33 @@ mod tests {
     }
 
     #[test]
-    fn run_applies_pending_in_ascending_order() {
+    fn run_drains_all_pending_in_ascending_order() {
         let store = InMemIntentStore::new();
         // Insert out of order; the sink must see ascending seq.
         fill(&store, &[seq(3, 0, 1), seq(1, 0, 1), seq(2, 0, 1)]);
         let mut sink = RecordingSink::new();
-        // All three replicas fully closed -> None watermark -> no upper bound.
-        let n = Committer::run(&store, &[None, None, None], 3, &mut sink).unwrap();
+        // `LeaderSink`: no watermark, no peer reports — drain the whole store.
+        let n = Committer::run(&store, &mut sink).unwrap();
         assert_eq!(n, 3);
         assert_eq!(
             sink.incorporated,
             vec![seq(1, 0, 1), seq(2, 0, 1), seq(3, 0, 1)]
         );
-        // Store drained.
+        // Store fully drained.
         assert_eq!(store.pending_len().unwrap(), 0);
     }
 
     #[test]
-    fn run_applies_only_below_watermark() {
+    fn run_drains_single_idle_intent() {
+        // The B3 case: a single pending intent on an otherwise-idle shard MUST
+        // drain (the old exclusive watermark never drained the latest/only one).
         let store = InMemIntentStore::new();
-        fill(
-            &store,
-            &[seq(1, 0, 1), seq(2, 0, 1), seq(3, 0, 1), seq(4, 0, 1)],
-        );
+        fill(&store, &[seq(7, 0, 1)]);
         let mut sink = RecordingSink::new();
-        // Majority watermark = seq(3): only seq(1) and seq(2) are < W.
-        let reports = [Some(seq(3, 0, 1)), Some(seq(3, 0, 2)), Some(seq(1, 0, 9))];
-        // Sorted [1@9, 3@1, 3@2] -> idx 1 = seq(3,0,1).
-        assert_eq!(
-            compute_stability_watermark(&reports, 3),
-            Watermark::UpTo(seq(3, 0, 1))
-        );
-        let n = Committer::run(&store, &reports, 3, &mut sink).unwrap();
-        assert_eq!(n, 2);
-        assert_eq!(sink.incorporated, vec![seq(1, 0, 1), seq(2, 0, 1)]);
-        // seq(3) and seq(4) stay pending (>= W).
-        let remaining: Vec<_> = store
-            .pending()
-            .unwrap()
-            .iter()
-            .map(|i| i.perspective_seq)
-            .collect();
-        assert_eq!(remaining, vec![seq(3, 0, 1), seq(4, 0, 1)]);
+        let n = Committer::run(&store, &mut sink).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(sink.incorporated, vec![seq(7, 0, 1)]);
+        assert_eq!(store.pending_len().unwrap(), 0);
     }
 
     #[test]
@@ -652,7 +430,7 @@ mod tests {
         let store = InMemIntentStore::new();
         fill(&store, &[seq(1, 0, 1), seq(2, 0, 1), seq(3, 0, 1)]);
         let mut sink = RecordingSink::new();
-        let n = Committer::run(&store, &[None, None, None], 3, &mut sink).unwrap();
+        let n = Committer::run(&store, &mut sink).unwrap();
         assert_eq!(n, 3);
         // All incorporated and pruned -> next_pending is None.
         assert_eq!(store.next_pending_seq().unwrap(), None);
@@ -663,28 +441,8 @@ mod tests {
     fn run_empty_store_returns_zero() {
         let store = InMemIntentStore::new();
         let mut sink = RecordingSink::new();
-        assert_eq!(
-            Committer::run(&store, &[None, None, None], 3, &mut sink).unwrap(),
-            0
-        );
+        assert_eq!(Committer::run(&store, &mut sink).unwrap(), 0);
         assert!(sink.incorporated.is_empty());
-    }
-
-    #[test]
-    fn run_sub_majority_gather_applies_nothing() {
-        // The phase-3 fix: a sub-majority gather (1 of 3 reported) computes
-        // `NotStable` (the two silent members pad as `Unknown`), so the
-        // committer applies NOTHING and prunes nothing — the intents wait for a
-        // later, quorate run. (The pre-fix code treated the sub-majority `None`
-        // as "no upper bound" and drained everything — the unsafe behavior this
-        // gate fixed.)
-        let store = InMemIntentStore::new();
-        fill(&store, &[seq(1, 0, 1), seq(2, 0, 1)]);
-        let mut sink = RecordingSink::new();
-        let n = Committer::run(&store, &[Some(seq(9, 0, 1))], 3, &mut sink).unwrap();
-        assert_eq!(n, 0);
-        assert!(sink.incorporated.is_empty());
-        assert_eq!(store.pending_len().unwrap(), 2);
     }
 
     #[test]
@@ -693,12 +451,11 @@ mod tests {
         let store = InMemIntentStore::new();
         fill(&store, &[seq(1, 0, 1), seq(2, 0, 1), seq(3, 0, 1)]);
         let mut sink = RecordingSink::new();
-        let first = Committer::run(&store, &[None, None, None], 3, &mut sink).unwrap();
+        let first = Committer::run(&store, &mut sink).unwrap();
         assert_eq!(first, 3);
-        // Store is drained AND the sink's high-water-mark is seq(3). A second
-        // run finds nothing pending -> 0, and even if it did, the floor guard
-        // would drop anything <= seq(3).
-        let second = Committer::run(&store, &[None, None, None], 3, &mut sink).unwrap();
+        // Store drained AND the sink's floor is seq(3). A second run finds
+        // nothing pending -> 0.
+        let second = Committer::run(&store, &mut sink).unwrap();
         assert_eq!(second, 0);
         // Sink saw each intent exactly once.
         assert_eq!(
@@ -708,18 +465,16 @@ mod tests {
     }
 
     #[test]
-    fn run_skips_intent_at_or_below_log_high_water_mark() {
-        // F-2 mechanism: an intent present in the store whose seq <=
-        // sink.max_incorporated_seq() is DROPPED, not re-applied — simulating
-        // a re-gathered / replayed intent the log already has. The log
-        // (max_incorporated), not the prune state, is the source of truth.
+    fn run_skips_intent_at_or_below_floor() {
+        // F-2 perf pre-filter: an intent in the store whose seq <=
+        // sink.max_incorporated_seq() is DROPPED (re-gathered / replayed). The
+        // log floor, not prune state, is the source of truth.
         let store = InMemIntentStore::new();
-        // The store still holds seq(2) and seq(3) (e.g. a crash before prune,
-        // or a re-gathered intent), but the log already incorporated up to
-        // seq(2).
+        // The store still holds seq(2) and seq(3) (a crash before prune, or a
+        // re-gathered intent), but the log already incorporated up to seq(2).
         fill(&store, &[seq(2, 0, 1), seq(3, 0, 1)]);
         let mut sink = RecordingSink::new().with_max_incorporated(seq(2, 0, 1));
-        let n = Committer::run(&store, &[None, None, None], 3, &mut sink).unwrap();
+        let n = Committer::run(&store, &mut sink).unwrap();
         // Only seq(3) is above the floor; seq(2) is dropped, not re-applied.
         assert_eq!(n, 1);
         assert_eq!(sink.incorporated, vec![seq(3, 0, 1)]);
@@ -730,48 +485,24 @@ mod tests {
     #[test]
     fn run_floor_equal_to_seq_is_excluded() {
         // The floor filter is strict (`seq > max_inc`): an intent whose seq
-        // exactly equals the high-water-mark is already in the log -> skipped.
+        // exactly equals the floor is already in the log -> skipped.
         let store = InMemIntentStore::new();
         fill(&store, &[seq(5, 0, 1)]);
         let mut sink = RecordingSink::new().with_max_incorporated(seq(5, 0, 1));
-        let n = Committer::run(&store, &[None, None, None], 3, &mut sink).unwrap();
+        let n = Committer::run(&store, &mut sink).unwrap();
         assert_eq!(n, 0);
         assert!(sink.incorporated.is_empty());
-    }
-
-    #[test]
-    fn run_watermark_and_floor_compose() {
-        // Both filters active: floor at seq(2), watermark at seq(5). Only
-        // seq(3) and seq(4) qualify (> 2 AND < 5).
-        let store = InMemIntentStore::new();
-        fill(
-            &store,
-            &[
-                seq(1, 0, 1),
-                seq(2, 0, 1),
-                seq(3, 0, 1),
-                seq(4, 0, 1),
-                seq(5, 0, 1),
-            ],
-        );
-        let mut sink = RecordingSink::new().with_max_incorporated(seq(2, 0, 1));
-        // Watermark seq(5): reports sorted [5@1, 5@2, 9@3] -> idx 1 = seq(5,0,2)?
-        // Keep it simple — force W = seq(5,0,1) via two reports at 5 and a high one.
-        let reports = [Some(seq(5, 0, 1)), Some(seq(5, 0, 1)), Some(seq(9, 0, 1))];
-        assert_eq!(
-            compute_stability_watermark(&reports, 3),
-            Watermark::UpTo(seq(5, 0, 1))
-        );
-        let n = Committer::run(&store, &reports, 3, &mut sink).unwrap();
-        assert_eq!(n, 2);
-        assert_eq!(sink.incorporated, vec![seq(3, 0, 1), seq(4, 0, 1)]);
     }
 
     // ---- recover_pending (election intent-recovery / gate-1 O2) -----------
 
     /// Collect the recovered perspective-seqs (ascending) for a gather.
-    fn recovered_seqs(stores: &[&dyn IntentStore], n: usize) -> Vec<PerspectiveSeq> {
-        recover_pending(stores, n)
+    fn recovered_seqs(
+        stores: &[&dyn IntentStore],
+        cluster_size: usize,
+        min_acks: usize,
+    ) -> Vec<PerspectiveSeq> {
+        recover_pending(stores, cluster_size, min_acks)
             .unwrap()
             .iter()
             .map(|i| i.perspective_seq)
@@ -779,18 +510,15 @@ mod tests {
     }
 
     #[test]
-    fn recover_o2_overlap_every_majority_recovers_acked_intent() {
-        // The core O2 property. N=3, min_acks=2. An intent `I` is acked on the
-        // durability quorum {A,B} only. For EVERY majority gather the new
-        // leader could form — {A,B}, {A,C}, {B,C} — `recover_pending` must
-        // include `I`, because any 2-of-3 gather intersects the 2-of-3
-        // durability quorum {A,B} by ≥1, so at least one gathered store holds I.
+    fn recover_o2_overlap_every_gather_recovers_acked_intent() {
+        // The core O2 property. RF=3, min_acks=2, threshold = 2. An intent `I`
+        // is acked on the durability quorum {A,B} only. For EVERY 2-of-3 gather
+        // the new leader could form — {A,B}, {A,C}, {B,C} — recover_pending must
+        // include `I` (any 2-of-3 gather intersects the 2-of-3 durability set).
         let a = InMemIntentStore::new();
         let b = InMemIntentStore::new();
         let c = InMemIntentStore::new();
         let acked = seq(7, 0, 1);
-        // `I` is durable on {A,B} only — C never received it (e.g. it was the
-        // replica left out of the min_acks quorum).
         assert_eq!(a.put(intent(acked, None)).unwrap(), PutOutcome::Recorded);
         assert_eq!(b.put(intent(acked, None)).unwrap(), PutOutcome::Recorded);
 
@@ -798,24 +526,43 @@ mod tests {
         let br: &dyn IntentStore = &b;
         let cr: &dyn IntentStore = &c;
 
-        // All three 2-of-3 majority gathers must recover the acked intent.
         for (label, gather) in [
             ("{A,B}", [ar, br]),
             ("{A,C}", [ar, cr]),
             ("{B,C}", [br, cr]),
         ] {
-            let recovered = recovered_seqs(&gather, 3);
+            let recovered = recovered_seqs(&gather, 3, 2);
             assert!(
                 recovered.contains(&acked),
-                "majority gather {label} must recover acked intent I"
+                "gather {label} must recover acked intent I"
             );
         }
     }
 
     #[test]
+    fn recover_threshold_rf6_min2_needs_five_views() {
+        // MF-7: RF=6, min_acks=2 → threshold 5. A 5-view gather succeeds; a
+        // 4-view gather is InsufficientQuorum (the bug majority(6)=4 would have
+        // allowed — a 4-of-6 gather can miss a 2-of-6 acked intent).
+        let stores: Vec<InMemIntentStore> = (0..6).map(|_| InMemIntentStore::new()).collect();
+        let refs: Vec<&dyn IntentStore> = stores.iter().map(|s| s as &dyn IntentStore).collect();
+
+        // 5 views → Ok.
+        assert!(recover_pending(&refs[..5], 6, 2).is_ok());
+
+        // 4 views → InsufficientQuorum { have: 4, need: 5 }.
+        match recover_pending(&refs[..4], 6, 2) {
+            Err(IntentError::InsufficientQuorum { have, need }) => {
+                assert_eq!(have, 4);
+                assert_eq!(need, 5);
+            }
+            other => panic!("expected InsufficientQuorum {{have:4,need:5}}, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn recover_dedups_same_intent_in_two_stores() {
-        // The same intent present in two gathered stores appears once in the
-        // union (BTreeMap keyed by perspective-seq).
+        // The same intent in two gathered stores appears once in the union.
         let a = InMemIntentStore::new();
         let b = InMemIntentStore::new();
         let s = seq(3, 0, 1);
@@ -823,35 +570,32 @@ mod tests {
         b.put(intent(s, None)).unwrap();
         let ar: &dyn IntentStore = &a;
         let br: &dyn IntentStore = &b;
-        let recovered = recover_pending(&[ar, br], 3).unwrap();
+        let recovered = recover_pending(&[ar, br], 3, 2).unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].perspective_seq, s);
     }
 
     #[test]
     fn recover_unions_ascending() {
-        // Stores holding disjoint, out-of-order seqs union into one ascending
-        // sequence regardless of per-store insertion order.
+        // Disjoint, out-of-order seqs union into one ascending sequence.
         let a = InMemIntentStore::new();
         let b = InMemIntentStore::new();
-        // A holds the high+low, B holds the middle ones — none in global order.
         fill(&a, &[seq(5, 0, 1), seq(1, 0, 1)]);
         fill(&b, &[seq(3, 0, 1), seq(2, 0, 1)]);
         let ar: &dyn IntentStore = &a;
         let br: &dyn IntentStore = &b;
         assert_eq!(
-            recovered_seqs(&[ar, br], 3),
+            recovered_seqs(&[ar, br], 3, 2),
             vec![seq(1, 0, 1), seq(2, 0, 1), seq(3, 0, 1), seq(5, 0, 1)]
         );
     }
 
     #[test]
-    fn recover_insufficient_quorum_below_majority() {
-        // 1 of 3 stores is below majority(3)=2 → InsufficientQuorum, refusing
-        // to reconstruct an incomplete (possibly intent-losing) pending set.
+    fn recover_insufficient_quorum_below_threshold() {
+        // RF=3/min_acks=2 → threshold 2. 1 view < 2 → InsufficientQuorum.
         let a = InMemIntentStore::new();
         let ar: &dyn IntentStore = &a;
-        match recover_pending(&[ar], 3) {
+        match recover_pending(&[ar], 3, 2) {
             Err(IntentError::InsufficientQuorum { have, need }) => {
                 assert_eq!(have, 1);
                 assert_eq!(need, 2);
@@ -862,9 +606,6 @@ mod tests {
 
     #[test]
     fn restore_into_is_idempotent() {
-        // Restoring a recovered set into an empty store inserts all of it; a
-        // second restore of the same set inserts nothing new and leaves the
-        // pending set unchanged (the store keys by perspective-seq).
         let recovered = vec![
             intent(seq(1, 0, 1), None),
             intent(seq(2, 0, 1), None),
@@ -878,7 +619,6 @@ mod tests {
         let second = restore_into(&target, &recovered).unwrap();
         assert_eq!(second, 0, "re-restore inserts nothing new (idempotent)");
         assert_eq!(target.pending_len().unwrap(), 3);
-        // Pending matches the recovered set, ascending.
         let pending: Vec<_> = target
             .pending()
             .unwrap()
@@ -890,23 +630,18 @@ mod tests {
 
     #[test]
     fn recover_then_commit_drops_already_incorporated() {
-        // recovery + F-2 compose: recover a union of seq(1),seq(2),seq(3) from
-        // a majority gather, restore into a fresh leader store, then run the
-        // committer against a log that already incorporated up to seq(2)
-        // (max_incorporated). With all-`None` reports (FullyClosed → no upper
-        // bound), only seq(3) is incorporated — the recovered seq(1),seq(2) are
-        // dropped by the committer's F-2 floor, NOT by recovery. This proves
-        // recovery rebuilds the full pending set and the committer's floor (not
-        // recovery) is what de-duplicates against the log.
+        // recovery + F-2 compose: recover seq(1),seq(2),seq(3) from a gather,
+        // restore into a fresh leader store, then drain against a log that
+        // already incorporated up to seq(2). Only seq(3) is incorporated — the
+        // recovered seq(1),seq(2) are dropped by the committer's F-2 floor.
         let a = InMemIntentStore::new();
         let b = InMemIntentStore::new();
-        // Spread the acked intents across the durability quorum {A,B}.
         fill(&a, &[seq(1, 0, 1), seq(3, 0, 1)]);
         fill(&b, &[seq(2, 0, 1), seq(3, 0, 1)]);
         let ar: &dyn IntentStore = &a;
         let br: &dyn IntentStore = &b;
 
-        let recovered = recover_pending(&[ar, br], 3).unwrap();
+        let recovered = recover_pending(&[ar, br], 3, 2).unwrap();
         assert_eq!(
             recovered
                 .iter()
@@ -915,17 +650,13 @@ mod tests {
             vec![seq(1, 0, 1), seq(2, 0, 1), seq(3, 0, 1)],
         );
 
-        // A fresh new-leader store, populated only by recovery.
         let leader = InMemIntentStore::new();
         assert_eq!(restore_into(&leader, &recovered).unwrap(), 3);
 
-        // The log already incorporated up to seq(2); FullyClosed watermark.
         let mut sink = RecordingSink::new().with_max_incorporated(seq(2, 0, 1));
-        let n = Committer::run(&leader, &[None, None, None], 3, &mut sink).unwrap();
+        let n = Committer::run(&leader, &mut sink).unwrap();
         assert_eq!(n, 1, "only seq(3) is above the F-2 floor");
         assert_eq!(sink.incorporated, vec![seq(3, 0, 1)]);
-        // The leader store is pruned up to seq(3), clearing the dropped lower
-        // recovered intents too.
         assert_eq!(leader.pending_len().unwrap(), 0);
     }
 }

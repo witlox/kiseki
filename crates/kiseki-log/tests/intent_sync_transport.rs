@@ -192,39 +192,8 @@ fn gather_pending_preserves_appends_over_the_wire() {
     }
 }
 
-/// next_pending: a populated peer reports its lowest seq; an empty peer
-/// reports `None` (mapped to an absent next-pending in the report).
-#[test]
-fn next_pending_reports_lowest_then_none() {
-    let ports = find_ports(2);
-    let addr_a = format!("127.0.0.1:{}", ports[0]);
-    let addr_b = format!("127.0.0.1:{}", ports[1]);
-    let _node_a = spawn_node(1, &addr_a);
-    let node_b = spawn_node(2, &addr_b);
-
-    let gatherer =
-        TransportIntentGatherer::new(test_shard(), vec![(NodeId(2), addr_b.clone())], None);
-    let rt = make_runtime();
-
-    // Empty store → None reported for B.
-    let empty = rt.block_on(gatherer.gather_next_pending_seqs()).unwrap();
-    assert_eq!(empty, vec![(NodeId(2), None)], "empty peer reports None");
-
-    // Populate B with two intents; lowest is seq(4,0,2).
-    let b_store = node_b.intent_store(test_shard()).unwrap();
-    b_store.put(rich_intent(seq(9, 0, 2), None)).unwrap();
-    b_store.put(rich_intent(seq(4, 0, 2), None)).unwrap();
-
-    let filled = rt.block_on(gatherer.gather_next_pending_seqs()).unwrap();
-    assert_eq!(
-        filled,
-        vec![(NodeId(2), Some(seq(4, 0, 2)))],
-        "populated peer reports its lowest pending seq",
-    );
-}
-
-/// An unreachable peer (an addr with no listener) is omitted — not an error,
-/// not a fabricated report. The reachable peer still answers.
+/// An unreachable peer (an addr with no listener) is omitted from the recovery
+/// gather — not an error, not a fabricated entry. The reachable peer answers.
 #[test]
 fn unreachable_peer_is_skipped() {
     let ports = find_ports(3); // a:0, b:1, dead:2 (never bound to a listener)
@@ -245,20 +214,14 @@ fn unreachable_peer_is_skipped() {
     );
     let rt = make_runtime();
 
-    let next = rt.block_on(gatherer.gather_next_pending_seqs()).unwrap();
-    assert_eq!(
-        next,
-        vec![(NodeId(2), Some(seq(1, 0, 2)))],
-        "dead peer omitted from next_pending; not fabricated",
-    );
-
     let pending = rt.block_on(gatherer.gather_pending()).unwrap();
     assert_eq!(
         pending.len(),
         1,
-        "only the reachable peer in gather_pending"
+        "only the reachable peer in gather_pending; dead peer omitted"
     );
     assert_eq!(pending[0].0, NodeId(2));
+    assert_eq!(pending[0].1.len(), 1, "B's one intent");
 }
 
 /// Two reachable peers B and C → one entry each, correctly keyed by NodeId.
@@ -299,10 +262,4 @@ fn two_peers_keyed_distinctly() {
         .collect();
     assert_eq!(by_node.get(&2), Some(&1), "B keyed with its 1 intent");
     assert_eq!(by_node.get(&3), Some(&2), "C keyed with its 2 intents");
-
-    let next = rt.block_on(gatherer.gather_next_pending_seqs()).unwrap();
-    let next_by_node: BTreeMap<u64, Option<PerspectiveSeq>> =
-        next.into_iter().map(|(n, s)| (n.0, s)).collect();
-    assert_eq!(next_by_node.get(&2), Some(&Some(seq(1, 0, 2))));
-    assert_eq!(next_by_node.get(&3), Some(&Some(seq(1, 0, 3))));
 }

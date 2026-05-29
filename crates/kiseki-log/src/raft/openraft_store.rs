@@ -315,10 +315,10 @@ impl OpenRaftLogStore {
 
     /// This shard's current Raft **voter** node ids, read from the live
     /// membership metrics (ADR-047 phase 5b). Learners are excluded — only
-    /// voters carry the durability quorum the `IntentSync` watermark counts
-    /// against. The set includes this node when it is itself a voter; the
-    /// caller (the [`TransportIntentGatherer`](crate::intent_sync)) drops the
-    /// local id before fanning out. Empty before membership is initialized.
+    /// voters carry the durability quorum the recovery gather counts against.
+    /// The set includes this node when it is itself a voter; the caller (the
+    /// [`TransportIntentGatherer`](crate::intent_sync)) drops the local id
+    /// before fanning out. Empty before membership is initialized.
     #[must_use]
     pub fn voter_ids(&self) -> Vec<u64> {
         self.raft
@@ -328,6 +328,26 @@ impl OpenRaftLogStore {
             .membership()
             .voter_ids()
             .collect()
+    }
+
+    /// Is this node the **established leader** of this shard's Raft group right
+    /// now (ADR-047 `LeaderSink` leadership detection)? Reads
+    /// `ServerState::Leader` from the live metrics watch — a cheap, lock-free
+    /// borrow, safe to poll on the committer supervisor's tick. A deposed
+    /// leader flips to `Candidate`/`Follower` here as soon as openraft sees a
+    /// higher term, which is the supervisor's signal to stop draining.
+    #[must_use]
+    pub fn is_leader(&self) -> bool {
+        self.raft.is_leader()
+    }
+
+    /// The node id this shard's Raft group currently regards as leader, if any
+    /// (ADR-047 `LeaderSink` — the `put_intent_and_fan` fan-includes-leader
+    /// target). `None` during an election (no committed leader). Read from the
+    /// live metrics watch.
+    #[must_use]
+    pub fn current_leader_id(&self) -> Option<u64> {
+        self.raft.metrics().borrow_watched().current_leader
     }
 
     /// Append a delta through Raft consensus.

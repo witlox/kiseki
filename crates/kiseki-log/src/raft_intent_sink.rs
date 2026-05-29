@@ -72,10 +72,10 @@ pub trait IntentLogAppender: Send + Sync {
 ///
 /// - **Outside any runtime context** (a bare `std::thread`, or a `#[test]`
 ///   thread): a plain [`Handle::block_on`].
-/// - **Inside a runtime context** (the phase-5c committer thread drives
-///   [`run_committer_loop`](crate::shard_committer::run_committer_loop) via
-///   `Handle::block_on`, so the sync `tick` → `incorporate` runs *while* a
-///   `block_on` is active): [`tokio::task::block_in_place`] wraps the inner
+/// - **Inside a runtime context** (the `LeaderSink` committer supervisor thread
+///   drives the drain loop via `Handle::block_on`, so the sync `drain_local` →
+///   `incorporate` runs *while* a `block_on` is active):
+///   [`tokio::task::block_in_place`] wraps the inner
 ///   `block_on`, telling tokio this worker is about to block so it can move
 ///   other tasks off it. `block_in_place` requires the multi-threaded Raft
 ///   runtime (it is — `RaftShardStore::new` builds `new_multi_thread`).
@@ -278,8 +278,8 @@ mod tests {
         fill(&store, &[seq(3, 0, 1), seq(1, 0, 1), seq(2, 0, 1)]);
 
         let mut sink = RaftLogIncorporationSink::new(RecordingAppender::new(None), handle);
-        // All-`None` reports → FullyClosed → no upper bound, incorporate all.
-        let n = Committer::run(&store, &[None, None, None], 3, &mut sink).unwrap();
+        // `LeaderSink` drain-all: incorporate every pending intent above floor.
+        let n = Committer::run(&store, &mut sink).unwrap();
         assert_eq!(n, 3);
         assert_eq!(
             sink.appender.recorded_seqs(),
@@ -308,7 +308,7 @@ mod tests {
         // The store holds seq1, seq2, seq3; the F-2 floor must drop seq1+seq2.
         let store = InMemIntentStore::new();
         fill(&store, &[seq(1, 0, 1), seq(2, 0, 1), seq(3, 0, 1)]);
-        let n = Committer::run(&store, &[None, None, None], 3, &mut sink).unwrap();
+        let n = Committer::run(&store, &mut sink).unwrap();
         assert_eq!(n, 1, "only seq(3) is above the F-2 floor");
         assert_eq!(
             sink.appender.recorded_seqs(),
@@ -331,7 +331,7 @@ mod tests {
             None,
             "empty floor before any run"
         );
-        let n = Committer::run(&store, &[None, None, None], 3, &mut sink).unwrap();
+        let n = Committer::run(&store, &mut sink).unwrap();
         assert_eq!(n, 3);
         // After incorporating up to seqN, the cache reports seqN.
         assert_eq!(

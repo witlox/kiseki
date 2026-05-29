@@ -33,6 +33,7 @@
 //! `intent_sync_transport.rs` / `multi_shard_transport.rs`.
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use kiseki_common::ids::{ChunkId, NodeId, OrgId, ShardId};
@@ -43,6 +44,12 @@ use kiseki_log::raft_store::NewChunkMeta;
 use kiseki_log::shard::ShardConfig;
 use kiseki_log::traits::{AppendChunkAndDeltaRequest, AppendDeltaRequest};
 use kiseki_log::RaftShardStore;
+
+/// Serializes the tests that mutate the process-global `KISEKI_MIN_ACKS` env
+/// var, so a parallel run cannot have one test clear the var while another is
+/// mid-construction (the var is read once in `RaftShardStore::new`). Held for
+/// the whole body of each env-sensitive test.
+static MIN_ACKS_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn test_shard() -> ShardId {
     ShardId(uuid::Uuid::from_u128(0x0475_b0fa_u128))
@@ -152,6 +159,9 @@ fn spawn_durable_node(
 /// plus at least one peer's store.
 #[test]
 fn put_intent_and_fan_reaches_quorum_on_three_nodes() {
+    let _env = MIN_ACKS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::remove_var("KISEKI_MIN_ACKS"); // default = 2
     let ports = find_ports(3);
     let peers = peers_map(&ports);
@@ -194,6 +204,9 @@ fn put_intent_and_fan_reaches_quorum_on_three_nodes() {
 /// but a single copy is below the floor, so the caller MUST NOT ack.
 #[test]
 fn put_intent_and_fan_errs_on_quorum_shortfall() {
+    let _env = MIN_ACKS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("KISEKI_MIN_ACKS", "2");
     let ports = find_ports(1);
     let peers = peers_map(&ports); // a single-node peers map → no fan targets
@@ -218,6 +231,9 @@ fn put_intent_and_fan_errs_on_quorum_shortfall() {
 /// a non-durable intent loses data on crash).
 #[test]
 fn put_intent_and_fan_refuses_non_durable_store() {
+    let _env = MIN_ACKS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("KISEKI_MIN_ACKS", "1");
     let ports = find_ports(1);
     let peers = peers_map(&ports);
@@ -254,40 +270,43 @@ fn put_intent_and_fan_refuses_non_durable_store() {
     std::env::remove_var("KISEKI_MIN_ACKS");
 }
 
-/// End-to-end producer → committer → Raft: with `decoupled_ack` on, the spawned
-/// per-shard committer drains the local intent store into the Raft log.
+/// End-to-end producer → committer → Raft (ADR-047 `LeaderSink`): with
+/// `decoupled_ack` on, the per-shard committer SUPERVISOR on the leader runs
+/// election recovery then drains its local intent store into the Raft log.
 ///
-/// The committer's stability watermark is the MAJORITY low-water-mark: it
-/// incorporates the local store's intents that a majority of voters have closed
-/// below (ADR-047 §3 — phase-5b logic, exercised here through the real spawn).
-/// To exercise the spawn → drain → Raft wiring deterministically we put the
-/// intents directly on the LEADER's local intent store (so the two peers report
-/// nothing pending → FullyClosed watermark → the leader incorporates all). This
-/// is exactly the "loop is spawned + drains a pre-populated store" check, plus
-/// the assertion that the drained intents land in the shard's Raft log.
+/// `LeaderSink` is single-incorporator-on-the-leader: no watermark, no peer
+/// gossip. The supervisor on the elected leader detects leadership, runs
+/// `recover()` once (gathering peers' pending — here empty), then `drain_local`
+/// on each tick, draining ALL local pending intents above the F-2 floor. We
+/// drive that deterministically by putting the intents directly on the leader's
+/// local intent store and asserting they land in the shard's Raft log + the
+/// store drains.
 ///
-/// (`put_intent_and_fan`'s quorum semantics are pinned by the dedicated tests
-/// above; this one isolates the committer-spawn wiring from the watermark's
-/// own convergence timing, which depends on where the fan placed copies.)
+/// (`put_intent_and_fan`'s quorum semantics — incl. fan-includes-leader — are
+/// pinned by the dedicated tests above; this one isolates the supervisor's
+/// become-leader → recover → drain wiring.)
 #[test]
 fn committer_spawn_incorporates_intent_into_the_log() {
+    let _env = MIN_ACKS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::remove_var("KISEKI_MIN_ACKS");
     let ports = find_ports(3);
     let peers = peers_map(&ports);
     let addrs: Vec<String> = (0..3).map(|i| format!("127.0.0.1:{}", ports[i])).collect();
 
-    // decoupled_ack = true + durable on all three → each spawns a committer.
+    // decoupled_ack = true + durable on all three → each spawns a supervisor.
     let (n1, _d1) = spawn_durable_node(1, &addrs[0], &peers, true);
     let (n2, _d2) = spawn_durable_node(2, &addrs[1], &peers, true);
     let (n3, _d3) = spawn_durable_node(3, &addrs[2], &peers, true);
 
     n1.initialize_shard(test_shard()).expect("init membership");
-    std::thread::sleep(Duration::from_secs(4)); // election + committers running
+    std::thread::sleep(Duration::from_secs(4)); // election + supervisors running
 
-    // Pre-populate ONLY the leader's local intent store (peers stay empty so
-    // they report None → the leader's committer sees a FullyClosed majority
-    // watermark and incorporates). This is the spawned committer draining a
-    // pre-populated store, end to end into the Raft log.
+    // Pre-populate the leader's local intent store. Under LeaderSink the leader
+    // is the sole incorporator and drains its OWN store (the fan includes the
+    // leader), so its supervisor incorporates these on the next drain tick —
+    // end to end into the Raft log. (n1 is the seed and the elected leader.)
     let store = n1.intent_store(test_shard()).unwrap();
     store.put(rich_intent(seq(40, 0, 1), None)).unwrap();
     store.put(rich_intent(seq(41, 0, 1), None)).unwrap();

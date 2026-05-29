@@ -408,13 +408,23 @@ impl ShardSmInner {
                 );
                 LogResponse::Appended(tip)
             }
-            // ADR-047 phase 5a (option 2): an async-committed intent — applied
-            // exactly like `ChunkAndDelta` (atomic chunk-meta + delta) but it
-            // additionally carries the committer-assigned perspective-seq. Record
-            // the running max so a recovering leader reads the gate-1 F-2
-            // idempotency floor from the replicated log. The delta's stamped HLC
-            // stays the log index (no I-L1 change) — the perspective-seq is
-            // recorded here, separately.
+            // ADR-047 `LeaderSink`: an async-committed intent — applied exactly
+            // like `ChunkAndDelta` (atomic chunk-meta + delta) but carrying the
+            // committer-assigned perspective-seq.
+            //
+            // **Append-gate (MF-6 / gate-1 F-2 — the authoritative idempotency
+            // floor).** This is the SOLE source of truth for at-most-once
+            // incorporation, replicated identically on every replica. If
+            // `perspective_seq <= max_incorporated_seq`, the intent is already
+            // in the log (a recovery re-gather, a re-fan, or a deposed-leader
+            // retry that landed): SKIP the append entirely — no `tip++`, no
+            // delta, no chunk-meta mutation — and return the *unchanged* tip as
+            // a no-op `Appended`. Only a genuinely-new seq (strictly above the
+            // floor) appends and then advances the floor. The committer-side
+            // sink cache is only a perf pre-filter; this gate is the defense.
+            //
+            // The delta's stamped HLC stays the log index (no I-L1 change) — the
+            // perspective-seq is recorded as `max_incorporated_seq`, separately.
             LogCommand::IncorporateIntent {
                 tenant_id_bytes,
                 operation,
@@ -425,6 +435,15 @@ impl ShardSmInner {
                 new_chunks,
                 perspective_seq,
             } => {
+                // F-2 append-gate: drop anything at or below the floor. This
+                // makes re-incorporation (recovery / re-fan / replay) a no-op
+                // that returns the current tip without touching state.
+                if self
+                    .max_incorporated_seq
+                    .is_some_and(|floor| *perspective_seq <= floor)
+                {
+                    return LogResponse::Appended(self.tip);
+                }
                 self.apply_new_chunks(tenant_id_bytes, new_chunks, log_index);
                 let tip = self.append_delta_inner(
                     tenant_id_bytes,
@@ -435,10 +454,9 @@ impl ShardSmInner {
                     *has_inline_data,
                     log_index,
                 );
-                self.max_incorporated_seq = Some(
-                    self.max_incorporated_seq
-                        .map_or(*perspective_seq, |cur| cur.max(*perspective_seq)),
-                );
+                // Strictly above the floor (guarded above) → advance it. The
+                // running max is preserved (a higher seq only raises it).
+                self.max_incorporated_seq = Some(*perspective_seq);
                 LogResponse::Appended(tip)
             }
             LogCommand::IncrementChunkRefcount {
@@ -976,15 +994,11 @@ mod tests {
         }
     }
 
-    /// An `IncorporateIntent` advances `max_incorporated_seq` to the running
-    /// max — higher seqs raise it, lower seqs do not. A `ChunkAndDelta` (the
-    /// sync path) and an `AppendDelta` leave it unchanged.
-    #[test]
-    fn incorporate_intent_advances_floor_monotonically() {
-        let mut inner = fresh_inner();
-        let tenant = org(1);
-
-        let mk = |seq: kiseki_common::time::HybridLogicalClock| LogCommand::IncorporateIntent {
+    fn mk_incorporate(
+        tenant: [u8; 16],
+        seq: kiseki_common::time::HybridLogicalClock,
+    ) -> LogCommand {
+        LogCommand::IncorporateIntent {
             tenant_id_bytes: tenant,
             operation: 0,
             hashed_key: [0; 32],
@@ -993,7 +1007,18 @@ mod tests {
             has_inline_data: false,
             new_chunks: vec![],
             perspective_seq: seq,
-        };
+        }
+    }
+
+    /// An `IncorporateIntent` advances `max_incorporated_seq` to the running
+    /// max — higher seqs raise it, a seq at-or-below the floor is a SKIPPED
+    /// no-op (MF-6 append-gate). A `ChunkAndDelta` (the sync path) and an
+    /// `AppendDelta` leave it unchanged.
+    #[test]
+    fn incorporate_intent_advances_floor_monotonically() {
+        let mut inner = fresh_inner();
+        let tenant = org(1);
+        let mk = |seq| mk_incorporate(tenant, seq);
 
         // Fresh: no intent incorporated yet.
         assert_eq!(inner.max_incorporated_seq, None);
@@ -1006,7 +1031,7 @@ mod tests {
         let _ = inner.apply_command(&mk(hlc(5, 0, 1)), 2);
         assert_eq!(inner.max_incorporated_seq, Some(hlc(5, 0, 1)));
 
-        // A lower seq does NOT lower it (the max is monotone).
+        // A lower seq is at/below the floor → SKIPPED (no delta), floor intact.
         let _ = inner.apply_command(&mk(hlc(3, 0, 1)), 3);
         assert_eq!(inner.max_incorporated_seq, Some(hlc(5, 0, 1)));
 
@@ -1038,6 +1063,45 @@ mod tests {
             5,
         );
         assert_eq!(inner.max_incorporated_seq, Some(hlc(5, 0, 1)));
+    }
+
+    /// MF-6: the append-gate makes re-incorporation idempotent. Applying the
+    /// SAME `IncorporateIntent` (same `perspective_seq`) twice — as recovery
+    /// re-gather / re-fan / replay would — produces exactly ONE delta and
+    /// advances the floor exactly once. The second apply is a no-op returning
+    /// the unchanged tip, leaving `deltas` / `tip` / `delta_count` untouched.
+    #[test]
+    fn incorporate_intent_append_gate_is_idempotent_on_replay() {
+        let mut inner = fresh_inner();
+        let tenant = org(1);
+
+        let tip_of = |r: LogResponse| match r {
+            LogResponse::Appended(t) => t,
+            other => panic!("expected Appended, got {other:?}"),
+        };
+
+        // First apply of seq(5): one delta appended, floor = seq(5).
+        let r1 = inner.apply_command(&mk_incorporate(tenant, hlc(5, 0, 1)), 1);
+        assert_eq!(tip_of(r1), 1);
+        assert_eq!(inner.deltas.len(), 1, "one delta after first apply");
+        assert_eq!(inner.tip, 1);
+        assert_eq!(inner.delta_count, 1);
+        assert_eq!(inner.max_incorporated_seq, Some(hlc(5, 0, 1)));
+
+        // Re-apply the SAME seq (a recovery re-gather / replay): SKIPPED. No
+        // new delta, tip unchanged, floor unchanged — at most once.
+        let r2 = inner.apply_command(&mk_incorporate(tenant, hlc(5, 0, 1)), 2);
+        assert_eq!(tip_of(r2), 1, "no-op returns unchanged tip");
+        assert_eq!(inner.deltas.len(), 1, "still exactly one delta — no double");
+        assert_eq!(inner.tip, 1, "tip not advanced by the skipped apply");
+        assert_eq!(inner.delta_count, 1);
+        assert_eq!(inner.max_incorporated_seq, Some(hlc(5, 0, 1)));
+
+        // A strictly-higher seq DOES append (the gate only skips <= floor).
+        let r3 = inner.apply_command(&mk_incorporate(tenant, hlc(6, 0, 1)), 3);
+        assert_eq!(tip_of(r3), 2);
+        assert_eq!(inner.deltas.len(), 2, "higher seq appends a second delta");
+        assert_eq!(inner.max_incorporated_seq, Some(hlc(6, 0, 1)));
     }
 
     /// The F-2 floor survives a `ShardSnapshot` `serde_json` save→load, so a
