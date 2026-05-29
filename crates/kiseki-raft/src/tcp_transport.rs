@@ -550,7 +550,9 @@ where
 
 /// Type-erased per-shard dispatcher. Each `register_shard<C, SM>`
 /// call builds a closure capturing the typed `Raft<C, SM>` handle.
-type ShardDispatch = Arc<
+/// Exported so a higher crate (ADR-047 kiseki-log) can construct an
+/// auxiliary dispatcher of this exact type for `register_aux`.
+pub type ShardDispatch = Arc<
     dyn for<'a> Fn(&'a str, &'a [u8]) -> futures::future::BoxFuture<'a, DispatchOutcome>
         + Send
         + Sync,
@@ -565,6 +567,10 @@ pub enum DispatchOutcome {
     Ok(Vec<u8>),
     ParseError,
     Panicked,
+    /// The dispatcher does not recognize this tag — the listener may
+    /// fall through to an auxiliary dispatcher; if none handles it,
+    /// the wire status is `ParseError`.
+    UnknownTag,
 }
 
 /// Clonable handle to the per-node shard registry. Each shard's
@@ -574,6 +580,11 @@ pub enum DispatchOutcome {
 #[derive(Clone)]
 pub struct RegistryHandle {
     inner: Arc<DashMap<ShardId, ShardDispatch>>,
+    /// Auxiliary (non-Raft) per-shard dispatchers (ADR-047). The
+    /// listener consults this map only after the shard's Raft
+    /// dispatcher returns `UnknownTag`, so the consensus-critical
+    /// Raft path never touches it.
+    aux: Arc<DashMap<ShardId, ShardDispatch>>,
     /// Optional metrics handle — when set, register/unregister
     /// updates `kiseki_raft_transport_registry_size`.
     metrics: Option<Arc<crate::transport_metrics::RaftTransportMetrics>>,
@@ -652,7 +663,11 @@ impl RegistryHandle {
                                 Err(_) => DispatchOutcome::Panicked,
                             }
                         }
-                        _ => DispatchOutcome::ParseError,
+                        // Not a Raft tag. Signal the listener to fall
+                        // through to the auxiliary dispatcher (if any);
+                        // a genuinely unknown tag still maps to the
+                        // `ParseError` wire status.
+                        _ => DispatchOutcome::UnknownTag,
                     }
                 })
             },
@@ -674,6 +689,21 @@ impl RegistryHandle {
             #[allow(clippy::cast_possible_wrap)]
             m.registry_size.set(self.inner.len() as i64);
         }
+    }
+
+    /// Register an auxiliary (non-Raft) per-shard tag dispatcher. The listener
+    /// routes a tag to this dispatcher only after the shard's Raft dispatcher
+    /// returns `UnknownTag`, so aux tags MUST NOT collide with the Raft tags
+    /// ("append_entries"/"vote"/"full_snapshot"). Idempotent — replaces the
+    /// previous aux dispatcher. (ADR-047 phase 5b-rpc registers the IntentSync
+    /// handler here.)
+    pub fn register_aux(&self, shard_id: ShardId, dispatch: ShardDispatch) {
+        self.aux.insert(shard_id, dispatch);
+    }
+
+    /// Remove a shard's auxiliary dispatcher.
+    pub fn unregister_aux(&self, shard_id: ShardId) {
+        self.aux.remove(&shard_id);
     }
 
     /// Number of shards currently registered. Exposed for the
@@ -710,6 +740,7 @@ impl RaftRpcListener {
             tls_acceptor: ArcSwap::from_pointee(acceptor),
             registry: RegistryHandle {
                 inner: Arc::new(DashMap::new()),
+                aux: Arc::new(DashMap::new()),
                 metrics: None,
             },
             active_per_peer: Arc::new(DashMap::new()),
@@ -901,6 +932,39 @@ async fn handle_one_connection(
     }
 }
 
+/// ADR-047 auxiliary tag-dispatch (UnknownTag fallthrough).
+///
+/// When the shard's Raft dispatcher returns `UnknownTag` (its `_` arm —
+/// any tag that is not "append_entries"/"vote"/"full_snapshot"), route
+/// the request to the shard's auxiliary (non-Raft) dispatcher if one is
+/// registered, using ITS outcome. If no aux dispatcher exists (or the
+/// aux also returns `UnknownTag`), the outcome stays `UnknownTag`, which
+/// the listener maps to the same `ParseError` wire status as before this
+/// hook existed — so a truly-unknown tag is indistinguishable on the
+/// wire. Any other Raft outcome (`Ok`/`ParseError`/`Panicked`) is
+/// returned unchanged: the consensus-critical path never reaches the
+/// aux map. An aux panic is caught and mapped to `Panicked`, matching
+/// the Raft dispatcher's panic semantics.
+async fn aux_fallthrough(
+    registry: &RegistryHandle,
+    shard_id: ShardId,
+    tag: &str,
+    payload: &[u8],
+    outcome: DispatchOutcome,
+) -> DispatchOutcome {
+    if !matches!(outcome, DispatchOutcome::UnknownTag) {
+        return outcome;
+    }
+    let Some(aux) = registry.aux.get(&shard_id).map(|e| Arc::clone(&*e)) else {
+        return DispatchOutcome::UnknownTag;
+    };
+    let fut = std::panic::AssertUnwindSafe(aux(tag, payload));
+    match futures::FutureExt::catch_unwind(fut).await {
+        Ok(o) => o,
+        Err(_) => DispatchOutcome::Panicked,
+    }
+}
+
 async fn serve_one_request<S>(
     stream: &mut S,
     registry: &RegistryHandle,
@@ -977,9 +1041,19 @@ where
     // to the dispatcher, which postcard-decodes against the typed
     // handler.
     let outcome = dispatch(&tag, &payload_value).await;
+    // ADR-047 auxiliary tag-dispatch: the Raft dispatcher signals
+    // `UnknownTag` for any non-Raft tag. Fall through to the shard's
+    // auxiliary (non-Raft) dispatcher if one is registered. The Raft
+    // tags never reach the fallthrough, so the consensus-critical path
+    // is untouched.
+    let outcome = aux_fallthrough(registry, shard_id, &tag, &payload_value, outcome).await;
     let (status, body, outcome_label) = match outcome {
         DispatchOutcome::Ok(b) => (DispatchStatus::Ok, b, crate::transport_metrics::outcome::OK),
-        DispatchOutcome::ParseError => (
+        // A genuinely unknown tag (no aux dispatcher, or aux also
+        // returned `UnknownTag`) is reported identically to a
+        // `ParseError` on the wire — same status, empty body, same
+        // metrics label — so callers cannot tell the hook exists.
+        DispatchOutcome::ParseError | DispatchOutcome::UnknownTag => (
             DispatchStatus::ParseError,
             Vec::new(),
             crate::transport_metrics::outcome::PARSE_ERROR,
@@ -1137,5 +1211,202 @@ mod tests {
         // io::Error from outside this module returns None.
         let foreign = io::Error::other("from somewhere else");
         assert_eq!(classify_network_error(&foreign), None);
+    }
+
+    // -----------------------------------------------------------------
+    // ADR-047 auxiliary tag-dispatch (UnknownTag fallthrough)
+    // -----------------------------------------------------------------
+    //
+    // Standing up a full `openraft::Raft` inside this crate's tests is
+    // heavy (it needs a state machine + log store + network factory,
+    // none of which `kiseki-raft` exposes for tests). The listener
+    // fallthrough under test treats every `ShardDispatch` identically —
+    // it cannot tell a real Raft dispatcher from any other closure — so
+    // these tests insert a STUB main dispatcher that replicates the Raft
+    // dispatcher's tag-matching contract byte-for-byte: it returns
+    // `Ok` for a Raft-shaped tag and `UnknownTag` for everything else
+    // (exactly what `register_shard`'s closure does at its `_` arm).
+    // The end-to-end wire path (`RaftRpcListener` + `rpc_call_plain`)
+    // is the real production code.
+
+    /// Build a stub main dispatcher mirroring the Raft dispatcher's tag
+    /// contract: a recognized Raft tag → `Ok`, anything else →
+    /// `UnknownTag` (the `_` arm of `register_shard`'s closure).
+    fn stub_raft_dispatch() -> ShardDispatch {
+        Arc::new(
+            move |tag: &str, _payload: &[u8]| -> futures::future::BoxFuture<'_, DispatchOutcome> {
+                let tag = tag.to_owned();
+                Box::pin(async move {
+                    match tag.as_str() {
+                        "append_entries" | "vote" | "full_snapshot" => {
+                            // Echo a marker so the "Raft path still wins"
+                            // test can assert the aux was NOT consulted.
+                            let resp: Vec<u8> = b"raft".to_vec();
+                            DispatchOutcome::Ok(postcard::to_stdvec(&resp).unwrap())
+                        }
+                        _ => DispatchOutcome::UnknownTag,
+                    }
+                })
+            },
+        )
+    }
+
+    /// Spawn a plaintext listener on an ephemeral port, returning its
+    /// address and a registry handle obtained before `run()` consumed
+    /// the listener.
+    async fn spawn_listener() -> (String, RegistryHandle) {
+        // Bind first to learn the OS-assigned port, then hand the bound
+        // address to the listener.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+        let listener = RaftRpcListener::new(addr.clone(), None);
+        let registry = listener.registry();
+        tokio::spawn(async move {
+            let _ = listener.run().await;
+        });
+        // Give the accept loop a moment to bind.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (addr, registry)
+    }
+
+    /// An aux tag (one the Raft dispatcher does not recognize) is routed
+    /// to the registered auxiliary dispatcher, and the exact bytes it
+    /// returned cross the wire unchanged (status Ok + body == b"pong").
+    #[tokio::test]
+    async fn aux_tag_routes_to_aux_dispatcher() {
+        let (addr, registry) = spawn_listener().await;
+        let shard = ShardId(uuid::Uuid::from_u128(0x0A_0002));
+
+        registry.inner.insert(shard, stub_raft_dispatch());
+        let aux: ShardDispatch = Arc::new(
+            move |tag: &str, _payload: &[u8]| -> futures::future::BoxFuture<'_, DispatchOutcome> {
+                let tag = tag.to_owned();
+                Box::pin(async move {
+                    if tag == "intent_test" {
+                        DispatchOutcome::Ok(b"pong".to_vec())
+                    } else {
+                        DispatchOutcome::UnknownTag
+                    }
+                })
+            },
+        );
+        registry.register_aux(shard, aux);
+
+        let (status, body) = raw_rpc(&addr, shard, "intent_test", &[]).await;
+        assert_eq!(status, DispatchStatus::Ok as u8);
+        assert_eq!(body, b"pong", "aux dispatcher bytes must cross the wire");
+    }
+
+    /// A Raft tag still reaches the (stub) Raft dispatcher even when an
+    /// aux dispatcher is registered — the aux is NEVER consulted for a
+    /// recognized Raft tag.
+    #[tokio::test]
+    async fn raft_tag_still_routes_to_raft_with_aux_present() {
+        let (addr, registry) = spawn_listener().await;
+        let shard = ShardId(uuid::Uuid::from_u128(0x0A_0003));
+
+        registry.inner.insert(shard, stub_raft_dispatch());
+        // An aux that would HIJACK any tag if (incorrectly) consulted.
+        let aux: ShardDispatch = Arc::new(
+            move |_tag: &str, _payload: &[u8]| -> futures::future::BoxFuture<'_, DispatchOutcome> {
+                Box::pin(async move { DispatchOutcome::Ok(b"AUX_HIJACK".to_vec()) })
+            },
+        );
+        registry.register_aux(shard, aux);
+
+        let (status, body) = raw_rpc(&addr, shard, "append_entries", &[]).await;
+        assert_eq!(status, DispatchStatus::Ok as u8);
+        // The stub Raft dispatcher returns a postcard-encoded b"raft";
+        // crucially it is NOT the aux's "AUX_HIJACK" — proving the aux
+        // was not consulted for a Raft tag.
+        let decoded: Vec<u8> = postcard::from_bytes(&body).expect("decode raft marker");
+        assert_eq!(decoded, b"raft");
+        assert_ne!(body.as_slice(), b"AUX_HIJACK");
+    }
+
+    /// A bogus tag on a shard with NO aux dispatcher returns the
+    /// `ParseError` wire status — identical to the pre-ADR-047 behavior.
+    #[tokio::test]
+    async fn unknown_tag_without_aux_is_parse_error() {
+        let (addr, registry) = spawn_listener().await;
+        let shard = ShardId(uuid::Uuid::from_u128(0x0A_0004));
+
+        registry.inner.insert(shard, stub_raft_dispatch());
+        // No register_aux for this shard.
+
+        let (status, body) = raw_rpc(&addr, shard, "definitely_not_a_tag", &[]).await;
+        assert_eq!(
+            status,
+            DispatchStatus::ParseError as u8,
+            "unknown tag with no aux must map to ParseError (unchanged wire behavior)"
+        );
+        assert!(body.is_empty(), "ParseError carries no body");
+    }
+
+    /// An aux dispatcher that also returns `UnknownTag` for the tag
+    /// collapses to the same `ParseError` wire status — the fallthrough
+    /// is exhausted, so the response is indistinguishable from "no aux".
+    #[tokio::test]
+    async fn aux_returning_unknown_tag_is_parse_error() {
+        let (addr, registry) = spawn_listener().await;
+        let shard = ShardId(uuid::Uuid::from_u128(0x0A_0005));
+
+        registry.inner.insert(shard, stub_raft_dispatch());
+        let aux: ShardDispatch = Arc::new(
+            move |_tag: &str, _payload: &[u8]| -> futures::future::BoxFuture<'_, DispatchOutcome> {
+                Box::pin(async move { DispatchOutcome::UnknownTag })
+            },
+        );
+        registry.register_aux(shard, aux);
+
+        let (status, body) = raw_rpc(&addr, shard, "something_unknown", &[]).await;
+        assert_eq!(status, DispatchStatus::ParseError as u8);
+        assert!(body.is_empty());
+    }
+
+    /// `unregister_aux` removes the aux dispatcher — a previously-routed
+    /// aux tag goes back to `ParseError`.
+    #[tokio::test]
+    async fn unregister_aux_restores_parse_error() {
+        let (addr, registry) = spawn_listener().await;
+        let shard = ShardId(uuid::Uuid::from_u128(0x0A_0006));
+
+        registry.inner.insert(shard, stub_raft_dispatch());
+        let aux: ShardDispatch = Arc::new(
+            move |_tag: &str, _payload: &[u8]| -> futures::future::BoxFuture<'_, DispatchOutcome> {
+                Box::pin(async move { DispatchOutcome::Ok(b"pong".to_vec()) })
+            },
+        );
+        registry.register_aux(shard, aux);
+        let (status, _) = raw_rpc(&addr, shard, "intent_test", &[]).await;
+        assert_eq!(status, DispatchStatus::Ok as u8);
+
+        registry.unregister_aux(shard);
+        let (status, body) = raw_rpc(&addr, shard, "intent_test", &[]).await;
+        assert_eq!(status, DispatchStatus::ParseError as u8);
+        assert!(body.is_empty());
+    }
+
+    // -- test helpers ------------------------------------------------
+
+    /// Drive a single plaintext RPC and return the raw (status_byte,
+    /// body) without the typed postcard decode `rpc_exchange` does — so
+    /// tests can assert on the exact wire bytes / status the listener
+    /// produced.
+    async fn raw_rpc(addr: &str, shard: ShardId, tag: &str, payload: &[u8]) -> (u8, Vec<u8>) {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let body = encode_request_body(shard, tag, &payload.to_vec()).unwrap();
+        let len = u32::try_from(body.len()).unwrap();
+        stream.write_all(&len.to_be_bytes()).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await.unwrap();
+        let resp_len = u32::from_be_bytes(len_buf) as usize;
+        let mut resp = vec![0u8; resp_len];
+        stream.read_exact(&mut resp).await.unwrap();
+        (resp[0], resp[1..].to_vec())
     }
 }
