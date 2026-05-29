@@ -17,6 +17,8 @@ use kiseki_common::ids::{ChunkId, NodeId, OrgId, SequenceNumber, ShardId};
 
 use crate::delta::Delta;
 use crate::error::LogError;
+use crate::intent::{FjallIntentStore, InMemIntentStore, IntentStore};
+use crate::intent_sync::{build_intent_dispatcher, TransportIntentGatherer};
 use crate::raft::state_machine::ClusterChunkStateEntry;
 use crate::raft::OpenRaftLogStore;
 use crate::shard::{ShardConfig, ShardInfo, ShardState};
@@ -43,6 +45,15 @@ use kiseki_common::locks::LockOrDie;
 /// silently and that shard's cross-node messages never arrived.
 pub struct RaftShardStore {
     shards: Mutex<HashMap<ShardId, Arc<OpenRaftLogStore>>>,
+    /// Per-shard ADR-047 [`IntentStore`]s. Populated by `create_shard`
+    /// alongside the Raft group so a peer can SERVE its intent state via the
+    /// `IntentSync` aux dispatcher. Empty + inert in production this phase (no
+    /// producer writes intents, no committer task queries) — the gatherer is
+    /// only invoked by the 5c/5d committer task. Durable
+    /// ([`FjallIntentStore`]) when `data_dir` is set, else
+    /// [`InMemIntentStore`], mirroring the shard log store's persistence
+    /// choice.
+    intent_stores: Mutex<HashMap<ShardId, Arc<dyn IntentStore>>>,
     node_id: u64,
     peers: BTreeMap<u64, String>,
     /// Dedicated runtime for Raft async operations. Kept separate from
@@ -95,6 +106,7 @@ impl RaftShardStore {
         .expect("Raft runtime thread panicked");
         Self {
             shards: Mutex::new(HashMap::new()),
+            intent_stores: Mutex::new(HashMap::new()),
             node_id,
             peers,
             rt,
@@ -208,6 +220,49 @@ impl RaftShardStore {
             .contains_key(&shard_id)
     }
 
+    /// This node's ADR-047 [`IntentStore`] for `shard_id`, if the shard has
+    /// been created here. The 5c producer records intents through this handle;
+    /// the 5b-rpc aux dispatcher serves peers from the same one. `None` for a
+    /// shard this node does not host.
+    #[must_use]
+    pub fn intent_store(&self, shard_id: ShardId) -> Option<Arc<dyn IntentStore>> {
+        self.intent_stores
+            .lock()
+            .lock_or_die("raft_shard_store.intent_stores")
+            .get(&shard_id)
+            .map(Arc::clone)
+    }
+
+    /// Build a [`TransportIntentGatherer`] for `shard_id` (ADR-047 phase
+    /// 5b-rpc, client side).
+    ///
+    /// Derives the shard's voter node ids from the live Raft membership,
+    /// **drops the local node**, and resolves each remaining voter to its
+    /// transport addr via the `peers` map (a voter with no addr entry is
+    /// dropped — it cannot be reached). The gatherer fans the two intent tags
+    /// to those peers; an unreachable one is skipped, never fabricated.
+    ///
+    /// Returns `None` for a shard this node does not host. The committer's
+    /// `cluster_size` is `gatherer.peer_count() + 1` (the peers plus self).
+    ///
+    /// **Not wired into any production path this phase** — provided for the
+    /// 5c/5d committer task that spawns behind the `DecoupledAckEnabled` gate.
+    #[must_use]
+    pub fn intent_gatherer(&self, shard_id: ShardId) -> Option<TransportIntentGatherer> {
+        let store = self.get_shard(shard_id).ok()?;
+        let local = self.node_id;
+        let peers: Vec<(NodeId, String)> = store
+            .voter_ids()
+            .into_iter()
+            .filter(|id| *id != local)
+            .filter_map(|id| self.peers.get(&id).map(|addr| (NodeId(id), addr.clone())))
+            .collect();
+        // TLS is not plumbed into kiseki-log's transport yet (the Raft network
+        // uses plaintext `TcpNetworkFactory::new`); pass `None`. The field is
+        // here for the mTLS seam when TLS lands.
+        Some(TransportIntentGatherer::new(shard_id, peers, None))
+    }
+
     /// Create a shard's Raft group on this node.
     ///
     /// **Does not call `Raft::initialize()`** — the per-shard handle
@@ -273,10 +328,57 @@ impl RaftShardStore {
         .join()
         .expect("Raft shard creation thread panicked");
 
+        // ADR-047 phase 5b-rpc: create this shard's IntentStore so peers can
+        // SERVE their intent state via the IntentSync aux dispatcher. Durable
+        // (FjallIntentStore at `<data_dir>/<shard_id>/intents`) when a data
+        // dir is set, else in-memory — mirroring the shard log store's
+        // persistence choice above. Inert this phase: empty + only queried by
+        // the 5c/5d committer task.
+        //
+        // A durable-open failure degrades to the in-memory store rather than
+        // failing shard creation. That is safe ONLY because nothing acks on
+        // this store yet (the gatherer is on no production path this phase).
+        //
+        // !!! 5c/5d OBLIGATION (no-loss / O3): once the producer fast-acks a
+        // write on its intent being quorum-DURABLE, an in-memory intent store
+        // would lose acked writes on crash — violating ADR-047's core
+        // guarantee. So the capability gate MUST NOT enable decoupled-ack on a
+        // shard whose durable intent store failed to open (fail closed: keep
+        // that shard on the synchronous path, or fail shard creation). Do NOT
+        // let this silent fallback survive into the acked path.
+        let intent_store: Arc<dyn IntentStore> = match &self.data_dir {
+            Some(dir) => {
+                let path = dir.join(shard_id.0.to_string()).join("intents");
+                match FjallIntentStore::open(&path) {
+                    Ok(s) => Arc::new(s),
+                    Err(e) => {
+                        tracing::error!(
+                            shard_id = %shard_id.0,
+                            error = %e,
+                            "durable IntentStore open failed; using in-memory (INERT now, but \
+                             decoupled-ack MUST stay disabled on this shard — see 5c/5d obligation)",
+                        );
+                        Arc::new(InMemIntentStore::new())
+                    }
+                }
+            }
+            None => Arc::new(InMemIntentStore::new()),
+        };
+        self.intent_stores
+            .lock()
+            .lock_or_die("raft_shard_store.intent_stores")
+            .insert(shard_id, Arc::clone(&intent_store));
+
         // Register this shard's Raft handle with the listener so
         // inbound multiplexed RPCs route here.
         if let Some(reg) = registry {
             reg.register_shard(shard_id, store.raft_handle());
+            // ADR-047 aux dispatcher: register the IntentSync handler on the
+            // SAME shard so a peer's committer can read this node's intent
+            // state over the multiplexed transport. The listener consults it
+            // only after the Raft dispatcher returns `UnknownTag`, so the
+            // consensus path is untouched.
+            reg.register_aux(shard_id, build_intent_dispatcher(intent_store));
             tracing::info!(shard_id = %shard_id.0, "shard registered with Raft RPC listener");
         }
 

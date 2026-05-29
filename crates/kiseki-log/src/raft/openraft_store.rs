@@ -313,6 +313,23 @@ impl OpenRaftLogStore {
         Arc::new(self.raft.clone())
     }
 
+    /// This shard's current Raft **voter** node ids, read from the live
+    /// membership metrics (ADR-047 phase 5b). Learners are excluded — only
+    /// voters carry the durability quorum the `IntentSync` watermark counts
+    /// against. The set includes this node when it is itself a voter; the
+    /// caller (the [`TransportIntentGatherer`](crate::intent_sync)) drops the
+    /// local id before fanning out. Empty before membership is initialized.
+    #[must_use]
+    pub fn voter_ids(&self) -> Vec<u64> {
+        self.raft
+            .metrics()
+            .borrow_watched()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect()
+    }
+
     /// Append a delta through Raft consensus.
     ///
     /// Accepts an `AppendDeltaRequest` (the `LogOps` trait's request type).
