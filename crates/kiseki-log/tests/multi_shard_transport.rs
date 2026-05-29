@@ -432,3 +432,96 @@ fn measure_openraft_round_latency_fjall() {
     });
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// PERF BISECTION (2026-05-29, #259): round latency through the production
+/// `RaftShardStore` wrapper — 2 nodes, single shard. RaftShardStore runs
+/// openraft on a DEDICATED runtime (self.rt), so the append crosses a
+/// runtime boundary (caller-rt → raft-rt → back), unlike the raw
+/// OpenRaftLogStore probe (~1ms, all one runtime). If this jumps toward
+/// ~15ms, the cross-runtime hop / dedicated-runtime scheduling is the
+/// stacked wait. If still ~1-2ms, the wait needs the FULL-server task
+/// population (hydrator/scrub/listeners/other shards) → tokio-console on
+/// the real server. `#[ignore]` — manual probe.
+#[test]
+#[ignore = "perf probe: round latency through RaftShardStore (dedicated runtime)"]
+fn measure_round_latency_raftshardstore() {
+    use kiseki_common::time::{ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime};
+    use kiseki_log::delta::OperationType;
+    use kiseki_log::traits::{AppendChunkAndDeltaRequest, AppendDeltaRequest};
+
+    let ports = find_ports(2);
+    let peers = peers_map(&ports);
+    let shard = shard_a();
+    let a0 = peers[&1].clone();
+    let a1 = peers[&2].clone();
+
+    let n1 = RaftShardStore::new(1, peers.clone(), None);
+    let n2 = RaftShardStore::new(2, peers.clone(), None);
+    n1.create_shard(
+        shard,
+        test_tenant(),
+        NodeId(1),
+        ShardConfig::default(),
+        Some(&a0),
+    );
+    n2.create_shard(
+        shard,
+        test_tenant(),
+        NodeId(1),
+        ShardConfig::default(),
+        Some(&a1),
+    );
+    n1.initialize_shard(shard).expect("init");
+    std::thread::sleep(Duration::from_secs(4)); // election
+
+    let mk = |i: u64| AppendChunkAndDeltaRequest {
+        delta: AppendDeltaRequest {
+            shard_id: shard,
+            tenant_id: test_tenant(),
+            operation: OperationType::Create,
+            timestamp: DeltaTimestamp {
+                hlc: HybridLogicalClock {
+                    physical_ms: 1000,
+                    logical: 0,
+                    node_id: NodeId(1),
+                },
+                wall: WallTime {
+                    millis_since_epoch: 1000,
+                    timezone: "UTC".into(),
+                },
+                quality: ClockQuality::Ntp,
+            },
+            hashed_key: [(i % 251) as u8; 32],
+            chunk_refs: vec![],
+            payload: vec![0xab; 32],
+            has_inline_data: false,
+        },
+        new_chunks: vec![],
+    };
+
+    let rt = make_runtime();
+    rt.block_on(async {
+        for i in 0..10 {
+            let _ = LogOps::append_chunk_and_delta(&n1, mk(i)).await;
+        }
+        let mut lat: Vec<Duration> = Vec::new();
+        for i in 10..110 {
+            let t = std::time::Instant::now();
+            LogOps::append_chunk_and_delta(&n1, mk(i))
+                .await
+                .expect("timed");
+            lat.push(t.elapsed());
+        }
+        lat.sort_unstable();
+        let n = lat.len();
+        let mean = lat.iter().sum::<Duration>() / u32::try_from(n).unwrap_or(1);
+        println!(
+            "ROUND-LATENCY-RAFTSHARDSTORE (2-node, dedicated raft runtime, cross-runtime hop): \
+             n={n} mean={:?} p50={:?} min={:?} max={:?}",
+            mean,
+            lat[n / 2],
+            lat[0],
+            lat[n - 1]
+        );
+    });
+}
