@@ -132,6 +132,43 @@ pub enum LogCommand {
         /// `ShardConfig::inline_ceiling_bytes`.
         inline_ceiling_bytes: u64,
     },
+    /// ADR-047 phase 5a (option 2): incorporate an async-committed write
+    /// intent into the Raft log. Semantically identical to [`Self::ChunkAndDelta`]
+    /// (seed `cluster_chunk_state` rows + append the delta, atomically) but
+    /// additionally carries the committer-assigned `perspective_seq`; the state
+    /// machine records the running max as `max_incorporated_seq`, the gate-1
+    /// **F-2** idempotency floor a recovering leader reads to drop re-gathered
+    /// intents.
+    ///
+    /// This is a NEW variant rather than a field on `ChunkAndDelta` because the
+    /// Raft log and network are `postcard`-encoded (positional, non-self-
+    /// describing — `#[serde(default)]` is inert): adding a field would break
+    /// decode of every pre-upgrade log entry. A new variant keeps all existing
+    /// variant indices byte-identical, so a post-upgrade binary still replays
+    /// the old log; the variant only appears once the ADR-047 capability gate
+    /// flips, per the F-4 two-release migration (release 1 ships the decoder,
+    /// release 2 enables writing). **Keep this variant LAST** — postcard keys
+    /// variants by declaration order.
+    IncorporateIntent {
+        /// Tenant ID (delta side).
+        tenant_id_bytes: [u8; 16],
+        /// Operation type code (delta side).
+        operation: u8,
+        /// Hashed key (delta side).
+        hashed_key: [u8; 32],
+        /// Chunk reference IDs (delta side).
+        chunk_refs: Vec<[u8; 32]>,
+        /// Encrypted payload (delta side).
+        payload: Vec<u8>,
+        /// Has inline data (delta side).
+        has_inline_data: bool,
+        /// Chunk metadata to create alongside the delta (see
+        /// [`Self::ChunkAndDelta::new_chunks`]).
+        new_chunks: Vec<NewChunkMeta>,
+        /// The committer-assigned perspective-seq for this intent (mandatory —
+        /// this variant is only ever produced by the async-commit path).
+        perspective_seq: kiseki_common::time::HybridLogicalClock,
+    },
 }
 
 /// New `cluster_chunk_state` entry to be created as part of a
@@ -166,6 +203,15 @@ impl std::fmt::Display for LogCommand {
             } => write!(
                 f,
                 "ChunkAndDelta(op={operation}, new_chunks={})",
+                new_chunks.len()
+            ),
+            Self::IncorporateIntent {
+                operation,
+                new_chunks,
+                ..
+            } => write!(
+                f,
+                "IncorporateIntent(op={operation}, new_chunks={})",
                 new_chunks.len()
             ),
             Self::IncrementChunkRefcount { .. } => write!(f, "IncrementChunkRefcount"),
@@ -370,6 +416,11 @@ impl RaftLogStore {
                 sm.info.byte_size += u64::from(payload_size) + 128;
                 sm.deltas.push(delta);
             }
+            // ADR-047 phase 5a: the in-memory fallback store tracks neither
+            // `cluster_chunk_state` nor the `max_incorporated_seq` floor (both
+            // live in the openraft `ShardStateMachine`), so `IncorporateIntent`
+            // is applied exactly like `ChunkAndDelta` — append the delta, discard
+            // `new_chunks` and the perspective-seq.
             LogCommand::ChunkAndDelta {
                 tenant_id_bytes,
                 operation,
@@ -378,6 +429,16 @@ impl RaftLogStore {
                 payload,
                 has_inline_data,
                 new_chunks: _,
+            }
+            | LogCommand::IncorporateIntent {
+                tenant_id_bytes,
+                operation,
+                hashed_key,
+                chunk_refs,
+                payload,
+                has_inline_data,
+                new_chunks: _,
+                perspective_seq: _,
             } => {
                 // The simple in-memory RaftLogStore doesn't track
                 // cluster_chunk_state — that lives in the openraft
@@ -691,6 +752,100 @@ impl LogOps for RaftLogStore {
 mod tests {
     use super::*;
     use crate::delta::OperationType;
+
+    /// Wire-format guard (ADR-047 phase 5a / adversary finding F-P5a-1).
+    ///
+    /// The Raft log (`kiseki-raft::fjall_log_store`) and the network
+    /// (`tcp_transport`) encode `LogCommand` with **postcard** — a positional,
+    /// non-self-describing format. The enum discriminant is a varint of the
+    /// variant's DECLARATION INDEX and struct fields carry no names, so two
+    /// rules keep a pre-upgrade persisted log decodable by a post-upgrade
+    /// binary (and mixed-version replication safe):
+    ///
+    ///   1. NEVER reorder or insert variants — only **append** (existing
+    ///      indices stay byte-identical). `#[serde(default)]` does NOT help —
+    ///      postcard ignores it.
+    ///   2. NEVER add/remove a field on an existing variant — add a **new
+    ///      variant** (this is why `IncorporateIntent` is a variant, not a
+    ///      field on `ChunkAndDelta`).
+    ///
+    /// This test pins the discriminants of the load-bearing variants. If it
+    /// fails, a change has shifted the postcard wire format and WILL corrupt
+    /// every pre-upgrade Raft log entry on the next deploy. Fix by appending,
+    /// not reordering.
+    #[test]
+    fn logcommand_postcard_discriminants_are_stable() {
+        let disc = |c: &LogCommand| postcard::to_stdvec(c).expect("encode")[0];
+        assert_eq!(
+            disc(&LogCommand::AppendDelta {
+                tenant_id_bytes: [0; 16],
+                operation: 0,
+                hashed_key: [0; 32],
+                chunk_refs: vec![],
+                payload: vec![],
+                has_inline_data: false,
+            }),
+            0,
+            "AppendDelta must stay variant 0"
+        );
+        assert_eq!(
+            disc(&LogCommand::ChunkAndDelta {
+                tenant_id_bytes: [0; 16],
+                operation: 0,
+                hashed_key: [0; 32],
+                chunk_refs: vec![],
+                payload: vec![],
+                has_inline_data: false,
+                new_chunks: vec![],
+            }),
+            1,
+            "ChunkAndDelta must stay variant 1"
+        );
+        // IncorporateIntent was appended last (ADR-047 phase 5a) — index 9.
+        assert_eq!(
+            disc(&LogCommand::IncorporateIntent {
+                tenant_id_bytes: [0; 16],
+                operation: 0,
+                hashed_key: [0; 32],
+                chunk_refs: vec![],
+                payload: vec![],
+                has_inline_data: false,
+                new_chunks: vec![],
+                perspective_seq: kiseki_common::time::HybridLogicalClock::zero(NodeId(0)),
+            }),
+            9,
+            "IncorporateIntent is the last variant — appending more must keep it stable, never insert before it"
+        );
+    }
+
+    /// `IncorporateIntent` round-trips through postcard with its
+    /// `perspective_seq` intact (the F-2 floor the state machine records).
+    #[test]
+    fn incorporate_intent_postcard_round_trips() {
+        let seq = kiseki_common::time::HybridLogicalClock {
+            physical_ms: 42,
+            logical: 7,
+            node_id: NodeId(3),
+        };
+        let cmd = LogCommand::IncorporateIntent {
+            tenant_id_bytes: [0xAB; 16],
+            operation: 1,
+            hashed_key: [0xCD; 32],
+            chunk_refs: vec![[0xEE; 32]],
+            payload: vec![1, 2, 3],
+            has_inline_data: true,
+            new_chunks: vec![],
+            perspective_seq: seq,
+        };
+        let bytes = postcard::to_stdvec(&cmd).expect("encode");
+        let back: LogCommand = postcard::from_bytes(&bytes).expect("decode");
+        match back {
+            LogCommand::IncorporateIntent {
+                perspective_seq, ..
+            } => assert_eq!(perspective_seq, seq),
+            other => panic!("expected IncorporateIntent, got {other}"),
+        }
+    }
 
     fn test_shard() -> ShardId {
         ShardId(uuid::Uuid::from_u128(1))

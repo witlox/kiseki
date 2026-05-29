@@ -38,6 +38,9 @@ tempfile = "3"
 
 [dev-dependencies]
 kiseki-control = { workspace = true }
+# Wire-format guard test: the Raft log + network encode LogCommand with
+# postcard (kiseki-raft), so a regression test pins the variant discriminants.
+postcard = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-stream = "0.1"

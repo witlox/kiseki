@@ -69,6 +69,13 @@ struct ShardSnapshot {
     shard_id: Option<[u8; 16]>,
     /// Tenant ID bytes (if set).
     tenant_id: Option<[u8; 16]>,
+    /// ADR-047 phase 5a (option 2): the F-2 idempotency floor — the highest
+    /// perspective-seq incorporated into the log. Persisted across snapshots so
+    /// a leader recovering from an installed snapshot (rather than log replay)
+    /// still reads the floor. `#[serde(default)]` keeps pre-5a snapshots
+    /// loadable (they decode to `None`).
+    #[serde(default)]
+    max_incorporated_seq: Option<kiseki_common::time::HybridLogicalClock>,
 }
 
 /// Serializable form of a Delta for snapshots.
@@ -204,6 +211,13 @@ pub struct ShardSmInner {
     /// across replicas (otherwise nodes disagree on when a shard
     /// crosses the I-L6 ceiling).
     pub(crate) config: crate::shard::ShardConfig,
+    /// ADR-047 phase 5a (option 2): the highest perspective-seq the async
+    /// committer has incorporated into this shard's Raft log, recorded as the
+    /// max of every applied `IncorporateIntent::perspective_seq`. The
+    /// gate-1 **F-2** floor: a recovering leader reads this to drop any
+    /// re-gathered intent at or below it rather than re-applying. `None` until
+    /// the first intent is incorporated (the sync write path never sets it).
+    pub(crate) max_incorporated_seq: Option<kiseki_common::time::HybridLogicalClock>,
 }
 
 impl ShardSmInner {
@@ -226,6 +240,7 @@ impl ShardSmInner {
             range_end: [0xFFu8; 32],
             state: crate::shard::ShardState::Healthy,
             config: crate::shard::ShardConfig::default(),
+            max_incorporated_seq: None,
         }
     }
 
@@ -393,6 +408,39 @@ impl ShardSmInner {
                 );
                 LogResponse::Appended(tip)
             }
+            // ADR-047 phase 5a (option 2): an async-committed intent — applied
+            // exactly like `ChunkAndDelta` (atomic chunk-meta + delta) but it
+            // additionally carries the committer-assigned perspective-seq. Record
+            // the running max so a recovering leader reads the gate-1 F-2
+            // idempotency floor from the replicated log. The delta's stamped HLC
+            // stays the log index (no I-L1 change) — the perspective-seq is
+            // recorded here, separately.
+            LogCommand::IncorporateIntent {
+                tenant_id_bytes,
+                operation,
+                hashed_key,
+                chunk_refs,
+                payload,
+                has_inline_data,
+                new_chunks,
+                perspective_seq,
+            } => {
+                self.apply_new_chunks(tenant_id_bytes, new_chunks, log_index);
+                let tip = self.append_delta_inner(
+                    tenant_id_bytes,
+                    *operation,
+                    hashed_key,
+                    chunk_refs,
+                    payload,
+                    *has_inline_data,
+                    log_index,
+                );
+                self.max_incorporated_seq = Some(
+                    self.max_incorporated_seq
+                        .map_or(*perspective_seq, |cur| cur.max(*perspective_seq)),
+                );
+                LogResponse::Appended(tip)
+            }
             LogCommand::IncrementChunkRefcount {
                 tenant_id_bytes,
                 chunk_id,
@@ -518,6 +566,7 @@ impl RaftSnapshotBuilder<C> for ShardStateMachine {
             watermarks: inner.watermarks.as_vec(),
             shard_id: Some(*inner.shard_id.0.as_bytes()),
             tenant_id: Some(*inner.tenant_id.0.as_bytes()),
+            max_incorporated_seq: inner.max_incorporated_seq,
         };
         let data = serde_json::to_vec(&snap).map_err(io::Error::other)?;
         let snapshot_id = format!(
@@ -590,6 +639,10 @@ impl RaftStateMachine<C> for ShardStateMachine {
         inner.delta_count = snap.delta_count;
         inner.tip = snap.tip;
         inner.maintenance = snap.maintenance;
+        // ADR-047 phase 5a (option 2): restore the F-2 idempotency floor so a
+        // leader recovering from an installed snapshot reads the same floor a
+        // log-replay recovery would.
+        inner.max_incorporated_seq = snap.max_incorporated_seq;
         // Restore deltas, offloading inline content to the store if available.
         inner.deltas = snap
             .deltas
@@ -644,6 +697,7 @@ impl RaftStateMachine<C> for ShardStateMachine {
             watermarks: inner.watermarks.as_vec(),
             shard_id: Some(*inner.shard_id.0.as_bytes()),
             tenant_id: Some(*inner.tenant_id.0.as_bytes()),
+            max_incorporated_seq: inner.max_incorporated_seq,
         };
         let data = serde_json::to_vec(&snap).map_err(io::Error::other)?;
         let meta = SnapshotMetaOf::<C> {
@@ -903,5 +957,120 @@ mod tests {
             .expect("entry still present (tombstoned, not removed)");
         assert_eq!(entry.refcount, 0);
         assert!(entry.tombstoned, "refcount=0 must mark entry tombstoned");
+    }
+
+    // -----------------------------------------------------------
+    // ADR-047 phase 5a (option 2) — max_incorporated_seq.
+    //
+    // An IncorporateIntent advances the state machine's F-2 idempotency floor
+    // (the running max); a synchronous append (ChunkAndDelta / AppendDelta)
+    // leaves it untouched. The floor survives a ShardSnapshot serde round-trip
+    // so a snapshot-recovered leader reads it.
+    // -----------------------------------------------------------
+
+    fn hlc(physical_ms: u64, logical: u32, node: u64) -> kiseki_common::time::HybridLogicalClock {
+        kiseki_common::time::HybridLogicalClock {
+            physical_ms,
+            logical,
+            node_id: kiseki_common::ids::NodeId(node),
+        }
+    }
+
+    /// An `IncorporateIntent` advances `max_incorporated_seq` to the running
+    /// max — higher seqs raise it, lower seqs do not. A `ChunkAndDelta` (the
+    /// sync path) and an `AppendDelta` leave it unchanged.
+    #[test]
+    fn incorporate_intent_advances_floor_monotonically() {
+        let mut inner = fresh_inner();
+        let tenant = org(1);
+
+        let mk = |seq: kiseki_common::time::HybridLogicalClock| LogCommand::IncorporateIntent {
+            tenant_id_bytes: tenant,
+            operation: 0,
+            hashed_key: [0; 32],
+            chunk_refs: vec![],
+            payload: vec![],
+            has_inline_data: false,
+            new_chunks: vec![],
+            perspective_seq: seq,
+        };
+
+        // Fresh: no intent incorporated yet.
+        assert_eq!(inner.max_incorporated_seq, None);
+
+        // An IncorporateIntent sets the floor.
+        let _ = inner.apply_command(&mk(hlc(2, 0, 1)), 1);
+        assert_eq!(inner.max_incorporated_seq, Some(hlc(2, 0, 1)));
+
+        // A higher seq raises it.
+        let _ = inner.apply_command(&mk(hlc(5, 0, 1)), 2);
+        assert_eq!(inner.max_incorporated_seq, Some(hlc(5, 0, 1)));
+
+        // A lower seq does NOT lower it (the max is monotone).
+        let _ = inner.apply_command(&mk(hlc(3, 0, 1)), 3);
+        assert_eq!(inner.max_incorporated_seq, Some(hlc(5, 0, 1)));
+
+        // A ChunkAndDelta (the sync write path) leaves the floor intact.
+        let _ = inner.apply_command(
+            &LogCommand::ChunkAndDelta {
+                tenant_id_bytes: tenant,
+                operation: 0,
+                hashed_key: [0; 32],
+                chunk_refs: vec![],
+                payload: vec![],
+                has_inline_data: false,
+                new_chunks: vec![],
+            },
+            4,
+        );
+        assert_eq!(inner.max_incorporated_seq, Some(hlc(5, 0, 1)));
+
+        // A plain AppendDelta also leaves it intact.
+        let _ = inner.apply_command(
+            &LogCommand::AppendDelta {
+                tenant_id_bytes: tenant,
+                operation: 0,
+                hashed_key: [0; 32],
+                chunk_refs: vec![],
+                payload: vec![],
+                has_inline_data: false,
+            },
+            5,
+        );
+        assert_eq!(inner.max_incorporated_seq, Some(hlc(5, 0, 1)));
+    }
+
+    /// The F-2 floor survives a `ShardSnapshot` `serde_json` save→load, so a
+    /// leader recovering from an installed snapshot (not a log replay) still
+    /// reads it. Mirrors the `install_snapshot` restore wiring.
+    #[test]
+    fn max_incorporated_seq_survives_snapshot_round_trip() {
+        let snap = ShardSnapshot {
+            delta_count: 3,
+            tip: 3,
+            maintenance: false,
+            deltas: vec![],
+            watermarks: vec![],
+            shard_id: Some([1u8; 16]),
+            tenant_id: Some([2u8; 16]),
+            max_incorporated_seq: Some(hlc(7, 1, 9)),
+        };
+        let bytes = serde_json::to_vec(&snap).unwrap();
+        let loaded: ShardSnapshot = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(loaded.max_incorporated_seq, Some(hlc(7, 1, 9)));
+
+        // A pre-5a snapshot (the field absent on the wire) decodes to None via
+        // #[serde(default)] — the additive-compat guarantee.
+        let legacy = serde_json::json!({
+            "delta_count": 0,
+            "tip": 0,
+            "maintenance": false,
+            "deltas": [],
+            "watermarks": [],
+            "shard_id": null,
+            "tenant_id": null
+        });
+        let loaded_legacy: ShardSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(loaded_legacy.max_incorporated_seq, None);
     }
 }

@@ -27,6 +27,7 @@ pub mod merge;
 pub mod metrics;
 pub mod persistent_store;
 pub mod raft;
+pub mod raft_intent_sink;
 pub mod raft_shard_store;
 pub mod raft_store;
 pub mod shard;

@@ -61,6 +61,13 @@ pub enum IntentError {
         /// Majority threshold required (`cluster_size / 2 + 1`).
         need: usize,
     },
+
+    /// Appending an incorporated intent into the Raft log failed (ADR-047
+    /// phase 5a). Carries the underlying append/Raft error rendered to a
+    /// `String` so the [`IncorporationSink`](crate::intent_committer::IncorporationSink)
+    /// seam need not leak `LogError` into callers that match on `IntentError`.
+    #[error("intent incorporation into the log failed: {0}")]
+    Incorporate(String),
 }
 
 impl From<fjall::Error> for IntentError {

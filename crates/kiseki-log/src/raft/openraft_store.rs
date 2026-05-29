@@ -24,9 +24,10 @@ use super::state_machine::{ShardSmInner, ShardStateMachine};
 use super::types::{LogResponse, LogTypeConfig};
 use crate::delta::Delta;
 use crate::error::LogError;
+use crate::intent::PerspectiveSeq;
 use crate::raft_store::LogCommand;
 use crate::shard::{ShardInfo, ShardState};
-use crate::traits::{AppendDeltaRequest, ReadDeltasRequest};
+use crate::traits::{AppendChunkAndDeltaRequest, AppendDeltaRequest, ReadDeltasRequest};
 use kiseki_common::locks::LockOrDie;
 
 type C = LogTypeConfig;
@@ -510,6 +511,64 @@ impl OpenRaftLogStore {
         }
     }
 
+    /// ADR-047 phase 5a (option 2): incorporate an async-committed intent
+    /// into the Raft log.
+    ///
+    /// Like [`Self::append_chunk_and_delta`] — seeds the `cluster_chunk_state`
+    /// rows and appends the delta atomically — but emits the dedicated
+    /// [`LogCommand::IncorporateIntent`] variant carrying the committer-assigned
+    /// `perspective_seq`. The state machine records the running max as
+    /// `max_incorporated_seq` (the gate-1 F-2 floor); a recovering leader reads
+    /// it via [`Self::max_incorporated_seq`] to drop re-gathered intents.
+    ///
+    /// # Errors
+    /// [`LogError::MaintenanceMode`] if the shard is draining;
+    /// [`LogError::LeaderUnavailable`] if this node is not the leader;
+    /// [`LogError::Unavailable`] on any other Raft client-write failure.
+    pub async fn append_intent(
+        &self,
+        req: AppendChunkAndDeltaRequest,
+        perspective_seq: PerspectiveSeq,
+    ) -> Result<SequenceNumber, LogError> {
+        {
+            let inner = self.state.lock().await;
+            if inner.maintenance {
+                return Err(LogError::MaintenanceMode(self.shard_id));
+            }
+        }
+
+        let cmd = LogCommand::IncorporateIntent {
+            tenant_id_bytes: *req.delta.tenant_id.0.as_bytes(),
+            operation: op_to_u8(req.delta.operation),
+            hashed_key: req.delta.hashed_key,
+            chunk_refs: req.delta.chunk_refs.iter().map(|c| c.0).collect(),
+            payload: req.delta.payload,
+            has_inline_data: req.delta.has_inline_data,
+            new_chunks: req.new_chunks,
+            // The async-commit path: stamp the committer-assigned perspective-seq
+            // so the state machine advances the F-2 floor.
+            perspective_seq: perspective_seq.0,
+        };
+
+        let resp = self.raft.client_write(cmd).await.map_err(|e| {
+            if matches!(
+                e,
+                openraft::errors::RaftError::APIError(
+                    openraft::error::ClientWriteError::ForwardToLeader(_)
+                )
+            ) {
+                LogError::LeaderUnavailable(self.shard_id)
+            } else {
+                LogError::Unavailable
+            }
+        })?;
+
+        match resp.response() {
+            LogResponse::Appended(seq) => Ok(SequenceNumber(*seq)),
+            LogResponse::Ok | LogResponse::DecrementOutcome(_) => Err(LogError::Unavailable),
+        }
+    }
+
     /// ADR-042 §4 — `append_chunk_and_delta` that surfaces
     /// `LogError::ForwardToLeader` instead of `LeaderUnavailable`.
     /// Used by [`crate::traits::LogOps::append_chunk_and_delta_with_forwarding`]
@@ -791,6 +850,17 @@ impl OpenRaftLogStore {
     pub async fn current_tip(&self) -> SequenceNumber {
         let inner = self.state.lock().await;
         SequenceNumber(inner.tip)
+    }
+
+    /// ADR-047 phase 5a (option 2): the highest perspective-seq incorporated
+    /// into this shard's Raft log — the gate-1 F-2 idempotency floor.
+    ///
+    /// Read from the same replicated state machine `current_tip` reads, so a
+    /// recovering leader sees the floor as of the last applied log entry (or
+    /// installed snapshot). `None` until the first intent is incorporated.
+    pub async fn max_incorporated_seq(&self) -> Option<kiseki_common::time::HybridLogicalClock> {
+        let inner = self.state.lock().await;
+        inner.max_incorporated_seq
     }
 
     /// Check whether the shard is in maintenance mode.
