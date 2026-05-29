@@ -68,25 +68,6 @@ pub enum LogCommand {
         /// no new chunks" (e.g., delete operation).
         new_chunks: Vec<NewChunkMeta>,
     },
-    /// ADR-046 (W1) — write coalescing. N independent `ChunkAndDelta`
-    /// proposals committed as ONE Raft log entry to amortize the
-    /// consensus round across the batch. Applied atomically: every item
-    /// or none (Raft entry atomicity), in batch order, each producing one
-    /// delta at its own sequence and HLC `logical = item index` (the
-    /// items share the entry's `log_index`, so `logical` disambiguates —
-    /// ADR-046 rev-2 H1). Idempotency is enforced gateway/queue-side
-    /// BEFORE an item enters a batch (rev-2 H2); the apply is a pure
-    /// append, exactly like `ChunkAndDelta`.
-    ///
-    /// **Mixed-version gate (rev-2 C1):** this is a durable log-format
-    /// addition — every replica must ship the decoder (this variant)
-    /// before any leader emits one. Release R ships decode+apply,
-    /// hard-gated off; emission is authorized by a committed cluster-wide
-    /// capability in R+1.
-    BatchChunkAndDelta {
-        /// The coalesced proposals, applied in order.
-        items: Vec<ChunkAndDeltaItem>,
-    },
     /// Increment the refcount of an existing `cluster_chunk_state`
     /// entry. Used when a second composition references an already-
     /// stored chunk via dedup (I-C2). No effect on deltas.
@@ -174,31 +155,6 @@ pub struct NewChunkMeta {
     pub original_len: u64,
 }
 
-/// One coalesced proposal inside [`LogCommand::BatchChunkAndDelta`]
-/// (ADR-046, W1). Carries exactly the fields of a single
-/// `LogCommand::ChunkAndDelta` — no `idempotency_key` (idempotency is
-/// gateway/queue-side, rev-2 H2). Applying a batch is equivalent to
-/// applying each item as a `ChunkAndDelta` in order, with the HLC
-/// `logical` set to the item's batch index.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ChunkAndDeltaItem {
-    /// Tenant ID (delta side).
-    pub tenant_id_bytes: [u8; 16],
-    /// Operation type code (delta side).
-    pub operation: u8,
-    /// Hashed key (delta side).
-    pub hashed_key: [u8; 32],
-    /// Chunk reference IDs (delta side).
-    pub chunk_refs: Vec<[u8; 32]>,
-    /// Encrypted payload (delta side).
-    pub payload: Vec<u8>,
-    /// Has inline data (delta side).
-    pub has_inline_data: bool,
-    /// Chunk metadata to create alongside the delta (see
-    /// [`LogCommand::ChunkAndDelta`]'s `new_chunks`).
-    pub new_chunks: Vec<NewChunkMeta>,
-}
-
 impl std::fmt::Display for LogCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -212,9 +168,6 @@ impl std::fmt::Display for LogCommand {
                 "ChunkAndDelta(op={operation}, new_chunks={})",
                 new_chunks.len()
             ),
-            Self::BatchChunkAndDelta { items } => {
-                write!(f, "BatchChunkAndDelta(items={})", items.len())
-            }
             Self::IncrementChunkRefcount { .. } => write!(f, "IncrementChunkRefcount"),
             Self::DecrementChunkRefcount { .. } => write!(f, "DecrementChunkRefcount"),
             Self::SetMaintenance { enabled } => write!(f, "SetMaintenance({enabled})"),
@@ -488,72 +441,6 @@ impl RaftLogStore {
                 sm.info.delta_count += 1;
                 sm.info.byte_size += u64::from(payload_size) + 128;
                 sm.deltas.push(delta);
-            }
-            LogCommand::BatchChunkAndDelta { items } => {
-                // ADR-046 (W1). In-memory fallback: apply each item as a
-                // plain delta (this path doesn't track cluster_chunk_state,
-                // same simplification as the ChunkAndDelta branch above).
-                // The items share the entry `index`, so HLC `logical` is
-                // the item's batch position (rev-2 H1) to keep the deltas
-                // distinct + monotonic.
-                for (i, item) in items.iter().enumerate() {
-                    let next_seq = SequenceNumber(sm.info.tip.0 + 1);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let payload_size = item.payload.len() as u32;
-                    let op = match item.operation {
-                        0 => crate::delta::OperationType::Create,
-                        1 => crate::delta::OperationType::Update,
-                        2 => crate::delta::OperationType::Delete,
-                        3 => crate::delta::OperationType::Rename,
-                        4 => crate::delta::OperationType::SetAttribute,
-                        5 => crate::delta::OperationType::Finalize,
-                        _ => crate::delta::OperationType::NamespaceCreate,
-                    };
-                    let timestamp = kiseki_common::time::DeltaTimestamp {
-                        hlc: kiseki_common::time::HybridLogicalClock {
-                            physical_ms: index,
-                            logical: u32::try_from(i).unwrap_or(u32::MAX),
-                            node_id: NodeId(0),
-                        },
-                        wall: kiseki_common::time::WallTime {
-                            millis_since_epoch: index,
-                            timezone: "UTC".into(),
-                        },
-                        quality: kiseki_common::time::ClockQuality::Ntp,
-                    };
-                    let delta = Delta {
-                        header: DeltaHeader {
-                            sequence: next_seq,
-                            shard_id,
-                            tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_bytes(
-                                item.tenant_id_bytes,
-                            )),
-                            operation: op,
-                            timestamp,
-                            hashed_key: item.hashed_key,
-                            tombstone: item.operation == 2,
-                            chunk_refs: item
-                                .chunk_refs
-                                .iter()
-                                .map(|b| kiseki_common::ids::ChunkId(*b))
-                                .collect(),
-                            payload_size,
-                            has_inline_data: item.has_inline_data,
-                        },
-                        payload: DeltaPayload {
-                            ciphertext: item.payload.clone(),
-                            auth_tag: Vec::new(),
-                            nonce: Vec::new(),
-                            system_epoch: None,
-                            tenant_epoch: None,
-                            tenant_wrapped_material: Vec::new(),
-                        },
-                    };
-                    sm.info.tip = next_seq;
-                    sm.info.delta_count += 1;
-                    sm.info.byte_size += u64::from(payload_size) + 128;
-                    sm.deltas.push(delta);
-                }
             }
             LogCommand::IncrementChunkRefcount { .. }
             | LogCommand::DecrementChunkRefcount { .. } => {

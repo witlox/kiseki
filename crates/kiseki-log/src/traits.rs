@@ -152,24 +152,6 @@ pub trait LogOps: Send + Sync {
         self.append_delta_with_forwarding(req.delta).await
     }
 
-    /// ADR-046 (W1) — commit N `ChunkAndDelta` proposals (all on one
-    /// shard) and return one sequence number per item, in order. The
-    /// **default** applies them one at a time (correct, but NOT coalesced
-    /// — no consensus amortization); the Raft-backed store overrides this
-    /// to commit all items in a single `BatchChunkAndDelta` log entry.
-    /// Idempotency is the caller's (queue-side) responsibility — items
-    /// here are already de-duplicated.
-    async fn append_batch_chunk_and_delta(
-        &self,
-        reqs: Vec<AppendChunkAndDeltaRequest>,
-    ) -> Result<Vec<SequenceNumber>, LogError> {
-        let mut seqs = Vec::with_capacity(reqs.len());
-        for req in reqs {
-            seqs.push(self.append_chunk_and_delta_with_forwarding(req).await?);
-        }
-        Ok(seqs)
-    }
-
     /// Bump a chunk's `cluster_chunk_state` refcount on an existing
     /// entry — Phase 16b. No-op default (in-memory store does not
     /// track `cluster_chunk_state`). Production override proposes

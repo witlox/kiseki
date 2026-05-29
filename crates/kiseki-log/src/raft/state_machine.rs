@@ -249,11 +249,6 @@ impl ShardSmInner {
         payload: &[u8],
         has_inline_data: bool,
         log_index: u64,
-        // HLC logical component. 0 for a standalone entry; the item's
-        // batch index for `BatchChunkAndDelta` (N items share one
-        // `log_index`, so `logical` keeps their HLCs distinct + monotonic
-        // — ADR-046 rev-2 H1).
-        logical: u32,
     ) -> u64 {
         self.tip += 1;
         self.delta_count += 1;
@@ -267,7 +262,7 @@ impl ShardSmInner {
         let timestamp = kiseki_common::time::DeltaTimestamp {
             hlc: kiseki_common::time::HybridLogicalClock {
                 physical_ms: log_index,
-                logical,
+                logical: 0,
                 node_id: kiseki_common::ids::NodeId(0),
             },
             wall: kiseki_common::time::WallTime {
@@ -370,7 +365,6 @@ impl ShardSmInner {
                     payload,
                     *has_inline_data,
                     log_index,
-                    0, // standalone entry → HLC logical 0
                 );
                 LogResponse::Appended(tip)
             }
@@ -396,33 +390,8 @@ impl ShardSmInner {
                     payload,
                     *has_inline_data,
                     log_index,
-                    0, // standalone entry → HLC logical 0
                 );
                 LogResponse::Appended(tip)
-            }
-            LogCommand::BatchChunkAndDelta { items } => {
-                // ADR-046 (W1): apply each coalesced item in batch order,
-                // atomic with the entry. chunk-meta first then the delta
-                // (D-4, same as the single ChunkAndDelta). Per-item HLC
-                // `logical = i` (rev-2 H1) since all items share this
-                // entry's `log_index`. One seq per item, returned in order
-                // for the coalescing queue's per-item fan-out.
-                let mut seqs = Vec::with_capacity(items.len());
-                for (i, item) in items.iter().enumerate() {
-                    self.apply_new_chunks(&item.tenant_id_bytes, &item.new_chunks, log_index);
-                    let tip = self.append_delta_inner(
-                        &item.tenant_id_bytes,
-                        item.operation,
-                        &item.hashed_key,
-                        &item.chunk_refs,
-                        &item.payload,
-                        item.has_inline_data,
-                        log_index,
-                        u32::try_from(i).unwrap_or(u32::MAX),
-                    );
-                    seqs.push(tip);
-                }
-                LogResponse::BatchAppended(seqs)
             }
             LogCommand::IncrementChunkRefcount {
                 tenant_id_bytes,
@@ -810,66 +779,6 @@ mod tests {
             entry.original_len, 1024,
             "original_len must round-trip into cluster_chunk_state"
         );
-    }
-
-    /// ADR-046 (W1): a `BatchChunkAndDelta` applies every item atomically
-    /// in one apply step — N deltas at consecutive sequences, each item's
-    /// chunk-meta created, and (rev-2 H1) each delta's HLC `logical` set to
-    /// its batch index (all N share the entry's `log_index`, so `logical`
-    /// keeps them distinct + monotonic). Returns one seq per item, in order.
-    #[test]
-    fn batch_chunk_and_delta_applies_all_items_with_per_item_hlc_logical() {
-        let mut inner = fresh_inner();
-        let log_index = 5;
-        let items: Vec<_> = (0..3u8)
-            .map(|i| crate::raft_store::ChunkAndDeltaItem {
-                tenant_id_bytes: org(i + 1),
-                operation: 0, // Create
-                hashed_key: [0x10 + i; 32],
-                chunk_refs: vec![chunk(0x20 + i)],
-                payload: vec![0xAA; 8],
-                has_inline_data: false,
-                new_chunks: vec![NewChunkMeta {
-                    chunk_id: chunk(0x20 + i),
-                    placement: vec![1, 2, 3],
-                    original_len: 8,
-                }],
-            })
-            .collect();
-
-        let resp = inner.apply_command(&LogCommand::BatchChunkAndDelta { items }, log_index);
-
-        // One seq per item, consecutive from tip, in batch order.
-        match resp {
-            LogResponse::BatchAppended(seqs) => assert_eq!(seqs, vec![1, 2, 3]),
-            other => panic!("expected BatchAppended, got {other}"),
-        }
-        assert_eq!(inner.deltas.len(), 3, "all 3 items appended");
-        assert_eq!(inner.tip, 3);
-
-        // rev-2 H1: per-item HLC `logical` = batch index; all share
-        // physical_ms = log_index (so they are NOT HLC-indistinguishable).
-        for (i, d) in inner.deltas.iter().enumerate() {
-            assert_eq!(d.header.sequence.0, (i as u64) + 1);
-            assert_eq!(d.header.timestamp.hlc.physical_ms, log_index);
-            assert_eq!(
-                d.header.timestamp.hlc.logical,
-                u32::try_from(i).unwrap(),
-                "batch item {i} must carry HLC logical={i}"
-            );
-        }
-
-        // Each item's chunk-meta created in the same atomic step.
-        for i in 0..3u8 {
-            let key = (
-                OrgId(uuid::Uuid::from_bytes(org(i + 1))),
-                ChunkId(chunk(0x20 + i)),
-            );
-            assert!(
-                inner.cluster_chunk_state.contains_key(&key),
-                "chunk-meta for item {i} must exist after batch apply"
-            );
-        }
     }
 
     /// Separate tenants writing the same `chunk_id` end up with

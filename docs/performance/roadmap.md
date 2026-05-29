@@ -19,22 +19,37 @@ Baseline measurements are the 2026-05-28 `default` matrix (RUN 3) —
 
 ## TL;DR
 
-**One problem dominates everything: writes are commit-bound.** A single
-PUT (S3 / native / NFS COMMIT) costs ~p50 180 ms and the cluster tops out
-at **~250 op/s · ~15 MB/s** aggregate, versus a derived target of
-**5.2 GB/s (S3) / 10 GB/s (pNFS) / 360 k op/s (native)**. Reads already
-scale (**23 k op/s · 1.4 GiB/s**, 0 err).
+**Writes top out at ~250 op/s · ~15 MB/s aggregate** on the 6-node run
+(vs derived targets 5.2 GB/s S3 / 10 GB/s pNFS / 360 k op/s native);
+reads scale (23 k op/s · 1.4 GiB/s).
 
-**One root cause dominates the writes: every write is its own Raft
-consensus round, awaited synchronously — no batching, no pipelining.**
-At ~30–45 ms consensus RTT per entry, throughput is bounded by
-`(shards × concurrency) ÷ RTT`, not by NIC/disk/CPU. Until writes batch
-into shared consensus rounds, no amount of NIC/disk headroom helps.
+**2026-05-29 — the cause is NOT the consensus round** (this supersedes
+the "commit-bound / batched-commit is the lever" framing kept below for
+history). The isolated openraft `client_write` round is **~1 ms** (2-node
+loopback, no server load — `multi_shard_transport::
+measure_openraft_round_latency`, mean 973 µs). The single-node full write
+path is **240 µs**. Yet the full multi-node path is **~15 ms (local) /
+~42 ms (GCP)**. That delta is a **stacked off-CPU wait** in the commit
+pipeline under full-server load — and its mechanism is **NOT yet proven**:
+it is *not* the openraft round (1 ms), *not* the gateway work (240 µs),
+and *not* cleanly co-location (GCP on dedicated HW was also lowball, and a
+CPU flamegraph shows idle, not hot stacks). The right probe is **off-CPU /
+async-aware** (tokio-console per-task poll/wait, or per-step timing spans
+in the loaded server) — NOT a flamegraph.
 
-The single highest-leverage change is **group/batched Raft commit**
-(coalesce concurrent writes on a shard-leader into one consensus entry).
-Everything else (distributed leaders, hydrator throughput, per-chunk
-fsync, read concurrency) is real but secondary.
+**W1 (batched Raft commit) was built and REJECTED.** openraft already
+auto-batches concurrent `client_write`s (`max_payload_entries: 300`),
+proven by 13× throughput scaling conc-1→16 *without* W1 — so coalescing
+adds nothing against a 1 ms round. Reverted; ADR-046 kept as a rejected
+record.
+
+**Path to target (no consensus changes):** one server per box (removes
+the co-located-test contention that produced the local 15 ms) +
+**client-side route-to-leader** (removes the ~9 ms forward hop the GCP run
+paid on 5/6 of writes) + concurrency × shards. Per-write floor ≈ round
+(1 ms) + gateway work (240 µs) ≈ **~1.5 ms** → 18 shards × ~30 conc /
+1.5 ms ≈ 360 k. **First prove the stacked-wait mechanism** (off-CPU
+profile) before building the route-to-leader change.
 
 ---
 
@@ -90,7 +105,15 @@ target.
 
 ## Write fix plan (prioritised)
 
-### W1 — Batched / pipelined Raft commit (the lever) · **#126**
+### W1 — Batched / pipelined Raft commit · **#126** — ❌ REJECTED (2026-05-29)
+**Built (ADR-046, R+R+1) and reverted.** openraft already auto-batches
+concurrent `client_write`s (`max_payload_entries: 300`) — measured 13×
+throughput scaling conc-1→16 *without* W1 — so coalescing into one entry
+amortises a round that's already amortised, against a round that's only
+~1 ms anyway. No measurable lift (flat local + GCP). The premise below
+(35 ms RTT/write) was the wrong number; the round is ~1 ms. Kept here as
+the rejected analysis:
+
 Coalesce concurrent writes arriving at a shard-leader into a **single
 Raft entry per consensus round** (a bounded micro-batch: flush on N
 entries or T µs, whichever first). One ~35 ms RTT then amortises across
@@ -105,20 +128,11 @@ the whole batch instead of one write.
   serially.
 - **Effort:** ADR-grade (changes the write→commit contract; interacts
   with idempotency_key and the I-CP invariants). **Risk:** Medium-High.
-- **Status: LANDED (gated off) — ADR-046.** Release R (decode + atomic
-  apply + queue) and **Release R+1 (emission wired)** both landed
-  2026-05-28 on `perf/2026-05-28-roadmap`. The `WriteCoalescer` sits in
-  `kiseki-log` and routes `RaftShardStore::append_chunk_and_delta
-  [_with_forwarding]` — the convergence point for local **and**
-  #114-forwarded writes — through a per-shard micro-batch when enabled.
-  Idempotency stays gateway-side (rev-2 H2); `ForwardToLeader` survives
-  the batch fan-out (rev-2 M3). Integration-tested on real Raft.
-- **Enable:** set `KISEKI_WRITE_COALESCE=on` on **every** node (default
-  OFF — mixed-version gate, ADR-046 §C1). Tunables:
-  `KISEKI_WRITE_COALESCE_{MAX_BATCH,MAX_BATCH_BYTES,FLUSH_US,QUEUE_DEPTH}`.
-  **Measure** the lift via the `raft_commit` put-phase histogram on the
-  next GCP run; the ~40× projection below is still a projection until
-  that real-hardware number lands.
+- **Status: profile-first.** The 2026-05-28 code audit (below) found the
+  consensus-layer batching/fsync are *already* in place, so coalescing
+  is the *likely* fix but must be confirmed by a pprof decomposition of
+  the 180 ms before it's worth the ADR. Not landed this pass —
+  deliberately, to avoid a speculative durability-path change. #126.
 
 ### W2 — Distributed shard leaders · #99 / #111 / #114 (landed)
 Spreading leaders across all 6 nodes (`namespace-create --shards 6`)

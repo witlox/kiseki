@@ -350,9 +350,7 @@ impl OpenRaftLogStore {
 
         match resp.response() {
             LogResponse::Appended(seq) => Ok(SequenceNumber(*seq)),
-            LogResponse::Ok | LogResponse::DecrementOutcome(_) | LogResponse::BatchAppended(_) => {
-                Err(LogError::Unavailable)
-            }
+            LogResponse::Ok | LogResponse::DecrementOutcome(_) => Err(LogError::Unavailable),
         }
     }
 
@@ -415,9 +413,7 @@ impl OpenRaftLogStore {
 
         match resp.response() {
             LogResponse::Appended(seq) => Ok(SequenceNumber(*seq)),
-            LogResponse::Ok | LogResponse::DecrementOutcome(_) | LogResponse::BatchAppended(_) => {
-                Err(LogError::Unavailable)
-            }
+            LogResponse::Ok | LogResponse::DecrementOutcome(_) => Err(LogError::Unavailable),
         }
     }
 
@@ -466,9 +462,7 @@ impl OpenRaftLogStore {
 
         match resp.response() {
             LogResponse::Appended(seq) => Ok(SequenceNumber(*seq)),
-            LogResponse::Ok | LogResponse::DecrementOutcome(_) | LogResponse::BatchAppended(_) => {
-                Err(LogError::Unavailable)
-            }
+            LogResponse::Ok | LogResponse::DecrementOutcome(_) => Err(LogError::Unavailable),
         }
     }
 
@@ -512,9 +506,7 @@ impl OpenRaftLogStore {
 
         match resp.response() {
             LogResponse::Appended(seq) => Ok(SequenceNumber(*seq)),
-            LogResponse::Ok | LogResponse::DecrementOutcome(_) | LogResponse::BatchAppended(_) => {
-                Err(LogError::Unavailable)
-            }
+            LogResponse::Ok | LogResponse::DecrementOutcome(_) => Err(LogError::Unavailable),
         }
     }
 
@@ -552,60 +544,7 @@ impl OpenRaftLogStore {
 
         match resp.response() {
             LogResponse::Appended(seq) => Ok(SequenceNumber(*seq)),
-            LogResponse::Ok | LogResponse::DecrementOutcome(_) | LogResponse::BatchAppended(_) => {
-                Err(LogError::Unavailable)
-            }
-        }
-    }
-
-    /// ADR-046 (W1) — commit N `ChunkAndDelta` proposals as ONE Raft entry
-    /// (`BatchChunkAndDelta`), amortizing the consensus round across the
-    /// batch. Returns one sequence number per item, in batch order, for
-    /// the coalescing queue's per-item fan-out. All items target this
-    /// shard (the queue is per-shard). Same maintenance + leader-forward
-    /// error mapping as the single append.
-    pub async fn append_batch_chunk_and_delta(
-        &self,
-        items: Vec<(AppendDeltaRequest, Vec<crate::raft_store::NewChunkMeta>)>,
-    ) -> Result<Vec<SequenceNumber>, LogError> {
-        if items.is_empty() {
-            return Ok(Vec::new());
-        }
-        {
-            let inner = self.state.lock().await;
-            if inner.maintenance {
-                return Err(LogError::MaintenanceMode(self.shard_id));
-            }
-        }
-
-        let cmd = LogCommand::BatchChunkAndDelta {
-            items: items
-                .into_iter()
-                .map(|(req, new_chunks)| crate::raft_store::ChunkAndDeltaItem {
-                    tenant_id_bytes: *req.tenant_id.0.as_bytes(),
-                    operation: op_to_u8(req.operation),
-                    hashed_key: req.hashed_key,
-                    chunk_refs: req.chunk_refs.iter().map(|c| c.0).collect(),
-                    payload: req.payload,
-                    has_inline_data: req.has_inline_data,
-                    new_chunks,
-                })
-                .collect(),
-        };
-
-        let resp = self
-            .raft
-            .client_write(cmd)
-            .await
-            .map_err(|e| map_raft_error_with_forwarding(e, self.shard_id))?;
-
-        match resp.response() {
-            LogResponse::BatchAppended(seqs) => {
-                Ok(seqs.iter().map(|s| SequenceNumber(*s)).collect())
-            }
-            LogResponse::Appended(_) | LogResponse::Ok | LogResponse::DecrementOutcome(_) => {
-                Err(LogError::Unavailable)
-            }
+            LogResponse::Ok | LogResponse::DecrementOutcome(_) => Err(LogError::Unavailable),
         }
     }
 

@@ -44,14 +44,6 @@ op/s in exchange for a bounded loss window.
 > knob (NFSv4.1 fast-path workaround), not a durability knob —
 > documented in [`performance.md`](performance.md#kiseki_disable_pnfs_layout-force-mds-only-nfsv4).
 
-> `KISEKI_WRITE_COALESCE` (ADR-046 W1 write batching, default OFF) is
-> **not** a durability knob either: a coalesced batch commits as ONE
-> atomic Raft entry, so the per-node loss window is identical to a
-> single write — every item in a batch is replicated + durable together
-> or fails together and retries. It IS a **mixed-version gate**: only
-> enable it once every node runs a binary that decodes
-> `BatchChunkAndDelta` (Release R+). See ADR-046 §"Gate (rev-2 C1)".
-
 
 ### `KISEKI_CHUNK_FLUSH_INTERVAL_MS` (chunk-store flush interval)
 

@@ -261,10 +261,14 @@ fn measure_openraft_round_latency() {
     let (n1, _n2) = rt.block_on(async {
         let l1 = RaftRpcListener::new(format!("127.0.0.1:{}", ports[0]), None);
         let r1 = l1.registry();
-        tokio::spawn(async move { let _ = l1.run().await; });
+        tokio::spawn(async move {
+            let _ = l1.run().await;
+        });
         let l2 = RaftRpcListener::new(format!("127.0.0.1:{}", ports[1]), None);
         let r2 = l2.registry();
-        tokio::spawn(async move { let _ = l2.run().await; });
+        tokio::spawn(async move {
+            let _ = l2.run().await;
+        });
         let n1 = OpenRaftLogStore::new(1, shard_a(), test_tenant(), &peers, None, None)
             .await
             .unwrap();
@@ -283,8 +287,15 @@ fn measure_openraft_round_latency() {
         tenant_id: test_tenant(),
         operation: OperationType::Create,
         timestamp: DeltaTimestamp {
-            hlc: HybridLogicalClock { physical_ms: 1000, logical: 0, node_id: NodeId(1) },
-            wall: WallTime { millis_since_epoch: 1000, timezone: "UTC".into() },
+            hlc: HybridLogicalClock {
+                physical_ms: 1000,
+                logical: 0,
+                node_id: NodeId(1),
+            },
+            wall: WallTime {
+                millis_since_epoch: 1000,
+                timezone: "UTC".into(),
+            },
             quality: ClockQuality::Ntp,
         },
         hashed_key: [(i % 251) as u8; 32],
@@ -296,12 +307,16 @@ fn measure_openraft_round_latency() {
     rt.block_on(async {
         // warmup
         for i in 0..10 {
-            n1.append_chunk_and_delta(mk(i), vec![]).await.expect("warmup append");
+            n1.append_chunk_and_delta(mk(i), vec![])
+                .await
+                .expect("warmup append");
         }
         let mut lat: Vec<Duration> = Vec::new();
         for i in 10..110 {
             let t = std::time::Instant::now();
-            n1.append_chunk_and_delta(mk(i), vec![]).await.expect("timed append");
+            n1.append_chunk_and_delta(mk(i), vec![])
+                .await
+                .expect("timed append");
             lat.push(t.elapsed());
         }
         lat.sort_unstable();
@@ -310,7 +325,10 @@ fn measure_openraft_round_latency() {
         println!(
             "OPENRAFT-ROUND-LATENCY (2-node loopback TCP, no gateway/chunk/fjall load): \
              n={n} mean={:?} p50={:?} min={:?} max={:?}",
-            mean, lat[n / 2], lat[0], lat[n - 1]
+            mean,
+            lat[n / 2],
+            lat[0],
+            lat[n - 1]
         );
     });
 }
