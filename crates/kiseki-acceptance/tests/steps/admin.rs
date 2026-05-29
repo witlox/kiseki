@@ -132,7 +132,7 @@ async fn given_pool_no_devices(w: &mut KisekiWorld, pool: String) {
 
 #[when(regex = r#"^the admin adds devices \[([^\]]*)\]$"#)]
 async fn when_add_devices(w: &mut KisekiWorld, _devices: String) {
-    if let Some(p) = w.legacy.chunk_store.pool_mut("warm-ssd") {
+    if let Some(mut p) = w.legacy.chunk_store.pool_mut("warm-ssd") {
         for i in 1..=3 {
             p.devices.push(kiseki_chunk::pool::PoolDevice {
                 id: format!("dev-{i}"),
@@ -1757,7 +1757,7 @@ async fn given_pool_at_warning(w: &mut KisekiWorld, pool: String, pct: u64) {
             .with_devices(6),
         );
     }
-    if let Some(p) = w.legacy.chunk_store.pool_mut(&pool) {
+    if let Some(mut p) = w.legacy.chunk_store.pool_mut(&pool) {
         p.used_bytes = p.capacity_bytes * pct / 100;
     }
 }

@@ -491,7 +491,7 @@ impl PersistentChunkStore {
     /// §D4). `write_fragment` calls it with `None` (fastest-fit);
     /// `write_fragment_in_pool` derives the tier from the pool name.
     fn write_fragment_tier(
-        &mut self,
+        &self,
         chunk_id: &ChunkId,
         fragment_index: u32,
         bytes: &[u8],
@@ -539,36 +539,44 @@ impl PersistentChunkStore {
 }
 
 impl ChunkOps for PersistentChunkStore {
-    fn write_chunk(&mut self, envelope: Envelope, pool: &str) -> Result<bool, ChunkError> {
+    fn write_chunk(&self, envelope: Envelope, pool: &str) -> Result<bool, ChunkError> {
         let chunk_id = envelope.chunk_id;
 
-        // Hold the chunks lock for the entire operation to prevent a race
-        // where two concurrent writes for the same chunk_id both pass the
-        // dedup check. The I/O is the bottleneck, not the lock.
+        // GH #137: the chunks index lock is released across the device
+        // I/O so concurrent writers parallelize. Correctness against
+        // the dedup race is preserved by a re-check after I/O (see the
+        // "lost-race" branch below); the only side effect of a lost
+        // race is an orphan extent, which the periodic scrub reclaims.
         let dedup_started = std::time::Instant::now();
-        let mut chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
-
-        // Dedup: if chunk already exists, just bump refcount.
-        if let Some(entry) = chunks.get_mut(&chunk_id) {
-            entry.record.refcount = entry
-                .record
-                .refcount
-                .checked_add(1)
-                .ok_or_else(|| ChunkError::Io("refcount overflow".into()))?;
-            let updated = entry.record.clone();
-            drop(chunks);
-            self.observe_write_phase("dedup_check", dedup_started.elapsed());
-            let save_started = std::time::Instant::now();
-            self.meta.put_chunk(&updated)?;
-            self.observe_write_phase("save_meta", save_started.elapsed());
-            return Ok(false);
+        {
+            let mut chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
+            // Dedup fast path: chunk already present → bump refcount,
+            // clone the updated record, release the lock, persist meta.
+            if let Some(entry) = chunks.get_mut(&chunk_id) {
+                entry.record.refcount = entry
+                    .record
+                    .refcount
+                    .checked_add(1)
+                    .ok_or_else(|| ChunkError::Io("refcount overflow".into()))?;
+                let updated = entry.record.clone();
+                drop(chunks);
+                self.observe_write_phase("dedup_check", dedup_started.elapsed());
+                let save_started = std::time::Instant::now();
+                self.meta.put_chunk(&updated)?;
+                self.observe_write_phase("save_meta", save_started.elapsed());
+                return Ok(false);
+            }
+            // Absent: release the lock immediately — do NOT hold it
+            // across the device I/O below.
         }
         self.observe_write_phase("dedup_check", dedup_started.elapsed());
 
-        // Allocate + write ciphertext, splitting across multiple
-        // extents if it exceeds the per-extent cap (Bug 5 fix). On
-        // crash between writes and metadata persist, orphan extents
-        // are reclaimed by periodic scrub (ADR-029 F-I6).
+        // Allocate + write ciphertext WITHOUT the chunks lock held,
+        // splitting across multiple extents if it exceeds the
+        // per-extent cap (Bug 5 fix). On crash between writes and
+        // metadata persist — or if we lose the dedup race below —
+        // orphan extents are reclaimed by periodic scrub (ADR-029
+        // F-I6).
         //
         // Empty payloads (POSIX `touch` / NFSv4 OPEN-CREATE on a
         // zero-byte file) skip device allocation entirely. The
@@ -615,26 +623,52 @@ impl ChunkOps for PersistentChunkStore {
             tenant_wrapped_material: envelope.tenant_wrapped_material.clone(),
         };
 
-        // Update pool usage (use data_bytes for accurate capacity
-        // accounting). DashMap shard lock — the sharded layout
-        // means a writer for pool A doesn't contend with a writer
-        // for pool B, in contrast to the prior `Mutex<HashMap>`.
-        if let Some(mut p) = self.pools.get_mut(pool) {
-            p.used_bytes += data_bytes;
+        // Re-lock and re-check for the dedup race: another concurrent
+        // writer may have inserted this chunk_id while we did I/O.
+        let updated_for_dedup = {
+            let mut chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
+            if let Some(entry) = chunks.get_mut(&chunk_id) {
+                // Lost the race. Bump the winner's refcount and clone
+                // its record; our just-written extents become orphans
+                // reclaimed by the periodic scrub (do NOT free them
+                // inline, and do NOT charge pools.used_bytes — the
+                // winner already accounted for the chunk).
+                entry.record.refcount = entry
+                    .record
+                    .refcount
+                    .checked_add(1)
+                    .ok_or_else(|| ChunkError::Io("refcount overflow".into()))?;
+                Some(entry.record.clone())
+            } else {
+                // Still absent — we win. Charge pool usage and insert.
+                // DashMap shard lock — a writer for pool A doesn't
+                // contend with a writer for pool B.
+                if let Some(mut p) = self.pools.get_mut(pool) {
+                    p.used_bytes += data_bytes;
+                }
+                chunks.insert(
+                    chunk_id,
+                    ChunkEntry {
+                        record: record.clone(),
+                        extents,
+                    },
+                );
+                None
+            }
+        };
+
+        if let Some(updated) = updated_for_dedup {
+            // Lost-race dedup hit: persist the winner's bumped record
+            // and return "not new". Our orphan extents stay on device
+            // for the scrub.
+            let save_started = std::time::Instant::now();
+            self.meta.put_chunk(&updated)?;
+            self.observe_write_phase("save_meta", save_started.elapsed());
+            return Ok(false);
         }
 
-        // Insert into in-memory index.
-        chunks.insert(
-            chunk_id,
-            ChunkEntry {
-                record: record.clone(),
-                extents,
-            },
-        );
-
-        drop(chunks);
-
-        // Persist metadata; sync only when group-commit is OFF.
+        // We won the race — persist metadata; sync only when
+        // group-commit is OFF.
         let save_started = std::time::Instant::now();
         self.meta.put_chunk(&record)?;
         self.observe_write_phase("save_meta", save_started.elapsed());
@@ -650,6 +684,37 @@ impl ChunkOps for PersistentChunkStore {
         }
 
         Ok(true)
+    }
+
+    /// GH #137: atomic dedup pre-flight in ONE chunk-index critical
+    /// section (no device I/O), so the gateway's per-write
+    /// `try_increment_if_exists` runs under `SyncBridge`'s read lock and
+    /// no longer serializes writers. Overrides the two-step trait default
+    /// (which is only atomic under `&mut self` exclusivity). The meta
+    /// persist runs after the lock is released — same ordering as the
+    /// dedup-hit fast path in `write_chunk`.
+    fn try_increment_if_exists(&self, chunk_id: &ChunkId) -> Result<Option<u64>, ChunkError> {
+        let updated = {
+            let mut chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
+            match chunks.get_mut(chunk_id) {
+                Some(entry) => {
+                    entry.record.refcount = entry
+                        .record
+                        .refcount
+                        .checked_add(1)
+                        .ok_or_else(|| ChunkError::Io("refcount overflow".into()))?;
+                    Some(entry.record.clone())
+                }
+                None => None,
+            }
+        };
+        match updated {
+            Some(rec) => {
+                self.meta.put_chunk(&rec)?;
+                Ok(Some(rec.refcount))
+            }
+            None => Ok(None),
+        }
     }
 
     fn read_chunk(&self, chunk_id: &ChunkId) -> Result<Envelope, ChunkError> {
@@ -688,7 +753,7 @@ impl ChunkOps for PersistentChunkStore {
         }
     }
 
-    fn increment_refcount(&mut self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
+    fn increment_refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
         let mut chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
         let entry = chunks
             .get_mut(chunk_id)
@@ -705,7 +770,7 @@ impl ChunkOps for PersistentChunkStore {
         Ok(rc)
     }
 
-    fn decrement_refcount(&mut self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
+    fn decrement_refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
         let mut chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
         let entry = chunks
             .get_mut(chunk_id)
@@ -841,7 +906,7 @@ impl ChunkOps for PersistentChunkStore {
     /// frees the old extent before allocating a new one so the
     /// device doesn't accumulate orphan extents on retries.
     fn write_fragment(
-        &mut self,
+        &self,
         chunk_id: &ChunkId,
         fragment_index: u32,
         bytes: Vec<u8>,
@@ -850,7 +915,7 @@ impl ChunkOps for PersistentChunkStore {
     }
 
     fn write_fragment_in_pool(
-        &mut self,
+        &self,
         chunk_id: &ChunkId,
         fragment_index: u32,
         bytes: Vec<u8>,
@@ -1085,8 +1150,7 @@ mod tests {
         let dev_path = dir.path().join("chunks.dev");
         let meta_path = dir.path().join("chunks.meta");
 
-        let mut store =
-            PersistentChunkStore::init(&dev_path, &meta_path, 64 * 1024 * 1024).unwrap();
+        let store = PersistentChunkStore::init(&dev_path, &meta_path, 64 * 1024 * 1024).unwrap();
         store.set_sync_per_write(false);
 
         let metric = Arc::new(
@@ -1143,8 +1207,7 @@ mod tests {
         let dev_path = dir.path().join("chunks.dev");
         let meta_path = dir.path().join("chunks.meta");
 
-        let mut store =
-            PersistentChunkStore::init(&dev_path, &meta_path, 64 * 1024 * 1024).unwrap();
+        let store = PersistentChunkStore::init(&dev_path, &meta_path, 64 * 1024 * 1024).unwrap();
 
         let metric = Arc::new(
             HistogramVec::new(
@@ -1178,8 +1241,7 @@ mod tests {
         let dev_path = dir.path().join("chunks.dev");
         let meta_path = dir.path().join("chunks.meta");
 
-        let mut store =
-            PersistentChunkStore::init(&dev_path, &meta_path, 64 * 1024 * 1024).unwrap();
+        let store = PersistentChunkStore::init(&dev_path, &meta_path, 64 * 1024 * 1024).unwrap();
 
         let env = test_envelope(0x42);
         let chunk_id = env.chunk_id;
@@ -1200,7 +1262,7 @@ mod tests {
 
         let chunk_id;
         {
-            let mut store =
+            let store =
                 PersistentChunkStore::init(&dev_path, &meta_path, 64 * 1024 * 1024).unwrap();
             let env = test_envelope(0x99);
             chunk_id = env.chunk_id;
@@ -1222,8 +1284,7 @@ mod tests {
         let dev_path = dir.path().join("chunks.dev");
         let meta_path = dir.path().join("chunks.meta");
 
-        let mut store =
-            PersistentChunkStore::init(&dev_path, &meta_path, 64 * 1024 * 1024).unwrap();
+        let store = PersistentChunkStore::init(&dev_path, &meta_path, 64 * 1024 * 1024).unwrap();
 
         let env1 = test_envelope(0x10);
         let chunk_id = env1.chunk_id;
@@ -1285,7 +1346,7 @@ mod tests {
         let meta_path = dir.path().join("chunks.meta");
 
         {
-            let mut store =
+            let store =
                 PersistentChunkStore::init(&dev_path, &meta_path, 64 * 1024 * 1024).unwrap();
             for i in 0..50u8 {
                 store.write_chunk(test_envelope(i), "default").unwrap();
@@ -1315,8 +1376,7 @@ mod tests {
         let dev_path = dir.path().join("chunks.dev");
         let meta_path = dir.path().join("chunks.meta");
 
-        let mut store =
-            PersistentChunkStore::init(&dev_path, &meta_path, 256 * 1024 * 1024).unwrap();
+        let store = PersistentChunkStore::init(&dev_path, &meta_path, 256 * 1024 * 1024).unwrap();
 
         // 64 MiB chunk — exceeds the 16 MiB per-extent cap by 4×.
         let big_ciphertext: Vec<u8> = (0..64usize * 1024 * 1024)
@@ -1357,8 +1417,7 @@ mod tests {
         let dev_path = dir.path().join("chunks.dev");
         let meta_path = dir.path().join("chunks.meta");
 
-        let mut store =
-            PersistentChunkStore::init(&dev_path, &meta_path, 64 * 1024 * 1024).unwrap();
+        let store = PersistentChunkStore::init(&dev_path, &meta_path, 64 * 1024 * 1024).unwrap();
 
         let env = Envelope {
             ciphertext: Vec::new(),
@@ -1387,8 +1446,7 @@ mod tests {
         let dev_path = dir.path().join("chunks.dev");
         let meta_path = dir.path().join("chunks.meta");
 
-        let mut store =
-            PersistentChunkStore::init(&dev_path, &meta_path, 256 * 1024 * 1024).unwrap();
+        let store = PersistentChunkStore::init(&dev_path, &meta_path, 256 * 1024 * 1024).unwrap();
 
         let big: Vec<u8> = (0..40usize * 1024 * 1024)
             .map(|i| u8::try_from(i % 241).unwrap())
@@ -1447,8 +1505,7 @@ mod tests {
 
         // 256 MiB device — comfortably larger than the 16 MiB fragment
         // plus superblock + bitmap overhead.
-        let mut store =
-            PersistentChunkStore::init(&dev_path, &meta_path, 256 * 1024 * 1024).unwrap();
+        let store = PersistentChunkStore::init(&dev_path, &meta_path, 256 * 1024 * 1024).unwrap();
 
         // 16 MiB fragment — what EC-4+2 produces for a 64 MiB chunk
         // (the gateway's MAX_PLAINTEXT_PER_CHUNK).
@@ -1503,7 +1560,7 @@ mod tests {
         let device: Arc<dyn DeviceBackend> =
             Arc::new(FileBackedDevice::init(&dev_path, 64 * 1024 * 1024).unwrap());
 
-        let mut store = PersistentChunkStore::from_device(Arc::clone(&device), &meta_path)
+        let store = PersistentChunkStore::from_device(Arc::clone(&device), &meta_path)
             .expect("from_device init");
 
         let env = test_envelope(0x39);
@@ -1550,7 +1607,7 @@ mod tests {
         // Same call sequence the runtime uses post-#39 wiring.
         let device =
             kiseki_block::open_or_init_device(&dev_path, 64 * 1024 * 1024).expect("selector init");
-        let mut store =
+        let store =
             PersistentChunkStore::from_device(device, &meta_path).expect("from_device init");
 
         store
@@ -1562,5 +1619,232 @@ mod tests {
             vec![0x42u8; 256],
             "round-trip via selector + from_device must preserve payload",
         );
+    }
+
+    /// GH #137 — concurrency correctness for the parallelized write
+    /// path. `write_chunk` now releases the `chunks` index lock across
+    /// the device I/O, so N threads writing M distinct chunks each
+    /// must all land. The store sits behind an `Arc` and every thread
+    /// shares `&self` (no exclusive lock), exercising the parallel
+    /// alloc + insert path. Every chunk must be readable afterwards
+    /// with refcount 1, and the store must hold exactly N*M chunks.
+    #[test]
+    fn concurrent_distinct_chunk_writes_all_persist() {
+        use std::sync::Arc;
+
+        const THREADS: u32 = 16;
+        const PER_THREAD: u32 = 32;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dev_path = dir.path().join("chunks.dev");
+        let meta_path = dir.path().join("chunks.meta");
+
+        // Group-commit mode (sync_per_write=false) is the production
+        // perf config; exercise the lock-release path under it.
+        let store =
+            Arc::new(PersistentChunkStore::init(&dev_path, &meta_path, 256 * 1024 * 1024).unwrap());
+        store.set_sync_per_write(false);
+
+        // Distinct chunk_id per (thread, index): first 4 bytes encode
+        // the thread, next 4 encode the index. Distinct content too.
+        let envelope_for = |t: u32, i: u32| {
+            let mut id = [0u8; 32];
+            id[0..4].copy_from_slice(&t.to_le_bytes());
+            id[4..8].copy_from_slice(&i.to_le_bytes());
+            Envelope {
+                ciphertext: vec![
+                    u8::try_from((t.wrapping_mul(31).wrapping_add(i)) % 256).unwrap();
+                    128
+                ],
+                auth_tag: [0xAA; 16],
+                nonce: [0xBB; 12],
+                system_epoch: KeyEpoch(1),
+                tenant_epoch: None,
+                tenant_wrapped_material: None,
+                chunk_id: ChunkId(id),
+            }
+        };
+
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let store = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..PER_THREAD {
+                    let new = store
+                        .write_chunk(envelope_for(t, i), "default")
+                        .expect("concurrent write must succeed");
+                    assert!(new, "distinct chunk must be a new write");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("writer thread joined");
+        }
+
+        // Every distinct chunk readable with the right bytes + refcount.
+        for t in 0..THREADS {
+            for i in 0..PER_THREAD {
+                let env = envelope_for(t, i);
+                let read = store
+                    .read_chunk(&env.chunk_id)
+                    .expect("every chunk readable after concurrent writes");
+                assert_eq!(read.ciphertext, env.ciphertext, "chunk content preserved");
+                assert_eq!(
+                    store.refcount(&env.chunk_id).unwrap(),
+                    1,
+                    "distinct chunk refcount must be exactly 1",
+                );
+            }
+        }
+
+        let stats = store.storage_stats();
+        assert_eq!(
+            stats.chunk_count,
+            u64::from(THREADS * PER_THREAD),
+            "store must hold exactly N*M distinct chunks",
+        );
+    }
+
+    /// GH #137 — dedup correctness under concurrency. N threads write
+    /// the SAME content (same `chunk_id`) at once. The lock-release +
+    /// re-check race handling in `write_chunk` must collapse them to a
+    /// single stored chunk with refcount == N: exactly one thread sees
+    /// `Ok(true)` (the real write), the rest see `Ok(false)` (dedup or
+    /// lost-race). No lost updates, no double-free, no panic/deadlock.
+    /// The lost-race losers leave orphan extents reclaimed by the
+    /// scrub — never charged to the refcount.
+    #[test]
+    fn concurrent_same_chunk_writes_dedup_refcount() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        const THREADS: u32 = 16;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dev_path = dir.path().join("chunks.dev");
+        let meta_path = dir.path().join("chunks.meta");
+
+        let store =
+            Arc::new(PersistentChunkStore::init(&dev_path, &meta_path, 256 * 1024 * 1024).unwrap());
+        store.set_sync_per_write(false);
+
+        let new_writes = Arc::new(AtomicU32::new(0));
+        let chunk_id = ChunkId([0x7C; 32]);
+
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let store = Arc::clone(&store);
+            let new_writes = Arc::clone(&new_writes);
+            handles.push(std::thread::spawn(move || {
+                let env = Envelope {
+                    ciphertext: vec![0x7C; 4096],
+                    auth_tag: [0xAA; 16],
+                    nonce: [0xBB; 12],
+                    system_epoch: KeyEpoch(1),
+                    tenant_epoch: None,
+                    tenant_wrapped_material: None,
+                    chunk_id,
+                };
+                if store.write_chunk(env, "default").expect("write ok") {
+                    new_writes.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("writer thread joined");
+        }
+
+        // Exactly one thread performed the real write; the rest were
+        // dedup hits (either the fast path or the post-I/O re-check).
+        assert_eq!(
+            new_writes.load(Ordering::SeqCst),
+            1,
+            "exactly one concurrent writer of identical content must be the new write",
+        );
+        // Final refcount accounts for every writer — no lost updates.
+        assert_eq!(
+            store.refcount(&chunk_id).unwrap(),
+            u64::from(THREADS),
+            "refcount must equal the number of concurrent writers",
+        );
+        // Exactly one chunk stored, readable with the right bytes.
+        let stats = store.storage_stats();
+        assert_eq!(
+            stats.chunk_count, 1,
+            "identical content dedups to one chunk"
+        );
+        let read = store.read_chunk(&chunk_id).unwrap();
+        assert_eq!(read.ciphertext, vec![0x7C; 4096], "deduped chunk readable");
+    }
+
+    /// GH #137 — the in-memory `ChunkStore` behind a shared
+    /// `SyncBridge` must also tolerate concurrent `&self` writers
+    /// without deadlock or lost updates, even though it stays
+    /// effectively serial (one mutex per map). std threads share an
+    /// `Arc<SyncBridge<ChunkStore>>` and drive the async write inline.
+    #[test]
+    fn concurrent_chunkstore_writes_through_shared_sync_bridge() {
+        use crate::async_ops::SyncBridge;
+        use crate::store::ChunkStore;
+        use std::sync::Arc;
+
+        const THREADS: u32 = 16;
+        const PER_THREAD: u32 = 16;
+
+        let store = ChunkStore::new();
+        store.add_pool(crate::pool::AffinityPool::new(
+            "default",
+            crate::pool::DurabilityStrategy::Replication { copies: 1 },
+            1 << 30,
+        ));
+        let bridge = Arc::new(SyncBridge::new(store));
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .build()
+            .unwrap();
+
+        let envelope_for = |t: u32, i: u32| {
+            let mut id = [0u8; 32];
+            id[0..4].copy_from_slice(&t.to_le_bytes());
+            id[4..8].copy_from_slice(&i.to_le_bytes());
+            Envelope {
+                ciphertext: vec![0xCD; 64],
+                auth_tag: [0u8; 16],
+                nonce: [0u8; 12],
+                system_epoch: KeyEpoch(1),
+                tenant_epoch: None,
+                tenant_wrapped_material: None,
+                chunk_id: ChunkId(id),
+            }
+        };
+
+        rt.block_on(async {
+            use crate::async_ops::AsyncChunkOps;
+            let mut tasks = Vec::new();
+            for t in 0..THREADS {
+                let bridge = Arc::clone(&bridge);
+                tasks.push(tokio::spawn(async move {
+                    for i in 0..PER_THREAD {
+                        let new = bridge
+                            .write_chunk(envelope_for(t, i), "default")
+                            .await
+                            .expect("write ok");
+                        assert!(new, "distinct chunk is a new write");
+                    }
+                }));
+            }
+            for task in tasks {
+                task.await.expect("task joined");
+            }
+
+            // All N*M distinct chunks readable with refcount 1.
+            for t in 0..THREADS {
+                for i in 0..PER_THREAD {
+                    let env = envelope_for(t, i);
+                    assert_eq!(bridge.refcount(&env.chunk_id).await.unwrap(), 1);
+                }
+            }
+        });
     }
 }
