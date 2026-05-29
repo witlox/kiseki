@@ -591,6 +591,13 @@ fn spawn_with_env(
         // 30s) so the capacity-observability scenario can assert shortly
         // after writing without a long sleep.
         .env("KISEKI_CAPACITY_REFRESH_INTERVAL_S", "2");
+    // ADR-047: pass the decoupled-ack capability through to spawned servers when
+    // the parent env sets it (default off — existing scenarios run the
+    // synchronous path unchanged). Lets a functional run exercise the live
+    // decoupled-ack path on the real multi-node harness.
+    if let Ok(v) = std::env::var("KISEKI_DECOUPLED_ACK") {
+        cmd.env("KISEKI_DECOUPLED_ACK", v);
+    }
     if let Some(bytes) = chunk_device_bytes {
         // GH #115 ENOSPC scenario: cap the file-backed chunk device so
         // a handful of PUTs fills it and the gateway returns a clean 507.
