@@ -332,3 +332,103 @@ fn measure_openraft_round_latency() {
         );
     });
 }
+
+/// PERF BISECTION (2026-05-29, #259 follow-up): same 2-node round probe,
+/// but with the FJALL persistent log (data_dir=Some) + the server's
+/// KISEKI_RAFT_FLUSH_INTERVAL_MS=100, vs the in-memory probe above. If
+/// fjall makes the round jump from ~1ms toward ~15ms, the stacked wait is
+/// in the log persistence / io-flush-tracking path. If it stays ~1-2ms,
+/// fjall is NOT it and the wait is in the RaftShardStore dedicated-runtime
+/// / full-server task population. `#[ignore]` — manual probe.
+#[test]
+#[ignore = "perf probe: openraft round latency with fjall persistent log"]
+fn measure_openraft_round_latency_fjall() {
+    use kiseki_common::time::{ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime};
+    use kiseki_log::delta::OperationType;
+    use kiseki_log::traits::AppendDeltaRequest;
+    use std::path::PathBuf;
+
+    // Match the GCP/compose server: periodic flush every 100ms.
+    std::env::set_var("KISEKI_RAFT_FLUSH_INTERVAL_MS", "100");
+    let base = std::env::temp_dir().join(format!("kiseki-round-probe-{}", uuid::Uuid::new_v4()));
+    let d1: PathBuf = base.join("n1");
+    let d2: PathBuf = base.join("n2");
+    std::fs::create_dir_all(&d1).unwrap();
+    std::fs::create_dir_all(&d2).unwrap();
+
+    let rt = make_runtime();
+    let ports = find_ports(2);
+    let peers = peers_map(&ports);
+    let n1 = rt.block_on(async {
+        let l1 = RaftRpcListener::new(format!("127.0.0.1:{}", ports[0]), None);
+        let r1 = l1.registry();
+        tokio::spawn(async move {
+            let _ = l1.run().await;
+        });
+        let l2 = RaftRpcListener::new(format!("127.0.0.1:{}", ports[1]), None);
+        let r2 = l2.registry();
+        tokio::spawn(async move {
+            let _ = l2.run().await;
+        });
+        let n1 = OpenRaftLogStore::new(1, shard_a(), test_tenant(), &peers, Some(&d1), None)
+            .await
+            .unwrap();
+        r1.register_shard(shard_a(), n1.raft_handle());
+        let n2 = OpenRaftLogStore::new(2, shard_a(), test_tenant(), &peers, Some(&d2), None)
+            .await
+            .unwrap();
+        r2.register_shard(shard_a(), n2.raft_handle());
+        n1.initialize_membership(&peers).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        n1
+    });
+
+    let mk = |i: u64| AppendDeltaRequest {
+        shard_id: shard_a(),
+        tenant_id: test_tenant(),
+        operation: OperationType::Create,
+        timestamp: DeltaTimestamp {
+            hlc: HybridLogicalClock {
+                physical_ms: 1000,
+                logical: 0,
+                node_id: NodeId(1),
+            },
+            wall: WallTime {
+                millis_since_epoch: 1000,
+                timezone: "UTC".into(),
+            },
+            quality: ClockQuality::Ntp,
+        },
+        hashed_key: [(i % 251) as u8; 32],
+        chunk_refs: vec![],
+        payload: vec![0xab; 32],
+        has_inline_data: false,
+    };
+    rt.block_on(async {
+        for i in 0..10 {
+            n1.append_chunk_and_delta(mk(i), vec![])
+                .await
+                .expect("warmup");
+        }
+        let mut lat: Vec<Duration> = Vec::new();
+        for i in 10..110 {
+            let t = std::time::Instant::now();
+            n1.append_chunk_and_delta(mk(i), vec![])
+                .await
+                .expect("timed");
+            lat.push(t.elapsed());
+        }
+        lat.sort_unstable();
+        let n = lat.len();
+        let mean = lat.iter().sum::<Duration>() / u32::try_from(n).unwrap_or(1);
+        println!(
+            "OPENRAFT-ROUND-LATENCY-FJALL (2-node loopback TCP, fjall log, flush=100ms, \
+             no gateway/chunk load): n={n} mean={:?} p50={:?} min={:?} max={:?}",
+            mean,
+            lat[n / 2],
+            lat[0],
+            lat[n - 1]
+        );
+    });
+    let _ = std::fs::remove_dir_all(&base);
+}
