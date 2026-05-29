@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::doc_markdown,
+    clippy::too_many_lines
+)]
 //! Multi-shard transport integration test — ADR-041.
 //!
 //! 2 nodes × 2 shards per node, sharing one Raft RPC port per node.

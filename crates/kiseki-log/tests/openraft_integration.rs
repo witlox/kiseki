@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
 //! Integration test: single-node Raft log store.
 //!
 //! Exercises the full path: `Raft::new` -> initialize -> `client_write` ->
