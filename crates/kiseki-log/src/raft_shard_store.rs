@@ -397,6 +397,11 @@ impl RaftShardStore {
     ) -> Result<(), LogError> {
         use futures::StreamExt;
 
+        // ADR-047 hot-path timer (pif.total) — covers the whole body,
+        // including the non-durable refuse path so a degraded shard's
+        // refusal time is observable.
+        kiseki_tracing::hot_timer_guard!(_ht_pif_total = "pif.total");
+
         // Non-durable guard FIRST: refuse before any write so an in-memory
         // degrade can never produce an acked-but-volatile intent.
         let is_durable = self
@@ -418,7 +423,13 @@ impl RaftShardStore {
 
         // Local put first — one durable copy. A local failure is fatal: with
         // the local copy missing we can never reach min_acks safely.
-        store.put(intent.clone()).map_err(|e| {
+        // ADR-047 hot-path timer (pif.local_put) — local fjall WAL
+        // write; one of the two non-RTT critical-path costs on this
+        // function alongside leader_first_hop.
+        let local_put_res = kiseki_tracing::hot_span!("pif.local_put", {
+            store.put(intent.clone())
+        });
+        local_put_res.map_err(|e| {
             tracing::warn!(shard_id = %shard_id.0, error = %e, "put_intent_and_fan: local intent store write failed");
             LogError::Unavailable
         })?;
@@ -433,17 +444,24 @@ impl RaftShardStore {
 
         // Voter peers (minus self), each resolved to an addr. Reuse the same
         // resolver the recovery gather uses so the fan targets the voter set.
-        let peers = self.resolve_voter_peers(shard_id).unwrap_or_default();
+        // ADR-047 hot-path timer (pif.resolve_peers) — DashMap reads +
+        // current-leader lookup. Usually sub-microsecond locally; on
+        // contended large clusters the lookup-with-dashmap-shard-lock
+        // can surface.
+        let (peers, leader_id) = kiseki_tracing::hot_span!("pif.resolve_peers", {
+            let peers = self.resolve_voter_peers(shard_id).unwrap_or_default();
+            // MF-3: identify the leader. If the leader is a remote voter, fan it
+            // FIRST (must-include), then top up with the rest. If this node IS the
+            // leader, the local put already holds it. If unknown, no special order
+            // — the recovery backstop covers it.
+            let leader_id = self
+                .get_shard(shard_id)
+                .ok()
+                .and_then(|s| s.current_leader_id());
+            (peers, leader_id)
+        });
         let wire = WireIntent::from(&intent);
 
-        // MF-3: identify the leader. If the leader is a remote voter, fan it
-        // FIRST (must-include), then top up with the rest. If this node IS the
-        // leader, the local put already holds it. If unknown, no special order
-        // — the recovery backstop covers it.
-        let leader_id = self
-            .get_shard(shard_id)
-            .ok()
-            .and_then(|s| s.current_leader_id());
         let local = self.node_id;
         let leader_is_local = leader_id == Some(local);
 
@@ -453,7 +471,15 @@ impl RaftShardStore {
         if !leader_is_local {
             if let Some(lid) = leader_id {
                 if let Some((node_id, addr)) = peers.iter().find(|(n, _)| n.0 == lid).cloned() {
-                    if fan_one_intent(node_id, addr, shard_id, wire.clone()).await {
+                    // ADR-047 hot-path timer (pif.leader_first_hop) —
+                    // THE single cross-node RTT the gateway pays
+                    // before the parallel top-up starts. Per the
+                    // escalation A-1 finding this is the candidate
+                    // for being the under-measured ~5 ms on GCP.
+                    let acked = kiseki_tracing::hot_span!("pif.leader_first_hop", {
+                        fan_one_intent(node_id, addr, shard_id, wire.clone()).await
+                    });
+                    if acked {
                         acks += 1;
                         if acks >= self.min_acks {
                             return Ok(());
@@ -465,6 +491,11 @@ impl RaftShardStore {
 
         // Fan the remaining voter peers (excluding the leader already fanned) in
         // PARALLEL; stop as soon as the durable copies reach min_acks.
+        // ADR-047 hot-path timer (pif.parallel_topup) — wraps the
+        // fan-out construction + the await-loop. A `?`-early return
+        // from inside (no such path here today) would still drop the
+        // guard cleanly.
+        kiseki_tracing::hot_timer_guard!(_ht_pif_topup = "pif.parallel_topup");
         let mut fan = futures::stream::FuturesUnordered::new();
         for (node_id, addr) in peers {
             // Skip the leader if we already fanned it above.

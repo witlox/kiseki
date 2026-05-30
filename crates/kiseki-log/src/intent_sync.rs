@@ -164,11 +164,17 @@ pub fn build_intent_dispatcher(store: Arc<dyn IntentStore>) -> ShardDispatch {
                         // WriteIntent → durably record it. A decode fault or a
                         // store error degrades to ParseError, which the producer
                         // counts as a NON-ack (no durable copy credited).
-                        let wire: WireIntent = match postcard::from_bytes(&payload) {
-                            Ok(w) => w,
-                            Err(e) => {
-                                tracing::warn!(error = %e, tag = %tag, "IntentSync intent_put decode failed");
-                                return DispatchOutcome::ParseError;
+                        // ADR-047 hot-path timer (aux.decode) — the
+                        // postcard decode + proto re-decode for the
+                        // append. Per-peer cost on every fanned intent.
+                        let wire: WireIntent = {
+                            kiseki_tracing::hot_timer_guard!(_ht_dec = "aux.decode");
+                            match postcard::from_bytes(&payload) {
+                                Ok(w) => w,
+                                Err(e) => {
+                                    tracing::warn!(error = %e, tag = %tag, "IntentSync intent_put decode failed");
+                                    return DispatchOutcome::ParseError;
+                                }
                             }
                         };
                         let intent = match wire.into_intent() {
@@ -178,12 +184,29 @@ pub fn build_intent_dispatcher(store: Arc<dyn IntentStore>) -> ShardDispatch {
                                 return DispatchOutcome::ParseError;
                             }
                         };
-                        match store.put(intent) {
+                        // ADR-047 hot-path timer (aux.store_put) —
+                        // local fjall IntentStore write on the peer.
+                        // Mirrors `pif.local_put` on the producer side
+                        // so we can compare in-process vs across-the-
+                        // wire local-store cost.
+                        let put_res = kiseki_tracing::hot_span!("aux.store_put", {
+                            store.put(intent)
+                        });
+                        match put_res {
                             // Recorded OR Duplicate both mean the intent is now
                             // durable on this replica — credit the ack either
                             // way (idempotent re-fan must still count, ADR-047
                             // §5 / O3). The reply body is an empty `()`.
-                            Ok(_) => encode_ok(&()),
+                            Ok(_) => {
+                                // ADR-047 hot-path timer (aux.encode_response)
+                                // — postcard-encode of the empty `()` ack.
+                                // Trivial but split so any future ack-body
+                                // bloat shows up here, not buried in the
+                                // total round-trip cost.
+                                kiseki_tracing::hot_span!("aux.encode_response", {
+                                    encode_ok(&())
+                                })
+                            }
                             Err(e) => {
                                 tracing::warn!(error = %e, tag = %tag, "IntentSync intent_put store write failed");
                                 DispatchOutcome::ParseError

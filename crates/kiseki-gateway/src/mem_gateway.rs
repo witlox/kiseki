@@ -2327,15 +2327,24 @@ impl InMemoryGateway {
         let mut landed: Vec<ChunkLanded> = Vec::with_capacity(pieces_len);
 
         for piece in raw_pieces {
-            let chunk_id = derive_chunk_id(
-                piece,
-                self.dedup_policy,
-                self.tenant_hmac_key.as_ref().map(|k| k.as_slice()),
-            )
-            .map_err(|e| {
-                tracing::warn!(error = %e, "gateway write: derive_chunk_id failed");
-                GatewayError::Upstream(e.to_string())
-            })?;
+            // ADR-047 hot-path timer (per-piece chunk-id derivation —
+            // HMAC-SHA256, ~100 µs/64 KiB localhost). Guard form emits
+            // NO statement when `hot-path-trace` is OFF. The brief
+            // says this should cover only the `derive_chunk_id` call;
+            // since the guard lives until end-of-iter, we narrow the
+            // measured region with an explicit inner scope.
+            let chunk_id = {
+                kiseki_tracing::hot_timer_guard!(_ht_derive = "gw.derive_chunk_id");
+                derive_chunk_id(
+                    piece,
+                    self.dedup_policy,
+                    self.tenant_hmac_key.as_ref().map(|k| k.as_slice()),
+                )
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "gateway write: derive_chunk_id failed");
+                    GatewayError::Upstream(e.to_string())
+                })?
+            };
 
             // Dedup short-circuit: if the chunk already exists, skip
             // the per-write HKDF + AEAD seal + nonce-RNG and just
@@ -2470,7 +2479,16 @@ impl InMemoryGateway {
             // single fjall.get from the lookup feeds the cascade
             // decision directly so the backend skips its own pre-
             // flight read.
-            let comp_id = match (req.name.as_deref(), req.comp_id_override) {
+            // ADR-047 hot-path timer (gw.comp_create) — covers the
+            // local CompositionStore write (one fjall append + the
+            // in-memory map updates). Three-way match is a single
+            // logical "create the comp" site; we time the whole
+            // dispatch + storage call. Result captured into `comp_res`,
+            // then `?`-mapped below so the guard drops BEFORE the
+            // possible `?` propagation includes the map_err cost.
+            let comp_res = {
+                kiseki_tracing::hot_timer_guard!(_ht_comp = "gw.comp_create");
+                match (req.name.as_deref(), req.comp_id_override) {
                 // Cross-protocol comp-id pin (Group V #1). The NFS
                 // flush-on-COMMIT path supplies the placeholder UUID it
                 // returned to the client at CREATE time so the resulting
@@ -2503,7 +2521,9 @@ impl InMemoryGateway {
                     )
                 }
                 (None, None) => comps.create(req.namespace_id, chunk_ids.clone(), bytes_written),
-            }
+                }
+            };
+            let comp_id = comp_res
             .map_err(|e| {
                 tracing::warn!(error = %e, "gateway write: compositions.create failed");
                 // Map the typed NamespaceNotFound through to the
@@ -2638,23 +2658,35 @@ impl InMemoryGateway {
                 let seq = self.next_perspective_seq();
                 // ADR-047 MF-1: encode the seq INTO the Create payload
                 // so the hydrator's LWW guard sees it.
-                let async_comp_payload = kiseki_composition::encode_composition_create_payload(
-                    comp_id,
-                    emit_params.2,
-                    bytes_written,
-                    req.name.as_deref(),
-                    &[],
-                    Some(seq),
+                // ADR-047 hot-path timer (gw.encode_payload) — covers
+                // postcard-encode + name copy for the Create payload.
+                let async_comp_payload = kiseki_tracing::hot_span!(
+                    "gw.encode_payload",
+                    {
+                        kiseki_composition::encode_composition_create_payload(
+                            comp_id,
+                            emit_params.2,
+                            bytes_written,
+                            req.name.as_deref(),
+                            &[],
+                            Some(seq),
+                        )
+                    }
                 );
-                let append = kiseki_composition::log_bridge::build_chunk_and_delta_request(
-                    shard_id,
-                    emit_params.1,
-                    kiseki_log::delta::OperationType::Create,
-                    hashed_key,
-                    emit_params.3.clone(),
-                    async_comp_payload,
-                    new_chunks.clone(),
-                );
+                // ADR-047 hot-path timer (gw.build_append) — covers
+                // the AppendChunkAndDeltaRequest construction including
+                // the chunk-refs / new-chunks copies it folds in.
+                let append = kiseki_tracing::hot_span!("gw.build_append", {
+                    kiseki_composition::log_bridge::build_chunk_and_delta_request(
+                        shard_id,
+                        emit_params.1,
+                        kiseki_log::delta::OperationType::Create,
+                        hashed_key,
+                        emit_params.3.clone(),
+                        async_comp_payload,
+                        new_chunks.clone(),
+                    )
+                });
                 // Idempotency: reuse the request-supplied key when it is
                 // exactly 16 bytes (the intent key width); otherwise `None`
                 // (at-least-once — the committer dedups on the Raft apply).
@@ -2672,6 +2704,13 @@ impl InMemoryGateway {
                     append,
                 };
                 let intent_started = std::time::Instant::now();
+                // ADR-047 hot-path timer (gw.put_intent_and_fan_call)
+                // — covers the entire quorum-fan call from the gateway's
+                // perspective (the inner pif.* timers break it down
+                // further: local_put, leader_first_hop, parallel_topup).
+                kiseki_tracing::hot_timer_guard!(
+                    _ht_pif = "gw.put_intent_and_fan_call"
+                );
                 match log.put_intent_and_fan(shard_id, intent).await {
                     Ok(()) => {
                         // Intent is `min_acks`-durable: fast-ack now. Do NOT

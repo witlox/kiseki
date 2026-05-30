@@ -450,14 +450,25 @@ impl ShardSmInner {
         // (1) Duplicate gate — seq already in the recent window. No-op,
         // return the unchanged tip (matches the pre-PART-8 `Appended(tip)`
         // contract for replay/duplicate).
-        if self.dedup_contains(&item.perspective_seq) {
+        // ADR-047 hot-path timer (sm.recent_dedup) — HashSet::contains
+        // on the seq set, sub-µs but fires on every apply.
+        let is_dup = kiseki_tracing::hot_span!("sm.recent_dedup", {
+            self.dedup_contains(&item.perspective_seq)
+        });
+        if is_dup {
             return self.tip;
         }
         // (2) Ancient gate — log_index below the cutoff is suspicious; record
         // the alarm + log and refuse. This catches a long-partition recovery
         // delivering a re-gathered intent whose log-index window has rolled
         // off, per Finding AA.
-        if log_index < self.ancient_cutoff_log_index {
+        // ADR-047 hot-path timer (sm.ancient_check) — single u64
+        // compare; histogram exists so a future refuse-with-alarm
+        // path that fans expensive logging is observable.
+        let is_ancient = kiseki_tracing::hot_span!("sm.ancient_check", {
+            log_index < self.ancient_cutoff_log_index
+        });
+        if is_ancient {
             dedup_ancient_refused_counter()
                 .with_label_values(&[&self.shard_id.0.to_string()])
                 .inc();
@@ -471,19 +482,33 @@ impl ShardSmInner {
             return self.tip;
         }
         // (3) Real apply — chunk_meta + delta, atomic in this SM lock.
-        self.apply_new_chunks(&item.tenant_id_bytes, &item.new_chunks, log_index);
-        let tip = self.append_delta_inner(
-            &item.tenant_id_bytes,
-            item.operation,
-            &item.hashed_key,
-            &item.chunk_refs,
-            &item.payload,
-            item.has_inline_data,
-            log_index,
-        );
+        // ADR-047 hot-path timer (sm.apply_new_chunks) — chunk_meta
+        // table updates (one row per new chunk).
+        kiseki_tracing::hot_span!("sm.apply_new_chunks", {
+            self.apply_new_chunks(&item.tenant_id_bytes, &item.new_chunks, log_index);
+        });
+        // ADR-047 hot-path timer (sm.append_delta_inner) — THE
+        // per-apply cost: tip bump + delta append + (optional)
+        // inline offload. Per the escalation this is one of the
+        // candidates for the unattributed budget tail.
+        let tip = kiseki_tracing::hot_span!("sm.append_delta_inner", {
+            self.append_delta_inner(
+                &item.tenant_id_bytes,
+                item.operation,
+                &item.hashed_key,
+                &item.chunk_refs,
+                &item.payload,
+                item.has_inline_data,
+                log_index,
+            )
+        });
         // (4) Record + evict — same apply block, so a follower applying this
         // same entry independently arrives at the same set state.
-        self.push_recent_and_evict(log_index, item.perspective_seq, now_ms);
+        // ADR-047 hot-path timer (sm.push_recent) — recent set push
+        // + cutoff advance + evict. Dedup-window-size dependent.
+        kiseki_tracing::hot_span!("sm.push_recent", {
+            self.push_recent_and_evict(log_index, item.perspective_seq, now_ms);
+        });
         tip
     }
 

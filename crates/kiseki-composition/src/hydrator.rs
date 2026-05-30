@@ -474,7 +474,16 @@ impl CompositionHydrator {
         // pre-batch entry. Same lock-ordering invariant the
         // leader-side mutators (`update`, `delete`, `rename`) follow.
         let apply_result = store.with_storage_locked(|s| {
-            let r = s.apply_hydration_batch(batch);
+            // ADR-047 hot-path timer (hydrator.persistent_apply_batch)
+            // — the backend's atomic commit. On fjall this is one
+            // memtable batch flush; the existing
+            // `hydrator_apply_duration` histogram covers the closure
+            // outer cost (Mutex acquisition + cache invalidation),
+            // this finer timer pins the storage call alone so the
+            // mutex-hold-time vs storage-commit-time split is direct.
+            let r = kiseki_tracing::hot_span!("hydrator.persistent_apply_batch", {
+                s.apply_hydration_batch(batch)
+            });
             if r.is_ok() {
                 for id in &touched_ids {
                     store.invalidate_cache(*id);
@@ -556,8 +565,14 @@ fn stage_create(
     staging: &mut Staging,
     delta: &kiseki_log::delta::Delta,
 ) -> DeltaOutcome {
-    let Some((comp_id, namespace_id, size, name, chunk_plaintext_lens, perspective_seq)) =
+    // ADR-047 hot-path timer (hydrator.decode_payload) — per-delta
+    // create-payload decode (postcard). Per the escalation this is
+    // a candidate for the unattributed hydrator-apply cost on
+    // followers.
+    let decoded = kiseki_tracing::hot_span!("hydrator.decode_payload", {
         decode_composition_create_payload(&delta.payload.ciphertext)
+    });
+    let Some((comp_id, namespace_id, size, name, chunk_plaintext_lens, perspective_seq)) = decoded
     else {
         return DeltaOutcome::PermanentSkip {
             reason: "create_payload_decode",
@@ -571,7 +586,12 @@ fn stage_create(
     // re-bind from regressing a newer-seq winner.
     if staging.view(store, comp_id).is_some() {
         if let Some(name) = name {
-            staging.bind_name(namespace_id, name, comp_id, perspective_seq);
+            // ADR-047 hot-path timer (hydrator.bind_name) — re-bind
+            // path. Cheaper than the fresh-create bind below but
+            // fires on every replayed Create on a follower.
+            kiseki_tracing::hot_span!("hydrator.bind_name", {
+                staging.bind_name(namespace_id, name, comp_id, perspective_seq);
+            });
         }
         return DeltaOutcome::Applied;
     }
@@ -618,7 +638,13 @@ fn stage_create(
         chunk_plaintext_lens: chunk_plaintext_lens.unwrap_or_default(),
     });
     if let Some(name) = name {
-        staging.bind_name(namespace_id, name, comp_id, perspective_seq);
+        // ADR-047 hot-path timer (hydrator.bind_name) — fresh-create
+        // path. Same label as the re-bind site above so the
+        // histogram aggregates both replay and fresh costs (the
+        // per-name-replication index hot path #127 closed).
+        kiseki_tracing::hot_span!("hydrator.bind_name", {
+            staging.bind_name(namespace_id, name, comp_id, perspective_seq);
+        });
     }
     DeltaOutcome::Applied
 }

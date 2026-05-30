@@ -22,6 +22,8 @@ use std::io;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -376,6 +378,49 @@ where
     }
 }
 
+/// `KISEKI_RAFT_FAKE_RTT_US` — simulated outbound RTT (microseconds)
+/// added BEFORE every request write on the client side. Read once at
+/// module init via a `OnceLock`. Empty / unset / `0` / unparseable →
+/// the sleep is skipped (~1 cmp + branch per call, no syscall).
+///
+/// Purpose: harness-driven scenario discrimination per
+/// `specs/escalations/2026-05-30-decoupled-ack-perf-10x-analysis.md`
+/// A-1 finding. Localhost loopback RTT is ~30 µs; the ~22 ms p50 on
+/// GCP implies several ms / hop. Setting `KISEKI_RAFT_FAKE_RTT_US=2000`
+/// on a localhost cluster injects a 2 ms-per-RTT shape so we can
+/// validate whether the "extra RTT per write" hypothesis is the
+/// dominant factor on real cluster numbers without owning a real
+/// cluster.
+///
+/// Always-on (NOT gated by `hot-path-trace`): the cost when unset is
+/// one `OnceLock::get()` + one `if x > 0` compare per RPC.
+fn fake_rtt_us() -> u64 {
+    static CACHE: OnceLock<u64> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("KISEKI_RAFT_FAKE_RTT_US")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Inject the configured fake RTT before issuing the request — pure
+/// `tokio::time::sleep`, runs on the current task. Zero-µs when the
+/// env var is unset / 0 (the function short-circuits without ever
+/// touching the timer wheel).
+async fn maybe_inject_fake_rtt() {
+    let us = fake_rtt_us();
+    if us == 0 {
+        return;
+    }
+    tokio::time::sleep(Duration::from_micros(us)).await;
+}
+
+/// `rpc_call_plain`: open a fresh plain-TCP connection to `addr` and
+/// run one `rpc_exchange`. For harness-driven scenario discrimination
+/// per `specs/escalations/2026-05-30-decoupled-ack-perf-10x-analysis.md`
+/// A-1 finding we inject the optional `KISEKI_RAFT_FAKE_RTT_US`
+/// outbound-latency sleep BEFORE writing the request.
 async fn rpc_call_plain<Req: Serialize, Resp: DeserializeOwned>(
     addr: &str,
     shard_id: ShardId,
@@ -383,9 +428,17 @@ async fn rpc_call_plain<Req: Serialize, Resp: DeserializeOwned>(
     req: &Req,
 ) -> io::Result<Resp> {
     let mut stream = TcpStream::connect(addr).await?;
+    maybe_inject_fake_rtt().await;
     rpc_exchange(&mut stream, shard_id, tag, req).await
 }
 
+/// `rpc_call_tls`: open a fresh mTLS connection to `addr` and run one
+/// `rpc_exchange`. For harness-driven scenario discrimination per
+/// `specs/escalations/2026-05-30-decoupled-ack-perf-10x-analysis.md`
+/// A-1 finding we inject the optional `KISEKI_RAFT_FAKE_RTT_US`
+/// outbound-latency sleep BEFORE writing the request (post-handshake
+/// — TLS connect is itself >1 RTT and the goal is to model app-level
+/// RTT on top of an already-warm connection).
 async fn rpc_call_tls<Req: Serialize, Resp: DeserializeOwned>(
     addr: &str,
     shard_id: ShardId,
@@ -407,6 +460,7 @@ async fn rpc_call_tls<Req: Serialize, Resp: DeserializeOwned>(
         .connect(server_name, tcp)
         .await
         .map_err(|e| network_error(NetworkErrorKind::Transport, e))?;
+    maybe_inject_fake_rtt().await;
     rpc_exchange(&mut tls_stream, shard_id, tag, req).await
 }
 

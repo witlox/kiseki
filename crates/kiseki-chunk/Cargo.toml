@@ -17,6 +17,13 @@ default = []
 gpu-cuda = ["libc"]
 # AMD ROCm GPU-direct via HIP (requires ROCm toolkit).
 gpu-rocm = ["libc"]
+# ADR-047 escalation — propagation pass-through for the hot-path
+# timers. kiseki-chunk itself isn't instrumented today (the cluster
+# wrapper in kiseki-chunk-cluster carries the timers); the feature
+# exists here so a single `cargo build -p kiseki-server
+# --features hot-path-trace` toggles everything via the workspace
+# graph. OFF by default.
+hot-path-trace = ["kiseki-tracing/hot-path-trace"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -24,6 +31,10 @@ libc = { workspace = true, optional = true }
 kiseki-block = { workspace = true }
 kiseki-common = { workspace = true }
 kiseki-crypto = { workspace = true }
+# Propagation pass-through for the ADR-047 hot-path timers (see
+# `hot-path-trace` feature above). Heavy deps inside kiseki-tracing
+# are feature-gated; OFF expansion is `()`.
+kiseki-tracing = { workspace = true }
 parking_lot = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 # `serde_json` retained for the small-object inline store + the

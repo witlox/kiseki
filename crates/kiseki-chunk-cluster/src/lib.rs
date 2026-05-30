@@ -749,11 +749,31 @@ impl AsyncChunkOps for ClusteredChunkStore {
         }
 
         // 1. Local write — counts as one ack.
-        let stored = self.local.write_chunk(envelope.clone(), pool).await?;
+        // ADR-047 hot-path timer (chunk.save_meta) — local
+        // PersistentChunkStore write: dedup-check + extent IO +
+        // chunk-meta fjall save. The existing
+        // `chunk_persistent_write_phase_duration` histogram inside
+        // PersistentChunkStore breaks the inner phases out further;
+        // this timer pins the call boundary at the cluster wrapper.
+        let stored = kiseki_tracing::hot_span!("chunk.save_meta", {
+            self.local.write_chunk(envelope.clone(), pool).await
+        })?;
         let mut acks: usize = 1;
+
+        // The brief's `chunk.derive_or_dedup` and `chunk.encrypt`
+        // labels live UPSTREAM of this function — the gateway runs
+        // both before constructing the Envelope handed in here. They
+        // are timed at the gateway call sites (`gw.derive_chunk_id`,
+        // `gw.encode_payload`); no chunk-cluster site exists today.
 
         // 2. Fan out to peers in parallel. Replication-N: each peer
         //    holds the whole envelope at fragment_index=0.
+        // ADR-047 hot-path timer (chunk.fan_put_fragment) — covers
+        // construction + the parallel-fan await loop. Stops on
+        // first-min-acks-met early exit (the drop(futs)+return path
+        // below), so the histogram measures the actual await-to-
+        // quorum cost rather than the worst-case total fan time.
+        kiseki_tracing::hot_timer_guard!(_ht_fan = "chunk.fan_put_fragment");
         if !self.peers.is_empty() {
             let chunk_id = envelope.chunk_id;
             let tenant_id = self.cfg.tenant_id;

@@ -11,6 +11,13 @@ publish = false  # internal crate; only kiseki-client publishes (release.yml)
 [lints]
 workspace = true
 
+[features]
+default = []
+# ADR-047 escalation — fine-grained per-step write-path timers.
+# Propagates `kiseki-tracing/hot-path-trace`. OFF by default (zero
+# runtime cost; macros expand to `()`).
+hot-path-trace = ["kiseki-tracing/hot-path-trace"]
+
 [dependencies]
 async-trait = { workspace = true }
 kiseki-common = { workspace = true }

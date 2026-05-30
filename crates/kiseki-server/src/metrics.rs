@@ -637,6 +637,14 @@ impl KisekiMetrics {
             .register(Box::new(storage_admin_calls_total.clone()))
             .expect("register");
 
+        // ADR-047 hot-path timers: register the `kiseki_hotpath_*`
+        // histogram-vec when the `hot-path-trace` feature is on. OFF
+        // builds skip this entirely — no metric appears on /metrics,
+        // no allocation, no atomic. The function is fully cfg-gated
+        // inside kiseki-tracing so a non-feature build sees no symbol.
+        #[cfg(feature = "hot-path-trace")]
+        kiseki_tracing::hot_path::register(&registry).expect("hotpath metric register");
+
         Self {
             registry,
             raft_commit_latency,

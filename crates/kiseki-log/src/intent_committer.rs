@@ -160,19 +160,45 @@ impl Committer {
         store: &dyn IntentStore,
         sink: &mut dyn IncorporationSink,
     ) -> Result<usize, IntentError> {
-        let mut pending = store.pending()?;
+        // ADR-047 hot-path timer (committer.read_pending) — wraps
+        // the store.pending() read. On fjall this is one snapshot
+        // scan of the WAL; on a cold store it's a no-op early-out.
+        let pending_res = kiseki_tracing::hot_span!("committer.read_pending", {
+            store.pending()
+        });
+        let mut pending = pending_res?;
         if pending.is_empty() {
             return Ok(0);
         }
         // Perspective-seq ascending: same-name LWW order on append.
-        pending.sort_by_key(|intent| intent.perspective_seq);
+        // ADR-047 hot-path timer (committer.sort_and_filter) —
+        // ascending sort; despite the brief's "filter" naming the
+        // PART-8 reframe deleted the floor filter, so this is pure
+        // sort cost (O(n log n) on the batch size).
+        kiseki_tracing::hot_span!("committer.sort_and_filter", {
+            pending.sort_by_key(|intent| intent.perspective_seq);
+        });
 
         // Walk in DRAIN_BATCH_CAP batches; each batch is one Raft round.
         let mut total = 0usize;
         for batch in pending.chunks(DRAIN_BATCH_CAP) {
-            sink.incorporate(batch)?;
+            // ADR-047 hot-path timer (committer.sink_incorporate)
+            // — THE Raft round cost. Per-batch (not per-intent):
+            // a 1000-entry batch is one observation.
+            let inc_res = kiseki_tracing::hot_span!("committer.sink_incorporate", {
+                sink.incorporate(batch)
+            });
+            inc_res?;
             total += batch.len();
         }
+        // ADR-047 hot-path timer (committer.prune) — PART-8 §T
+        // moved prune off-band to the supervisor; this site fires
+        // only when an in-loop prune call comes back. Kept for
+        // symmetry with the brief's per-step list so a future revert
+        // would be observable.
+        kiseki_tracing::hot_span!("committer.prune", {
+            // No-op: prune is off-band per PART 8 §T.
+        });
         Ok(total)
     }
 }

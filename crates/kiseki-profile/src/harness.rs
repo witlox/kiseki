@@ -170,6 +170,12 @@ impl ProfileServer {
             "KISEKI_COMPOSITION_FLUSH_INTERVAL_MS",
             "KISEKI_CHUNK_FLUSH_INTERVAL_MS",
             "KISEKI_RAFT_FLUSH_INTERVAL_MS",
+            // ADR-047 escalation harness knob — simulated outbound
+            // RTT (µs) injected into every Raft client RPC. Read once
+            // at module init by kiseki-raft::tcp_transport. Forwarded
+            // here so the profile harness can sweep its effect on
+            // single-host runs to model real-cluster RTTs.
+            "KISEKI_RAFT_FAKE_RTT_US",
         ] {
             if let Ok(v) = std::env::var(var) {
                 cmd.env(var, v);
@@ -768,7 +774,15 @@ fn spawn_cluster_node(
     // mirrors ProfileServer's passthrough. dhat lands a per-node
     // suffix the same way pprof does, but the server uses the literal
     // path so we hand it a {base}.node{i} variant when set.
-    for var in ["DHAT_OUTPUT_FILE", "KISEKI_OBSERVABILITY"] {
+    for var in [
+        "DHAT_OUTPUT_FILE",
+        "KISEKI_OBSERVABILITY",
+        // ADR-047 escalation harness knob — every spawned node sees
+        // the same simulated outbound Raft RTT so cross-node traffic
+        // is delayed symmetrically. Same pass-through pattern as the
+        // single-node ProfileServer above.
+        "KISEKI_RAFT_FAKE_RTT_US",
+    ] {
         if let Ok(v) = std::env::var(var) {
             if var == "DHAT_OUTPUT_FILE" {
                 cmd.env(var, format!("{v}.node{node_id}"));
