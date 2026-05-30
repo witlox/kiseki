@@ -975,8 +975,8 @@ impl InMemoryGateway {
     ///
     /// `name` is the optional S3 URL key. When `Some`, the resulting
     /// composition is bound to it in the per-bucket name index AND
-    /// the binding is replicated via the Raft Create-delta's v2
-    /// payload so followers' hydrators install the same name binding.
+    /// the binding is replicated via the Raft Create-delta's `name`
+    /// field so followers' hydrators install the same name binding.
     /// Without this, multipart-uploaded objects would be addressable
     /// by key only on the leader — followers would see the
     /// composition (via the delta) but not the name binding (via the
@@ -1032,7 +1032,7 @@ impl InMemoryGateway {
             );
             // Bind the URL key locally so the leader resolves
             // GET-by-key immediately; followers get the same binding
-            // via the Raft delta (v2 payload's `name` field).
+            // via the Raft delta's `name` field.
             if let Some(n) = name {
                 comps
                     .bind_name(comp.namespace_id, n.to_owned(), comp_id)
@@ -1051,7 +1051,7 @@ impl InMemoryGateway {
             "complete_multipart: pre-Raft",
         );
 
-        // Phase 2: emit Create delta — v2 payload carries the optional
+        // Phase 2: emit Create delta — payload carries the optional
         // name; new_chunks list seeds cluster_chunk_state for cross-
         // node reads. This is structurally identical to the regular
         // `write` path above; sharing the boilerplate would muddy
@@ -1098,12 +1098,13 @@ impl InMemoryGateway {
                 })
                 .collect();
 
-            let comp_payload = kiseki_composition::encode_composition_create_payload_named(
+            let comp_payload = kiseki_composition::encode_composition_create_payload(
                 comp_id,
                 emit_params.2,
                 emit_params.4,
                 name,
                 &emit_params.5,
+                None,
             );
             tracing::debug!(
                 comp_id = %comp_id.0,
@@ -1121,16 +1122,27 @@ impl InMemoryGateway {
             // the Create delta + `cluster_chunk_state` asynchronously. On
             // ANY error we fall through to the synchronous emit — no loss.
             if self.decoupled_ack {
+                let seq = self.next_perspective_seq();
+                // ADR-047 MF-1: re-encode the payload with `Some(seq)`
+                // so the hydrator's per-name LWW guard sees it. The
+                // sync-path payload above passes `None`.
+                let async_comp_payload = kiseki_composition::encode_composition_create_payload(
+                    comp_id,
+                    emit_params.2,
+                    emit_params.4,
+                    name,
+                    &emit_params.5,
+                    Some(seq),
+                );
                 let append = kiseki_composition::log_bridge::build_chunk_and_delta_request(
                     shard_id,
                     emit_params.1,
                     kiseki_log::delta::OperationType::Create,
                     hashed_key,
                     emit_params.3.clone(),
-                    comp_payload.clone(),
+                    async_comp_payload,
                     new_chunks.clone(),
                 );
-                let seq = self.next_perspective_seq();
                 // No idempotency context on the multipart-complete seam
                 // today (the upload_id is the client's retry token, not a
                 // 16-byte intent key) — at-least-once; the committer dedups
@@ -2497,7 +2509,8 @@ impl InMemoryGateway {
             let comps = self.compositions.as_ref();
             // ----- Create (+ bind name atomically when a key is given) -----
             // The Raft delta below carries the name to followers via
-            // the v2 create payload so their hydrators stay consistent.
+            // the create payload's `name` field so their hydrators
+            // stay consistent.
             //
             // When a name is present we fold create + bind_name into a
             // single storage-mutex + single backend-batch call so the
@@ -2629,13 +2642,20 @@ impl InMemoryGateway {
                 })
                 .collect();
 
-            // Phase 16f: payload encodes (comp_id, namespace_id, size) so
-            // followers can hydrate their CompositionStore from the log.
-            // S3 per-key naming extends the payload (v2 length-dispatched
-            // form) with the optional name so followers can replay name
-            // bindings; legacy v1 callers (NFS, internal) keep the 40-
-            // byte payload and the hydrator's name index stays untouched.
-            let comp_payload = kiseki_composition::encode_composition_create_payload_named(
+            // Phase 16f: payload encodes (comp_id, namespace_id, size,
+            // name?, lens?, perspective_seq?) so followers hydrate
+            // their CompositionStore from the log. S3 per-key naming
+            // carries the optional `name` so followers replay name
+            // bindings; nameless callers (NFS metadata-only path,
+            // internal) pass `None` and the hydrator's name index
+            // stays untouched.
+            //
+            // ADR-047 MF-1: the synchronous emit below passes
+            // `perspective_seq = None` (sync surface); the
+            // asynchronous decoupled-ack producer re-encodes with
+            // `Some(seq)` inside its branch so the hydrator-side
+            // LWW guard engages on followers.
+            let comp_payload = kiseki_composition::encode_composition_create_payload(
                 comp_id,
                 emit_params.2,
                 bytes_written,
@@ -2644,6 +2664,7 @@ impl InMemoryGateway {
                 // grid; readers derive per-chunk offsets via index math
                 // (no per-chunk lens needed in the delta).
                 &[],
+                None,
             );
             tracing::debug!(
                 comp_id = %comp_id.0,
@@ -2664,20 +2685,36 @@ impl InMemoryGateway {
             // non-durable / single-node error we fall through to the
             // synchronous emit so no write is ever lost.
             if self.decoupled_ack && req.surface.is_async_ack_eligible() {
+                let seq = self.next_perspective_seq();
+                // ADR-047 MF-1: encode the seq INTO the Create payload
+                // so the hydrator's LWW guard sees it (the seq carried
+                // on the intent itself is the Raft-apply order, not
+                // the per-name LWW key — that's the HLC inside the
+                // payload). The sync-path payload above passes
+                // `None` for the seq so the sync emit fallback below
+                // binds unconditionally.
+                let async_comp_payload = kiseki_composition::encode_composition_create_payload(
+                    comp_id,
+                    emit_params.2,
+                    bytes_written,
+                    req.name.as_deref(),
+                    &[],
+                    Some(seq),
+                );
                 // Build byte-for-byte the SAME append the synchronous emit
-                // would commit, so the committer incorporates an identical
-                // delta. Clone the consumable params (cheap — `payload`/
-                // `new_chunks` are metadata, not the file body).
+                // would commit (except for the seq suffix), so the
+                // committer incorporates an identical delta. Clone the
+                // consumable params (cheap — `payload` / `new_chunks` are
+                // metadata, not the file body).
                 let append = kiseki_composition::log_bridge::build_chunk_and_delta_request(
                     shard_id,
                     emit_params.1,
                     kiseki_log::delta::OperationType::Create,
                     hashed_key,
                     emit_params.3.clone(),
-                    comp_payload.clone(),
+                    async_comp_payload,
                     new_chunks.clone(),
                 );
-                let seq = self.next_perspective_seq();
                 // Idempotency: reuse the request-supplied key when it is
                 // exactly 16 bytes (the intent key width); otherwise `None`
                 // (at-least-once — the committer dedups on the Raft apply).

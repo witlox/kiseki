@@ -128,9 +128,7 @@ struct ShardSnapshot {
     /// refused-with-alarm (the SM increments
     /// `kiseki_log_dedup_ancient_refused_total` and logs `tracing::error!`).
     /// Persisted in snapshots so a freshly-installed follower honors the same
-    /// cutoff. `#[serde(default)]` makes pre-PART-8 snapshots decode to 0
-    /// (no ancient refusal until the window evicts).
-    #[serde(default)]
+    /// cutoff.
     ancient_cutoff_log_index: u64,
     /// ADR-047 PART 8 — the bounded recent-incorporated-seqs window. One
     /// `RecentIncorporatedEntry` per applied `IncorporateIntent` *strictly above
@@ -138,7 +136,6 @@ struct ShardSnapshot {
     /// or time-cap fires; eviction advances `ancient_cutoff_log_index`. The
     /// authoritative gate against duplicate apply for the recent window
     /// (multi-writer late-arrival / re-fan / replay).
-    #[serde(default)]
     recent_incorporated: Vec<RecentIncorporatedEntry>,
 }
 
@@ -1496,21 +1493,6 @@ mod tests {
         assert_eq!(loaded.recent_incorporated.len(), 2);
         assert_eq!(loaded.recent_incorporated[0].perspective_seq, hlc(1, 0, 1));
         assert_eq!(loaded.recent_incorporated[1].perspective_seq, hlc(2, 0, 1));
-
-        // A pre-PART-8 snapshot decodes with default cutoff = 0 + empty deque
-        // — additive-compat.
-        let legacy = serde_json::json!({
-            "delta_count": 0,
-            "tip": 0,
-            "maintenance": false,
-            "deltas": [],
-            "watermarks": [],
-            "shard_id": null,
-            "tenant_id": null
-        });
-        let loaded_legacy: ShardSnapshot = serde_json::from_value(legacy).unwrap();
-        assert_eq!(loaded_legacy.ancient_cutoff_log_index, 0);
-        assert!(loaded_legacy.recent_incorporated.is_empty());
     }
 
     /// PART 8 §U — a batched `IncorporateIntents` runs each item through the

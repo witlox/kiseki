@@ -21,17 +21,21 @@ pub const INLINE_DATA_THRESHOLD: u64 = 4096;
 // Each operation uses its own fixed-size payload format. The discriminator
 // is the delta header's `operation` field (already present, already
 // decoded by the hydrator), so the payload layouts don't need a leading
-// op byte. Decoders are length-checked and return `None` on mismatch so
-// the hydrator can defensively skip records from a future or legacy
-// encoding without getting stuck.
+// op byte. Decoders return `None` when the wire shape does not parse —
+// the hydrator treats that as a permanent skip so a malformed delta
+// doesn't wedge the loop.
 
-/// Wire size of the **Create** payload (40 bytes).
+/// Wire size of the fixed prefix of the **Create** payload (40 bytes).
 ///
 /// Layout (little-endian where applicable):
 ///   `[0..16)`  `composition_id` UUID
 ///   `[16..32)` `namespace_id` UUID
 ///   `[32..40)` `bytes_written` (u64 LE)
-pub const COMPOSITION_CREATE_PAYLOAD_LEN: usize = 40;
+///
+/// The Create payload always continues past this prefix with a
+/// length-prefixed name + lens + perspective-seq tail; see
+/// [`encode_composition_create_payload`] for the full shape.
+pub const COMPOSITION_CREATE_PAYLOAD_PREFIX_LEN: usize = 40;
 
 /// Wire size of the **Update** payload (24 bytes).
 ///
@@ -157,106 +161,126 @@ pub fn decode_namespace_create_payload(payload: &[u8]) -> Option<crate::namespac
     })
 }
 
-/// Encode a composition-create delta payload (legacy v1: 40 bytes,
-/// no name).
-#[must_use]
-pub fn encode_composition_create_payload(
-    comp_id: CompositionId,
-    namespace_id: NamespaceId,
-    bytes_written: u64,
-) -> Vec<u8> {
-    encode_composition_create_payload_named(comp_id, namespace_id, bytes_written, None, &[])
-}
-
-/// Encode a composition-create delta payload with an optional name
-/// (S3 PUT key) and an optional per-chunk plaintext-length vector.
-///
-/// Wire format:
-/// - Legacy v1 (no name, no lens): 40 bytes — `[comp_id 16][ns_id 16][size 8]`.
-/// - v2 (name only): 44 + `name_len` bytes — v1 + `[name_len 4][name]`.
-/// - v3 (name + per-chunk lens): v2 + `[lens_count 4][lens_count × u32 LE]`.
-///   Requires `name.is_some()` so the form is unambiguously
-///   length-distinguishable from v1/v2; pass `Some("")` if the
-///   composition is anonymous and lens are still needed.
-///
-/// Length-based dispatch (no magic byte) keeps backwards compatibility
-/// with existing on-the-wire deltas the hydrator may still see during
-/// rolling upgrades. `chunk_plaintext_lens` is currently set only by
-/// `complete_multipart`: regular PUTs follow the
-/// `MAX_PLAINTEXT_PER_CHUNK` grid and the read path uses index math.
-#[must_use]
-pub fn encode_composition_create_payload_named(
-    comp_id: CompositionId,
-    namespace_id: NamespaceId,
-    bytes_written: u64,
-    name: Option<&str>,
-    chunk_plaintext_lens: &[u32],
-) -> Vec<u8> {
-    // v3 requires a name to be encoded (so the v2 framing is present).
-    // Callers that need lens with no name should pass Some("").
-    let has_lens = !chunk_plaintext_lens.is_empty();
-    let effective_name = if has_lens { name.or(Some("")) } else { name };
-    let name_bytes = effective_name.unwrap_or("").as_bytes();
-    let cap = if effective_name.is_some() {
-        COMPOSITION_CREATE_PAYLOAD_LEN
-            + 4
-            + name_bytes.len()
-            + if has_lens {
-                4 + 4 * chunk_plaintext_lens.len()
-            } else {
-                0
-            }
-    } else {
-        COMPOSITION_CREATE_PAYLOAD_LEN
-    };
-    let mut out = Vec::with_capacity(cap);
-    out.extend_from_slice(comp_id.0.as_bytes());
-    out.extend_from_slice(namespace_id.0.as_bytes());
-    out.extend_from_slice(&bytes_written.to_le_bytes());
-    if effective_name.is_some() {
-        let name_len = u32::try_from(name_bytes.len()).unwrap_or(u32::MAX);
-        out.extend_from_slice(&name_len.to_le_bytes());
-        out.extend_from_slice(name_bytes);
-    }
-    if has_lens {
-        let lens_count = u32::try_from(chunk_plaintext_lens.len()).unwrap_or(u32::MAX);
-        out.extend_from_slice(&lens_count.to_le_bytes());
-        for &len in chunk_plaintext_lens {
-            out.extend_from_slice(&len.to_le_bytes());
-        }
-    }
-    out
-}
-
-/// Decode a composition-create delta payload (legacy 3-tuple form,
-/// drops the optional name + lens). Kept for callers that don't yet
-/// care about the additional fields; new callers should use
-/// [`decode_composition_create_payload_named`].
-#[must_use]
-pub fn decode_composition_create_payload(
-    payload: &[u8],
-) -> Option<(CompositionId, NamespaceId, u64)> {
-    decode_composition_create_payload_named(payload).map(|(c, n, s, _, _)| (c, n, s))
-}
-
 /// Decoded composition-create delta payload — see
-/// [`decode_composition_create_payload_named`].
+/// [`decode_composition_create_payload`].
+///
+/// Tuple: `(comp_id, namespace_id, size, name, chunk_plaintext_lens,
+/// perspective_seq)`. `name` is `Some(_)` when the Create carried a
+/// per-key binding (S3 / FUSE / NFS named PUT) and `None` for nameless
+/// internal creates. `chunk_plaintext_lens` is `Some(_)` only for
+/// multipart uploads (parts have arbitrary plaintext sizes); regular
+/// PUTs leave it `None` and the read path uses the
+/// `MAX_PLAINTEXT_PER_CHUNK` grid math. `perspective_seq` is `Some(_)`
+/// when the async (decoupled-ack) producer minted an ingress HLC for
+/// the per-name LWW guard, and `None` for sync surfaces.
 pub type DecodedCompositionCreate = (
     CompositionId,
     NamespaceId,
     u64,
     Option<String>,
     Option<Vec<u32>>,
+    Option<kiseki_log::intent::PerspectiveSeq>,
 );
 
-/// Decode a composition-create delta payload, including the optional
-/// name and the optional per-chunk plaintext lens. Recognizes:
-/// - v1 (40 bytes): name = None, lens = None.
-/// - v2 (44 + `name_len`): name = Some, lens = None.
-/// - v3 (v2 + `[4 lens_count][n × u32]`): name = Some, lens = Some(Vec).
+/// Encode a composition-create delta payload.
+///
+/// The wire shape is one fixed layout; there is no version dispatch.
+/// Every field after the fixed 40-byte prefix is present, with
+/// presence-bits / length-prefixes carrying the optional ones:
+///
+/// ```text
+/// [comp_id              : 16]
+/// [namespace_id         : 16]
+/// [bytes_written u64 LE : 8 ]   <- fixed 40-byte prefix
+/// [name_present u8      : 1 ]
+///   if 1: [name_len u32 LE : 4][name utf8 : name_len]
+/// [lens_count u32 LE    : 4 ]   <- 0 when no per-chunk lens carried
+///   for each: [chunk_plaintext_len u32 LE : 4]
+/// [seq_present u8       : 1 ]
+///   if 1: [physical_ms u64 LE : 8][logical u32 LE : 4][node_id u64 LE : 8]
+/// ```
+///
+/// `chunk_plaintext_lens` is currently set only by
+/// `complete_multipart`: regular PUTs follow the
+/// `MAX_PLAINTEXT_PER_CHUNK` grid and the read path uses index math,
+/// so they pass `&[]` (encoded as `lens_count = 0`).
+///
+/// **Cross-surface seq contract (ADR-047 MF-9):** the synchronous
+/// (POSIX / NFS / FUSE) gateway path passes `perspective_seq = None`
+/// — the name-bind for that write is unconditional, Raft-commit-order
+/// authoritative. The asynchronous (S3 / native decoupled-ack)
+/// producer mints a `PerspectiveSeq` per write and passes
+/// `Some(seq)`; the hydrator-side LWW guard then resolves concurrent
+/// async same-name binds by `Some(seq) > Some(stored_seq)`. `None`
+/// (sync) is treated as `-∞` for comparison so a sync-then-async
+/// sequence lets the async write win (it has a real HLC timestamp);
+/// an async-then-sync sequence lets the sync write win
+/// (unconditional). See per-site doc comments on the four bind /
+/// unbind sites for the full rule.
 #[must_use]
-pub fn decode_composition_create_payload_named(payload: &[u8]) -> Option<DecodedCompositionCreate> {
-    if payload.len() < COMPOSITION_CREATE_PAYLOAD_LEN {
+pub fn encode_composition_create_payload(
+    comp_id: CompositionId,
+    namespace_id: NamespaceId,
+    bytes_written: u64,
+    name: Option<&str>,
+    chunk_plaintext_lens: &[u32],
+    perspective_seq: Option<kiseki_log::intent::PerspectiveSeq>,
+) -> Vec<u8> {
+    let name_bytes = name.map(str::as_bytes);
+    let name_section_len = match name_bytes {
+        Some(b) => 1 + 4 + b.len(),
+        None => 1,
+    };
+    let lens_section_len = 4 + 4 * chunk_plaintext_lens.len();
+    let seq_section_len = 1 + if perspective_seq.is_some() { 20 } else { 0 };
+    let cap = COMPOSITION_CREATE_PAYLOAD_PREFIX_LEN
+        + name_section_len
+        + lens_section_len
+        + seq_section_len;
+
+    let mut out = Vec::with_capacity(cap);
+    // Fixed prefix.
+    out.extend_from_slice(comp_id.0.as_bytes());
+    out.extend_from_slice(namespace_id.0.as_bytes());
+    out.extend_from_slice(&bytes_written.to_le_bytes());
+    // Name section.
+    match name_bytes {
+        Some(b) => {
+            out.push(1);
+            let name_len = u32::try_from(b.len()).unwrap_or(u32::MAX);
+            out.extend_from_slice(&name_len.to_le_bytes());
+            out.extend_from_slice(b);
+        }
+        None => out.push(0),
+    }
+    // Lens section.
+    let lens_count = u32::try_from(chunk_plaintext_lens.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&lens_count.to_le_bytes());
+    for &len in chunk_plaintext_lens {
+        out.extend_from_slice(&len.to_le_bytes());
+    }
+    // Perspective-seq section.
+    match perspective_seq {
+        Some(seq) => {
+            out.push(1);
+            out.extend_from_slice(&seq.0.physical_ms.to_le_bytes());
+            out.extend_from_slice(&seq.0.logical.to_le_bytes());
+            out.extend_from_slice(&seq.0.node_id.0.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+    out
+}
+
+/// Decode a composition-create delta payload.
+///
+/// Returns `None` on any structural mismatch — the hydrator treats
+/// that as a permanent skip. The wire shape is the single layout
+/// produced by [`encode_composition_create_payload`]; any other shape
+/// is an error, not a recognised prior version.
+#[must_use]
+pub fn decode_composition_create_payload(payload: &[u8]) -> Option<DecodedCompositionCreate> {
+    if payload.len() < COMPOSITION_CREATE_PAYLOAD_PREFIX_LEN {
         return None;
     }
     let comp_uuid = uuid::Uuid::from_slice(&payload[0..16]).ok()?;
@@ -264,63 +288,98 @@ pub fn decode_composition_create_payload_named(payload: &[u8]) -> Option<Decoded
     let mut size_bytes = [0u8; 8];
     size_bytes.copy_from_slice(&payload[32..40]);
     let size = u64::from_le_bytes(size_bytes);
-    if payload.len() == COMPOSITION_CREATE_PAYLOAD_LEN {
-        return Some((
-            CompositionId(comp_uuid),
-            NamespaceId(ns_uuid),
-            size,
-            None,
-            None,
-        ));
-    }
-    // v2 / v3: must have at least 4 bytes for name_len.
-    if payload.len() < COMPOSITION_CREATE_PAYLOAD_LEN + 4 {
-        return None;
-    }
-    let mut len_bytes = [0u8; 4];
-    len_bytes.copy_from_slice(&payload[40..44]);
-    let name_len = u32::from_le_bytes(len_bytes) as usize;
-    let name_end = 44 + name_len;
-    if payload.len() < name_end {
-        return None;
-    }
-    let name_bytes = &payload[44..name_end];
-    let name = Some(std::str::from_utf8(name_bytes).ok()?.to_owned());
-    // v2 (no lens suffix): exact length match against v2.
-    if payload.len() == name_end {
-        return Some((
-            CompositionId(comp_uuid),
-            NamespaceId(ns_uuid),
-            size,
-            name,
-            None,
-        ));
-    }
-    // v3: `[4 lens_count][n × u32]` after the v2 form.
-    if payload.len() < name_end + 4 {
+
+    let mut pos = COMPOSITION_CREATE_PAYLOAD_PREFIX_LEN;
+
+    // Name section.
+    let name = {
+        let present = *payload.get(pos)?;
+        pos += 1;
+        match present {
+            0 => None,
+            1 => {
+                if payload.len() < pos + 4 {
+                    return None;
+                }
+                let mut len_bytes = [0u8; 4];
+                len_bytes.copy_from_slice(&payload[pos..pos + 4]);
+                pos += 4;
+                let name_len = u32::from_le_bytes(len_bytes) as usize;
+                if payload.len() < pos + name_len {
+                    return None;
+                }
+                let name = std::str::from_utf8(&payload[pos..pos + name_len])
+                    .ok()?
+                    .to_owned();
+                pos += name_len;
+                Some(name)
+            }
+            _ => return None,
+        }
+    };
+
+    // Lens section.
+    if payload.len() < pos + 4 {
         return None;
     }
     let mut count_bytes = [0u8; 4];
-    count_bytes.copy_from_slice(&payload[name_end..name_end + 4]);
+    count_bytes.copy_from_slice(&payload[pos..pos + 4]);
+    pos += 4;
     let lens_count = u32::from_le_bytes(count_bytes) as usize;
-    let lens_start = name_end + 4;
-    let lens_end = lens_start + 4 * lens_count;
-    if payload.len() != lens_end {
+    let lens_bytes = lens_count.checked_mul(4)?;
+    if payload.len() < pos + lens_bytes {
         return None;
     }
     let mut lens = Vec::with_capacity(lens_count);
-    for i in 0..lens_count {
-        let off = lens_start + 4 * i;
+    for _ in 0..lens_count {
         let mut b = [0u8; 4];
-        b.copy_from_slice(&payload[off..off + 4]);
+        b.copy_from_slice(&payload[pos..pos + 4]);
         lens.push(u32::from_le_bytes(b));
+        pos += 4;
     }
+    let lens = if lens_count == 0 { None } else { Some(lens) };
+
+    // Perspective-seq section.
+    let perspective_seq = {
+        let present = *payload.get(pos)?;
+        pos += 1;
+        match present {
+            0 => None,
+            1 => {
+                if payload.len() < pos + 20 {
+                    return None;
+                }
+                let mut phys = [0u8; 8];
+                phys.copy_from_slice(&payload[pos..pos + 8]);
+                let mut logical = [0u8; 4];
+                logical.copy_from_slice(&payload[pos + 8..pos + 12]);
+                let mut node = [0u8; 8];
+                node.copy_from_slice(&payload[pos + 12..pos + 20]);
+                pos += 20;
+                Some(kiseki_log::intent::PerspectiveSeq(
+                    kiseki_common::time::HybridLogicalClock {
+                        physical_ms: u64::from_le_bytes(phys),
+                        logical: u32::from_le_bytes(logical),
+                        node_id: kiseki_common::ids::NodeId(u64::from_le_bytes(node)),
+                    },
+                ))
+            }
+            _ => return None,
+        }
+    };
+
+    // Trailing bytes after the seq section are a structural error.
+    if pos != payload.len() {
+        return None;
+    }
+
     Some((
         CompositionId(comp_uuid),
         NamespaceId(ns_uuid),
         size,
         name,
-        Some(lens),
+        lens,
+        perspective_seq,
     ))
 }
 
@@ -2336,5 +2395,113 @@ mod tests {
         let legacy = &bytes[..NAMESPACE_CREATE_PAYLOAD_LEN];
         let back_legacy = decode_namespace_create_payload(legacy).expect("legacy decode");
         assert!(back_legacy.tier_policy.is_empty());
+    }
+
+    // -- Composition-create payload round-trip (the one wire shape) --------
+
+    #[test]
+    fn create_payload_round_trip_nameless() {
+        // Nameless Create (NFS / internal): no name, no lens, no seq.
+        let comp_id = CompositionId(uuid::Uuid::from_u128(1));
+        let ns_id = NamespaceId(uuid::Uuid::from_u128(2));
+        let bytes = encode_composition_create_payload(comp_id, ns_id, 7, None, &[], None);
+        let (c, n, s, name, lens, seq) =
+            decode_composition_create_payload(&bytes).expect("nameless decode");
+        assert_eq!(c, comp_id);
+        assert_eq!(n, ns_id);
+        assert_eq!(s, 7);
+        assert!(name.is_none());
+        assert!(lens.is_none());
+        assert!(seq.is_none());
+    }
+
+    #[test]
+    fn create_payload_round_trip_named_sync() {
+        // Sync-surface named Create: name present, no lens, no seq.
+        let comp_id = CompositionId(uuid::Uuid::from_u128(1));
+        let ns_id = NamespaceId(uuid::Uuid::from_u128(2));
+        let bytes =
+            encode_composition_create_payload(comp_id, ns_id, 32, Some("named/sync"), &[], None);
+        let (_c, _n, _s, name, lens, seq) =
+            decode_composition_create_payload(&bytes).expect("named-sync decode");
+        assert_eq!(name.as_deref(), Some("named/sync"));
+        assert!(lens.is_none());
+        assert!(seq.is_none());
+    }
+
+    #[test]
+    fn create_payload_round_trip_named_async_with_seq() {
+        use kiseki_common::ids::NodeId;
+        use kiseki_common::time::HybridLogicalClock;
+        use kiseki_log::intent::PerspectiveSeq;
+        let comp_id = CompositionId(uuid::Uuid::from_u128(7));
+        let ns_id = NamespaceId(uuid::Uuid::from_u128(13));
+        let seq = PerspectiveSeq(HybridLogicalClock {
+            physical_ms: 0xDEAD_BEEF,
+            logical: 0xCAFE,
+            node_id: NodeId(42),
+        });
+        let bytes = encode_composition_create_payload(
+            comp_id,
+            ns_id,
+            128,
+            Some("lww/file.bin"),
+            &[],
+            Some(seq),
+        );
+        let (c, n, s, name, lens, decoded_seq) =
+            decode_composition_create_payload(&bytes).expect("named-async decode");
+        assert_eq!(c, comp_id);
+        assert_eq!(n, ns_id);
+        assert_eq!(s, 128);
+        assert_eq!(name.as_deref(), Some("lww/file.bin"));
+        assert!(lens.is_none());
+        assert_eq!(decoded_seq, Some(seq));
+    }
+
+    #[test]
+    fn create_payload_round_trip_named_with_seq_and_lens() {
+        use kiseki_common::ids::NodeId;
+        use kiseki_common::time::HybridLogicalClock;
+        use kiseki_log::intent::PerspectiveSeq;
+        let comp_id = CompositionId(uuid::Uuid::from_u128(9));
+        let ns_id = NamespaceId(uuid::Uuid::from_u128(13));
+        let seq = PerspectiveSeq(HybridLogicalClock {
+            physical_ms: 1_000_000,
+            logical: 3,
+            node_id: NodeId(1),
+        });
+        let lens = vec![100u32, 200, 300];
+        let bytes = encode_composition_create_payload(
+            comp_id,
+            ns_id,
+            600,
+            Some("multipart/key"),
+            &lens,
+            Some(seq),
+        );
+        let (_c, _n, _s, name, decoded_lens, decoded_seq) =
+            decode_composition_create_payload(&bytes).expect("named+lens+seq decode");
+        assert_eq!(name.as_deref(), Some("multipart/key"));
+        assert_eq!(decoded_lens, Some(lens));
+        assert_eq!(decoded_seq, Some(seq));
+    }
+
+    #[test]
+    fn create_payload_rejects_trailing_bytes() {
+        // Trailing bytes after a well-formed payload are a structural
+        // error — the decoder returns None and the hydrator records a
+        // permanent skip.
+        let comp_id = CompositionId(uuid::Uuid::from_u128(1));
+        let ns_id = NamespaceId(uuid::Uuid::from_u128(2));
+        let mut bytes = encode_composition_create_payload(comp_id, ns_id, 7, None, &[], None);
+        bytes.push(0xAB);
+        assert!(decode_composition_create_payload(&bytes).is_none());
+    }
+
+    #[test]
+    fn create_payload_rejects_short_prefix() {
+        // Shorter than the fixed 40-byte prefix — structural failure.
+        assert!(decode_composition_create_payload(&[0u8; 5]).is_none());
     }
 }

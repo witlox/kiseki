@@ -115,6 +115,10 @@ pub struct KisekiWorld {
     pub last_response: Option<Vec<u8>>,
     pub writes_rejected: bool,
     pub reads_working: bool,
+    /// ADR-047 MF-1 / MF-9 — set by the multi-node concurrent
+    /// same-name convergence step; checked by the follow-up
+    /// "converged value is one of" step.
+    pub last_converged_value: Option<String>,
 
     // --- Name → ID mappings (Gherkin readability) ---
     pub shard_names: HashMap<String, ShardId>,
@@ -173,6 +177,7 @@ impl KisekiWorld {
             last_response: None,
             writes_rejected: false,
             reads_working: false,
+            last_converged_value: None,
             shard_names: HashMap::new(),
             tenant_ids: HashMap::new(),
             namespace_ids: HashMap::new(),
