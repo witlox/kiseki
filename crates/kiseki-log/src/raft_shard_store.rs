@@ -426,9 +426,8 @@ impl RaftShardStore {
         // ADR-047 hot-path timer (pif.local_put) — local fjall WAL
         // write; one of the two non-RTT critical-path costs on this
         // function alongside leader_first_hop.
-        let local_put_res = kiseki_tracing::hot_span!("pif.local_put", {
-            store.put(intent.clone())
-        });
+        let local_put_res =
+            kiseki_tracing::hot_span!("pif.local_put", { store.put(intent.clone()) });
         local_put_res.map_err(|e| {
             tracing::warn!(shard_id = %shard_id.0, error = %e, "put_intent_and_fan: local intent store write failed");
             LogError::Unavailable

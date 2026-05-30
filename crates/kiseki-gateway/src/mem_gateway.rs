@@ -2489,42 +2489,43 @@ impl InMemoryGateway {
             let comp_res = {
                 kiseki_tracing::hot_timer_guard!(_ht_comp = "gw.comp_create");
                 match (req.name.as_deref(), req.comp_id_override) {
-                // Cross-protocol comp-id pin (Group V #1). The NFS
-                // flush-on-COMMIT path supplies the placeholder UUID it
-                // returned to the client at CREATE time so the resulting
-                // composition lands under that exact id. `create_at` is
-                // idempotent on the supplied id — a follow-up flush
-                // with the same id is a no-op rather than a duplicate
-                // composition. `name` is incompatible with the
-                // override (S3 PUT doesn't use override; NFS doesn't
-                // use name); ignore name here.
-                (_, Some(target_id)) => comps
-                    .create_at(
-                        target_id,
-                        req.namespace_id,
-                        chunk_ids.clone(),
-                        bytes_written,
-                    )
-                    .map(|()| target_id),
-                (Some(name), None) => {
-                    let check_owner = req
-                        .conditional
-                        .as_ref()
-                        .map(|cond| ConditionalCheckAdapter { cond, name });
-                    let check_ref = check_owner.as_ref().map(|c| c as &dyn ConditionalCheck);
-                    comps.create_with_name(
-                        req.namespace_id,
-                        name.to_owned(),
-                        check_ref,
-                        chunk_ids.clone(),
-                        bytes_written,
-                    )
-                }
-                (None, None) => comps.create(req.namespace_id, chunk_ids.clone(), bytes_written),
+                    // Cross-protocol comp-id pin (Group V #1). The NFS
+                    // flush-on-COMMIT path supplies the placeholder UUID it
+                    // returned to the client at CREATE time so the resulting
+                    // composition lands under that exact id. `create_at` is
+                    // idempotent on the supplied id — a follow-up flush
+                    // with the same id is a no-op rather than a duplicate
+                    // composition. `name` is incompatible with the
+                    // override (S3 PUT doesn't use override; NFS doesn't
+                    // use name); ignore name here.
+                    (_, Some(target_id)) => comps
+                        .create_at(
+                            target_id,
+                            req.namespace_id,
+                            chunk_ids.clone(),
+                            bytes_written,
+                        )
+                        .map(|()| target_id),
+                    (Some(name), None) => {
+                        let check_owner = req
+                            .conditional
+                            .as_ref()
+                            .map(|cond| ConditionalCheckAdapter { cond, name });
+                        let check_ref = check_owner.as_ref().map(|c| c as &dyn ConditionalCheck);
+                        comps.create_with_name(
+                            req.namespace_id,
+                            name.to_owned(),
+                            check_ref,
+                            chunk_ids.clone(),
+                            bytes_written,
+                        )
+                    }
+                    (None, None) => {
+                        comps.create(req.namespace_id, chunk_ids.clone(), bytes_written)
+                    }
                 }
             };
-            let comp_id = comp_res
-            .map_err(|e| {
+            let comp_id = comp_res.map_err(|e| {
                 tracing::warn!(error = %e, "gateway write: compositions.create failed");
                 // Map the typed NamespaceNotFound through to the
                 // gateway's typed variant so the HTTP layer can
@@ -2660,19 +2661,16 @@ impl InMemoryGateway {
                 // so the hydrator's LWW guard sees it.
                 // ADR-047 hot-path timer (gw.encode_payload) — covers
                 // postcard-encode + name copy for the Create payload.
-                let async_comp_payload = kiseki_tracing::hot_span!(
-                    "gw.encode_payload",
-                    {
-                        kiseki_composition::encode_composition_create_payload(
-                            comp_id,
-                            emit_params.2,
-                            bytes_written,
-                            req.name.as_deref(),
-                            &[],
-                            Some(seq),
-                        )
-                    }
-                );
+                let async_comp_payload = kiseki_tracing::hot_span!("gw.encode_payload", {
+                    kiseki_composition::encode_composition_create_payload(
+                        comp_id,
+                        emit_params.2,
+                        bytes_written,
+                        req.name.as_deref(),
+                        &[],
+                        Some(seq),
+                    )
+                });
                 // ADR-047 hot-path timer (gw.build_append) — covers
                 // the AppendChunkAndDeltaRequest construction including
                 // the chunk-refs / new-chunks copies it folds in.
@@ -2708,9 +2706,7 @@ impl InMemoryGateway {
                 // — covers the entire quorum-fan call from the gateway's
                 // perspective (the inner pif.* timers break it down
                 // further: local_put, leader_first_hop, parallel_topup).
-                kiseki_tracing::hot_timer_guard!(
-                    _ht_pif = "gw.put_intent_and_fan_call"
-                );
+                kiseki_tracing::hot_timer_guard!(_ht_pif = "gw.put_intent_and_fan_call");
                 match log.put_intent_and_fan(shard_id, intent).await {
                     Ok(()) => {
                         // Intent is `min_acks`-durable: fast-ack now. Do NOT
