@@ -67,16 +67,11 @@ struct OpenRaftAppender {
 }
 
 impl crate::raft_intent_sink::IntentLogAppender for OpenRaftAppender {
-    async fn append_intent(
+    async fn append_intents(
         &self,
-        req: AppendChunkAndDeltaRequest,
-        seq: crate::intent::PerspectiveSeq,
+        items: Vec<crate::raft_store::IncorporateItem>,
     ) -> Result<(), LogError> {
-        crate::raft_intent_sink::IntentLogAppender::append_intent(&*self.store, req, seq).await
-    }
-
-    async fn max_incorporated_seq(&self) -> Option<kiseki_common::time::HybridLogicalClock> {
-        crate::raft_intent_sink::IntentLogAppender::max_incorporated_seq(&*self.store).await
+        crate::raft_intent_sink::IntentLogAppender::append_intents(&*self.store, items).await
     }
 }
 
@@ -951,25 +946,41 @@ impl RaftShardStore {
     }
 }
 
-/// The per-shard committer supervisor loop (ADR-047 `LeaderSink`, MF-2 + MF-5).
+/// PART 8 §W — bounded post-promotion wait. After a false→true leadership
+/// edge, the supervisor polls `applied_log_index >= committed_log_index` for
+/// up to this duration before resuming drain. On timeout it logs a warn and
+/// proceeds (do NOT deadlock — the SM gate still catches duplicates).
+const POST_PROMOTION_WAIT_MAX: Duration = Duration::from_secs(5);
+
+/// PART 8 §W — poll cadence for the post-promotion wait.
+const POST_PROMOTION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The per-shard committer supervisor loop (ADR-047 `LeaderSink`, PART 8).
 ///
 /// Runs on a dedicated thread (the threading contract — drives a synchronous
 /// [`RaftLogIncorporationSink`] that `block_on`s the async log). Each tick:
 ///
-/// 1. **Self-prune (every node):** prune the local intent store up to this
-///    node's OWN applied `max_incorporated_seq` (read from the replicated log).
-///    Safe on leader and follower alike — once a seq is incorporated and
-///    replicated here, the local intent copy is redundant. Bounds follower
-///    store growth under sustained load (the MF-5 / Finding-F fix).
-/// 2. **Leadership transition:** read `is_leader()`. On the false→true edge,
-///    run `recover()` once (gather peers' pending, union, restore) BEFORE
-///    draining — retried each tick until it reaches threshold. On the true→
-///    false edge, stop draining (idle until re-elected).
-/// 3. **Drain (leader only, after recovery succeeded):** `drain_local()`.
+/// 1. **Per-intent self-prune (every node, PART 8 §T):** snapshot the SM's
+///    `recent_incorporated_seqs`; for each seq in the snapshot, call
+///    [`IntentStore::remove_seq`] on the local store. Bounded by the
+///    snapshot size. The SM owns the dedup set (replicated, snapshot-included);
+///    the supervisor reads it off-band and prunes only intents *known to be
+///    applied on this replica*. Preserves the Raft/store fault isolation that
+///    a per-apply prune would lose (Finding T).
+/// 2. **Leadership transition + post-promotion wait-for-current (§W):** read
+///    `is_leader()`. On the false→true edge, BEFORE running `recover()`, poll
+///    `applied_log_index >= committed_log_index` for up to
+///    [`POST_PROMOTION_WAIT_MAX`] so the recent-set covers everything in the
+///    log before draining gates new appends. On the true→false edge, stop
+///    draining (idle until re-elected).
+/// 3. **Election recovery + recovery dedup:** gather + `recover()` (filtered to
+///    drop already-incorporated and ancient intents on the way in — see §6).
+/// 4. **Drain (leader only, after recovery succeeded):** `drain_local()`.
 ///
 /// Per-tick errors are logged and swallowed so one bad pass never kills the
 /// loop. Shutdown is via the `shutdown` watch (set by `Self::shutdown` / `Drop`
 /// / shard retire).
+#[allow(clippy::too_many_lines)] // supervisor cohesion > arbitrary line cap
 async fn run_supervisor_loop<S, G>(
     shard_id: ShardId,
     mut committer: ShardCommitter<S>,
@@ -985,29 +996,45 @@ async fn run_supervisor_loop<S, G>(
     if *shutdown.borrow() {
         return;
     }
-    // Leadership edge state: are we currently the leader, and (if so) have we
-    // completed recovery for this leadership term?
     let mut was_leader = false;
     let mut recovered_this_term = false;
 
     loop {
-        // --- (1) Self-prune on every node (MF-5) ---------------------------
-        // Prune up to this node's applied max_incorporated_seq. A follower
-        // applies IncorporateIntent too, so its floor advances as the log
-        // replicates; everything at/below it is redundant in the intent store.
-        if let Some(applied_floor) = leadership_store.max_incorporated_seq().await {
-            if let Err(e) = prune_store.prune(crate::intent::PerspectiveSeq(applied_floor)) {
-                tracing::debug!(shard_id = %shard_id.0, error = %e, "intent self-prune failed; retry next tick");
+        // --- (1) Per-intent self-prune on every node (PART 8 §T) ----------
+        // Snapshot the SM's recent_incorporated set and remove exactly those
+        // local intents. Only intents already replicated AND applied on this
+        // node disappear; everything else stays for recovery to re-derive.
+        let snapshot = leadership_store.recent_incorporated_snapshot().await;
+        for seq in &snapshot {
+            if let Err(e) = prune_store.remove_seq(crate::intent::PerspectiveSeq(*seq)) {
+                tracing::debug!(shard_id = %shard_id.0, error = %e, "per-intent self-prune failed; retry next tick");
             }
         }
 
-        // --- (2) Leadership transition -------------------------------------
+        // --- (2) Leadership transition ------------------------------------
         let is_leader = leadership_store.is_leader();
         if is_leader && !was_leader {
-            // false→true edge: a new leadership term. Recovery must complete
-            // before we resume draining (R1/R5).
             recovered_this_term = false;
-            tracing::info!(shard_id = %shard_id.0, "LeaderSink: became shard leader — recovering before drain");
+            tracing::info!(shard_id = %shard_id.0, "LeaderSink: became shard leader — waiting for applied catch-up");
+            // §W — bounded wait for the SM to apply the inherited log so the
+            // recent_incorporated set covers it before we gate new appends.
+            let start = std::time::Instant::now();
+            loop {
+                let applied_idx = leadership_store.applied_log_index();
+                let highest_committed = leadership_store.committed_log_index();
+                if applied_idx >= highest_committed {
+                    break;
+                }
+                if start.elapsed() >= POST_PROMOTION_WAIT_MAX {
+                    tracing::warn!(
+                        shard_id = %shard_id.0,
+                        applied = applied_idx, committed = highest_committed,
+                        "LeaderSink: post-promotion wait timeout — proceeding (SM gate still catches duplicates)",
+                    );
+                    break;
+                }
+                tokio::time::sleep(POST_PROMOTION_POLL_INTERVAL).await;
+            }
         } else if !is_leader && was_leader {
             tracing::info!(shard_id = %shard_id.0, "LeaderSink: lost shard leadership — parking committer");
         }
@@ -1017,27 +1044,80 @@ async fn run_supervisor_loop<S, G>(
             // (2a) Election recovery — once per term, retried until it lands.
             if !recovered_this_term {
                 match gatherer.gather_pending().await {
-                    Ok(peers) => match committer.recover(&peers) {
-                        Ok(restored) => {
-                            recovered_this_term = true;
-                            tracing::info!(
-                                shard_id = %shard_id.0,
-                                restored,
-                                "LeaderSink: election recovery complete — resuming drain",
-                            );
+                    Ok(peers) => {
+                        // PART 8 §6 — recovery dedup. Drop any re-gathered
+                        // intent whose seq is in the SM's recent set (already
+                        // incorporated on this node) or whose source's
+                        // sentinel falls below the ancient cutoff. Re-read
+                        // the snapshot AFTER any wait so it reflects the
+                        // applied log.
+                        let recent_snap = leadership_store.recent_incorporated_snapshot().await;
+                        let cutoff = leadership_store.ancient_cutoff_log_index().await;
+                        let filtered: Vec<(NodeId, Vec<WriteIntent>)> = peers
+                            .into_iter()
+                            .map(|(node, set)| {
+                                let kept: Vec<WriteIntent> = set
+                                    .into_iter()
+                                    .filter(|intent| {
+                                        let seq = intent.perspective_seq.0;
+                                        // Already applied here -> drop.
+                                        if recent_snap.contains(&seq) {
+                                            return false;
+                                        }
+                                        // The recovery filter for "ancient"
+                                        // is operationally suspicious. Without
+                                        // a log-index attached to the recovered
+                                        // intent we can't compare against
+                                        // cutoff directly, but a non-zero
+                                        // cutoff with an empty recent set is
+                                        // already odd; we surface that as an
+                                        // alarm + drop only when the cutoff
+                                        // is non-zero AND this seq pre-dates
+                                        // every recent-set entry's physical_ms
+                                        // — a heuristic for Finding Q's
+                                        // partition-recovery case.
+                                        if cutoff > 0 {
+                                            if let Some(min_recent) = recent_snap
+                                                .iter()
+                                                .min_by_key(|h| h.physical_ms)
+                                            {
+                                                if seq.physical_ms < min_recent.physical_ms.saturating_sub(1) {
+                                                    tracing::warn!(
+                                                        shard_id = %shard_id.0,
+                                                        seq = ?seq,
+                                                        cutoff,
+                                                        "LeaderSink: recovery dropped ancient intent (Finding Q alarm)",
+                                                    );
+                                                    return false;
+                                                }
+                                            }
+                                        }
+                                        true
+                                    })
+                                    .collect();
+                                (node, kept)
+                            })
+                            .collect();
+                        match committer.recover(&filtered) {
+                            Ok(restored) => {
+                                recovered_this_term = true;
+                                tracing::info!(
+                                    shard_id = %shard_id.0,
+                                    restored,
+                                    "LeaderSink: election recovery complete — resuming drain",
+                                );
+                            }
+                            Err(crate::intent::IntentError::InsufficientQuorum { have, need }) => {
+                                tracing::warn!(
+                                    shard_id = %shard_id.0, have, need,
+                                    "LeaderSink: recovery gather below threshold — retrying, NOT draining",
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(shard_id = %shard_id.0, error = %e, "LeaderSink: recovery restore failed — retrying");
+                            }
                         }
-                        Err(crate::intent::IntentError::InsufficientQuorum { have, need }) => {
-                            // Sub-threshold gather: do NOT resume draining (could
-                            // miss an acked intent). Retry next tick.
-                            tracing::warn!(
-                                shard_id = %shard_id.0, have, need,
-                                "LeaderSink: recovery gather below threshold — retrying, NOT draining",
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(shard_id = %shard_id.0, error = %e, "LeaderSink: recovery restore failed — retrying");
-                        }
-                    },
+                    }
                     Err(e) => {
                         tracing::warn!(shard_id = %shard_id.0, error = %e, "LeaderSink: recovery peer gather failed — retrying");
                     }

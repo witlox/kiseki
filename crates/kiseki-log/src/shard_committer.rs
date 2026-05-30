@@ -260,7 +260,8 @@ mod tests {
     #[test]
     fn drain_local_drains_full_store() {
         // `LeaderSink`: a leader with a populated store drains it fully into the
-        // sink ascending, with no peer reports.
+        // sink ascending, with no peer reports. PART 8 — the store is NOT
+        // pruned here; off-band per-intent prune lives in the supervisor.
         let store = Arc::new(InMemIntentStore::new());
         fill(&store, &[seq(3, 0, 1), seq(1, 0, 1), seq(2, 0, 1)]);
         let mut committer = ShardCommitter::new(store.clone(), RecordingSink::new(), 3, 2);
@@ -271,8 +272,11 @@ mod tests {
             committer.sink.incorporated,
             vec![seq(1, 0, 1), seq(2, 0, 1), seq(3, 0, 1)]
         );
-        // Store drained by the committer's prune.
-        assert_eq!(store.pending_len().unwrap(), 0);
+        assert_eq!(
+            store.pending_len().unwrap(),
+            3,
+            "store retains items; supervisor prunes off-band",
+        );
     }
 
     #[test]
@@ -286,21 +290,28 @@ mod tests {
         let n = committer.drain_local().unwrap();
         assert_eq!(n, 1);
         assert_eq!(committer.sink.incorporated, vec![seq(9, 0, 1)]);
-        assert_eq!(store.pending_len().unwrap(), 0);
+        // Off-band prune lives in the supervisor; committer leaves it.
+        assert_eq!(store.pending_len().unwrap(), 1);
     }
 
     #[test]
-    fn drain_local_skips_below_floor() {
-        // F-2 pre-filter: an intent at/below the sink floor is skipped.
+    fn drain_local_drains_all_no_floor() {
+        // PART 8 — no floor filter; drain everything (SM dedup is the gate).
+        // Also: the supervisor (not the committer) prunes, so the store
+        // remains populated after `drain_local`.
         let store = Arc::new(InMemIntentStore::new());
         fill(&store, &[seq(2, 0, 1), seq(3, 0, 1)]);
-        let sink = RecordingSink::new().with_max_incorporated(seq(2, 0, 1));
+        let sink = RecordingSink::new();
         let mut committer = ShardCommitter::new(store.clone(), sink, 3, 2);
 
         let n = committer.drain_local().unwrap();
-        assert_eq!(n, 1, "only seq(3) is above the floor");
-        assert_eq!(committer.sink.incorporated, vec![seq(3, 0, 1)]);
-        assert_eq!(store.pending_len().unwrap(), 0);
+        assert_eq!(n, 2, "drain-all sees both seqs");
+        assert_eq!(
+            committer.sink.incorporated,
+            vec![seq(2, 0, 1), seq(3, 0, 1)]
+        );
+        // Off-band prune lives in the supervisor; the committer leaves it.
+        assert_eq!(store.pending_len().unwrap(), 2);
     }
 
     #[test]
@@ -429,7 +440,10 @@ mod tests {
                 committer.sink.incorporated,
                 vec![seq(1, 0, 1), seq(2, 0, 1), seq(3, 0, 1)]
             );
-            assert_eq!(store.pending_len().unwrap(), 0);
+            // PART 8 — off-band prune lives in the supervisor; the committer
+            // leaves the store populated for the supervisor's per-intent
+            // remove against the SM's recent set.
+            assert_eq!(store.pending_len().unwrap(), 3);
         });
     }
 }

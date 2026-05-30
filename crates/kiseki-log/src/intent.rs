@@ -147,11 +147,21 @@ pub trait IntentStore: Send + Sync {
     /// Drop intents up to and including `up_to` once incorporated into the
     /// Raft log. Pruning is an optimization derivable from the log, never a
     /// correctness dependency (ADR-047 §F-2 — recovery re-derives from the
-    /// log's `max_incorporated_seq`).
+    /// log's recent-incorporated set).
     ///
     /// # Errors
     /// Backing-store I/O or codec failure (durable impls only).
     fn prune(&self, up_to: PerspectiveSeq) -> Result<(), IntentError>;
+
+    /// PART 8 §T — drop one specific intent by exact perspective-seq. Used by
+    /// the supervisor's per-intent self-prune: it reads the SM's
+    /// `recent_incorporated_seqs` and calls this once per seq in the set, so
+    /// only intents *known to be applied on this replica* are removed.
+    /// No-op if no intent with `seq` is present (idempotent).
+    ///
+    /// # Errors
+    /// Backing-store I/O or codec failure (durable impls only).
+    fn remove_seq(&self, seq: PerspectiveSeq) -> Result<(), IntentError>;
 
     /// Pending count — observability + backpressure (ADR-047 §F-6).
     ///
@@ -225,6 +235,21 @@ impl IntentStore for InMemIntentStore {
         // Drop dedup entries whose seq is no longer pending.
         let live: std::collections::HashSet<PerspectiveSeq> = g.by_seq.keys().copied().collect();
         g.by_key.retain(|_, seq| live.contains(seq));
+        Ok(())
+    }
+
+    fn remove_seq(&self, seq: PerspectiveSeq) -> Result<(), IntentError> {
+        let mut g = self.inner.lock().lock_or_die("intent_store.inner");
+        if let Some(intent) = g.by_seq.remove(&seq) {
+            if let Some(key) = intent.idempotency_key {
+                // Only drop the dedup pointer if it still maps to *this* seq —
+                // a later put with the same key (unlikely but defensible)
+                // already replaced it and must not lose its pointer.
+                if g.by_key.get(&key).copied() == Some(seq) {
+                    g.by_key.remove(&key);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -609,6 +634,34 @@ impl IntentStore for FjallIntentStore {
             let decoded = decode_value(v.as_ref())?;
             if let Some(idem) = decoded.idempotency_key {
                 batch.remove(&self.idem_ks, idem.to_vec());
+            }
+        }
+        batch.commit()?;
+        Ok(())
+    }
+
+    fn remove_seq(&self, seq: PerspectiveSeq) -> Result<(), IntentError> {
+        // PART 8 §T — per-seq prune. Same atomicity contract as `prune`:
+        // intent row + dedup pointer commit in one batch.
+        let _guard = self
+            .mutations
+            .lock()
+            .lock_or_die("intent_store.fjall.mutations");
+        let seq_key = encode_seq_key(seq);
+        let Some(v) = self.intents_ks.get(seq_key)? else {
+            // Idempotent — no-op when the seq is already gone.
+            return Ok(());
+        };
+        let decoded = decode_value(v.as_ref())?;
+        let mut batch = self.batch_for_write();
+        batch.remove(&self.intents_ks, seq_key.to_vec());
+        if let Some(idem) = decoded.idempotency_key {
+            // Match the in-mem impl: only drop the dedup pointer if it still
+            // points at THIS seq (a later put may have replaced it).
+            if let Some(pointer) = self.idem_ks.get(idem)? {
+                if pointer.as_ref() == seq_key.as_slice() {
+                    batch.remove(&self.idem_ks, idem.to_vec());
+                }
             }
         }
         batch.commit()?;
@@ -1004,5 +1057,60 @@ mod tests {
         assert_eq!(recorded, 1, "exactly one writer records");
         assert_eq!(duplicate, 15, "the rest dedup to the first");
         assert_eq!(store.pending_len().unwrap(), 1, "one intent persisted");
+    }
+
+    /// PART 8 §T — the supervisor's per-intent prune model.
+    ///
+    /// Simulates the supervisor: snapshot a set of "applied" perspective-seqs
+    /// (the SM's `recent_incorporated_seqs`), then call `remove_seq` for each
+    /// seq in the snapshot. Exactly those intents are removed; the rest stay
+    /// — so an un-incorporated intent never falls victim to a global floor.
+    #[test]
+    fn supervisor_per_intent_prune_removes_only_incorporated() {
+        let store = InMemIntentStore::new();
+        let s1 = seq(1, 0, 1);
+        let s2 = seq(2, 0, 1);
+        let s3 = seq(3, 0, 1);
+        let s4 = seq(4, 0, 1);
+        let s5 = seq(5, 0, 1);
+        for s in [s1, s2, s3, s4, s5] {
+            store.put(intent(s, None)).unwrap();
+        }
+        assert_eq!(store.pending_len().unwrap(), 5);
+
+        // The SM's recent_incorporated snapshot — 3 of the 5 seqs.
+        let recent: std::collections::HashSet<HybridLogicalClock> =
+            [s1.0, s3.0, s5.0].into_iter().collect();
+
+        // Supervisor walks the snapshot, calling remove_seq per item.
+        for seq in &recent {
+            store.remove_seq(PerspectiveSeq(*seq)).unwrap();
+        }
+
+        let remaining: Vec<PerspectiveSeq> = store
+            .pending()
+            .unwrap()
+            .into_iter()
+            .map(|i| i.perspective_seq)
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![s2, s4],
+            "only the two un-incorporated seqs remain",
+        );
+    }
+
+    /// PART 8 — `remove_seq` is idempotent on a missing seq.
+    #[test]
+    fn remove_seq_idempotent_when_absent() {
+        let store = InMemIntentStore::new();
+        store.put(intent(seq(1, 0, 1), None)).unwrap();
+        // Remove a seq that doesn't exist: no-op.
+        store.remove_seq(seq(99, 0, 1)).unwrap();
+        assert_eq!(store.pending_len().unwrap(), 1);
+        // Remove the present one, then again: still no-op.
+        store.remove_seq(seq(1, 0, 1)).unwrap();
+        store.remove_seq(seq(1, 0, 1)).unwrap();
+        assert_eq!(store.pending_len().unwrap(), 0);
     }
 }

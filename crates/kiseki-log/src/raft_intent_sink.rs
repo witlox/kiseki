@@ -1,35 +1,25 @@
-//! ADR-047 phase 5a (option 2) — the real [`IncorporationSink`].
+//! ADR-047 PART 8 — the real [`IncorporationSink`] over the live Raft log.
 //!
-//! [`crate::intent_committer`] owns the pure incorporation algorithm behind the
-//! synchronous [`IncorporationSink`] seam; [`crate::intent`] owns the durable
-//! intent record. This module bridges that seam to the **live Raft log**: it
-//! drains committed intents into the log via `append_intent`, which stamps each
-//! `ChunkAndDelta` command with its committer-assigned perspective-seq so the
-//! state machine records `max_incorporated_seq` — the gate-1 **F-2** floor a
-//! recovering leader reads to drop re-gathered intents (option 2: the floor is
-//! recorded *in the state machine*, not derived from prune state).
+//! Drains committed intents into the log via [`IntentLogAppender::append_intents`]
+//! — one batched [`crate::raft_store::LogCommand::IncorporateIntents`] per
+//! `incorporate` call. PART 8 deletes the global-floor read from this layer;
+//! the SM apply gate (`recent_incorporated` + ancient cutoff) is the
+//! authoritative dedup.
 //!
-//! The async log API ([`OpenRaftLogStore::append_intent`] /
-//! [`OpenRaftLogStore::max_incorporated_seq`]) is abstracted behind
-//! [`IntentLogAppender`] so the sink is unit-testable without a live raft node
-//! (the tests fake the appender). Dispatch is generic, not `dyn` — the trait's
-//! `async fn`s have no object-safe form here and none is needed.
-//!
-//! **This module delivers the sink and its tests only.** Wiring the per-shard
-//! committer task that drives it (on a dedicated thread per the threading
-//! contract below) is phase 5b/5c — this layer spawns nothing.
+//! The async log API is abstracted behind [`IntentLogAppender`] so the sink is
+//! unit-testable without a live raft node (the tests fake the appender).
+//! Dispatch is generic, not `dyn` — the trait's `async fn` has no object-safe
+//! form and none is needed.
 
 use tokio::runtime::Handle;
 
-use kiseki_common::time::HybridLogicalClock;
-
 use crate::error::LogError;
-use crate::intent::{IntentError, PerspectiveSeq};
+use crate::intent::IntentError;
 use crate::intent_committer::IncorporationSink;
-use crate::traits::AppendChunkAndDeltaRequest;
+use crate::raft_store::IncorporateItem;
 
 /// The async seam the [`RaftLogIncorporationSink`] needs from the log:
-/// append an incorporated intent and read the recorded F-2 floor.
+/// append a batched [`crate::raft_store::LogCommand::IncorporateIntents`].
 ///
 /// Implemented by [`crate::raft::openraft_store::OpenRaftLogStore`] in
 /// production; faked in tests so the sink is exercised without a live raft
@@ -37,72 +27,48 @@ use crate::traits::AppendChunkAndDeltaRequest;
 /// `async fn` form is fine — there is no `dyn IntentLogAppender`.
 #[allow(async_fn_in_trait)]
 pub trait IntentLogAppender: Send + Sync {
-    /// Append one incorporated intent to the Raft log under `seq`, recording
-    /// `seq` into the state machine's `max_incorporated_seq`.
+    /// Append a batched `IncorporateIntents` command to the Raft log.
+    /// All items in `items` are submitted as a single Raft round; the SM
+    /// applies each through the PART 8 per-item gate.
     ///
     /// # Errors
     /// [`LogError`] on any append / Raft client-write failure.
-    async fn append_intent(
-        &self,
-        req: AppendChunkAndDeltaRequest,
-        seq: PerspectiveSeq,
-    ) -> Result<(), LogError>;
-
-    /// The highest perspective-seq already incorporated into the log — the
-    /// recovery floor. `None` until the first intent is incorporated.
-    async fn max_incorporated_seq(&self) -> Option<HybridLogicalClock>;
+    async fn append_intents(&self, items: Vec<IncorporateItem>) -> Result<(), LogError>;
 }
 
 /// The real [`IncorporationSink`]: drains committed intents into the Raft log
-/// via [`IntentLogAppender::append_intent`].
+/// via [`IntentLogAppender::append_intents`] in batches.
 ///
 /// Bridges the **synchronous** [`IncorporationSink`] seam (the committer drives
-/// it synchronously) to the **async** log API via [`Handle::block_on`]. The
-/// cached `max_incorporated` is seeded from the log on construction so the
-/// committer applies the F-2 floor from the first pass.
+/// it synchronously) to the **async** log API via [`Handle::block_on`].
 ///
 /// # THREADING CONTRACT
 /// The per-shard committer task that drives this sink **MUST** run on its own
 /// dedicated thread — a `std::thread` holding a runtime [`Handle`] — **NOT** a
-/// shared tokio worker thread. Wiring that dedicated-thread committer is phase
-/// 5c (`RaftShardStore::spawn_committer`).
-///
-/// The sink bridges sync → async by blocking that dedicated thread on the Raft
-/// log append. Two call shapes are supported, picked at runtime:
+/// shared tokio worker thread. Two call shapes are supported, picked at
+/// runtime:
 ///
 /// - **Outside any runtime context** (a bare `std::thread`, or a `#[test]`
 ///   thread): a plain [`Handle::block_on`].
 /// - **Inside a runtime context** (the `LeaderSink` committer supervisor thread
 ///   drives the drain loop via `Handle::block_on`, so the sync `drain_local` →
 ///   `incorporate` runs *while* a `block_on` is active):
-///   [`tokio::task::block_in_place`] wraps the inner
-///   `block_on`, telling tokio this worker is about to block so it can move
-///   other tasks off it. `block_in_place` requires the multi-threaded Raft
-///   runtime (it is — `RaftShardStore::new` builds `new_multi_thread`).
+///   [`tokio::task::block_in_place`] wraps the inner `block_on`, telling tokio
+///   this worker is about to block so it can move other tasks off it.
+///   `block_in_place` requires the multi-threaded Raft runtime.
 ///
 /// A plain nested `Handle::block_on` would panic ("Cannot start a runtime from
 /// within a runtime"); the [`block_on_maybe_in_place`] helper avoids that.
 pub struct RaftLogIncorporationSink<A: IntentLogAppender> {
     appender: A,
     handle: Handle,
-    max_incorporated: Option<PerspectiveSeq>,
 }
 
 impl<A: IntentLogAppender> RaftLogIncorporationSink<A> {
-    /// Build a sink over `appender`, blocking on `handle` to seed the recovery
-    /// cache from the log's recorded `max_incorporated_seq`.
-    ///
-    /// Safe whether or not the caller is inside a runtime context (see the
-    /// type's threading contract): uses [`block_on_maybe_in_place`].
+    /// Build a sink over `appender`.
     #[must_use]
     pub fn new(appender: A, handle: Handle) -> Self {
-        let max_incorporated =
-            block_on_maybe_in_place(&handle, appender.max_incorporated_seq()).map(PerspectiveSeq);
-        Self {
-            appender,
-            handle,
-            max_incorporated,
-        }
+        Self { appender, handle }
     }
 }
 
@@ -125,45 +91,38 @@ fn block_on_maybe_in_place<F: std::future::Future>(handle: &Handle, fut: F) -> F
 }
 
 impl<A: IntentLogAppender> IncorporationSink for RaftLogIncorporationSink<A> {
-    fn max_incorporated_seq(&self) -> Option<PerspectiveSeq> {
-        self.max_incorporated
-    }
-
-    /// Append `ordered` (already ascending, every element strictly above the
-    /// current floor) into the Raft log, advancing the cached floor after each.
-    ///
-    /// Blocks the dedicated committer thread on each append via
-    /// [`block_on_maybe_in_place`] — safe whether or not that thread is itself
-    /// inside a `block_on` (the threading contract).
+    /// Append `ordered` (already ascending) into the Raft log as ONE batched
+    /// `IncorporateIntents` command. The committer caps each `ordered` slice
+    /// at `DRAIN_BATCH_CAP` (PART 8 §U) so a single Raft round absorbs at
+    /// most that many items; the SM applies each through the per-item gate.
     fn incorporate(&mut self, ordered: &[crate::intent::WriteIntent]) -> Result<(), IntentError> {
-        for intent in ordered {
-            block_on_maybe_in_place(
-                &self.handle,
-                self.appender
-                    .append_intent(intent.append.clone(), intent.perspective_seq),
-            )
-            .map_err(|e| IntentError::Incorporate(e.to_string()))?;
-            self.max_incorporated = Some(intent.perspective_seq);
+        if ordered.is_empty() {
+            return Ok(());
         }
+        let items: Vec<IncorporateItem> = ordered
+            .iter()
+            .map(|intent| IncorporateItem {
+                tenant_id_bytes: *intent.append.delta.tenant_id.0.as_bytes(),
+                operation: crate::raft::openraft_store::op_to_u8_pub(intent.append.delta.operation),
+                hashed_key: intent.append.delta.hashed_key,
+                chunk_refs: intent.append.delta.chunk_refs.iter().map(|c| c.0).collect(),
+                payload: intent.append.delta.payload.clone(),
+                has_inline_data: intent.append.delta.has_inline_data,
+                new_chunks: intent.append.new_chunks.clone(),
+                perspective_seq: intent.perspective_seq.0,
+            })
+            .collect();
+        block_on_maybe_in_place(&self.handle, self.appender.append_intents(items))
+            .map_err(|e| IntentError::Incorporate(e.to_string()))?;
         Ok(())
     }
 }
 
 impl IntentLogAppender for crate::raft::openraft_store::OpenRaftLogStore {
-    async fn append_intent(
-        &self,
-        req: AppendChunkAndDeltaRequest,
-        seq: PerspectiveSeq,
-    ) -> Result<(), LogError> {
-        // Drop the assigned SequenceNumber — the sink only needs success/fail;
-        // the F-2 floor is recorded inside the state machine apply, not here.
-        crate::raft::openraft_store::OpenRaftLogStore::append_intent(self, req, seq)
+    async fn append_intents(&self, items: Vec<IncorporateItem>) -> Result<(), LogError> {
+        crate::raft::openraft_store::OpenRaftLogStore::append_intents(self, items)
             .await
             .map(|_seq| ())
-    }
-
-    async fn max_incorporated_seq(&self) -> Option<HybridLogicalClock> {
-        crate::raft::openraft_store::OpenRaftLogStore::max_incorporated_seq(self).await
     }
 }
 
@@ -175,12 +134,14 @@ mod tests {
 
     use kiseki_common::ids::{NodeId, OrgId, ShardId};
     use kiseki_common::locks::LockOrDie;
-    use kiseki_common::time::{ClockQuality, DeltaTimestamp, WallTime};
+    use kiseki_common::time::{ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime};
 
     use crate::delta::OperationType;
-    use crate::intent::{IdempotencyKey, InMemIntentStore, IntentStore, PutOutcome, WriteIntent};
+    use crate::intent::{
+        IdempotencyKey, InMemIntentStore, IntentStore, PerspectiveSeq, PutOutcome, WriteIntent,
+    };
     use crate::intent_committer::Committer;
-    use crate::traits::AppendDeltaRequest;
+    use crate::traits::{AppendChunkAndDeltaRequest, AppendDeltaRequest};
 
     fn seq(physical_ms: u64, logical: u32, node: u64) -> PerspectiveSeq {
         PerspectiveSeq(HybridLogicalClock {
@@ -217,46 +178,36 @@ mod tests {
         }
     }
 
-    /// A fake [`IntentLogAppender`]: records every append in order and reports a
-    /// configurable initial `max_incorporated_seq`. No raft node needed.
+    /// A fake [`IntentLogAppender`]: records each batched append in order. No
+    /// raft node needed. PART 8 — no floor cache; the SM gate is authoritative.
     struct RecordingAppender {
-        appends: Mutex<Vec<(PerspectiveSeq, AppendChunkAndDeltaRequest)>>,
-        max_inc: Option<HybridLogicalClock>,
+        appends: Mutex<Vec<Vec<IncorporateItem>>>,
     }
 
     impl RecordingAppender {
-        fn new(max_inc: Option<HybridLogicalClock>) -> Self {
+        fn new() -> Self {
             Self {
                 appends: Mutex::new(Vec::new()),
-                max_inc,
             }
         }
 
-        fn recorded_seqs(&self) -> Vec<PerspectiveSeq> {
+        fn batches(&self) -> Vec<Vec<HybridLogicalClock>> {
             self.appends
                 .lock()
                 .lock_or_die("recording_appender.appends")
                 .iter()
-                .map(|(s, _)| *s)
+                .map(|b| b.iter().map(|i| i.perspective_seq).collect())
                 .collect()
         }
     }
 
     impl IntentLogAppender for RecordingAppender {
-        async fn append_intent(
-            &self,
-            req: AppendChunkAndDeltaRequest,
-            seq: PerspectiveSeq,
-        ) -> Result<(), LogError> {
+        async fn append_intents(&self, items: Vec<IncorporateItem>) -> Result<(), LogError> {
             self.appends
                 .lock()
                 .lock_or_die("recording_appender.appends")
-                .push((seq, req));
+                .push(items);
             Ok(())
-        }
-
-        async fn max_incorporated_seq(&self) -> Option<HybridLogicalClock> {
-            self.max_inc
         }
     }
 
@@ -267,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn sink_incorporates_in_perspective_order() {
+    fn sink_incorporates_in_perspective_order_as_one_batch() {
         // A local runtime: block_on works because the #[test] thread is not
         // itself a tokio worker (the threading contract the doc spells out).
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -277,67 +228,25 @@ mod tests {
         // Inserted out of order; the appender must see ascending perspective seq.
         fill(&store, &[seq(3, 0, 1), seq(1, 0, 1), seq(2, 0, 1)]);
 
-        let mut sink = RaftLogIncorporationSink::new(RecordingAppender::new(None), handle);
-        // `LeaderSink` drain-all: incorporate every pending intent above floor.
+        let mut sink = RaftLogIncorporationSink::new(RecordingAppender::new(), handle);
         let n = Committer::run(&store, &mut sink).unwrap();
         assert_eq!(n, 3);
+        let batches = sink.appender.batches();
+        assert_eq!(batches.len(), 1, "all 3 items fit in one batch under cap");
         assert_eq!(
-            sink.appender.recorded_seqs(),
-            vec![seq(1, 0, 1), seq(2, 0, 1), seq(3, 0, 1)],
-            "appender recorded all intents in ascending perspective order"
-        );
-        // The committer prunes after incorporation.
-        assert_eq!(store.pending_len().unwrap(), 0, "store pruned");
-    }
-
-    #[test]
-    fn sink_recovery_cache_initialized_from_appender() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let handle = rt.handle().clone();
-
-        // The log already incorporated up to seq(2): the appender reports it,
-        // and `new` seeds the cache from it (the recovery path).
-        let appender = RecordingAppender::new(Some(seq(2, 0, 1).0));
-        let mut sink = RaftLogIncorporationSink::new(appender, handle);
-        assert_eq!(
-            sink.max_incorporated_seq(),
-            Some(seq(2, 0, 1)),
-            "recovery cache seeded from the appender's max_incorporated_seq"
-        );
-
-        // The store holds seq1, seq2, seq3; the F-2 floor must drop seq1+seq2.
-        let store = InMemIntentStore::new();
-        fill(&store, &[seq(1, 0, 1), seq(2, 0, 1), seq(3, 0, 1)]);
-        let n = Committer::run(&store, &mut sink).unwrap();
-        assert_eq!(n, 1, "only seq(3) is above the F-2 floor");
-        assert_eq!(
-            sink.appender.recorded_seqs(),
-            vec![seq(3, 0, 1)],
-            "only seq(3) appended; seq1+seq2 dropped by the floor"
+            batches[0],
+            vec![seq(1, 0, 1).0, seq(2, 0, 1).0, seq(3, 0, 1).0],
+            "appender received ascending perspective order",
         );
     }
 
     #[test]
-    fn sink_cache_advances_after_incorporate() {
+    fn sink_runs_with_empty_store_is_noop() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let handle = rt.handle().clone();
-
         let store = InMemIntentStore::new();
-        fill(&store, &[seq(1, 0, 1), seq(2, 0, 1), seq(5, 0, 7)]);
-
-        let mut sink = RaftLogIncorporationSink::new(RecordingAppender::new(None), handle);
-        assert_eq!(
-            sink.max_incorporated_seq(),
-            None,
-            "empty floor before any run"
-        );
-        let n = Committer::run(&store, &mut sink).unwrap();
-        assert_eq!(n, 3);
-        // After incorporating up to seqN, the cache reports seqN.
-        assert_eq!(
-            sink.max_incorporated_seq(),
-            Some(seq(5, 0, 7)),
-            "cache advanced to the highest incorporated seq"
-        );
+        let mut sink = RaftLogIncorporationSink::new(RecordingAppender::new(), handle);
+        assert_eq!(Committer::run(&store, &mut sink).unwrap(), 0);
+        assert!(sink.appender.batches().is_empty());
     }
 }

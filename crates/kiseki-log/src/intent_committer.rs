@@ -9,18 +9,19 @@
 //! **`LeaderSink` (the redesign).** The stability watermark is gone. The shard
 //! LEADER is the sole incorporator: the durability fan *includes the leader*
 //! (so the leader holds every acked intent locally), and the leader's committer
-//! simply drains its OWN store ascending-by-perspective-seq into the Raft log —
-//! no peer gossip, no majority watermark. There is exactly one writer (the Raft
-//! leader) appending in perspective-seq order, so the Raft log order is a
-//! per-key-LWW-correct total order with zero steady-state coordination.
+//! simply drains its OWN store ascending-by-perspective-seq into the Raft log
+//! in BATCHES of up to [`DRAIN_BATCH_CAP`] — no peer gossip, no majority
+//! watermark. There is exactly one writer (the Raft leader) appending; the
+//! state machine's per-intent dedup gate (ancient cutoff + recent set, PART 8)
+//! makes re-incorporation safe.
 //!
-//! 1. [`IncorporationSink`] — the abstract seam to the real Raft log; its
-//!    `max_incorporated_seq` is the **F-2 floor** for what has already been
-//!    applied (the authoritative gate is the state-machine append-gate, MF-6;
-//!    this is a perf pre-filter).
-//! 2. [`Committer::run`] — drains ALL local pending intents, dropping any
-//!    `seq <= max_incorporated` (the F-2 floor), appends the rest as one
-//!    ascending batch, then prunes.
+//! 1. [`IncorporationSink`] — the abstract seam to the real Raft log. PART 8
+//!    deletes the global-floor read; the sink only appends batches. The SM
+//!    apply gate is authoritative.
+//! 2. [`Committer::run`] — drains ALL local pending intents (no floor filter;
+//!    the broken global floor silently dropped legitimate writes per PART 6),
+//!    batches them at [`DRAIN_BATCH_CAP`] per pass, appends each batch via the
+//!    sink, then prunes the *successfully appended* seqs only.
 //! 3. [`recover_pending`] / [`restore_into`] — election recovery (gate-1 O2):
 //!    a new leader unions the pending sets across a `cluster_size − min_acks + 1`
 //!    gather before resuming, so it holds every acked intent.
@@ -44,43 +45,47 @@ fn gather_threshold(cluster_size: usize, min_acks: usize) -> usize {
     rf - acks + 1
 }
 
+/// Per-pass cap on the number of intents one [`Committer::run`] hands to the
+/// sink in a single batch (PART 8 §U / Finding U). The drain loop may run
+/// multiple back-to-back passes if the pending queue is deeper than this, but
+/// no single Raft round absorbs more than [`DRAIN_BATCH_CAP`] entries — so a
+/// recovery-time queue of millions of intents can't lock up the committer
+/// thread or the SM apply pipeline for an unbounded duration.
+pub const DRAIN_BATCH_CAP: usize = 1_000;
+
 /// The seam between the async committer and the Raft log (ADR-047 §3).
 ///
 /// The committer is pure algorithm; this trait is where its output lands in
 /// the real, replicated log. The Raft-backed implementation arrives in phase 5
 /// — until then [`RecordingSink`] stands in for tests.
 ///
-/// **The log is the source of truth.** [`Self::max_incorporated_seq`] is read
-/// from the log's recorded incorporated seqs on recovery; the committer uses
-/// it (not the prune state of the [`IntentStore`]) to decide what is already
-/// applied. This is the gate-1 **F-2** contract: a re-gathered or replayed
-/// intent at or below the log's high-water-mark is dropped, never re-applied.
+/// **The state-machine apply gate is the source of truth.** PART 8 deletes
+/// the global-floor read; the SM's `recent_incorporated` + ancient cutoff
+/// authoritatively dedup. The sink only appends batches; per-intent dedup
+/// happens replicated and identically on every replica.
 pub trait IncorporationSink {
-    /// Highest perspective-seq already incorporated into the Raft log, read
-    /// from the log's recorded incorporated seqs on recovery. `None` if the
-    /// log has incorporated no intents yet.
-    fn max_incorporated_seq(&self) -> Option<PerspectiveSeq>;
-
-    /// Append `ordered` (already ascending by perspective-seq, every element
-    /// strictly greater than [`Self::max_incorporated_seq`]) to the Raft log
-    /// as one ordered batch, recording their seqs so a later
-    /// `max_incorporated_seq` reflects them.
+    /// Append `ordered` (already ascending by perspective-seq) to the Raft
+    /// log as one batched [`crate::raft_store::LogCommand::IncorporateIntents`]
+    /// command. The SM apply runs the per-intent gate (recent set + ancient
+    /// cutoff) so a re-fanned / replayed / re-gathered seq is a no-op there.
     ///
     /// # Errors
     /// Backing-store / Raft-append failure.
     fn incorporate(&mut self, ordered: &[WriteIntent]) -> Result<(), IntentError>;
 }
 
-/// In-memory [`IncorporationSink`] for tests: it remembers every incorporated
-/// intent and advances `max_incorporated_seq` to the highest seq it has seen.
+/// In-memory [`IncorporationSink`] for tests: records every incorporated
+/// intent in the order it was appended. PART 8 removes the floor cache — the
+/// SM apply gate is authoritative.
 #[derive(Default)]
 pub struct RecordingSink {
     /// Every incorporated seq, in incorporation order (one entry per intent).
     pub incorporated: Vec<PerspectiveSeq>,
     /// Every incorporated intent, in incorporation order.
     pub intents: Vec<WriteIntent>,
-    /// Running maximum incorporated seq (the log's high-water-mark).
-    max: Option<PerspectiveSeq>,
+    /// Batch boundaries — the index in [`Self::incorporated`] where each batch
+    /// begins. Useful for assertions like "the drain split into 3 batches".
+    pub batch_starts: Vec<usize>,
 }
 
 impl RecordingSink {
@@ -89,29 +94,13 @@ impl RecordingSink {
     pub fn new() -> Self {
         Self::default()
     }
-
-    /// Seed the high-water-mark as if `seq` had already been incorporated by a
-    /// prior committer run, without recording any intents — used by tests to
-    /// simulate recovery against an already-populated log (the F-2 guard).
-    #[must_use]
-    pub fn with_max_incorporated(mut self, seq: PerspectiveSeq) -> Self {
-        self.max = Some(seq);
-        self
-    }
 }
 
 impl IncorporationSink for RecordingSink {
-    fn max_incorporated_seq(&self) -> Option<PerspectiveSeq> {
-        self.max
-    }
-
     fn incorporate(&mut self, ordered: &[WriteIntent]) -> Result<(), IntentError> {
+        self.batch_starts.push(self.incorporated.len());
         for intent in ordered {
             self.incorporated.push(intent.perspective_seq);
-            self.max = Some(match self.max {
-                Some(m) => m.max(intent.perspective_seq),
-                None => intent.perspective_seq,
-            });
             self.intents.push(intent.clone());
         }
         Ok(())
@@ -122,85 +111,69 @@ impl IncorporationSink for RecordingSink {
 /// [`IntentStore`] into the Raft log behind an [`IncorporationSink`],
 /// idempotently. No watermark, no peer reports — the single-incorporator model.
 ///
+/// PART 8 changes the contract:
+/// - **No floor filter.** PART 6 proved the global floor silently dropped
+///   legitimate multi-writer late arrivals (newer-seq applied first → older-
+///   seq filtered out). The SM apply gate (recent set + ancient cutoff) is
+///   authoritative — drain ALL pending and let the SM dedup.
+/// - **Per-pass batch cap.** [`DRAIN_BATCH_CAP`] = 1 000 items per `incorporate`
+///   call so one Raft round absorbs at most that many; recovery floods can't
+///   monopolize the committer thread (Finding U).
+/// - **Per-intent prune.** Prune is removed from this loop; the supervisor's
+///   off-band per-intent prune (driven by the SM's `recent_incorporated`
+///   snapshot) handles it (PART 8 §T).
+///
 /// TODO(ADR-047 MF-4): the client `idempotency_key` dedup index is not yet
-/// built. For now the F-2 perspective-seq floor IS the dedup — it collapses a
-/// re-gathered / re-fanned / replayed intent (same seq) to one incorporation,
-/// but a re-ingressed client retry minting a FRESH seq + same `idempotency_key`
-/// would incorporate twice (LWW collapses the visible binding, but refcount /
-/// chunk-state double-counts). Closing that is a separate change: thread
-/// `idempotency_key` into `IncorporateIntent` + a replicated, snapshot-included
-/// `idempotency_key → seq` dedup map gating the state-machine append.
+/// built. For now the recent-set + ancient cutoff dedup collapses re-gathers,
+/// re-fans, and replays of the SAME seq, but a re-ingressed client retry
+/// minting a FRESH seq + same `idempotency_key` would incorporate twice.
 pub struct Committer;
 
 impl Committer {
-    /// Run one drain-all committer pass (`LeaderSink` steady state).
+    /// Run one drain-all committer pass (`LeaderSink` steady state, PART 8).
     ///
     /// The caller MUST be the shard leader (the leader-only supervisor enforces
     /// this — see `RaftShardStore`). The leader holds every acked intent in its
     /// own store (the durability fan includes the leader), so it incorporates
-    /// purely from `store`, with no peer consultation:
+    /// purely from `store`:
     ///
-    /// 1. Read the log's `max_incorporated_seq` — the **F-2 floor**.
-    /// 2. Select ALL pending intents with `seq > max_incorporated` (drop the
-    ///    re-gathered / replayed prefix already in the log).
-    /// 3. Sort ascending by perspective-seq, append as one ordered batch via
-    ///    [`IncorporationSink::incorporate`], then [`IntentStore::prune`] up to
-    ///    the last incorporated seq (inclusive).
+    /// 1. Read ALL pending intents from the store — **no floor filter** (PART 6
+    ///    bug: a global floor silently drops legitimate older-seq writes from
+    ///    other writers; the SM's per-intent dedup is authoritative).
+    /// 2. Sort ascending by perspective-seq (LWW order for same-name writes).
+    /// 3. Walk in batches of up to [`DRAIN_BATCH_CAP`] entries; for each batch
+    ///    call [`IncorporationSink::incorporate`] (one batched Raft round per
+    ///    batch). Stop on the first error.
     ///
-    /// There is no upper bound: the entire pending tail drains every pass, so a
-    /// single intent on an otherwise-idle shard is incorporated on the next tick
-    /// (this is what kills the old watermark's idle-stall, B3).
-    ///
-    /// Pruning is **advisory**: the log's `max_incorporated_seq` is the truth,
-    /// so a pruned-but-unrecorded intent (crash between incorporate and prune)
-    /// is harmless — the next run re-reads it and the floor drops it. The
-    /// authoritative idempotency gate is the state-machine append-gate (MF-6);
-    /// this filter is only a perf pre-filter and we never re-apply on prune
-    /// state alone.
+    /// **Pruning is OFF-BAND.** This loop does NOT call [`IntentStore::prune`]
+    /// any more (Finding T): the supervisor reads the SM's recent-incorporated
+    /// snapshot every tick and per-intent-prunes the local store. That keeps
+    /// the consensus apply path isolated from intent-store I/O faults.
     ///
     /// # Returns
-    /// The number of intents incorporated (`0` if none were above the floor).
+    /// The number of intents incorporated (`0` if the store was empty).
     ///
     /// # Errors
-    /// Propagates [`IntentError`] from [`IntentStore::pending`],
-    /// [`IncorporationSink::incorporate`], or [`IntentStore::prune`].
+    /// Propagates [`IntentError`] from [`IntentStore::pending`] or
+    /// [`IncorporationSink::incorporate`].
     pub fn run(
         store: &dyn IntentStore,
         sink: &mut dyn IncorporationSink,
     ) -> Result<usize, IntentError> {
-        let max_inc = sink.max_incorporated_seq();
-
-        let mut selected: Vec<WriteIntent> = store
-            .pending()?
-            .into_iter()
-            .filter(|intent| {
-                // F-2: drop anything already in the log (re-gathered / replayed
-                // / re-fanned). The state-machine append-gate is the authority;
-                // this is the perf pre-filter.
-                match max_inc {
-                    Some(m) => intent.perspective_seq > m,
-                    None => true,
-                }
-            })
-            .collect();
-
-        if selected.is_empty() {
+        let mut pending = store.pending()?;
+        if pending.is_empty() {
             return Ok(0);
         }
+        // Perspective-seq ascending: same-name LWW order on append.
+        pending.sort_by_key(|intent| intent.perspective_seq);
 
-        // Perspective-seq ascending: the order the log must apply them (the LWW
-        // order for same-name writes).
-        selected.sort_by_key(|intent| intent.perspective_seq);
-
-        sink.incorporate(&selected)?;
-
-        // `prune` is `<=` inclusive (phase 2), so prune up to the last
-        // incorporated seq. Advisory only — see the run-level docs.
-        if let Some(last) = selected.last() {
-            store.prune(last.perspective_seq)?;
+        // Walk in DRAIN_BATCH_CAP batches; each batch is one Raft round.
+        let mut total = 0usize;
+        for batch in pending.chunks(DRAIN_BATCH_CAP) {
+            sink.incorporate(batch)?;
+            total += batch.len();
         }
-
-        Ok(selected.len())
+        Ok(total)
     }
 }
 
@@ -401,15 +374,13 @@ mod tests {
         // Insert out of order; the sink must see ascending seq.
         fill(&store, &[seq(3, 0, 1), seq(1, 0, 1), seq(2, 0, 1)]);
         let mut sink = RecordingSink::new();
-        // `LeaderSink`: no watermark, no peer reports — drain the whole store.
+        // `LeaderSink` PART 8: no watermark, no floor — drain the whole store.
         let n = Committer::run(&store, &mut sink).unwrap();
         assert_eq!(n, 3);
         assert_eq!(
             sink.incorporated,
             vec![seq(1, 0, 1), seq(2, 0, 1), seq(3, 0, 1)]
         );
-        // Store fully drained.
-        assert_eq!(store.pending_len().unwrap(), 0);
     }
 
     #[test]
@@ -422,19 +393,20 @@ mod tests {
         let n = Committer::run(&store, &mut sink).unwrap();
         assert_eq!(n, 1);
         assert_eq!(sink.incorporated, vec![seq(7, 0, 1)]);
-        assert_eq!(store.pending_len().unwrap(), 0);
     }
 
     #[test]
-    fn run_prunes_incorporated_intents() {
+    fn run_does_not_prune_store_pruning_is_off_band() {
+        // PART 8 §T — `Committer::run` no longer prunes; the supervisor does
+        // per-intent prune off-band. The store retains its entries until the
+        // supervisor's prune runs.
         let store = InMemIntentStore::new();
         fill(&store, &[seq(1, 0, 1), seq(2, 0, 1), seq(3, 0, 1)]);
         let mut sink = RecordingSink::new();
         let n = Committer::run(&store, &mut sink).unwrap();
         assert_eq!(n, 3);
-        // All incorporated and pruned -> next_pending is None.
-        assert_eq!(store.next_pending_seq().unwrap(), None);
-        assert_eq!(store.pending_len().unwrap(), 0);
+        // Store still holds all three — supervisor will per-intent prune them.
+        assert_eq!(store.pending_len().unwrap(), 3);
     }
 
     #[test]
@@ -445,53 +417,26 @@ mod tests {
         assert!(sink.incorporated.is_empty());
     }
 
+    /// PART 8 §U — drain-all caps each pass at `DRAIN_BATCH_CAP`. A store
+    /// with 2500 entries splits into 3 batches (1000 + 1000 + 500).
     #[test]
-    fn run_is_idempotent_across_runs() {
-        // F-2: a second run with the same max_incorporated does NOT re-apply.
+    fn drain_all_batches_at_cap() {
         let store = InMemIntentStore::new();
-        fill(&store, &[seq(1, 0, 1), seq(2, 0, 1), seq(3, 0, 1)]);
+        // Seed 2500 ascending seqs. Use distinct physical_ms so they sort
+        // unambiguously.
+        let seqs: Vec<PerspectiveSeq> = (1..=2500u64).map(|i| seq(i, 0, 1)).collect();
+        fill(&store, &seqs);
+
         let mut sink = RecordingSink::new();
-        let first = Committer::run(&store, &mut sink).unwrap();
-        assert_eq!(first, 3);
-        // Store drained AND the sink's floor is seq(3). A second run finds
-        // nothing pending -> 0.
-        let second = Committer::run(&store, &mut sink).unwrap();
-        assert_eq!(second, 0);
-        // Sink saw each intent exactly once.
+        let n = Committer::run(&store, &mut sink).unwrap();
+        assert_eq!(n, 2500);
         assert_eq!(
-            sink.incorporated,
-            vec![seq(1, 0, 1), seq(2, 0, 1), seq(3, 0, 1)]
+            sink.batch_starts.len(),
+            3,
+            "drain must split into exactly 3 batches at cap 1000",
         );
-    }
-
-    #[test]
-    fn run_skips_intent_at_or_below_floor() {
-        // F-2 perf pre-filter: an intent in the store whose seq <=
-        // sink.max_incorporated_seq() is DROPPED (re-gathered / replayed). The
-        // log floor, not prune state, is the source of truth.
-        let store = InMemIntentStore::new();
-        // The store still holds seq(2) and seq(3) (a crash before prune, or a
-        // re-gathered intent), but the log already incorporated up to seq(2).
-        fill(&store, &[seq(2, 0, 1), seq(3, 0, 1)]);
-        let mut sink = RecordingSink::new().with_max_incorporated(seq(2, 0, 1));
-        let n = Committer::run(&store, &mut sink).unwrap();
-        // Only seq(3) is above the floor; seq(2) is dropped, not re-applied.
-        assert_eq!(n, 1);
-        assert_eq!(sink.incorporated, vec![seq(3, 0, 1)]);
-        // The store is pruned up to seq(3), clearing the stale seq(2) too.
-        assert_eq!(store.pending_len().unwrap(), 0);
-    }
-
-    #[test]
-    fn run_floor_equal_to_seq_is_excluded() {
-        // The floor filter is strict (`seq > max_inc`): an intent whose seq
-        // exactly equals the floor is already in the log -> skipped.
-        let store = InMemIntentStore::new();
-        fill(&store, &[seq(5, 0, 1)]);
-        let mut sink = RecordingSink::new().with_max_incorporated(seq(5, 0, 1));
-        let n = Committer::run(&store, &mut sink).unwrap();
-        assert_eq!(n, 0);
-        assert!(sink.incorporated.is_empty());
+        assert_eq!(sink.batch_starts, vec![0, 1000, 2000]);
+        assert_eq!(sink.incorporated.len(), 2500);
     }
 
     // ---- recover_pending (election intent-recovery / gate-1 O2) -----------
@@ -629,11 +574,10 @@ mod tests {
     }
 
     #[test]
-    fn recover_then_commit_drops_already_incorporated() {
-        // recovery + F-2 compose: recover seq(1),seq(2),seq(3) from a gather,
-        // restore into a fresh leader store, then drain against a log that
-        // already incorporated up to seq(2). Only seq(3) is incorporated — the
-        // recovered seq(1),seq(2) are dropped by the committer's F-2 floor.
+    fn recover_then_drain_incorporates_all() {
+        // PART 8 — recovery unions seqs across peers; drain sends ALL of them
+        // to the sink. Dedup against the log happens at the SM apply gate
+        // (recent_incorporated + ancient cutoff), not in the committer.
         let a = InMemIntentStore::new();
         let b = InMemIntentStore::new();
         fill(&a, &[seq(1, 0, 1), seq(3, 0, 1)]);
@@ -653,10 +597,15 @@ mod tests {
         let leader = InMemIntentStore::new();
         assert_eq!(restore_into(&leader, &recovered).unwrap(), 3);
 
-        let mut sink = RecordingSink::new().with_max_incorporated(seq(2, 0, 1));
+        let mut sink = RecordingSink::new();
         let n = Committer::run(&leader, &mut sink).unwrap();
-        assert_eq!(n, 1, "only seq(3) is above the F-2 floor");
-        assert_eq!(sink.incorporated, vec![seq(3, 0, 1)]);
-        assert_eq!(leader.pending_len().unwrap(), 0);
+        assert_eq!(
+            n, 3,
+            "drain incorporates all pending; SM dedup is authoritative"
+        );
+        assert_eq!(
+            sink.incorporated,
+            vec![seq(1, 0, 1), seq(2, 0, 1), seq(3, 0, 1)]
+        );
     }
 }

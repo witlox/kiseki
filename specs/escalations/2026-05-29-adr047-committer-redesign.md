@@ -413,3 +413,326 @@ Verdict: the LeaderSink DIRECTION breaks no other ADR/invariant (POSIX stays syn
 - **MF-11 (Concern): confirm + document the I-CS2 staleness bound** for the S3 async-visibility window (IntentForward/fan + leader tick + Raft round + hydrator poll); confirm the `is_async_ack_eligible` POSIX gate is airtight end-to-end (it is — ops.rs). I-V3 read-your-writes holds same-node (local optimistic composition); cross-node S3 is bounded-stale per I-CS2/F-3 (by design, not a regression).
 
 Clean to delete (no outside consumers): `compute_stability_watermark` + its tests; the steady-state `next_pending_seq` gather + `INTENT_NEXT_PENDING_TAG` (recovery uses `gather_pending` full-store, not next_pending — confirm during impl). KEEP + adapt: name-replication / hydrator tests (must still hold under the seq-guard); `intent_put_and_fan` ack-path tests. ConsumerWatermarks/I-L4 GC watermark is a DIFFERENT mechanism — untouched.
+
+---
+
+## PART 6 — POST-IMPLEMENTATION FINDING: the global floor is unsafe for multi-writer
+
+**Found during implementation review of the committed LeaderSink rework (142669c).** The deliberation (MF-6 + adversary finding G) endorsed a global `max_incorporated_seq` floor as the authoritative idempotency gate. Implementation revealed this is unsafe.
+
+### The bug
+The floor is used in two places — the drain filters `seq > floor`; the follower self-prune deletes `seq ≤ floor`. That's correct only under strict perspective-seq-ordered incorporation with no gaps. LeaderSink does NOT guarantee that:
+
+- node-A: write to **K1** (older HLC `S_a`); node-B: write to **K2** (newer HLC `S_b`). Both fan to leader.
+- `S_b` arrives first → incorporated → floor = `S_b`.
+- `S_a` arrives ~a tick later (jitter/slow ingress). Now `S_a < floor`:
+  - leader drain filters it out → never incorporated, AND
+  - follower self-prune deletes it (`S_a ≤ floor`).
+- `S_a` was min_acks-durable (acked) but is now gone → **K1's write silently lost** (no-loss violation).
+
+Masked under fast LAN (both in same 50ms tick → drain together in order). Reachable under jitter or concurrent multi-node writes to different keys. The cross-node test (single write) didn't catch it.
+
+**Root cause:** a *global* floor cannot distinguish "already incorporated" from "older-but-never-incorporated." That distinction needs a *per-intent* record.
+
+### Proposed fix
+1. **Drain incorporates ALL local pending** (delete the `> floor` filter). Each is unique (idempotency-key dedups at `put` for keyed writes; keyless retries get fresh seqs and are at-least-once per O3), pruned after → incorporated exactly once in steady state.
+2. **Follower prune becomes per-intent**: when the SM applies `IncorporateIntent(seq=X)`, prune the local intent with `perspective_seq == X` (the SM can call into the local IntentStore directly during apply — tight coupling but cleanest match). The current "prune up to floor" is replaced.
+3. **Recovery dedup via recent-log-scan**: on become-leader, the new leader's recovery re-gathers pending from peers; for each re-gathered intent, dedup against a bounded *recent-incorporated-seqs* structure in the SM (replicated). A re-gathered intent that's a committed-but-unpruned-on-peer copy is caught here. The structure is bounded by the longest plausible "committed-but-unpruned" window (replication-apply lag + retry window).
+4. **The SM append-gate** becomes "skip if this exact seq is in the recent-incorporated set" (per-intent, not floor). Authoritative idempotency at the apply boundary.
+
+### Open questions for the adversary
+- (Q1) Is `delete-the-floor-filter + per-intent prune` correct in **steady state**, given fan-includes-leader + 50ms ticks? Any other re-incorporation path besides recovery? (Suspect: keyless client-retry-via-re-fan — does the FjallIntentStore's idempotency-key `put`-dedup cover it for keyed writes, and is keyless-retry double-counting a real problem given each retry mints a fresh perspective-seq at ingress?)
+- (Q2) What's the **correct window** for the recent-incorporated-seqs structure? Bounded by what? Storage cost at 125k PUT/s?
+- (Q3) **Snapshot/restore** of the recent-seqs structure: how big can it get, and is replicating it via Raft cheap?
+- (Q4) **Refcount/chunk-state double-count**: if the log-scan dedup misses a re-incorporation (outside the window), the apply increments chunk refcounts twice. Real risk or theoretical?
+- (Q5) **Per-intent prune mechanism**: SM apply calls into the IntentStore vs supervisor reads recent applied seqs and prunes. Which is correct + simpler?
+- (Q6) Anything else this misses?
+
+---
+
+## PART 7 — ADVERSARY REVIEW OF THE FIX
+*(appended by the adversary)*
+
+**Methodology.** Verified each proposed mechanism against the actual code at commit `142669c` on `design/047-decoupled-write-ack`. My prior PART-3 review endorsed the global floor and missed PART-6's bug; that miss conditions this review. Every load-bearing claim of the proposed fix has been cross-checked against `crates/kiseki-log/src/intent_committer.rs`, `intent.rs`, `raft/state_machine.rs`, `raft_shard_store.rs`, `raft_intent_sink.rs`, `intent_sync.rs`, and the gateway's perspective-seq mint in `kiseki-gateway/src/mem_gateway.rs:639-650, 2680-2696`.
+
+Below: a finding per attack-question, severity-rated. Verdict + must-fixes at the end.
+
+---
+
+### Finding M (Q1.a) — Keyless client retry inflates compositions and orphans chunks under BOTH old and new design; the fix does not regress, but does not fix it either.
+
+- **Severity:** Medium
+- **Category:** Correctness > idempotency / Robustness > orphan state
+- **Location:** `kiseki-gateway/src/mem_gateway.rs:639-650` (`next_perspective_seq`), `:2680-2696` (intent mint, `idempotency_key` is `Some` only when client supplied an exactly-16-byte token, else `None`), `:1024` (`create_with_name` mints a fresh `Uuid::new_v4()` per attempt), `kiseki-log/src/raft/state_machine.rs:343-362` (`apply_new_chunks` is `or_insert_with`).
+- **Description:** A client PUT without a 16-byte `idempotency_key` (the common case — S3 path always nulls it per `s3.rs:137`, NFS likewise per `nfs.rs:116`, pNFS DS per `pnfs_ds_server.rs:710`) retried at the protocol layer mints (a) a fresh `comp_id = Uuid::new_v4()`, (b) a fresh `perspective_seq` (HLC tick), (c) a fresh chunk set if encryption is random-nonce (orthogonal to PR #104's deterministic nonce). Both intents are durable, both reach the leader's store, both pass the drain-all (no floor filter, and even with the floor filter both have seq > floor), both apply: two `Create` deltas at distinct tips, same name, two separate compositions. The newer-seq Create's name bind wins LWW (after Finding-B's seq-guard lands), the older-seq Create's composition is **orphan**: never name-bound, never deleted, its chunks' `cluster_chunk_state.refcount` stays at 1 (the second `apply_new_chunks` is a no-op for the same chunk_id because of `or_insert_with`; for fresh content-addressed chunk_ids the refcount is 1 on each). The proposed fix does not change this — drain-all under the OLD floor already incorporates both (each has `seq > floor` when added).
+- **Evidence:** All S3/NFS/pNFS protocol surfaces hardcode `idempotency_key: None`. Only the **native** protocol carries a client key (`native/server.rs:518, 587`), and even there the gateway only honors it when the bytes are exactly width-16 (`mem_gateway.rs:2688-2691`); a 1..=64 B native key not of width 16 still degrades to `None`. The TODO at `mem_gateway.rs:2684-2687` (a stable 16-byte derivation) is unwritten.
+- **Suggested resolution:** Two independent fixes, both belong in the *production* hardening (and were already pending as Finding E):
+  1. **Derive a 16-byte intent-level idempotency key from the protocol-layer request token + tenant + op + name** (a domain-separated HKDF or BLAKE3, deterministic, single-attempt-stable across protocol retries). That collapses every retry to the same `IntentStore::put` row (Duplicate), and only ONE composition is ever produced. This closes the orphan-composition leak across all surfaces.
+  2. If exactly-once is out of scope for this PR, **document the orphan-composition cost** and gate a periodic GC sweep that retires un-bound, no-version-history compositions older than a window. The chunk side is already safe (refcount stays 1 with `or_insert_with`).
+
+  The proposed PART-6 fix does NOT address this; do not let the fix's correctness debate distract from this pre-existing hole. Mark it as "known, not regressed."
+
+---
+
+### Finding N (Q1.b) — Keyed-client-retry dedup IS crash-safe in `FjallIntentStore`. The fix preserves this. Not a hole.
+
+- **Severity:** Informational
+- **Category:** Correctness > idempotency
+- **Location:** `kiseki-log/src/intent.rs:529-560` (`FjallIntentStore::put`), `:587-616` (`prune`).
+- **Description:** Verified: `FjallIntentStore::put` (a) holds a mutex covering the check + commit, (b) writes the intent row + dedup pointer in a SINGLE `batch.commit()`. A crash mid-commit replays the WAL all-or-nothing — there is no window in which a dedup pointer outlives its intent row or vice versa. A keyed retry on a DIFFERENT node similarly hits the local-then-fan path: if the previous attempt's intent reached this node's store (it would, since the fan includes the leader and the leader is reachable in the common case), the second `put` returns `Duplicate` carrying the original seq, the fan dispatcher credits the ack (`intent_sync.rs:181-186` "Recorded OR Duplicate both mean the intent is now durable on this replica — credit the ack either way"), and no second store row exists. The retry is exactly-once on the dedup-keyed path.
+- **Caveat:** This only fires if `WriteRequest.idempotency_key` is supplied AND happens to be exactly 16 bytes wide (gateway gate at `mem_gateway.rs:2688-2691`). For the S3/NFS/pNFS surfaces that hardcode `None`, this dedup is dormant. See Finding M.
+- **Suggested resolution:** None for the dedup itself. The "derive a 16-byte key" change in Finding M lights it up for all surfaces.
+
+---
+
+### Finding O (Q1.c) — Fan retry to a peer that already holds the intent: ack still counts, no double-store. Verified safe.
+
+- **Severity:** Informational
+- **Category:** Correctness > idempotency
+- **Location:** `kiseki-log/src/intent_sync.rs:181-191` (dispatcher: Recorded **or** Duplicate → ack credited); `intent.rs:188-195` (`InMemIntentStore::put` returns Duplicate on key collision; for keyless, the seq is globally unique and `by_seq.insert` overwrites in place — a re-fan of the same seq writes the same value).
+- **Description:** A re-fan to the same peer (a) for a keyed intent: idempotency-key already present → returns `Duplicate(existing_seq)`, dispatcher counts the ack, no second row. (b) For a keyless intent: same `perspective_seq` collides on the `by_seq` BTreeMap key → second `insert` overwrites the row with byte-identical contents → counts as Recorded but adds nothing. **No double-incorporation hazard from a fan retry**, regardless of the floor design.
+- **Suggested resolution:** None.
+
+---
+
+### Finding P (Q1.d) — Old-leader-didn't-prune-then-loses-leadership: under the OLD shipped design this DOES re-drain, but the SM append-gate catches it. Under the proposed fix, the per-intent dedup MUST be authoritative.
+
+- **Severity:** High (a design-correctness obligation on the PART-6 fix, not yet specified)
+- **Category:** Correctness > concurrency / state-machine idempotency
+- **Location:** `raft_shard_store.rs:1011-1014` (leader-loss is logged + drain stops, but pruning is not synchronously flushed), `:994-1002` (self-prune runs on every node every tick, including a deposed leader, but is keyed on the applied `max_incorporated_seq` — which moves only when an `IncorporateIntent` Raft round commits and applies); `intent_committer.rs:167-204` (`Committer::run` reads the floor THEN drains).
+- **Description:** Race trace under the SHIPPED (committed `142669c`) code path: node-L is leader. Tick T: drain incorporates intent I (seq S). The `client_write` succeeds (the Raft round commits). The SM apply on every replica advances `max_incorporated_seq` to S and (the *shipped* gate) returns `Appended(tip)`. Between client_write success and the apply running, **L is deposed** by a new election. Two interleavings: (i) the apply runs on L before the deposition → floor moves on L → next supervisor tick's self-prune drops S from the local store → safe. (ii) The apply lags (or never runs on L because the leadership change interrupts the apply pipeline) → L loses leadership with S still in its IntentStore and the **applied** floor still below S. Now L is a follower; the new leader L' drains its own store. If L' didn't have S (S was a partial fan that only landed on L), the new leader's `recover()` gather pulls L's pending — S is included — restored into L's local store — and then drain incorporates S. On L's side, the self-prune now runs against L's applied floor; the new leader's `IncorporateIntent(S)` replicates back, L applies it, floor advances to S on L, self-prune drops S. **The OLD floor-gate (shipped) catches the duplicate in the SM apply** — `state_machine.rs:438-446` "if `perspective_seq <= max_incorporated_seq`, return `Appended(self.tip)` no-op." That gate is the safety.
+
+  Under the **PART-6 proposed fix** the floor is gone; the SM append-gate becomes "skip if `perspective_seq` is in the recent-incorporated-seqs set." So the dedup correctness depends entirely on: (a) the structure being populated on the apply path **before** any re-incorporation can occur, and (b) the structure being replicated identically and snapshot-included so a leader that was just promoted reads the same set. Both are achievable but neither is in the proposal as code. The doc says "replicated in the SM" but does not specify *when* a seq enters the set (must be: at the same apply point that today moves `max_incorporated_seq`, i.e., the first IncorporateIntent for that seq).
+- **Evidence:** No teardown-on-deposition flushes the apply queue or guarantees the floor has caught up; self-prune is async on the supervisor tick (`raft_shard_store.rs:994-1002`), so a leadership loss between client_write and apply is fully reachable. The shipped SM gate at `state_machine.rs:438-446` is what saves us today.
+- **Suggested resolution:** Specify the per-intent set membership rule precisely: **a seq is added to the recent-incorporated-seqs structure inside the same `apply` block that appends the delta**, in the same SM mutation. That makes it impossible for a second apply of the same seq (re-gather or re-fan) to slip through, because Raft serializes applies per replica. Add an SM unit test that drives `IncorporateIntent(S)` twice and asserts the second is a no-op.
+
+---
+
+### Finding Q (Q2) — The recent-incorporated-seqs structure is critically under-bounded. At production throughput it is the new SPOF: under-size and you lose writes; over-size and snapshots / replication / restart explode.
+
+- **Severity:** Critical
+- **Category:** Robustness > resource exhaustion / Correctness > idempotency
+- **Location:** PART-6 §"Proposed fix" item 3, item 4. No corresponding code yet.
+- **Description:** "bounded by the longest plausible committed-but-unpruned window" is not a specification — it is a wish. Concretely:
+  - **(a) recovery-dedup window.** A re-gathered intent stays in a peer's IntentStore until that peer's self-prune fires. Self-prune is driven by the **peer's own applied** `max_incorporated_seq`, which advances when the IncorporateIntent's Raft apply lands on that peer. So `unprune_window ≥ max(per-peer Raft-apply-lag) + supervisor_interval (50 ms shipped) + the fjall prune scan cost`. Under healthy replication this is sub-second. Under partition recovery, or a follower that fell behind by minutes and is catching up via log replay or snapshot install, the unprune window is **the catch-up duration** — minutes to hours on a snapshot install on a wide cold replica. The dedup structure must cover that window or recovery will double-incorporate. This is not a tunable, it is a *correctness* bound coupled to operational tail latencies.
+  - **(b) steady-state keyless-retry window.** Q1.a's retries are NOT caught by this structure at all (each retry mints a fresh seq) — the structure dedups by `perspective_seq`, not by content. So this window is irrelevant for keyless retries. **Strike the "covers retries" justification.** Keyless-retry dedup is Finding M's problem, separate.
+  - **(c) storage cost.** At 125k PUT/s sustained (the GCP perf target), with a 60-second window (a realistic ceiling for routine apply lag), the set holds 7.5M seqs. `PerspectiveSeq` is `HybridLogicalClock { physical_ms:u64, logical:u32, node_id:NodeId(u64) }` = 20 bytes raw; a `BTreeSet<PerspectiveSeq>` node has overhead. Conservative: 64 B/entry → **480 MiB per shard, per replica**, replicated, in the SM snapshot. For a deployment with ~32 shards/node that's 15 GiB of SM state just for the dedup structure. **This is not "remotely sustainable" at scale.** Even at 10k PUT/s and a 10-second window it is 100k entries × 64 B = 6.4 MiB/shard — fine, but the bound is set by the worst-case operational window, not the steady state.
+  - **(d) bounding scheme.** A Bloom filter is the right answer for steady-state membership (constant size for tunable FPR), but a Bloom CANNOT be safely combined with "if-not-in-set then append": a false positive **silently drops a legitimate intent** (R1 no-loss violation). Time-windowed deque + hash index has the right semantics but the size problem above. **An LRU is wrong** — eviction discards in arrival order, not seq order, and a slow apply can evict a still-needed seq. Honest answer: **the structure must be a time-bounded set whose window is `max(replication-apply-lag) + safety`, and that bound is operationally determined.** Snapshot/restart cost has to be eaten — there is no safe-and-cheap shortcut.
+- **Evidence:** PART-6's bounding hand-waves "longest plausible." The proposal lists Bloom as a tunable-FPR alternative; a Bloom on this hot path violates R1 every time it false-positives.
+- **Suggested resolution:** **REJECT the unbounded-structure framing.** Specify concretely:
+  1. The window MUST be `max_applied_lag + supervisor_interval + safety_margin`, where `max_applied_lag` is an OPERATIONAL constant (e.g. P99.9 of the apply pipeline lag, with a hard cap that triggers a circuit-breaker if exceeded — refuse to drain and surface an alarm).
+  2. The structure is a **(perspective_seq → log_index) map**, ordered by perspective_seq (a BTreeMap), pruned by log-index age — i.e., "drop any entry whose log_index is more than W indices behind the current applied index." This couples the dedup window to Raft-log progress, not wall time (which means a stalled shard does not silently shrink its dedup window).
+  3. Document a hard ceiling on entries — say 10M — and refuse to admit beyond it (treat that as a circuit-breaker, halt and alarm rather than evict-and-lose).
+  4. Provide explicit storage math in the ADR per (cluster_PUTs/s, target_window, shard_count) so deployment can budget snapshot size BEFORE turning the gate on.
+
+  **Without this, the fix is correct in principle but unshippable in practice.**
+
+---
+
+### Finding R (Q3) — Snapshot/restore of the recent-seqs structure: must be in the SM snapshot. Will measurably inflate install-snapshot cost on wide cold replicas.
+
+- **Severity:** High
+- **Category:** Robustness > snapshot/restart cost
+- **Location:** `raft/state_machine.rs:55-79` (`ShardSnapshot` struct; `max_incorporated_seq` is already snapshot-included via `#[serde(default)]`), `:555-605` (`build_snapshot` serializes the inner state), `:642-672` (`install_snapshot` restores it).
+- **Description:** The shipped snapshot is `delta_count + tip + maintenance + deltas + watermarks + shard_id + tenant_id + max_incorporated_seq` — the deltas dominate the size (delta payload is the actual data). Adding a recent-incorporated-seqs map adds: per entry, ~20 B raw seq + a few B for the log-index → ~32 B/entry serialized (postcard). At Finding Q's 7.5M-entry ceiling, that's ~240 MB **per shard snapshot**, replicated to every newly-joining or catching-up follower. Today's `install_snapshot` (line 648-665) `serde-decodes` the whole blob in one pass; a 240-MB blob is multi-second on a single-thread decoder before the new follower can answer reads. This regresses I-L8 (snapshot install bounded) and the shard-restart latency budget the codebase already assumes (verified: no explicit snapshot size budget exists in the tree; grep for `snapshot.*size` yields only test bounds, so the contract is implicit). The fix's correctness obligation forces the structure into the snapshot — there is no skipping it — so the cost is unavoidable. **It must be budgeted.**
+- **Evidence:** `install_snapshot` does `postcard::from_bytes` on the whole `data: Vec<u8>` synchronously (line 653-658 range). No streaming decode, no chunked install. At Finding-Q sizes this is a multi-second pause on join.
+- **Suggested resolution:** (a) Window the structure aggressively (Finding Q); a 1-second window at 125k/s is 125k entries × 32 B = 4 MB — acceptable. (b) Document a snapshot-size budget per shard in the ADR (e.g. "≤ 64 MB without deltas") and assert the dedup structure size at build_snapshot time; refuse to grow it beyond the budget (alarm and circuit-break). (c) Consider a separate, **non-replicated** local cache for the recent-seqs structure plus a smaller **replicated** authoritative tail (the last K seqs by log-index), so the snapshot stays small and a freshly-installed follower rebuilds its cache by replaying the tail of the log. The replicated tail is the dedup source-of-truth; the local cache is a perf prefilter. This mirrors the current floor design without the multi-writer hole.
+
+---
+
+### Finding S (Q4) — Refcount / chunk-state double-count if dedup misses: real but bounded. The `or_insert_with` idempotency in `apply_new_chunks` already covers the per-chunk side; the orphan composition + delta-row inflation is the residual cost.
+
+- **Severity:** Medium
+- **Category:** Correctness > orphan state / Robustness > resource exhaustion
+- **Location:** `raft/state_machine.rs:343-362` (`apply_new_chunks`: `or_insert_with` is idempotent on `(tenant, chunk_id)`), `:268-338` (`append_delta_inner`: ALWAYS bumps tip and pushes a delta), `:447-460` (`IncorporateIntent` apply: calls `apply_new_chunks` then `append_delta_inner` then advances floor).
+- **Description:** Verified: a duplicate `IncorporateIntent(seq=S)` apply does NOT double-increment `cluster_chunk_state.refcount` — the entry is created with `refcount: 1` on first apply and `or_insert_with` is a no-op on re-apply (line 352-360). So the chunk side is safe. **But** `append_delta_inner` (line 336 `self.deltas.push(delta)`, line 268 `self.tip += 1`) ALWAYS appends a new delta and advances the tip. A duplicate apply produces TWO delta rows for the same hashed_key, at different tips, with different inline-data keys (`inline_key = hashed_key XOR tip` at line 294-301 means the second apply WRITES the inline payload to a different inline-store key). Consequences:
+  1. **Compaction merge:** `compaction_worker.rs` groups by `hashed_key`, sorts by Raft sequence, keeps the newest min_versions. Both deltas have the same `hashed_key` (the create-delta encodes the same comp_id → same hashed_key) → compaction collapses them. The orphan delta is reclaimed at compaction time, not at apply time.
+  2. **Pre-compaction read amplification:** between the duplicate apply and the next compaction, scans for that hashed_key return 2 rows; the hydrator sees BOTH `Create` deltas. `stage_create` is idempotent on the comp-already-staged path (`hydrator.rs:534-538` returns Applied + re-binds the name), so no double-composition. But it **re-binds the name** — under the un-shipped Finding-B seq-guard that is a no-op (incoming seq == stored seq, tie); without it the name index may flap.
+  3. **Inline-data leak:** the second apply writes inline data to a different inline-store key (`tip` differs). That row is never referenced by any composition (the comp_id only references the first delta's inline_key) and is never GC'd by the deltas index. **Real inline-store leak**, bounded by the duplicate rate × payload size. At 125k PUT/s with a 0.001% dedup miss (a slow apply lag escaping a 1-second window once per million) = ~0.1 leaks/s × inline payload size (≤ 64 KiB inline threshold). Bounded but real, and the leak has no GC.
+- **Evidence:** `append_delta_inner` line 336; the inline-key formula at line 294-301; no inline-store GC pass tied to delta compaction in `compaction_worker.rs`.
+- **Suggested resolution:** (a) The fix's authoritative SM dedup MUST land — the duplicate is supposed to be impossible. If Finding Q's window is honest, this is a vanishingly rare event (and circuit-broken before it can amplify). (b) **Tighten the apply path:** check membership BEFORE calling `append_delta_inner` AND `apply_new_chunks`, so a duplicate is a true no-op (no new chunk-state, no delta row, no inline write). The shipped floor-gate already does this (`state_machine.rs:441-446` returns early without touching state); the proposed per-intent gate must too. (c) Add a follow-up GC for orphan inline rows keyed on tip-XOR-hashed_key when the corresponding tip is compacted away. Track as a follow-up; do not block.
+
+---
+
+### Finding T (Q5) — Per-intent prune mechanism: "SM apply calls into the IntentStore directly" is the wrong coupling. The supervisor-side prune is already there and correct.
+
+- **Severity:** High
+- **Category:** Correctness > layering / Robustness > failure-modes
+- **Location:** PART-6 §"Proposed fix" item 2; existing supervisor self-prune at `raft_shard_store.rs:994-1002`; `IntentStore` trait at `intent.rs:117-138`.
+- **Description:** Three sub-questions:
+  1. **(a) Will the SM hold an `Arc<dyn IntentStore>`?** Structurally possible — there's precedent: `inline_store: Option<Arc<dyn InlineStore>>` at `state_machine.rs:191` is exactly this pattern. So this is feasible.
+  2. **(b) An `IntentStore` `prune` failure during apply — does it block the Raft apply (bad) or get swallowed (worse)?** Per `openraft`'s contract, the SM `apply` returns a response synchronously; an error here either propagates as a `RaftError` (which openraft treats as fatal — the node halts the apply pipeline) OR is `Result::unwrap_or_else`'d into a swallow. EITHER outcome is bad:
+     - **Halt-the-apply-pipeline:** a transient fjall I/O hiccup on the intent store halts Raft apply on that node — the shard becomes blind to all subsequent commits, including chunk refcount mutations, watermark advances, etc. This is the "bad" path the question warns about.
+     - **Swallow:** the intent stays in the store; the SM advances; on the next supervisor self-prune the floor will (under the OLD design) catch it. **But under the proposed fix the floor is gone** — the supervisor self-prune is now per-intent against the recent-seqs set. So a swallowed prune-failure leaks the row until... when? The supervisor self-prune needs to be able to retry from a record OUTSIDE the SM (in fjall) — which is exactly what the supervisor-side prune does today.
+  3. **(c) Alternative: supervisor reads recently-applied IncorporateIntent seqs from the Raft log + prunes off-band.** This is **what's shipped today** (`raft_shard_store.rs:994-1002`): every supervisor tick reads `leadership_store.max_incorporated_seq().await` and calls `prune_store.prune(...)`. Under the per-intent design, the supervisor needs to read the recent-seqs set (or its tail) and prune those specific intents — same I/O shape, just per-intent instead of `<= floor`.
+
+  **(c) is strictly safer than (a)+(b)**: it decouples consensus apply from the intent-store I/O fault domain. An intent-store stutter does not halt Raft; a Raft hiccup does not corrupt the intent store. The retry semantics are also natural (the supervisor re-attempts each tick). The "tight coupling — cleanest match" phrasing in PART-6 is a layering smell that trades real fault-isolation for an aesthetic of fewer hops.
+- **Evidence:** `inline_store` precedent at `state_machine.rs:191` (so the coupling pattern exists), supervisor self-prune at `raft_shard_store.rs:994-1002` (so the off-band prune pattern exists and works).
+- **Suggested resolution:** **Keep the prune off-band in the supervisor**, NOT in the SM apply. Specifically: change the supervisor self-prune from "prune ≤ applied floor" to "prune any local intent whose seq is in the applied recent-incorporated-seqs set." The SM owns the dedup set (replicated, snapshot-included); the supervisor reads it each tick and prunes accordingly. This preserves the fault-isolation that the global-floor design accidentally got right.
+
+---
+
+### Finding U (Q6) — Drain-all under load: real risk. Needs a batch cap, especially under restart / recovery / migration storms.
+
+- **Severity:** High
+- **Category:** Robustness > unbounded operations / liveness
+- **Location:** `intent_committer.rs:167-204` (`Committer::run` drains ALL pending in one pass, sorts, then `sink.incorporate(&selected)`); `raft_intent_sink.rs:138-150` (`incorporate` iterates and does ONE Raft `client_write` per intent, each blocking the dedicated committer thread).
+- **Description:** Today: drain-all sorts the entire pending set and calls `sink.incorporate` ONCE with the whole slice. The sink iterates the slice and `block_on(append_intent)` per element — so it is N sequential Raft rounds. At 125k PUT/s steady state with 50 ms ticks, a healthy run is 6.25k intents/drain; one Raft round per intent, sequentially blocked on the committer thread, is hopelessly slow (a Raft round is ~ms, so 6.25k rounds = 6+ seconds per drain — drain falls further behind every tick). **The shipped numbers must be lying or the drain coalesces somewhere I missed; either way the drain-all-N-rounds path is a structural latency bomb under load.**
+
+  Under recovery, a freshly-promoted leader restores its `peer_pending` union into its local store BEFORE draining (`raft_shard_store.rs:1018-1044`). If the partition was a few minutes long at 125k PUT/s on a busy shard, that union can be tens of millions of intents. Drain-all attempts ONE incorporate call with the whole set, blocking the committer thread the entire time. The supervisor never returns to the leadership check, never returns to the shutdown-signal `tokio::select!`. **This is a hang risk.** Add to that: the proposed fix's per-intent SM dedup must process every one, replicated, snapshot-impacted.
+- **Evidence:** `Committer::run` line 173-185 `store.pending()?.into_iter().filter(...).collect()` — unbounded. Line 195 `sink.incorporate(&selected)?` — unbounded. The sink iterates and blocks per intent.
+- **Suggested resolution:**
+  1. **Batch the drain**: cap each `drain_local` pass at K intents (e.g. K = 256-1024, tunable). Run multiple ticks back-to-back if the queue is deep (event-wake the supervisor when the pending depth crosses a watermark). Documents a hard per-pass cap.
+  2. **Batch the Raft append**: prefer batching multiple `IncorporateIntent` commands into a single `client_write` if the openraft commands support it (verify — `LogCommand` is an enum; a `LogCommand::IncorporateIntents(Vec<...>)` variant would consolidate the Raft round cost). This is a separate ADR follow-up but is the actual perf lever.
+  3. **Periodic shutdown-check**: even mid-drain, the supervisor must yield to `shutdown.changed()` between batches so shard-retire / split / merge / `Drop` does not block.
+
+  **Without (1) the recovery hang is real**; without (2) the latency target is unreachable at 125k PUT/s.
+
+---
+
+### Finding V (Q7-a) — Leaving `max_incorporated_seq` around as "the highest seq ever incorporated": benign as a metric, dangerous if anything else reads it as a gate.
+
+- **Severity:** Medium
+- **Category:** Correctness > obsolete state / Robustness > maintenance hazard
+- **Location:** `raft/state_machine.rs:78, 220, 459` (the field; advanced on every `IncorporateIntent`); `intent_committer.rs:171-185` (the committer reads it as `max_inc` and drops anything `<= m`); `raft_shard_store.rs:998` (the supervisor self-prune reads the applied `max_incorporated_seq` to prune the store).
+- **Description:** Under the PART-6 fix, the floor is no longer the drain filter (item 1 deletes that), no longer the gate (item 4 replaces with per-intent set), no longer the prune cutoff (item 2 replaces with per-intent prune). **Three consumers** of the floor exist in the shipped code. The proposal addresses all three but leaves the field. As a pure metric ("highest seq ever applied") it is fine. As a **read** by any future code path treating it as authoritative idempotency, it is a multi-writer hole reborn. The PART-6 race that motivated the fix (S_b applied first, S_a < floor → drain-filter drops it AND self-prune deletes it) was caused by exactly this kind of misread.
+- **Evidence:** Three current readers of `max_incorporated_seq`; the fix specifies replacements for all three but the field remains and is freely advanced.
+- **Suggested resolution:** Either (a) **delete the field** along with the three readers — there is no other consumer (verified: grep shows no other use sites), or (b) **rename it** to `highest_observed_seq` and add a `#[deprecated]` doc comment plus a `clippy::disallowed_methods`-style lint to prevent re-introducing a floor-gate misuse. Strongly prefer (a). Carrying an unused gate field is a latent debt; the next adversary review (or refactor) will misread it.
+
+---
+
+### Finding W (Q7-b) — Recovery dedup vs un-restored recent-seqs structure on snapshot install: real race.
+
+- **Severity:** High
+- **Category:** Correctness > startup ordering
+- **Location:** `raft/state_machine.rs:642-672` (`install_snapshot` restores the SM state including the structure once Finding R lands); `raft_shard_store.rs:1018-1052` (supervisor: on becoming leader, runs `gather_pending` + `recover()` + drain in sequence each tick); the recovery threshold guard `cluster_size − min_acks + 1` at `intent_committer.rs:256-265`.
+- **Description:** Trace: node-L was offline, comes back, joins as a follower, openraft sends it an `install_snapshot`. The snapshot includes the recent-incorporated-seqs structure (per Finding R). install_snapshot decodes synchronously into the SM. Meanwhile a leader election may complete on L itself (e.g. preferred-leader handoff) — `is_leader()` flips true. The supervisor on L sees the edge, runs `gather_pending` from peers, calls `recover()`, `restore_into` the local store, then drains. **Each step of drain calls `IncorporateIntent` whose SM apply consults the recent-seqs structure to dedup.** If the snapshot install has not yet completed when the drain begins, the structure is empty (or partial) and **every re-gathered seq is treated as new** → mass double-incorporation. The shipped global-floor design has the same race in principle but is safer in practice because the floor is a single `Option<HybridLogicalClock>` — a partial snapshot install either has it or not, and openraft's snapshot install is atomic at the apply boundary. A bulk structure is NOT atomic at the consumer level: even if install_snapshot writes it atomically, ANY interleaving where the supervisor reads `is_leader()=true` BEFORE the SM-side install completes is a window.
+
+  Additionally: the recovery threshold `cluster_size − min_acks + 1` is checked against the **gathered** peer count, NOT against the structure's readiness. A node that just got a fresh snapshot installs the seqs but has not yet seen any post-snapshot IncorporateIntent applies. If those applies pump up the recent-seqs structure, the supervisor must wait for the structure to be "current up to the last applied log index" before draining. There is no such gate today.
+- **Evidence:** `install_snapshot` at line 648-665, supervisor edge check at `raft_shard_store.rs:1006-1014`. Nothing serializes the two.
+- **Suggested resolution:** Add a **structure-ready gate** in the supervisor: after `gather_pending` + `recover()`, BEFORE draining, assert that the SM's `last_applied_log_index >= snapshot_install_log_index` AND the recent-seqs structure's "as-of" index is current. Concretely: track an `applied_log_index` on the SM (already present implicitly via `tip`) and an explicit `dedup_structure_last_applied` field; the supervisor reads both and refuses to drain until they agree with `raft.metrics().last_applied`. Same logic as the post-snapshot "wait for log catch-up" pattern used elsewhere in `kiseki-log`. Without this, snapshot install + leader-promotion-in-the-same-window is a double-incorporation generator.
+
+---
+
+### Finding X (Q7-c) — Per-name seq-guard (MF-1/9) is orthogonal: it does NOT compensate for chunk-refcount / inline-store / delta-row inflation. Different consumers, different scopes.
+
+- **Severity:** Informational (clarification of scope)
+- **Category:** Correctness > scope
+- **Location:** PART-2 §5 + Adversary Finding B (the per-name seq-guard); PART-5 MF-9 (Option-typed seq for sync vs async); the cluster_chunk_state path in `state_machine.rs:343-362`.
+- **Description:** The per-name seq-guard, when shipped, makes name-bind LWW-by-perspective-seq at hydrator apply time. It compensates for **name-binding** races (Finding A/B's "S2-forwarded-first / S1-later" reorder, and Finding I's RYW divergence). It does **NOT** compensate for:
+  - Chunk-state refcount inflation (Finding S, side 1 — covered by `or_insert_with`, not by the seq-guard).
+  - Delta-row inflation in the log (Finding S, side 2 — covered by compaction, not by the seq-guard).
+  - Inline-store row leak on duplicate apply (Finding S, side 3 — NO mechanism covers this without an inline GC pass).
+  - Orphan composition objects from keyless retries (Finding M — covered by deriving an idempotency key, not by the seq-guard).
+
+  So: the per-name seq-guard is **necessary but not sufficient** for the LeaderSink direction. The PART-6 fix's per-intent dedup is the chunk-state / delta-row / inline-leak defense; the per-name seq-guard is the name-bind defense. Both required.
+- **Evidence:** N/A — scope clarification.
+- **Suggested resolution:** Document this orthogonality in the ADR's "Correctness mechanisms" section so future readers don't conflate them and trim one as redundant.
+
+---
+
+### Finding Y (Q7-d) — Drain-all + leader-loss-mid-drain: the recovery pulls back what the old leader was about to drop. Edge but real.
+
+- **Severity:** Medium
+- **Category:** Correctness > leader-handoff races
+- **Location:** `raft_shard_store.rs:1011-1014` (leader-loss only logs + skips draining next tick — there is no in-flight cancellation of an active drain pass); `intent_committer.rs:167-204` (drain holds `&dyn IntentStore` and `&mut dyn IncorporationSink` for the entire pass, including the prune at line 199-201).
+- **Description:** Trace: leader L is mid-drain. It has incorporated intents I_1..I_k (each via a Raft `client_write` that returned Ok) and is about to call `store.prune(I_k.perspective_seq)`. Election happens; L is deposed before prune runs. L_new is elected. L_new's supervisor runs `gather_pending` — L is still up (just deposed) and answers with its full local store, which still contains I_1..I_k (not pruned). Merged into L_new's local store. L_new's drain incorporates I_1..I_k. **The proposed per-intent dedup catches them** at the SM apply, because their seqs are in the recent-seqs structure (assuming Q3/W are addressed). So this is safe IF Q2/Q3 are honest. Under the SHIPPED floor design this is also safe (floor gate). So the proposed fix preserves the safety but inherits all of Finding Q's structural fragility.
+
+  A second flavor: L is mid-drain, mid-`client_write` for I_k. The `client_write` returns `ForwardToLeader` because L just lost leadership — the openraft check fires post-submission, pre-apply. L's drain returns Err on that pass (`raft_intent_sink.rs:145` `.map_err(|e| IntentError::Incorporate(e.to_string()))`). The supervisor logs and continues (`raft_shard_store.rs:1049-1051`). The intent is NOT pruned (the prune in `Committer::run:199-201` runs AFTER successful incorporate). The intent survives in L's local store. L_new's recovery picks it up. **Safe** under the per-intent dedup (it WASN'T incorporated; correctly re-tried; per-intent set doesn't list it; incorporated by L_new).
+- **Evidence:** `Committer::run:195-201` (prune is conditional on incorporate succeeding); `raft_shard_store.rs:1049-1051` (drain error is logged and the tick continues).
+- **Suggested resolution:** No code change required IF Findings Q/R/W are honored. Document the case in the ADR's "Failure modes deliberately handled" list so future reviewers don't trip over it.
+
+---
+
+### Finding Z (Q7-other) — Supervisor self-prune races against drain in the SAME process. Mostly benign but worth tightening.
+
+- **Severity:** Low
+- **Category:** Concurrency
+- **Location:** `raft_shard_store.rs:994-1002` (self-prune is the FIRST step every tick) and `:1048-1051` (drain is the LAST step every tick, on the same supervisor thread, but `committer.drain_local()` is sync and `prune_store.prune()` is sync — they don't interleave within one tick). **However**, on a leader, the same `intent_store` is shared between `committer.local_store` (used by drain) and `prune_store` (used by self-prune). Both grab the fjall `mutations` lock; no deadlock (separate sync calls), but a prune mid-iter of a drain's `store.pending()` would be a data race. Verified safe because drain calls `store.pending()` → returns owned `Vec<WriteIntent>` THEN consumes it, releasing any borrow before prune runs. Per-call serialization via the fjall mutation lock.
+- **Description:** Confirmed safe. The supervisor's single-threaded structure (one tick = self-prune → leadership check → recover → drain) is the saving grace; if the supervisor were ever split across multiple threads / tasks, a concurrent self-prune + drain would need explicit ordering.
+- **Suggested resolution:** Add a doc comment on the supervisor pinning the single-threaded contract so a future refactor doesn't accidentally split it.
+
+---
+
+### Finding AA (other) — Drop-the-floor-filter breaks an existing recovery guarantee: a re-gathered intent that WAS already in the log re-applies and re-binds the name.
+
+- **Severity:** Critical
+- **Category:** Correctness > idempotency / recovery
+- **Location:** PART-6 §"Proposed fix" item 1 ("drop the `> floor` filter"); current `Committer::run` floor filter at `intent_committer.rs:177-185`; current SM apply-gate at `state_machine.rs:438-446`.
+- **Description:** Under the SHIPPED design, the SM apply-gate is the authoritative idempotency floor: re-applied IncorporateIntent with `seq <= max_incorporated_seq` is a no-op (line 441-446). The committer-side filter at `intent_committer.rs:177-185` is a perf prefilter only. Under the proposed fix, the committer-side filter is **deleted** (no `> floor`), and the SM gate becomes per-intent (only seqs IN the recent-seqs set are skipped). **For a recovered intent whose seq was applied a LONG time ago — outside the recent-seqs structure's window — the structure does not contain it. The SM apply-gate has nothing to compare against. The recovered intent re-applies → re-pushes the delta, re-binds the name, advances the tip.** This is double-incorporation when the structure window is too small for the recovery scenario.
+
+  Concretely: a long-partitioned follower's intent store may contain intents that ARE already in the Raft log but were applied weeks ago and pruned out of the recent-seqs structure. When that follower comes back and becomes leader, its recovery gather pulls in this stale intent set, drain-all attempts to incorporate them, the SM has no record, **mass re-application of historical writes**. The per-name seq-guard prevents the LWW from regressing (the older intent has older seq, loses to the current binding) — but the chunk-state side and inline-store side (Finding S) still suffer. And every re-applied intent's delta row is a duplicate that compaction has to clean up.
+
+  **This is the new R1/R5 hole opened by deleting the floor filter.** The shipped floor filter caught these "ancient" recoveries via `seq <= floor` (always true for an ancient intent). The proposed per-intent set is bounded; ancient intents fall out of the window; the gate misses.
+- **Evidence:** PART-6 §"Proposed fix" item 1: "Drain incorporates ALL local pending (delete the `> floor` filter)." `Committer::run:177-185` shows the filter being deleted. SM gate at `state_machine.rs:441-446` shows the floor-based skip being replaced. The recent-seqs structure's window is finite (Finding Q).
+- **Suggested resolution:** **Do not delete the floor filter at the committer side. Re-frame:** keep the floor as a `(last_applied_log_index, max_seq_at_or_before_that_index)` watermark — but make it a **per-replica observed-applied** floor, not a global "drop everything ≤" floor. The PART-6 race was specifically about the global-applied floor being used to filter LATE-ARRIVING-LOW-SEQ intents that were never incorporated. The fix: the floor is "the highest seq that has been APPLIED on this replica," NOT "the highest seq that has been incorporated cluster-wide." A late-arriving lower seq that is NOT in the recent-seqs structure AND is BELOW this replica's applied floor is unambiguously ancient → drop. A late-arriving lower seq that IS in the recent-seqs structure → drop (duplicate). A late-arriving lower seq above the floor's *log-index* window → admit.
+
+  This is a refinement, not a contradiction: the floor stays as an "ancient-cutoff" prefilter; the recent-seqs structure becomes the precise duplicate detector for the recent window. Together they cover (ancient + recent). The PART-6 race is resolved because the new floor is gated on log-index, not on cluster-applied seq, so a "newer-by-seq-but-older-by-log-index" intent is admitted (no false drop).
+
+  **This is the simpler-and-correct mechanism PART-6 missed**: keep the floor, change its semantics to log-index-gated rather than seq-gated; add the per-intent set ONLY for the recent window. Total complexity is the same, both holes closed.
+
+---
+
+### Finding AB (other) — The supervisor's `is_leader()` is a snapshot, not a watched edge. Long Raft elections can produce phantom recoveries.
+
+- **Severity:** Low
+- **Category:** Robustness > observability
+- **Location:** `raft_shard_store.rs:1005` (`leadership_store.is_leader()` polled per tick).
+- **Description:** `is_leader()` reads a metric snapshot. During an election the value can flap (candidate → leader → stepped-down within hundreds of ms if a higher-term vote arrives). Each false→true edge resets `recovered_this_term = false` and re-runs `gather_pending()` (a multi-peer RPC). At 50ms supervisor ticks, a flapping leadership produces a recovery storm — costly but not incorrect (recovery is idempotent on the local store).
+- **Evidence:** `is_leader()` is a `bool` snapshot, not a watch. The supervisor edge detector is `was_leader` boolean — no debounce.
+- **Suggested resolution:** Watch openraft's `metrics()` for `current_leader` changes with a debounce (e.g. require N consecutive ticks of stable leadership before treating it as a new term). Or watch `ServerState::Leader` via the openraft metrics stream rather than polling. Minor tightening.
+
+---
+
+### VERDICT: **REJECT-AS-WRITTEN → ACCEPT-WITH-CHANGES** with a reframe (Finding AA).
+
+The PART-6 diagnosis of the bug is correct: a global, perspective-seq-keyed floor used as a drain-filter is unsafe for multi-writer late arrivals. My PART-3 endorsement of that floor was wrong; I missed that the floor's semantics conflated "incorporated" with "highest-observed-and-applied," and the late-arrival case sits in the gap.
+
+But the proposed fix has critical structural problems:
+
+1. **Finding Q (Critical)** — the recent-incorporated-seqs structure is unbounded as proposed. At production throughput (125k PUT/s) and realistic operational windows (apply lag tails of seconds-to-minutes on partition recovery), the structure size is hundreds of MiB per shard per replica, replicated, snapshot-included. This is not shippable without a hard window discipline AND a circuit-breaker for over-cap.
+2. **Finding AA (Critical)** — deleting the committer-side floor filter outright opens a new R1/R5 hole: a long-partitioned follower's recovery dumps ancient intents that have fallen out of the recent-seqs window. The SM gate misses them, mass re-application ensues. The proposal needs a log-index-keyed ancient-cutoff floor (which is NOT the same as the broken seq-keyed cluster-applied floor) PLUS the per-intent recent-seqs structure for the recent window. Two complementary mechanisms, both finite.
+3. **Finding P (High)** — the per-intent dedup MUST be specified as "set membership updated in the SAME `apply` block as the delta append, atomically." Without that pin, the deposed-leader-mid-apply race is open.
+4. **Finding R (High)** — snapshot inflation is unavoidable; budget it explicitly and assert in build_snapshot.
+5. **Finding T (High)** — SM-side prune via `Arc<dyn IntentStore>` is the wrong coupling. Keep the prune off-band in the supervisor (it's already there); the supervisor reads the recent-seqs set and prunes per-intent. Same I/O shape, full fault-isolation.
+6. **Finding U (High)** — drain-all has no batch cap; recovery on a busy shard hangs the committer thread. Add per-pass cap K, batch the Raft append, yield to shutdown between batches.
+7. **Finding W (High)** — snapshot install + leader promotion race opens a mass double-incorporation window unless the supervisor explicitly waits for the dedup structure to be "current as of the last applied log index" before draining.
+
+**Reframe (simpler mechanism PART-6 missed):** Keep the floor as a **log-index-keyed ancient-cutoff filter** (the highest seq applied on THIS replica's log up to the last-applied-log-index), used by the committer as a "drop anything older than the apply-prefix of this replica's log" prefilter. Add the recent-incorporated-seqs structure ONLY for the recent window (the gap between the ancient cutoff and the current applied tip). The ancient cutoff is a single watermark — small, snapshot-trivial, replicated — and catches the partitioned-replica recovery case (Finding AA). The recent-seqs structure is bounded (Finding Q) and catches the multi-writer late-arrival case (PART-6's bug). The two together cover the failure spectrum.
+
+**Must-fix list (blocking):**
+1. Adopt the Finding-AA reframe: log-index-keyed ancient cutoff + bounded recent-seqs structure. Specify both mechanisms in the ADR.
+2. Specify the bounding discipline for the recent-seqs structure (Finding Q): log-index-windowed, hard ceiling, circuit-break on overflow, snapshot-size assertion.
+3. Pin the "set membership updated in the same apply block" rule (Finding P).
+4. Keep the prune off-band in the supervisor; the SM owns the set, the supervisor prunes the store (Finding T).
+5. Batch-cap the drain-all and add a between-batch shutdown yield (Finding U).
+6. Specify the structure-ready gate in the supervisor: refuse to drain until the recent-seqs structure is current-as-of-last-applied (Finding W).
+7. Delete or rename `max_incorporated_seq` so its semantics don't drift back (Finding V).
+8. Add an SM unit test that drives `IncorporateIntent(S)` twice in the SAME apply pipeline and asserts the second is a no-op. Add an integration test on a real multi-node `ClusterHarness` that reproduces the PART-6 race (concurrent K1 on node-A, K2 on node-B, jitter the arrival order, assert both visible after drain).
+
+**Should-fix (non-blocking but document):**
+9. The keyless-client-retry orphan composition (Finding M) — derive a 16-byte idempotency key for all surfaces, OR document the orphan cost + add an orphan-composition GC.
+10. Inline-store row leak on duplicate apply (Finding S item 3) — track as a follow-up with bounded GC.
+11. Supervisor leadership debounce (Finding AB) — minor noise reduction.
+
+**Endorsement caveat — I was wrong once.** My PART-3 endorsement of the global floor missed the multi-writer hole. I am now endorsing a more layered design (ancient cutoff + recent-seqs structure). I have argued through each Q1-Q7 attack and verified the code. The remaining residual risk is concentrated in **Finding Q's window calibration** — that's an operational dial whose wrong setting silently re-opens a no-loss hole. The ADR MUST land with explicit calibration math AND a runtime alarm on apply-lag exceeding the configured window, OR it should not land at all.
+
+---
+
+## PART 8 — DECISION ON THE FIX (reframe, accepted)
+
+Per PART 7 adversary review (verdict REJECT-as-written → ACCEPT with the reframe):
+
+**Accepted design — two complementary mechanisms:**
+1. **Ancient cutoff:** a log-index-keyed per-replica-applied watermark (NOT perspective-seq-keyed). Intents older than the cutoff are refused-with-alarm, never silently dropped. Catches long-partition recovery (Finding AA).
+2. **Bounded recent-incorporated-seqs set:** in the SM (replicated), covering the window between cutoff and applied tip. Hybrid bound (e.g. last 100k seqs OR ≤60s, whichever first). Hard-capped, circuit-breaker on overflow, alarm + refuse-with-error if apply-lag exceeds window. Catches multi-writer late-arrival + steady-state re-incorporation. NOT a Bloom (false-positives would silently drop legitimate intents).
+
+**Plus the must-fixes from PART 7:**
+- **P:** dedup-set update is atomic with the delta append in the same SM apply block.
+- **T:** per-intent prune stays **off-band in the supervisor** (the existing pattern at `raft_shard_store.rs:994-1002`), NOT in SM apply. SM owns the set; supervisor reads it (or reads applied IncorporateIntent seqs from the log tail) and prunes per-intent. Preserves Raft/store fault isolation.
+- **U:** **`IncorporateIntents(Vec<...>)`** batched log command with a per-pass cap (e.g. 1000) and yields to shutdown.
+- **W:** supervisor blocks draining post-leader-promotion until recent-seqs is current as of last applied log index.
+
+**Gate:** the concurrent-DIFFERENT-key multi-node BDD (the case that exposed the original floor bug) must pass. Plus the same-name concurrent BDD (LWW under reorder — still needs the per-name seq-guard MF-1/9).
+
+Verified safe (no fix needed): keyed-retry crash-safe (Finding N — `FjallIntentStore` atomic batch); fan retry Duplicate-counts-as-ack (Finding O). Per-name seq-guard (MF-1/9) is orthogonal — necessary but not sufficient (Finding X).

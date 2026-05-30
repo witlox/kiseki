@@ -169,6 +169,49 @@ pub enum LogCommand {
         /// this variant is only ever produced by the async-commit path).
         perspective_seq: kiseki_common::time::HybridLogicalClock,
     },
+    /// ADR-047 PART 8 §U — batched async-committed intents.
+    ///
+    /// One Raft round absorbs up to `KISEKI_DEDUP_DRAIN_BATCH_CAP` (default
+    /// 1 000) intents; each item runs through the same SM gate as the single
+    /// [`Self::IncorporateIntent`] variant (recent-set dedup + ancient cutoff +
+    /// atomic `chunk_meta` + delta append + window push/evict). Replaces the
+    /// per-intent N-Raft-round drain (Finding U) at the cost of a slightly
+    /// larger per-entry payload — the SM apply still runs O(items) work
+    /// inside the same lock-held block, so atomicity (§P) is preserved.
+    ///
+    /// **Keep this variant LAST** — `postcard` keys variants by declaration
+    /// order. A future variant appends after this one; never insert before.
+    IncorporateIntents {
+        /// The batch — every item carries the same shape as a single
+        /// [`Self::IncorporateIntent`].
+        items: Vec<IncorporateItem>,
+    },
+}
+
+/// One element of a batched [`LogCommand::IncorporateIntents`] (PART 8 §U).
+///
+/// Mirrors the fields of [`LogCommand::IncorporateIntent`] one-for-one so the
+/// per-item apply path is shared. Carrying the perspective-seq per item is
+/// mandatory — different items in the same batch can target different keys
+/// and were independently fanned to durability quorums.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct IncorporateItem {
+    /// Tenant ID (delta side).
+    pub tenant_id_bytes: [u8; 16],
+    /// Operation type code (delta side).
+    pub operation: u8,
+    /// Hashed key (delta side).
+    pub hashed_key: [u8; 32],
+    /// Chunk reference IDs (delta side).
+    pub chunk_refs: Vec<[u8; 32]>,
+    /// Encrypted payload (delta side).
+    pub payload: Vec<u8>,
+    /// Has inline data (delta side).
+    pub has_inline_data: bool,
+    /// Chunk metadata to create alongside the delta.
+    pub new_chunks: Vec<NewChunkMeta>,
+    /// The committer-assigned perspective-seq for this intent.
+    pub perspective_seq: kiseki_common::time::HybridLogicalClock,
 }
 
 /// New `cluster_chunk_state` entry to be created as part of a
@@ -214,6 +257,9 @@ impl std::fmt::Display for LogCommand {
                 "IncorporateIntent(op={operation}, new_chunks={})",
                 new_chunks.len()
             ),
+            Self::IncorporateIntents { items } => {
+                write!(f, "IncorporateIntents(items={})", items.len())
+            }
             Self::IncrementChunkRefcount { .. } => write!(f, "IncrementChunkRefcount"),
             Self::DecrementChunkRefcount { .. } => write!(f, "DecrementChunkRefcount"),
             Self::SetMaintenance { enabled } => write!(f, "SetMaintenance({enabled})"),
@@ -416,11 +462,13 @@ impl RaftLogStore {
                 sm.info.byte_size += u64::from(payload_size) + 128;
                 sm.deltas.push(delta);
             }
-            // ADR-047 phase 5a: the in-memory fallback store tracks neither
-            // `cluster_chunk_state` nor the `max_incorporated_seq` floor (both
-            // live in the openraft `ShardStateMachine`), so `IncorporateIntent`
-            // is applied exactly like `ChunkAndDelta` — append the delta, discard
-            // `new_chunks` and the perspective-seq.
+            // ADR-047 phase 5a / PART 8: the in-memory fallback store tracks
+            // neither `cluster_chunk_state` nor the dedup window (both live in
+            // the openraft `ShardStateMachine`), so `IncorporateIntent` and
+            // the batched `IncorporateIntents` are applied exactly like
+            // `ChunkAndDelta` — append the delta, discard `new_chunks` and the
+            // perspective-seq. The batched variant is unrolled below by
+            // calling back into `apply_to_sm` per item.
             LogCommand::ChunkAndDelta {
                 tenant_id_bytes,
                 operation,
@@ -502,6 +550,69 @@ impl RaftLogStore {
                 sm.info.delta_count += 1;
                 sm.info.byte_size += u64::from(payload_size) + 128;
                 sm.deltas.push(delta);
+            }
+            LogCommand::IncorporateIntents { items } => {
+                // Unroll each item into a plain AppendDelta apply. The
+                // fallback store has no dedup window, so duplicates are not
+                // gated here; production (openraft SM) is authoritative.
+                for item in items {
+                    let next_seq = SequenceNumber(sm.info.tip.0 + 1);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let payload_size = item.payload.len() as u32;
+                    let op = match item.operation {
+                        0 => crate::delta::OperationType::Create,
+                        1 => crate::delta::OperationType::Update,
+                        2 => crate::delta::OperationType::Delete,
+                        3 => crate::delta::OperationType::Rename,
+                        4 => crate::delta::OperationType::SetAttribute,
+                        5 => crate::delta::OperationType::Finalize,
+                        _ => crate::delta::OperationType::NamespaceCreate,
+                    };
+                    let timestamp = kiseki_common::time::DeltaTimestamp {
+                        hlc: kiseki_common::time::HybridLogicalClock {
+                            physical_ms: index,
+                            logical: 0,
+                            node_id: NodeId(0),
+                        },
+                        wall: kiseki_common::time::WallTime {
+                            millis_since_epoch: index,
+                            timezone: "UTC".into(),
+                        },
+                        quality: kiseki_common::time::ClockQuality::Ntp,
+                    };
+                    let delta = Delta {
+                        header: DeltaHeader {
+                            sequence: next_seq,
+                            shard_id,
+                            tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_bytes(
+                                item.tenant_id_bytes,
+                            )),
+                            operation: op,
+                            timestamp,
+                            hashed_key: item.hashed_key,
+                            tombstone: item.operation == 2,
+                            chunk_refs: item
+                                .chunk_refs
+                                .iter()
+                                .map(|b| kiseki_common::ids::ChunkId(*b))
+                                .collect(),
+                            payload_size,
+                            has_inline_data: item.has_inline_data,
+                        },
+                        payload: DeltaPayload {
+                            ciphertext: item.payload.clone(),
+                            auth_tag: Vec::new(),
+                            nonce: Vec::new(),
+                            system_epoch: None,
+                            tenant_epoch: None,
+                            tenant_wrapped_material: Vec::new(),
+                        },
+                    };
+                    sm.info.tip = next_seq;
+                    sm.info.delta_count += 1;
+                    sm.info.byte_size += u64::from(payload_size) + 128;
+                    sm.deltas.push(delta);
+                }
             }
             LogCommand::IncrementChunkRefcount { .. }
             | LogCommand::DecrementChunkRefcount { .. } => {
@@ -801,7 +912,7 @@ mod tests {
             1,
             "ChunkAndDelta must stay variant 1"
         );
-        // IncorporateIntent was appended last (ADR-047 phase 5a) — index 9.
+        // IncorporateIntent was appended at ADR-047 phase 5a — index 9.
         assert_eq!(
             disc(&LogCommand::IncorporateIntent {
                 tenant_id_bytes: [0; 16],
@@ -814,8 +925,66 @@ mod tests {
                 perspective_seq: kiseki_common::time::HybridLogicalClock::zero(NodeId(0)),
             }),
             9,
-            "IncorporateIntent is the last variant — appending more must keep it stable, never insert before it"
+            "IncorporateIntent index pinned at 9 since ADR-047 phase 5a"
         );
+        // PART 8 §U — IncorporateIntents appended last; the next addition
+        // must come after this one to keep the wire format stable.
+        assert_eq!(
+            disc(&LogCommand::IncorporateIntents { items: vec![] }),
+            10,
+            "IncorporateIntents (PART 8) is variant 10 — append-only beyond it"
+        );
+    }
+
+    /// PART 8 — `IncorporateIntents` round-trips through postcard with each
+    /// item's `perspective_seq` intact. Mirrors the single-variant test.
+    #[test]
+    fn incorporate_intents_postcard_round_trips() {
+        use crate::raft_store::IncorporateItem;
+        let seq_a = kiseki_common::time::HybridLogicalClock {
+            physical_ms: 42,
+            logical: 7,
+            node_id: NodeId(3),
+        };
+        let seq_b = kiseki_common::time::HybridLogicalClock {
+            physical_ms: 43,
+            logical: 0,
+            node_id: NodeId(3),
+        };
+        let cmd = LogCommand::IncorporateIntents {
+            items: vec![
+                IncorporateItem {
+                    tenant_id_bytes: [0xAB; 16],
+                    operation: 1,
+                    hashed_key: [0xCD; 32],
+                    chunk_refs: vec![[0xEE; 32]],
+                    payload: vec![1, 2, 3],
+                    has_inline_data: true,
+                    new_chunks: vec![],
+                    perspective_seq: seq_a,
+                },
+                IncorporateItem {
+                    tenant_id_bytes: [0xAB; 16],
+                    operation: 0,
+                    hashed_key: [0xFE; 32],
+                    chunk_refs: vec![],
+                    payload: vec![],
+                    has_inline_data: false,
+                    new_chunks: vec![],
+                    perspective_seq: seq_b,
+                },
+            ],
+        };
+        let bytes = postcard::to_stdvec(&cmd).expect("encode");
+        let back: LogCommand = postcard::from_bytes(&bytes).expect("decode");
+        match back {
+            LogCommand::IncorporateIntents { items } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].perspective_seq, seq_a);
+                assert_eq!(items[1].perspective_seq, seq_b);
+            }
+            other => panic!("expected IncorporateIntents, got {other}"),
+        }
     }
 
     /// `IncorporateIntent` round-trips through postcard with its

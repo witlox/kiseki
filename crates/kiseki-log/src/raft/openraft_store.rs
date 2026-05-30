@@ -24,10 +24,9 @@ use super::state_machine::{ShardSmInner, ShardStateMachine};
 use super::types::{LogResponse, LogTypeConfig};
 use crate::delta::Delta;
 use crate::error::LogError;
-use crate::intent::PerspectiveSeq;
 use crate::raft_store::LogCommand;
 use crate::shard::{ShardInfo, ShardState};
-use crate::traits::{AppendChunkAndDeltaRequest, AppendDeltaRequest, ReadDeltasRequest};
+use crate::traits::{AppendDeltaRequest, ReadDeltasRequest};
 use kiseki_common::locks::LockOrDie;
 
 type C = LogTypeConfig;
@@ -158,6 +157,14 @@ fn op_to_u8(op: crate::delta::OperationType) -> u8 {
         crate::delta::OperationType::Finalize => 5,
         crate::delta::OperationType::NamespaceCreate => 6,
     }
+}
+
+/// Re-export of the operation-code mapper so sibling modules
+/// ([`crate::raft_intent_sink`]) can build `IncorporateItem`s without
+/// duplicating the table.
+#[must_use]
+pub fn op_to_u8_pub(op: crate::delta::OperationType) -> u8 {
+    op_to_u8(op)
 }
 
 impl OpenRaftLogStore {
@@ -548,24 +555,22 @@ impl OpenRaftLogStore {
         }
     }
 
-    /// ADR-047 phase 5a (option 2): incorporate an async-committed intent
-    /// into the Raft log.
+    /// ADR-047 PART 8 — incorporate a BATCH of async-committed intents into
+    /// the Raft log as a single [`LogCommand::IncorporateIntents`] command.
     ///
-    /// Like [`Self::append_chunk_and_delta`] — seeds the `cluster_chunk_state`
-    /// rows and appends the delta atomically — but emits the dedicated
-    /// [`LogCommand::IncorporateIntent`] variant carrying the committer-assigned
-    /// `perspective_seq`. The state machine records the running max as
-    /// `max_incorporated_seq` (the gate-1 F-2 floor); a recovering leader reads
-    /// it via [`Self::max_incorporated_seq`] to drop re-gathered intents.
+    /// Replaces the per-intent `append_intent` (Finding U). Each item runs
+    /// through the per-item SM gate (recent set + ancient cutoff); items
+    /// already in the recent set are no-ops, items below the cutoff are
+    /// refused-with-alarm. Atomicity is preserved across the batch — the
+    /// whole apply runs under one SM-lock-held block.
     ///
     /// # Errors
     /// [`LogError::MaintenanceMode`] if the shard is draining;
     /// [`LogError::LeaderUnavailable`] if this node is not the leader;
     /// [`LogError::Unavailable`] on any other Raft client-write failure.
-    pub async fn append_intent(
+    pub async fn append_intents(
         &self,
-        req: AppendChunkAndDeltaRequest,
-        perspective_seq: PerspectiveSeq,
+        items: Vec<crate::raft_store::IncorporateItem>,
     ) -> Result<SequenceNumber, LogError> {
         {
             let inner = self.state.lock().await;
@@ -573,20 +578,13 @@ impl OpenRaftLogStore {
                 return Err(LogError::MaintenanceMode(self.shard_id));
             }
         }
+        if items.is_empty() {
+            // Nothing to do — return the current tip so callers can rely on
+            // a SequenceNumber result.
+            return Ok(self.current_tip().await);
+        }
 
-        let cmd = LogCommand::IncorporateIntent {
-            tenant_id_bytes: *req.delta.tenant_id.0.as_bytes(),
-            operation: op_to_u8(req.delta.operation),
-            hashed_key: req.delta.hashed_key,
-            chunk_refs: req.delta.chunk_refs.iter().map(|c| c.0).collect(),
-            payload: req.delta.payload,
-            has_inline_data: req.delta.has_inline_data,
-            new_chunks: req.new_chunks,
-            // The async-commit path: stamp the committer-assigned perspective-seq
-            // so the state machine advances the F-2 floor.
-            perspective_seq: perspective_seq.0,
-        };
-
+        let cmd = LogCommand::IncorporateIntents { items };
         let resp = self.raft.client_write(cmd).await.map_err(|e| {
             if matches!(
                 e,
@@ -889,15 +887,49 @@ impl OpenRaftLogStore {
         SequenceNumber(inner.tip)
     }
 
-    /// ADR-047 phase 5a (option 2): the highest perspective-seq incorporated
-    /// into this shard's Raft log — the gate-1 F-2 idempotency floor.
-    ///
-    /// Read from the same replicated state machine `current_tip` reads, so a
-    /// recovering leader sees the floor as of the last applied log entry (or
-    /// installed snapshot). `None` until the first intent is incorporated.
-    pub async fn max_incorporated_seq(&self) -> Option<kiseki_common::time::HybridLogicalClock> {
+    /// ADR-047 PART 8 §T — snapshot the perspective-seqs currently in the SM's
+    /// recent-incorporated set. The supervisor calls this each tick and
+    /// per-intent-prunes the local store so only intents *known to be applied
+    /// on this replica* are removed.
+    pub async fn recent_incorporated_snapshot(
+        &self,
+    ) -> std::collections::HashSet<kiseki_common::time::HybridLogicalClock> {
         let inner = self.state.lock().await;
-        inner.max_incorporated_seq
+        inner.recent_incorporated_snapshot()
+    }
+
+    /// ADR-047 PART 8 — the SM's ancient cutoff log-index. Recovery uses this
+    /// to filter out re-gathered intents whose intent-store residency is
+    /// suspiciously old (Finding Q).
+    pub async fn ancient_cutoff_log_index(&self) -> u64 {
+        let inner = self.state.lock().await;
+        inner.ancient_cutoff_log_index
+    }
+
+    /// PART 8 §W — the SM's last-applied Raft log index. Used by the
+    /// supervisor's post-promotion wait-for-current: drain does NOT start
+    /// until `applied_log_index >= committed_log_index`, so the recent set is
+    /// guaranteed to cover the just-promoted leader's incoming log.
+    #[must_use]
+    pub fn applied_log_index(&self) -> u64 {
+        self.raft
+            .metrics()
+            .borrow_watched()
+            .last_applied
+            .as_ref()
+            .map_or(0, openraft::LogId::index)
+    }
+
+    /// PART 8 §W — the SM's last-committed Raft log index. Used as the bar the
+    /// applied index must catch up to before draining resumes after promotion.
+    #[must_use]
+    pub fn committed_log_index(&self) -> u64 {
+        self.raft
+            .metrics()
+            .borrow_watched()
+            .committed
+            .as_ref()
+            .map_or(0, openraft::LogId::index)
     }
 
     /// Check whether the shard is in maintenance mode.
