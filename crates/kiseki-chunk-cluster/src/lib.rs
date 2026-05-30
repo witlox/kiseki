@@ -707,6 +707,12 @@ pub struct DeleteDistributedReport {
 
 #[async_trait]
 impl AsyncChunkOps for ClusteredChunkStore {
+    // Stays just over the 100-line clippy threshold after adding the
+    // EC-dedup-registration step (the alternative — extracting the EC
+    // branch into a helper — splits a tightly-coupled
+    // "fan + register-as-dedup-source" sequence across two functions
+    // for no readability gain).
+    #[allow(clippy::too_many_lines)]
     async fn write_chunk(&self, envelope: Envelope, pool: &str) -> Result<bool, ChunkError> {
         // Phase 16d step 1: dispatch on cfg.ec_strategy. Replication
         // path keeps the 16a fan-out semantics; EC path delegates
@@ -743,8 +749,60 @@ impl AsyncChunkOps for ClusteredChunkStore {
             } else {
                 crate::placement::pick_placement(&envelope.chunk_id, &self.cfg.cluster_nodes, total)
             };
+            // Snapshot the crypto metadata + ciphertext length BEFORE
+            // moving `envelope` into the EC fan. We don't need to
+            // keep the bytes around — the EC fragments are already
+            // durable after `write_chunk_ec` succeeds — but we DO
+            // need the same chunk_id + nonce + auth_tag + epoch
+            // fields a future replication-mode `read_chunk` from the
+            // same local chunks map would carry, plus the pre-EC
+            // ciphertext length for any trim-on-decode that uses it.
+            let dedup_envelope_metadata = Envelope {
+                chunk_id: envelope.chunk_id,
+                // ciphertext used solely as the source of `data_bytes`
+                // in `register_ec_chunk`'s record; we keep it sized
+                // to the real value via the length below — see the
+                // small `Vec` reserve + `set_len`-free init pattern.
+                ciphertext: Vec::new(),
+                auth_tag: envelope.auth_tag,
+                nonce: envelope.nonce,
+                system_epoch: envelope.system_epoch,
+                tenant_epoch: envelope.tenant_epoch,
+                tenant_wrapped_material: envelope.tenant_wrapped_material.clone(),
+            };
+            let ciphertext_len = envelope.ciphertext.len();
             self.write_chunk_ec(envelope, &placement, self.cfg.ec_strategy, pool)
                 .await?;
+            // Without this registration step, EC-mode writes only
+            // populate the per-fragment index in
+            // `PersistentChunkStore::fragments`. The gateway's
+            // pre-write `try_increment_if_exists` queries the
+            // chunk-id-keyed `chunks` map (which `write_chunk_ec`
+            // never touches), always misses, and every same-content
+            // PUT re-encrypts + re-EC-encodes + re-fans the same
+            // bytes to N peers — silently wasting CPU, storage and
+            // fabric bandwidth proportional to the workload's
+            // duplication rate. Replication mode never had this gap
+            // because `write_chunk` inserts into `chunks` directly.
+            //
+            // We reuse the existing `register_ec_chunk` shape and
+            // grow `ciphertext` to the original length (without
+            // touching the bytes) so the inner registration records
+            // `data_bytes` correctly without a 64 KiB+ clone.
+            let mut dedup_envelope = dedup_envelope_metadata;
+            dedup_envelope.ciphertext.resize(ciphertext_len, 0);
+            if let Err(e) = self.local.register_ec_chunk(&dedup_envelope, pool).await {
+                // Don't fail the write on a dedup-registration error
+                // — the fragments are durably placed and the
+                // composition's chunk reference is correct. The
+                // dedup-pre-flight will simply miss on future PUTs
+                // and we'll re-fan, which is the pre-fix behavior.
+                tracing::warn!(
+                    chunk_id = ?dedup_envelope.chunk_id,
+                    error = %e,
+                    "EC chunk dedup registration failed (write succeeded, dedup will miss)",
+                );
+            }
             return Ok(stored);
         }
 

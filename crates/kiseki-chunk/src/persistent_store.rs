@@ -725,6 +725,96 @@ impl ChunkOps for PersistentChunkStore {
         self.reconstruct_envelope(&entry.record, &entry.extents)
     }
 
+    /// Register a `chunk_id` in the dedup `chunks` map without doing any
+    /// device I/O — used by `ClusteredChunkStore::write_chunk`'s EC
+    /// branch after `write_chunk_ec` has successfully placed all
+    /// fragments. Without this hook, EC-mode writes only populate the
+    /// `fragments` map, leaving `chunks` empty; the gateway's pre-write
+    /// `try_increment_if_exists` then always misses and EC clusters
+    /// silently re-encrypt + re-fan duplicate content. The inserted
+    /// record carries zero-extent fields (the data lives in fragments,
+    /// not extents) — `ClusteredChunkStore::read_chunk` always uses the
+    /// EC ladder on EC strategies, so no caller reads via the local
+    /// extents from this entry.
+    ///
+    /// `data_bytes` is read from `envelope.ciphertext.len()`. The
+    /// caller may pass an envelope with the ciphertext drained to an
+    /// empty `Vec` to save a clone — in that case it MUST pre-resize the
+    /// `Vec` to `original_len` (the value `read_chunk_ec`'s `original_len`
+    /// argument expects); the bytes themselves are never read here.
+    ///
+    /// On a second call for the same `chunk_id` (same-content dedup)
+    /// this just bumps refcount, mirroring [`Self::write_chunk`]'s
+    /// dedup-hit branch.
+    ///
+    /// # Errors
+    /// Returns the same `ChunkError` shapes [`Self::write_chunk`] uses
+    /// for refcount overflow or meta-store persistence failure.
+    fn register_ec_chunk(&self, envelope: &Envelope, pool: &str) -> Result<bool, ChunkError> {
+        let chunk_id = envelope.chunk_id;
+        let data_bytes = envelope.ciphertext.len() as u64;
+
+        // Dedup fast path: already registered → bump refcount, persist
+        // the updated record, return false (= not new).
+        let updated = {
+            let mut chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
+            if let Some(entry) = chunks.get_mut(&chunk_id) {
+                entry.record.refcount = entry
+                    .record
+                    .refcount
+                    .checked_add(1)
+                    .ok_or_else(|| ChunkError::Io("refcount overflow".into()))?;
+                Some(entry.record.clone())
+            } else {
+                let record = ChunkRecord {
+                    chunk_id: chunk_id.0,
+                    refcount: 1,
+                    retention_holds: Vec::new(),
+                    pool_name: pool.to_owned(),
+                    // EC fragments aren't extents on THIS node — the
+                    // stored bytes count is across the cluster, so
+                    // we don't double-count local bytes here. data
+                    // bytes is the pre-EC ciphertext length used for
+                    // trimming on decode.
+                    stored_bytes: 0,
+                    data_bytes,
+                    extent_offset: 0,
+                    extent_length: 0,
+                    extra_extents: Vec::new(),
+                    nonce: envelope.nonce,
+                    auth_tag: envelope.auth_tag,
+                    system_epoch: envelope.system_epoch.0,
+                    tenant_epoch: envelope.tenant_epoch.map(|e| e.0),
+                    tenant_wrapped_material: envelope.tenant_wrapped_material.clone(),
+                };
+                chunks.insert(
+                    chunk_id,
+                    ChunkEntry {
+                        record: record.clone(),
+                        extents: Vec::new(),
+                    },
+                );
+                None
+            }
+        };
+
+        if let Some(rec) = updated {
+            self.meta.put_chunk(&rec)?;
+            Ok(false)
+        } else {
+            // Re-clone the just-inserted record for persistence.
+            let rec = {
+                let chunks = self.chunks.lock().lock_or_die("persistent_store.chunks");
+                chunks
+                    .get(&chunk_id)
+                    .map(|e| e.record.clone())
+                    .ok_or_else(|| ChunkError::Io("just-inserted EC chunk vanished".into()))?
+            };
+            self.meta.put_chunk(&rec)?;
+            Ok(true)
+        }
+    }
+
     fn storage_stats(&self) -> crate::store::StorageStats {
         // Device capacity is authoritative for used/total (a DevicePool
         // sums every JBOD member). Dedup accounting iterates the

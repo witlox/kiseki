@@ -63,6 +63,26 @@ pub trait AsyncChunkOps: Send + Sync {
     /// `refcount` + `increment_refcount` path.
     async fn try_increment_if_exists(&self, chunk_id: &ChunkId) -> Result<Option<u64>, ChunkError>;
 
+    /// Register a `chunk_id` in the dedup index without device I/O.
+    /// Called by the cluster wrapper after a successful EC fragment
+    /// fan; without it the dedup index stays empty in EC mode and the
+    /// gateway re-encrypts + re-fans the same content on every PUT.
+    /// Defaults to the trait error so non-cluster backends don't
+    /// have to implement it.
+    ///
+    /// # Errors
+    /// Backends may return `ChunkError::Io` on refcount overflow or
+    /// meta-store persistence failure.
+    async fn register_ec_chunk(
+        &self,
+        _envelope: &kiseki_crypto::envelope::Envelope,
+        _pool: &str,
+    ) -> Result<bool, ChunkError> {
+        Err(ChunkError::Io(
+            "register_ec_chunk not supported on this AsyncChunkOps".into(),
+        ))
+    }
+
     /// Decrement refcount. Returns the new refcount.
     async fn decrement_refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError>;
 
@@ -316,6 +336,17 @@ impl<T: ChunkOps + Send + Sync + 'static> AsyncChunkOps for SyncBridge<T> {
         // lock here, so the gateway's per-write dedup preflight no longer
         // serializes every writer through the exclusive lock.
         self.inner.read().try_increment_if_exists(chunk_id)
+    }
+
+    async fn register_ec_chunk(
+        &self,
+        envelope: &kiseki_crypto::envelope::Envelope,
+        pool: &str,
+    ) -> Result<bool, ChunkError> {
+        // Mirrors the `try_increment_if_exists` lock shape: the
+        // inner-store method is `&self` (chunk-index critical section
+        // only), so a read lock here is enough.
+        self.inner.read().register_ec_chunk(envelope, pool)
     }
 
     async fn decrement_refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
