@@ -125,6 +125,9 @@ impl ProfileServer {
             "KISEKI_COMPOSITION_FLUSH_INTERVAL_MS",
             "KISEKI_CHUNK_FLUSH_INTERVAL_MS",
             "KISEKI_RAFT_FLUSH_INTERVAL_MS",
+            // ADR-047 decoupled-ack capability gate — lets the matrix sweep
+            // baseline (default off) vs decoupled-ack-on without a recompile.
+            "KISEKI_DECOUPLED_ACK",
         ] {
             if let Ok(v) = std::env::var(var) {
                 cmd.env(var, v);
