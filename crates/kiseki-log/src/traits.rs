@@ -183,29 +183,29 @@ pub trait LogOps: Send + Sync {
     /// ADR-047 decoupled-ack: durably record `intent` on a quorum so the
     /// gateway can fast-ack a write BEFORE the synchronous Raft round.
     ///
-    /// Records the local per-shard intent store (one durable copy) and fans the
-    /// intent to the shard's voter peers in parallel, returning `Ok` ONLY once
-    /// the total durable copies reach `min_acks`. On a shortfall it returns
-    /// `Err` and the caller MUST NOT ack — an acked write is guaranteed on
-    /// `≥ min_acks` replicas (no-loss, I-L2/I-CS1).
+    /// This is THE write path for async-eligible surfaces (S3, Native) —
+    /// no capability gate. Implementations must record the local per-shard
+    /// intent store (one durable copy) and fan the intent to the shard's
+    /// voter peers in parallel, returning `Ok` ONLY once the total durable
+    /// copies reach `min_acks`. On a shortfall they return `Err` and the
+    /// gateway propagates the failure to the client — an acked write is
+    /// guaranteed on `≥ min_acks` replicas (no-loss, I-L2/I-CS1).
     ///
-    /// Multi-node only. The default impl returns [`LogError::Unavailable`] so
-    /// the single-node stores ([`crate::MemShardStore`],
-    /// [`crate::PersistentShardStore`]) signal "no decoupled-ack here" and the
-    /// gateway falls back to the synchronous append path. Only the Raft-backed
-    /// [`crate::RaftShardStore`] overrides with the real quorum intent-write.
+    /// Single-node stores ([`crate::MemShardStore`],
+    /// [`crate::PersistentShardStore`]) satisfy `min_acks = 1` with a
+    /// synchronous local append (no peers to fan to). The Raft-backed
+    /// [`crate::RaftShardStore`] does the real quorum intent-write.
     ///
     /// # Errors
-    /// [`LogError::Unavailable`] when this store does not support decoupled-ack
-    /// (the default) or the shard's intent store is non-durable; otherwise a
-    /// quorum-shortfall / shard-lookup error from the real implementation.
+    /// [`LogError::Unavailable`] when the shard's intent store is non-durable
+    /// (e.g. an in-memory test cluster) or the local store write fails;
+    /// [`LogError::QuorumLost`] when durable copies fall short of `min_acks`;
+    /// otherwise a shard-lookup or transport error.
     async fn put_intent_and_fan(
         &self,
-        _shard_id: ShardId,
-        _intent: crate::intent::WriteIntent,
-    ) -> Result<(), LogError> {
-        Err(LogError::Unavailable)
-    }
+        shard_id: ShardId,
+        intent: crate::intent::WriteIntent,
+    ) -> Result<(), LogError>;
 
     /// Read deltas in `[from, to]` inclusive from a shard.
     async fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError>;

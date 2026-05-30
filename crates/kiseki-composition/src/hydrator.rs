@@ -1045,6 +1045,13 @@ mod tests {
     #[allow(clippy::unimplemented)]
     #[async_trait::async_trait]
     impl LogOps for GapInjectingLog {
+        async fn put_intent_and_fan(
+            &self,
+            _shard_id: ShardId,
+            _intent: kiseki_log::intent::WriteIntent,
+        ) -> Result<(), kiseki_log::error::LogError> {
+            unimplemented!("test stub: hydrator never produces intents")
+        }
         async fn append_delta(
             &self,
             _req: AppendDeltaRequest,

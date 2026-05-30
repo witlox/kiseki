@@ -87,6 +87,26 @@ impl LogOps for RecordingLog {
         Ok(SequenceNumber(1))
     }
 
+    /// ADR-047: decoupled-ack is THE write path for S3/Native — the
+    /// gateway now calls `put_intent_and_fan` instead of the synchronous
+    /// `append_chunk_and_delta`. Mirror the bridge's empty-new-chunks
+    /// routing rule so dedup-hit writes (empty `new_chunks`) land in
+    /// `plain_calls` and fresh-chunk writes land in `chunk_and_delta_calls`
+    /// — the same accounting the existing assertions rely on.
+    async fn put_intent_and_fan(
+        &self,
+        _shard_id: ShardId,
+        intent: kiseki_log::intent::WriteIntent,
+    ) -> Result<(), LogError> {
+        let req = intent.append;
+        if req.new_chunks.is_empty() {
+            self.plain_calls.lock().unwrap().push(req.delta);
+        } else {
+            self.chunk_and_delta_calls.lock().unwrap().push(req);
+        }
+        Ok(())
+    }
+
     async fn increment_chunk_refcount(
         &self,
         shard_id: ShardId,
@@ -757,6 +777,18 @@ struct ForwardToLeaderLog {
 
 #[async_trait::async_trait]
 impl LogOps for ForwardToLeaderLog {
+    async fn put_intent_and_fan(
+        &self,
+        _shard_id: ShardId,
+        _intent: kiseki_log::intent::WriteIntent,
+    ) -> Result<(), LogError> {
+        // This stub focuses on the synchronous forward-to-leader path; the
+        // test driving it uses a POSIX surface so the gateway skips the
+        // decoupled path. If a future test exercises async forwarding it
+        // should return the leader hint here too.
+        Err(LogError::Unavailable)
+    }
+
     async fn append_delta(&self, _req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
         Ok(SequenceNumber(1))
     }
@@ -895,7 +927,11 @@ async fn write_to_remote_led_shard_forwards_to_leader() {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
-            surface: kiseki_gateway::WriteSurface::S3,
+            // Drive the synchronous forward-to-leader path: POSIX surfaces
+            // are NEVER decoupled (ADR-013), so the gateway emits via
+            // `emit_chunk_and_delta_forwarding_to` and exercises the
+            // `AppendForwarder` we wire above.
+            surface: kiseki_gateway::WriteSurface::Nfs,
         })
         .await
         .expect("write must succeed via leader append-forward, not ForwardToLeader error");

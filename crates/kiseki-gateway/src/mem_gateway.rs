@@ -333,14 +333,6 @@ pub struct InMemoryGateway {
     /// `PerspectiveSeq` so two writes ingressed on different nodes in
     /// the same physical millisecond still totally order (ADR-047 §1).
     node_id: kiseki_common::ids::NodeId,
-    /// ADR-047 decoupled-ack capability gate (per-node). When `true` AND
-    /// the write's surface is async-ack-eligible, `write_impl` /
-    /// `complete_multipart_internal` mint a perspective-seq, record the
-    /// intent on a quorum via `put_intent_and_fan`, and FAST-ACK instead
-    /// of awaiting the Raft commit — falling back to the synchronous emit
-    /// on any error so no write is ever lost. Wired from
-    /// `ServerConfig.decoupled_ack`. Default `false` (synchronous path).
-    decoupled_ack: bool,
     /// Per-node hybrid logical clock — the ingress total-order source
     /// (ADR-047 §1). `next_perspective_seq` ticks it with the current
     /// wall-ms and returns the assigned [`kiseki_log::intent::PerspectiveSeq`].
@@ -597,12 +589,12 @@ impl InMemoryGateway {
             decrypt_cache: parking_lot::Mutex::new(DecryptCache::new(read_decrypt_cache_ttl())),
             namespace_meta: std::sync::Arc::new(parking_lot::RwLock::new(namespace_meta_init)),
             namespace_provisioner: std::sync::RwLock::new(None),
-            // ADR-047: default to node 0 + synchronous acks. The runtime
-            // calls `with_node_id` / `with_decoupled_ack` to wire the real
-            // node id and the capability gate; single-node / in-memory
-            // tests keep node 0 and the synchronous path.
+            // ADR-047: default to node 0. The runtime calls `with_node_id`
+            // to wire the real id; single-node / in-memory tests keep 0.
+            // Decoupled-ack is THE write path for async-eligible surfaces —
+            // no capability gate (per-surface synchronous semantic is
+            // selected via `WriteSurface::is_async_ack_eligible`).
             node_id: kiseki_common::ids::NodeId(0),
-            decoupled_ack: false,
             perspective_clock: std::sync::Mutex::new(
                 kiseki_common::time::HybridLogicalClock::zero(kiseki_common::ids::NodeId(0)),
             ),
@@ -618,16 +610,6 @@ impl InMemoryGateway {
         self.node_id = nid;
         self.perspective_clock =
             std::sync::Mutex::new(kiseki_common::time::HybridLogicalClock::zero(nid));
-        self
-    }
-
-    /// ADR-047 — enable the decoupled fast-ack path. When `true`, an
-    /// async-ack-eligible surface (S3 / native) records the write intent on
-    /// a quorum and acks before the Raft commit. Wired from
-    /// `ServerConfig.decoupled_ack`.
-    #[must_use]
-    pub fn with_decoupled_ack(mut self, enabled: bool) -> Self {
-        self.decoupled_ack = enabled;
         self
     }
 
@@ -1098,104 +1080,67 @@ impl InMemoryGateway {
                 })
                 .collect();
 
-            let comp_payload = kiseki_composition::encode_composition_create_payload(
+            tracing::debug!(
+                comp_id = %comp_id.0,
+                shard_id = %shard_id.0,
+                "complete_multipart: put_intent_and_fan start",
+            );
+
+            // ADR-047 decoupled-ack: multipart-complete is an S3-surface
+            // write (always async-ack-eligible), so this is THE write path
+            // — no capability gate, no synchronous fallback. Mint a
+            // perspective-seq, record the intent on a quorum, and FAST-ACK.
+            // The parts' chunks are already `min_acks`-durable (uploaded
+            // BEFORE finalize — I-L5) and the composition + local name
+            // binding are already installed (read-your-writes holds on this
+            // node); the committer replays the Create delta +
+            // `cluster_chunk_state` asynchronously. On ANY error the error
+            // propagates to the client — pre-production: no legacy fallback.
+            let seq = self.next_perspective_seq();
+            // ADR-047 MF-1: encode the payload with `Some(seq)` so the
+            // hydrator's per-name LWW guard sees it.
+            let async_comp_payload = kiseki_composition::encode_composition_create_payload(
                 comp_id,
                 emit_params.2,
                 emit_params.4,
                 name,
                 &emit_params.5,
-                None,
+                Some(seq),
             );
-            tracing::debug!(
-                comp_id = %comp_id.0,
-                shard_id = %shard_id.0,
-                "complete_multipart: emit_chunk_and_delta start",
-            );
-
-            // ADR-047 decoupled-ack: multipart-complete is an S3-surface
-            // write (always async-ack-eligible), so the gate is just the
-            // capability flag. Mint a perspective-seq, record the intent on
-            // a quorum, and FAST-ACK. The parts' chunks are already
-            // `min_acks`-durable (uploaded BEFORE finalize — I-L5) and the
-            // composition + local name binding are already installed
-            // (read-your-writes holds on this node); the committer replays
-            // the Create delta + `cluster_chunk_state` asynchronously. On
-            // ANY error we fall through to the synchronous emit — no loss.
-            if self.decoupled_ack {
-                let seq = self.next_perspective_seq();
-                // ADR-047 MF-1: re-encode the payload with `Some(seq)`
-                // so the hydrator's per-name LWW guard sees it. The
-                // sync-path payload above passes `None`.
-                let async_comp_payload = kiseki_composition::encode_composition_create_payload(
-                    comp_id,
-                    emit_params.2,
-                    emit_params.4,
-                    name,
-                    &emit_params.5,
-                    Some(seq),
-                );
-                let append = kiseki_composition::log_bridge::build_chunk_and_delta_request(
-                    shard_id,
-                    emit_params.1,
-                    kiseki_log::delta::OperationType::Create,
-                    hashed_key,
-                    emit_params.3.clone(),
-                    async_comp_payload,
-                    new_chunks.clone(),
-                );
-                // No idempotency context on the multipart-complete seam
-                // today (the upload_id is the client's retry token, not a
-                // 16-byte intent key) — at-least-once; the committer dedups
-                // on Raft apply. TODO(ADR-047 §5): derive a stable key.
-                let intent = kiseki_log::intent::WriteIntent {
-                    perspective_seq: seq,
-                    idempotency_key: None,
-                    append,
-                };
-                match log.put_intent_and_fan(shard_id, intent).await {
-                    Ok(()) => {
-                        tracing::debug!(
-                            comp_id = %comp_id.0,
-                            shard_id = %shard_id.0,
-                            "complete_multipart: decoupled fast-ack (intent durable)",
-                        );
-                        return Ok(comp_id);
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            comp_id = %comp_id.0,
-                            shard_id = %shard_id.0,
-                            error = %e,
-                            "complete_multipart: decoupled-ack unavailable — synchronous fallback",
-                        );
-                    }
-                }
-            }
-
-            // #111: forward-aware so multipart-complete on a remote-led
-            // shard commits on the leader (the built append carries the
-            // parts' new_chunks, so the leader needs no local upload state).
-            kiseki_composition::log_bridge::emit_chunk_and_delta_forwarding_to(
-                log.as_ref(),
-                self.forwarder.as_deref(),
+            let append = kiseki_composition::log_bridge::build_chunk_and_delta_request(
                 shard_id,
                 emit_params.1,
                 kiseki_log::delta::OperationType::Create,
                 hashed_key,
                 emit_params.3,
-                comp_payload,
+                async_comp_payload,
                 new_chunks,
-            )
-            .await
-            .map_err(|e| {
-                tracing::warn!(
-                    comp_id = %comp_id.0,
-                    error = %e,
-                    "complete_multipart: emit_chunk_and_delta failed — composition is local-only",
-                );
-                GatewayError::Upstream(format!("multipart create-delta emit: {e}"))
-            })?;
-            tracing::debug!(comp_id = %comp_id.0, "complete_multipart: Raft Create-delta committed");
+            );
+            // No idempotency context on the multipart-complete seam today
+            // (the upload_id is the client's retry token, not a 16-byte
+            // intent key) — at-least-once; the committer dedups on Raft
+            // apply. TODO(ADR-047 §5): derive a stable key.
+            let intent = kiseki_log::intent::WriteIntent {
+                perspective_seq: seq,
+                idempotency_key: None,
+                append,
+            };
+            log.put_intent_and_fan(shard_id, intent)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(
+                        comp_id = %comp_id.0,
+                        shard_id = %shard_id.0,
+                        error = %e,
+                        "complete_multipart: put_intent_and_fan failed — write rejected",
+                    );
+                    GatewayError::Upstream(format!("multipart intent quorum: {e}"))
+                })?;
+            tracing::debug!(
+                comp_id = %comp_id.0,
+                shard_id = %shard_id.0,
+                "complete_multipart: decoupled fast-ack (intent durable)",
+            );
         }
         Ok(comp_id)
     }
@@ -2673,26 +2618,26 @@ impl InMemoryGateway {
                 "gateway write: emit_chunk_and_delta start",
             );
 
-            // ADR-047 decoupled-ack: when enabled AND the surface carries
-            // bounded-stale object semantics (S3 / native), mint a
-            // perspective-seq, record the intent on a quorum, and FAST-ACK
-            // — skipping the synchronous Raft await below. The chunks are
-            // already `min_acks`-durable (write_chunk happened above,
-            // BEFORE the intent — I-L5) and the composition is already
-            // created locally (read-your-writes holds on this node), so
-            // the committer task can incorporate the delta +
-            // `cluster_chunk_state` asynchronously. On ANY shortfall /
-            // non-durable / single-node error we fall through to the
-            // synchronous emit so no write is ever lost.
-            if self.decoupled_ack && req.surface.is_async_ack_eligible() {
+            // ADR-047 decoupled-ack: for async-ack-eligible surfaces
+            // (S3, Native) this is THE write path — no capability gate.
+            // Mint a perspective-seq, record the intent on a quorum, and
+            // FAST-ACK. The chunks are already `min_acks`-durable
+            // (write_chunk happened above, BEFORE the intent — I-L5) and
+            // the composition is already created locally
+            // (read-your-writes holds on this node), so the committer
+            // task incorporates the delta + `cluster_chunk_state`
+            // asynchronously. POSIX surfaces (NFS, FUSE) fall through to
+            // the synchronous emit below — `is_async_ack_eligible()`
+            // returns false for them (ADR-013 close-to-open).
+            //
+            // Pre-production: on ANY put_intent_and_fan error (quorum
+            // shortfall, non-durable, single-node) the error propagates
+            // to the client — NO synchronous fallback. The legacy fall-
+            // back lost data when min_acks couldn't be satisfied.
+            if req.surface.is_async_ack_eligible() {
                 let seq = self.next_perspective_seq();
                 // ADR-047 MF-1: encode the seq INTO the Create payload
-                // so the hydrator's LWW guard sees it (the seq carried
-                // on the intent itself is the Raft-apply order, not
-                // the per-name LWW key — that's the HLC inside the
-                // payload). The sync-path payload above passes
-                // `None` for the seq so the sync emit fallback below
-                // binds unconditionally.
+                // so the hydrator's LWW guard sees it.
                 let async_comp_payload = kiseki_composition::encode_composition_create_payload(
                     comp_id,
                     emit_params.2,
@@ -2701,11 +2646,6 @@ impl InMemoryGateway {
                     &[],
                     Some(seq),
                 );
-                // Build byte-for-byte the SAME append the synchronous emit
-                // would commit (except for the seq suffix), so the
-                // committer incorporates an identical delta. Clone the
-                // consumable params (cheap — `payload` / `new_chunks` are
-                // metadata, not the file body).
                 let append = kiseki_composition::log_bridge::build_chunk_and_delta_request(
                     shard_id,
                     emit_params.1,
@@ -2757,17 +2697,17 @@ impl InMemoryGateway {
                         });
                     }
                     Err(e) => {
-                        // Shortfall / non-durable / single-node — fall back
-                        // to the synchronous emit below. NEVER lose the
-                        // write. The composition stays created; the sync
-                        // path commits it normally (or rolls back on its
-                        // own error, preserving existing semantics).
-                        tracing::debug!(
+                        // Quorum shortfall / non-durable / single-node:
+                        // roll back the provisional composition and
+                        // surface the failure. No silent fallback.
+                        tracing::warn!(
                             comp_id = %comp_id.0,
                             shard_id = %shard_id.0,
                             error = %e,
-                            "gateway write: decoupled-ack unavailable — synchronous fallback",
+                            "gateway write: put_intent_and_fan failed — write rejected",
                         );
+                        let _ = self.compositions.delete(comp_id).ok();
+                        return Err(GatewayError::Upstream(format!("intent quorum: {e}")));
                     }
                 }
             }

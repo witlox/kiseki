@@ -111,18 +111,13 @@ pub struct RaftShardStore {
     /// data on crash (the F-P5b-rpc-1 obligation). A shard with `data_dir =
     /// None` (in-memory test cluster) is NOT durable and so is absent here.
     durable_intent_shards: Mutex<HashSet<ShardId>>,
-    /// ADR-047 decoupled-ack capability gate. When `false` (the default),
-    /// `create_shard` spawns no committer and the sync write path is
-    /// unchanged. Set in [`Self::new`] from the `decoupled_ack` param (the
-    /// runtime derives it from `KISEKI_DECOUPLED_ACK`).
-    decoupled_ack: bool,
     /// Minimum durable copies (local + remote acks) for an acked decoupled
     /// write. From `KISEKI_MIN_ACKS`, else [`DEFAULT_MIN_ACKS`]. Mirrors the
     /// chunk D-5 quorum default.
     min_acks: usize,
-    /// Per-shard async committer tasks spawned when `decoupled_ack` is on and
-    /// the shard's intent store is durable. Stopped in [`Self::shutdown`] /
-    /// `Drop`.
+    /// Per-shard async committer tasks spawned for each shard whose intent
+    /// store opened durably (ADR-047 §F-P5b-rpc-1 — no committer on a
+    /// non-durable shard). Stopped in [`Self::shutdown`] / `Drop`.
     committers: Mutex<HashMap<ShardId, ShardCommitterHandle>>,
     node_id: u64,
     peers: BTreeMap<u64, String>,
@@ -150,20 +145,15 @@ impl RaftShardStore {
     /// fjall keyspace and survives restart. When `None`, uses
     /// in-memory log (volatile).
     ///
-    /// `decoupled_ack` arms the ADR-047 decoupled-ack capability gate: when
-    /// `true`, `create_shard` spawns a per-shard async committer (for each
-    /// shard whose intent store is durable) and `put_intent_and_fan` performs
-    /// the quorum intent-write. When `false` (the runtime default unless
-    /// `KISEKI_DECOUPLED_ACK` is set), the synchronous write path is unchanged
-    /// and nothing extra is spawned. `min_acks` is read from `KISEKI_MIN_ACKS`
-    /// (else [`DEFAULT_MIN_ACKS`]).
+    /// ADR-047: decoupled-ack is THE write path for async-eligible surfaces
+    /// (no capability gate). `create_shard` spawns a per-shard async
+    /// committer for every shard whose intent store opens durably (the
+    /// F-P5b-rpc-1 obligation — incorporating from a non-durable store
+    /// could surface an intent a crash would lose). `put_intent_and_fan`
+    /// performs the quorum intent-write. `min_acks` is read from
+    /// `KISEKI_MIN_ACKS` (else [`DEFAULT_MIN_ACKS`]).
     #[must_use]
-    pub fn new(
-        node_id: u64,
-        peers: BTreeMap<u64, String>,
-        data_dir: Option<PathBuf>,
-        decoupled_ack: bool,
-    ) -> Self {
+    pub fn new(node_id: u64, peers: BTreeMap<u64, String>, data_dir: Option<PathBuf>) -> Self {
         let min_acks = std::env::var("KISEKI_MIN_ACKS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -196,7 +186,6 @@ impl RaftShardStore {
             shards: Mutex::new(HashMap::new()),
             intent_stores: Mutex::new(HashMap::new()),
             durable_intent_shards: Mutex::new(HashSet::new()),
-            decoupled_ack,
             min_acks,
             committers: Mutex::new(HashMap::new()),
             node_id,
@@ -337,8 +326,8 @@ impl RaftShardStore {
     /// Returns `None` for a shard this node does not host. The committer's
     /// `cluster_size` is `gatherer.peer_count() + 1` (the peers plus self).
     ///
-    /// **Not wired into any production path this phase** — provided for the
-    /// 5c/5d committer task that spawns behind the `DecoupledAckEnabled` gate.
+    /// Driven by the per-shard committer task spawned in `create_shard` when
+    /// the intent store opens durably.
     #[must_use]
     pub fn intent_gatherer(&self, shard_id: ShardId) -> Option<TransportIntentGatherer> {
         let peers = self.resolve_voter_peers(shard_id)?;
@@ -653,40 +642,39 @@ impl RaftShardStore {
         .join()
         .expect("Raft shard creation thread panicked");
 
-        // ADR-047 phase 5b-rpc: create this shard's IntentStore so peers can
-        // SERVE their intent state via the IntentSync aux dispatcher. Durable
+        // ADR-047: create this shard's IntentStore so peers can SERVE their
+        // intent state via the IntentSync aux dispatcher AND the local
+        // producer can record + fan intents for fast-ack. Durable
         // (FjallIntentStore at `<data_dir>/<shard_id>/intents`) when a data
         // dir is set, else in-memory — mirroring the shard log store's
-        // persistence choice above. Inert this phase: empty + only queried by
-        // the 5c/5d committer task.
+        // persistence choice above.
         //
-        // A durable-open failure degrades to the in-memory store rather than
-        // failing shard creation. That is safe ONLY because nothing acks on
-        // this store yet (the gatherer is on no production path this phase).
+        // F-P5b-rpc-1 obligation (no-loss / O3): once the producer fast-acks
+        // a write on its intent being quorum-DURABLE, an in-memory intent
+        // store would lose acked writes on crash — violating ADR-047's core
+        // guarantee. With the capability gate removed, decoupled-ack is THE
+        // write path for async-eligible surfaces, so a durable-open failure
+        // is a HARD ERROR for the shard (no silent degrade-to-volatile).
         //
-        // !!! 5c/5d OBLIGATION (no-loss / O3): once the producer fast-acks a
-        // write on its intent being quorum-DURABLE, an in-memory intent store
-        // would lose acked writes on crash — violating ADR-047's core
-        // guarantee. So the capability gate MUST NOT enable decoupled-ack on a
-        // shard whose durable intent store failed to open (fail closed: keep
-        // that shard on the synchronous path, or fail shard creation). Do NOT
-        // let this silent fallback survive into the acked path.
+        // `data_dir = None` is the explicit "in-memory test cluster" knob —
+        // the shard is intentionally non-durable; the supervisor below
+        // simply does not spawn and `put_intent_and_fan` refuses with
+        // `LogError::Unavailable`.
         let (intent_store, intent_store_durable): (Arc<dyn IntentStore>, bool) =
             match &self.data_dir {
                 Some(dir) => {
                     let path = dir.join(shard_id.0.to_string()).join("intents");
-                    match FjallIntentStore::open(&path) {
-                        Ok(s) => (Arc::new(s), true),
-                        Err(e) => {
-                            tracing::error!(
-                                shard_id = %shard_id.0,
-                                error = %e,
-                                "durable IntentStore open failed; using in-memory \
-                                 (decoupled-ack DISABLED on this shard — F-P5b-rpc-1)",
-                            );
-                            (Arc::new(InMemIntentStore::new()), false)
-                        }
-                    }
+                    let store = FjallIntentStore::open(&path).unwrap_or_else(|e| {
+                        panic!(
+                            "durable IntentStore open failed for shard {} at {}: {} \
+                             (ADR-047 F-P5b-rpc-1: cannot host a shard whose intent \
+                              store is non-durable — decoupled-ack is the write path)",
+                            shard_id.0,
+                            path.display(),
+                            e,
+                        )
+                    });
+                    (Arc::new(store), true)
                 }
                 // `data_dir = None` (in-memory test cluster) is volatile, so it is
                 // NOT durable for decoupled-ack purposes.
@@ -722,17 +710,18 @@ impl RaftShardStore {
             shards.insert(shard_id, Arc::clone(&store));
         }
 
-        // ADR-047 `LeaderSink`: spawn this shard's committer SUPERVISOR ONLY when
-        // the capability gate is on AND the intent store is durable. The
-        // durable gate is the F-P5b-rpc-1 obligation — incorporating from a
-        // non-durable store could surface an intent a crash would lose. If the
-        // gate is off, spawn nothing (sync behavior unchanged).
+        // ADR-047 `LeaderSink`: spawn this shard's committer SUPERVISOR when
+        // the intent store is durable (F-P5b-rpc-1 — incorporating from a
+        // non-durable store could surface an intent a crash would lose). For
+        // an in-memory test shard (`data_dir = None`) the supervisor does
+        // not spawn — `put_intent_and_fan` refuses with `Unavailable` and
+        // tests stay on the synchronous append path.
         //
         // The supervisor runs on EVERY node hosting the shard: it drains the
         // log only while this node is the Raft leader (running recover() once
         // on becoming leader), and self-prunes the local intent store on every
         // node (leader or follower) against the applied max_incorporated_seq.
-        if self.decoupled_ack && intent_store_durable {
+        if intent_store_durable {
             self.spawn_supervisor(shard_id, &store, intent_store);
         }
     }

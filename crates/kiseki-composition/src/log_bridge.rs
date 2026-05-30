@@ -286,6 +286,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LogOps for RecordingLog {
+        async fn put_intent_and_fan(
+            &self,
+            _shard_id: ShardId,
+            _intent: kiseki_log::intent::WriteIntent,
+        ) -> Result<(), LogError> {
+            // log_bridge tests drive the synchronous emit path directly —
+            // the decoupled-ack producer is in mem_gateway, not here.
+            Err(LogError::Unavailable)
+        }
+
         async fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
             self.plain_calls.lock().unwrap().push(req);
             Ok(SequenceNumber(1))

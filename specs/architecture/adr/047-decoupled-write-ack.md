@@ -65,7 +65,9 @@ Dedup is keyed on the **client `idempotency_key`** (stable across retries and re
 7. I-NG2/I-NG16 **commit-on-close atomicity** semantics under async apply (visible-after-apply, not visible-after-Ok).
 
 ## Rollout
-Two-release durable-format migration (decode the intent store everywhere one release before any node writes intents), capability gate (cluster-min-version, learning from ADR-046 gate-1 C1), then enable. Observability: `intent_pending_total`, `apply_lag_seconds`, `stability_watermark_seq`.
+Pre-production rollout: decoupled-ack is THE write path for async-eligible surfaces (S3, Native) — no capability gate. POSIX surfaces (NFS, FUSE) keep the synchronous semantic via `WriteSurface::is_async_ack_eligible` (ADR-013/014), which is a real per-surface contract, not a back-compat flag. Observability: `intent_pending_total`, `apply_lag_seconds`, `stability_watermark_seq`.
+
+> **2026-05-30 rip note.** The capability gate (`KISEKI_DECOUPLED_ACK` env + `DecoupledAckEnabled` cluster capability) was removed before any production deploy. Kiseki is pre-production; no migration is owed. Single-node `MemShardStore` / `PersistentShardStore` collapse `put_intent_and_fan` to a synchronous local append (`min_acks = 1` = one local copy); multi-node `RaftShardStore` does the real quorum intent-write. On a non-durable intent-store open the shard creation now PANICs (F-P5b-rpc-1: a non-durable acked intent would lose data — no silent degrade). The gateway no longer falls back to the synchronous emit on `put_intent_and_fan` failure; the error propagates to the client.
 
 ## Consequences
 - **I-L2 / I-CS1 revised** (done, marked Proposed) to the quorum-durable floor + async ordering.
@@ -87,7 +89,7 @@ Gate-1 returned 3C + 1H + 3M, all accepted. Resolutions:
 
 This split is the decision of record here; it is cross-referenced into **ADR-013** (POSIX: synchronous-apply required) and **ADR-014** (S3: async/bounded-stale permitted), and the invariants carry a per-surface qualifier (I-CS1, I-NG2). See "Follow-ups" below.
 
-**F-4 (mixed-version format) — two-release decode-first + capability gate.** The intent-store format ships decode-capable one release before any node emits intents. Emission is gated on a committed cluster-wide `DecoupledAckEnabled` capability (control-plane apply path, ON only after every node advertises support — the ADR-046 gate-1 C1 pattern). A non-advertising node joining flips it OFF → all surfaces fall back to synchronous-apply (safe). Snapshots include the dedup index + un-incorporated intents.
+**F-4 (mixed-version format) — N/A pre-production.** The capability gate was retired (2026-05-30 rip): kiseki is pre-production and no node fleet predates the intent-store format. Decoupled-ack is THE async-surface write path; there is nothing to flip off. Snapshots still include the dedup index + un-incorporated intents.
 
 **O1 skew** — max-skew bound `B`: an intent whose `physical_ms` exceeds local HLC by > B is clamped (logical-extended) + alerted; a node beyond B (NTP failure) is fenced from ingress.
 **O2 recovery** — the new leader completes intent-recovery (quorum gather + W re-derivation) **before** resuming apply; openraft leadership is necessary, not sufficient. Election concurrent with a membership change gathers from the intersection of old+new config quorums; no apply until the config is stable.
@@ -98,5 +100,5 @@ This split is the decision of record here; it is cross-referenced into **ADR-013
 1. **ADR-013** amendment — POSIX/NFS/FUSE require synchronous-apply (close-to-open); record the per-surface split.
 2. **ADR-014** amendment — S3/object async/bounded-stale permitted (matches the S3 contract).
 3. **Invariant restates** — I-NG2/I-NG16 (CommitStream `Ok` = durable; visibility = post-apply within I-CS2); I-CS1 per-surface qualifier; I-CS3 ("per-site CP" wording, now stale); ADR-032 §write-path + ADR-026 (describe the current synchronous-only mandate — note the relaxation).
-4. **Build phase** — intent store (durable, quorum-replicated, format-versioned), majority-watermark committer, idempotent re-incorporation, intent-recovery on election, per-surface read path (POSIX sync-apply / S3 bounded-stale + pending-intent resolve), capability gate + two-release migration, observability (`intent_pending_*`, `apply_lag_seconds`, `stability_watermark_seq`).
+4. **Build phase** — intent store (durable, quorum-replicated, format-versioned), majority-watermark committer, idempotent re-incorporation, intent-recovery on election, per-surface read path (POSIX sync-apply / S3 bounded-stale + pending-intent resolve), observability (`intent_pending_*`, `apply_lag_seconds`, `stability_watermark_seq`). (No capability gate — see 2026-05-30 rip note above.)
 5. **Adversary gate-2** (implementation mode) once code exists.

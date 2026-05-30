@@ -1,12 +1,13 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! ADR-047 decoupled-ack — gateway producer wiring.
 //!
-//! When `decoupled_ack` is on AND the write's surface is async-ack-eligible
-//! (S3 / native), `write_impl` mints a perspective-seq, records the intent on
-//! a quorum via `put_intent_and_fan`, and FAST-ACKs — skipping the synchronous
-//! Raft emit. On any `put_intent_and_fan` error it falls back to the
-//! synchronous path (no write is ever lost). POSIX surfaces (NFS / FUSE) are
-//! NEVER decoupled even with the gate on.
+//! Decoupled-ack is THE write path for async-eligible surfaces (S3, Native) —
+//! the capability gate is gone (pre-production). `write_impl` mints a
+//! perspective-seq, records the intent on a quorum via `put_intent_and_fan`,
+//! and fast-acks. On a `put_intent_and_fan` error the gateway propagates the
+//! failure to the client (NO synchronous fallback). POSIX surfaces (NFS, FUSE)
+//! are NEVER decoupled — `WriteSurface::is_async_ack_eligible` returns false
+//! for them and they take the synchronous emit (ADR-013 close-to-open).
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,14 +39,15 @@ fn test_shard() -> ShardId {
     ShardId(uuid::Uuid::from_u128(1))
 }
 
-/// A multi-node-capable log stub: it overrides `put_intent_and_fan` (the
-/// default `LogOps` impl returns `Err(Unavailable)`, i.e. "no decoupled-ack
-/// here"). `intent_ok` toggles the quorum outcome; both intent calls and the
-/// synchronous-emit calls are counted so a test can assert which path ran.
+/// A multi-node-capable log stub: `put_intent_and_fan` is required (no
+/// default impl) and `intent_ok` toggles the quorum outcome; both intent
+/// calls and the synchronous-emit calls are counted so a test can assert
+/// which path ran.
 #[derive(Default)]
 struct DecoupledSpyLog {
     /// `true` → `put_intent_and_fan` returns Ok (quorum durable);
-    /// `false` → returns Err (shortfall) so the gateway falls back.
+    /// `false` → returns Err (shortfall) so the gateway surfaces the
+    /// failure to the client (no fallback in this build).
     intent_ok: AtomicBool,
     /// How many times `put_intent_and_fan` was invoked.
     intent_calls: AtomicUsize,
@@ -75,8 +77,9 @@ impl LogOps for DecoupledSpyLog {
         if self.intent_ok.load(Ordering::SeqCst) {
             Ok(())
         } else {
-            // Quorum shortfall — the gateway must NOT ack on this; it
-            // falls back to the synchronous emit.
+            // Quorum shortfall — the gateway must NOT ack on this; the
+            // caller (test) asserts the gateway surfaces the failure
+            // instead of falling back to a synchronous emit.
             Err(LogError::Unavailable)
         }
     }
@@ -168,8 +171,9 @@ impl LogOps for DecoupledSpyLog {
     }
 }
 
-/// Build a gateway with `decoupled_ack` set to `enabled`, attached to `log`.
-fn setup(log: Arc<dyn LogOps + Send + Sync>, decoupled: bool) -> InMemoryGateway {
+/// Build a gateway attached to `log`. Decoupled-ack is THE write path for
+/// async-eligible surfaces — no capability flag.
+fn setup(log: Arc<dyn LogOps + Send + Sync>) -> InMemoryGateway {
     let compositions = CompositionStore::new().with_log(log);
     compositions.add_namespace(Namespace {
         id: test_namespace(),
@@ -184,7 +188,6 @@ fn setup(log: Arc<dyn LogOps + Send + Sync>, decoupled: bool) -> InMemoryGateway
     let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
     InMemoryGateway::new(compositions, kiseki_chunk::arc_async(chunks), master_key)
         .with_node_id(7)
-        .with_decoupled_ack(decoupled)
         .with_cluster_placement(vec![1, 2, 3])
         .with_target_copies(3)
 }
@@ -205,7 +208,7 @@ fn write_req(surface: WriteSurface, data: Vec<u8>) -> WriteRequest {
     }
 }
 
-/// Surface eligibility — the predicate that gates the decoupled path.
+/// Surface eligibility — the predicate that selects the decoupled path.
 #[test]
 fn surface_async_eligibility() {
     assert!(WriteSurface::S3.is_async_ack_eligible());
@@ -214,13 +217,13 @@ fn surface_async_eligibility() {
     assert!(!WriteSurface::Fuse.is_async_ack_eligible());
 }
 
-/// Decoupled ON + S3 + intent quorum Ok: the gateway fast-acks via
-/// `put_intent_and_fan` (no synchronous emit) and the data is
-/// read-your-writes readable on the SAME gateway.
+/// S3 with quorum Ok: the gateway fast-acks via `put_intent_and_fan` (no
+/// synchronous emit) and the data is read-your-writes readable on the SAME
+/// gateway.
 #[tokio::test(flavor = "multi_thread")]
 async fn s3_decoupled_fast_acks_and_is_read_your_writes() {
     let log = Arc::new(DecoupledSpyLog::with_intent_ok(true));
-    let gw = setup(Arc::clone(&log) as Arc<dyn LogOps + Send + Sync>, true);
+    let gw = setup(Arc::clone(&log) as Arc<dyn LogOps + Send + Sync>);
 
     let plaintext = vec![0xABu8; 4096];
     let resp = gw
@@ -231,7 +234,7 @@ async fn s3_decoupled_fast_acks_and_is_read_your_writes() {
     assert_eq!(
         log.intent_calls.load(Ordering::SeqCst),
         1,
-        "decoupled S3 write must record exactly one intent"
+        "S3 write must record exactly one intent"
     );
     assert_eq!(
         log.sync_calls.load(Ordering::SeqCst),
@@ -239,7 +242,6 @@ async fn s3_decoupled_fast_acks_and_is_read_your_writes() {
         "fast-ack must NOT take the synchronous emit path"
     );
     // The minted perspective-seq must carry this node's id (the tie-break).
-    // Extract under a scoped guard so it never lives across the await below.
     let minted_node = {
         let intents = log.intents.lock().unwrap();
         assert_eq!(intents.len(), 1);
@@ -263,18 +265,26 @@ async fn s3_decoupled_fast_acks_and_is_read_your_writes() {
     assert_eq!(read.data, plaintext, "decoupled write must round-trip");
 }
 
-/// Decoupled ON + S3 + intent quorum Err: the gateway falls back to the
-/// synchronous emit so the write still succeeds (no loss).
+/// S3 with quorum Err: the gateway surfaces the failure to the client.
+/// Pre-production — there is NO synchronous fallback. The synchronous
+/// emit must NOT be called and the write must fail loud.
 #[tokio::test(flavor = "multi_thread")]
-async fn s3_decoupled_falls_back_on_intent_error() {
+async fn s3_propagates_intent_error_no_fallback() {
     let log = Arc::new(DecoupledSpyLog::with_intent_ok(false));
-    let gw = setup(Arc::clone(&log) as Arc<dyn LogOps + Send + Sync>, true);
+    let gw = setup(Arc::clone(&log) as Arc<dyn LogOps + Send + Sync>);
 
     let plaintext = vec![0xCDu8; 4096];
-    let resp = gw
-        .write(write_req(WriteSurface::S3, plaintext.clone()))
+    let err = gw
+        .write(write_req(WriteSurface::S3, plaintext))
         .await
-        .expect("write must still succeed via synchronous fallback");
+        .expect_err("S3 write MUST fail when put_intent_and_fan errors");
+    // Surface the typed error string so a regression of the legacy
+    // fallback resurrects loudly.
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("intent quorum"),
+        "error must surface the intent-quorum failure (got: {err_str})",
+    );
 
     assert_eq!(
         log.intent_calls.load(Ordering::SeqCst),
@@ -283,31 +293,18 @@ async fn s3_decoupled_falls_back_on_intent_error() {
     );
     assert_eq!(
         log.sync_calls.load(Ordering::SeqCst),
-        1,
-        "on intent shortfall it MUST fall back to the synchronous emit"
+        0,
+        "on intent failure the synchronous emit MUST NOT run (no fallback)"
     );
-
-    // The write is durable (sync path committed) and read-your-writes holds.
-    let read = gw
-        .read(ReadRequest {
-            tenant_id: test_tenant(),
-            namespace_id: test_namespace(),
-            composition_id: resp.composition_id,
-            offset: 0,
-            length: plaintext.len() as u64,
-        })
-        .await
-        .expect("fallback write must be readable");
-    assert_eq!(read.data, plaintext);
 }
 
-/// Decoupled ON but NFS surface: POSIX close-to-open (ADR-013) is NEVER
-/// decoupled. The gateway must NOT call `put_intent_and_fan` and must take
-/// the synchronous emit instead.
+/// NFS surface is NEVER decoupled. POSIX close-to-open (ADR-013) requires
+/// the synchronous commit. The gateway must NOT call `put_intent_and_fan`
+/// and must take the synchronous emit instead.
 #[tokio::test(flavor = "multi_thread")]
-async fn nfs_surface_never_decoupled_even_when_enabled() {
+async fn nfs_surface_never_decoupled() {
     let log = Arc::new(DecoupledSpyLog::with_intent_ok(true));
-    let gw = setup(Arc::clone(&log) as Arc<dyn LogOps + Send + Sync>, true);
+    let gw = setup(Arc::clone(&log) as Arc<dyn LogOps + Send + Sync>);
 
     let plaintext = vec![0xEFu8; 4096];
     gw.write(write_req(WriteSurface::Nfs, plaintext))
@@ -326,26 +323,25 @@ async fn nfs_surface_never_decoupled_even_when_enabled() {
     );
 }
 
-/// Decoupled OFF + S3: the capability gate is closed, so even an
-/// async-eligible surface takes the synchronous path.
+/// FUSE surface is NEVER decoupled (same close-to-open contract as NFS).
 #[tokio::test(flavor = "multi_thread")]
-async fn s3_with_gate_off_is_synchronous() {
+async fn fuse_surface_never_decoupled() {
     let log = Arc::new(DecoupledSpyLog::with_intent_ok(true));
-    let gw = setup(Arc::clone(&log) as Arc<dyn LogOps + Send + Sync>, false);
+    let gw = setup(Arc::clone(&log) as Arc<dyn LogOps + Send + Sync>);
 
-    let plaintext = vec![0x12u8; 4096];
-    gw.write(write_req(WriteSurface::S3, plaintext))
+    let plaintext = vec![0x77u8; 4096];
+    gw.write(write_req(WriteSurface::Fuse, plaintext))
         .await
-        .expect("S3 write");
+        .expect("FUSE write");
 
     assert_eq!(
         log.intent_calls.load(Ordering::SeqCst),
         0,
-        "gate off → no intent path"
+        "FUSE (POSIX) must NEVER take the decoupled intent path"
     );
     assert_eq!(
         log.sync_calls.load(Ordering::SeqCst),
         1,
-        "gate off → synchronous emit"
+        "FUSE must take the synchronous emit"
     );
 }

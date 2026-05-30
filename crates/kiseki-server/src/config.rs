@@ -5,9 +5,8 @@ use std::path::PathBuf;
 
 /// Server configuration — populated from environment or defaults.
 // An env-derived config DTO: each `bool` is an independent capability flag
-// (`bootstrap`, `pnfs_enabled`, `allow_plaintext_nfs`, `decoupled_ack`), not
-// interacting state — the "refactor bools into a state machine" advice does
-// not apply.
+// (`bootstrap`, `pnfs_enabled`, `allow_plaintext_nfs`), not interacting state —
+// the "refactor bools into a state machine" advice does not apply.
 #[allow(clippy::struct_excessive_bools)]
 pub struct ServerConfig {
     /// Address for the data-path gRPC listener.
@@ -90,12 +89,6 @@ pub struct ServerConfig {
     /// (ADR-038 §D4.2). Has effect only if `KISEKI_INSECURE_NFS=true`
     /// is also set at process start. Default `false`.
     pub allow_plaintext_nfs: bool,
-    /// ADR-047 decoupled-ack capability gate. When `true`, async-eligible
-    /// surfaces (S3, native) fast-ack a write once the intent is durable on
-    /// a quorum (`put_intent_and_fan`) instead of awaiting the synchronous
-    /// Raft commit. POSIX surfaces (NFS, FUSE) always take the synchronous
-    /// path regardless. Derived from `KISEKI_DECOUPLED_ACK`. Default `false`.
-    pub decoupled_ack: bool,
 }
 
 /// pNFS configuration (ADR-038 §D9).
@@ -366,12 +359,6 @@ impl ServerConfig {
         let allow_plaintext_nfs =
             std::env::var("KISEKI_ALLOW_PLAINTEXT_NFS").is_ok_and(|v| v == "true" || v == "1");
 
-        // ADR-047 decoupled-ack capability gate. Mirrors the truthy set the
-        // runtime uses when deriving the same flag for `RaftShardStore::new`.
-        let decoupled_ack = std::env::var("KISEKI_DECOUPLED_ACK")
-            .ok()
-            .is_some_and(|v| matches!(v.as_str(), "1" | "on" | "true" | "yes"));
-
         Self {
             data_addr,
             advisory_addr,
@@ -397,7 +384,6 @@ impl ServerConfig {
             pnfs_enabled,
             pnfs,
             allow_plaintext_nfs,
-            decoupled_ack,
         }
     }
 }

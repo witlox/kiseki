@@ -61,7 +61,7 @@ fn single_node_store_with_shard(rt: &tokio::runtime::Runtime) -> (RaftShardStore
     let mut peers = BTreeMap::new();
     peers.insert(1u64, format!("127.0.0.1:{port}"));
 
-    let store = RaftShardStore::new(1, peers, None, false);
+    let store = RaftShardStore::new(1, peers, None);
     let shard_id = make_shard_id(1);
     store.create_shard(
         shard_id,
@@ -116,7 +116,7 @@ fn merge_shards_does_not_return_shard_not_found_for_existing_shards() {
     let mut peers = BTreeMap::new();
     peers.insert(1u64, format!("127.0.0.1:{port_a}"));
 
-    let store = RaftShardStore::new(1, peers, None, false);
+    let store = RaftShardStore::new(1, peers, None);
     let shard_a = make_shard_id(10);
     let shard_b = make_shard_id(11);
     store.create_shard(
@@ -158,7 +158,7 @@ fn logops_create_shard_makes_shard_visible_to_shard_health() {
     let mut peers = BTreeMap::new();
     peers.insert(1u64, format!("127.0.0.1:{port}"));
 
-    let store = RaftShardStore::new(1, peers, None, false);
+    let store = RaftShardStore::new(1, peers, None);
     let shard_id = make_shard_id(20);
 
     LogOps::create_shard(
@@ -387,7 +387,7 @@ fn single_node_with_shard_and_addr(rt: &tokio::runtime::Runtime) -> (RaftShardSt
     let mut peers = BTreeMap::new();
     peers.insert(1u64, format!("127.0.0.1:{port}"));
 
-    let store = RaftShardStore::new(1, peers, None, false);
+    let store = RaftShardStore::new(1, peers, None);
     let shard_id = make_shard_id(40);
     store.create_shard(
         shard_id,

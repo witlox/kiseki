@@ -7,13 +7,11 @@
 //! ADR-047 write-path relaxation.
 //!
 //! This module is the **foundational layer**: the perspective sequence, the
-//! intent record, the [`IntentStore`] trait, and an in-memory implementation.
-//! It is additive and **unwired** — the synchronous write path is unchanged.
-//! The durable quorum-replicated store, the majority-watermark async
-//! committer, election intent-recovery, the per-surface read path, and the
-//! `DecoupledAckEnabled` capability gate land in later build phases (ADR-047
-//! "Follow-ups" / issue #140). Gate-1 obligations O1–O4 + resolutions F-1..F-4
-//! are tracked there; this layer only owns ordering + idempotent recording.
+//! intent record, the [`IntentStore`] trait, and an in-memory + durable
+//! implementation. As of 2026-05-30 it is wired live: decoupled-ack is THE
+//! write path for async-eligible surfaces (S3, Native) — no capability gate.
+//! POSIX surfaces (NFS, FUSE) keep the synchronous semantic via
+//! `WriteSurface::is_async_ack_eligible` (ADR-013/014).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;

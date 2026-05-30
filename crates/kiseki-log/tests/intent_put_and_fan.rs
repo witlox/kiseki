@@ -22,10 +22,10 @@
 //!   does NOT falsely succeed.
 //! - **non-durable guard** — an in-memory (`data_dir = None`) intent store
 //!   refuses `put_intent_and_fan` (F-P5b-rpc-1) without writing.
-//! - **committer spawn drains to the log** — with `decoupled_ack` on and a
-//!   durable single-node shard, an intent put via `put_intent_and_fan` is
-//!   incorporated into the Raft log by the spawned committer within a short
-//!   poll (producer → committer → Raft, end to end on one node-group).
+//! - **committer spawn drains to the log** — on a durable shard the
+//!   spawned committer incorporates intents into the Raft log within a
+//!   short poll (producer → committer → Raft, end to end on one
+//!   node-group).
 //!
 //! Plain `#[test]` (not `#[tokio::test]`): `OpenRaftLogStore` paths internally
 //! `tokio::spawn`, and dropping a per-test runtime mid-flight panics. Each test
@@ -128,22 +128,16 @@ fn rich_intent(s: PerspectiveSeq, key: Option<IdempotencyKey>) -> WriteIntent {
 }
 
 /// A durable, multi-node `RaftShardStore` on `addr` with its own data dir.
-/// `decoupled_ack` arms the committer spawn. `peers` is the full cluster map so
-/// membership init makes every node a voter (the voter set `put_intent_and_fan`
-/// fans to). The `TempDir` is returned so the caller keeps the data dir alive.
+/// `peers` is the full cluster map so membership init makes every node a
+/// voter (the voter set `put_intent_and_fan` fans to). The `TempDir` is
+/// returned so the caller keeps the data dir alive.
 fn spawn_durable_node(
     node_id: u64,
     addr: &str,
     peers: &BTreeMap<u64, String>,
-    decoupled_ack: bool,
 ) -> (RaftShardStore, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let store = RaftShardStore::new(
-        node_id,
-        peers.clone(),
-        Some(dir.path().to_path_buf()),
-        decoupled_ack,
-    );
+    let store = RaftShardStore::new(node_id, peers.clone(), Some(dir.path().to_path_buf()));
     store.create_shard(
         test_shard(),
         test_tenant(),
@@ -167,9 +161,9 @@ fn put_intent_and_fan_reaches_quorum_on_three_nodes() {
     let peers = peers_map(&ports);
     let addrs: Vec<String> = (0..3).map(|i| format!("127.0.0.1:{}", ports[i])).collect();
 
-    let (n1, _d1) = spawn_durable_node(1, &addrs[0], &peers, false);
-    let (n2, _d2) = spawn_durable_node(2, &addrs[1], &peers, false);
-    let (n3, _d3) = spawn_durable_node(3, &addrs[2], &peers, false);
+    let (n1, _d1) = spawn_durable_node(1, &addrs[0], &peers);
+    let (n2, _d2) = spawn_durable_node(2, &addrs[1], &peers);
+    let (n3, _d3) = spawn_durable_node(3, &addrs[2], &peers);
 
     // Initialize membership on the seed; wait for election so voter_ids() is
     // populated (the set put_intent_and_fan resolves its fan targets from).
@@ -212,7 +206,7 @@ fn put_intent_and_fan_errs_on_quorum_shortfall() {
     let peers = peers_map(&ports); // a single-node peers map → no fan targets
     let addr = format!("127.0.0.1:{}", ports[0]);
 
-    let (n1, _d1) = spawn_durable_node(1, &addr, &peers, false);
+    let (n1, _d1) = spawn_durable_node(1, &addr, &peers);
     n1.initialize_shard(test_shard()).expect("init membership");
     std::thread::sleep(Duration::from_secs(2));
 
@@ -240,7 +234,7 @@ fn put_intent_and_fan_refuses_non_durable_store() {
     let addr = format!("127.0.0.1:{}", ports[0]);
 
     // data_dir = None → in-memory intent store → non-durable.
-    let n1 = RaftShardStore::new(1, peers, None, true);
+    let n1 = RaftShardStore::new(1, peers, None);
     n1.create_shard(
         test_shard(),
         test_tenant(),
@@ -270,9 +264,9 @@ fn put_intent_and_fan_refuses_non_durable_store() {
     std::env::remove_var("KISEKI_MIN_ACKS");
 }
 
-/// End-to-end producer → committer → Raft (ADR-047 `LeaderSink`): with
-/// `decoupled_ack` on, the per-shard committer SUPERVISOR on the leader runs
-/// election recovery then drains its local intent store into the Raft log.
+/// End-to-end producer → committer → Raft (ADR-047 `LeaderSink`): the
+/// per-shard committer SUPERVISOR on the leader runs election recovery
+/// then drains its local intent store into the Raft log.
 ///
 /// `LeaderSink` is single-incorporator-on-the-leader: no watermark, no peer
 /// gossip. The supervisor on the elected leader detects leadership, runs
@@ -295,10 +289,10 @@ fn committer_spawn_incorporates_intent_into_the_log() {
     let peers = peers_map(&ports);
     let addrs: Vec<String> = (0..3).map(|i| format!("127.0.0.1:{}", ports[i])).collect();
 
-    // decoupled_ack = true + durable on all three → each spawns a supervisor.
-    let (n1, _d1) = spawn_durable_node(1, &addrs[0], &peers, true);
-    let (n2, _d2) = spawn_durable_node(2, &addrs[1], &peers, true);
-    let (n3, _d3) = spawn_durable_node(3, &addrs[2], &peers, true);
+    // Durable on all three → each spawns a supervisor.
+    let (n1, _d1) = spawn_durable_node(1, &addrs[0], &peers);
+    let (n2, _d2) = spawn_durable_node(2, &addrs[1], &peers);
+    let (n3, _d3) = spawn_durable_node(3, &addrs[2], &peers);
 
     n1.initialize_shard(test_shard()).expect("init membership");
     std::thread::sleep(Duration::from_secs(4)); // election + supervisors running

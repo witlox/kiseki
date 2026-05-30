@@ -681,6 +681,17 @@ fn op_to_u8(op: crate::delta::OperationType) -> u8 {
 
 #[async_trait::async_trait]
 impl LogOps for RaftLogStore {
+    /// ADR-047: simple in-memory `RaftLogStore` is single-node /
+    /// test-fixture grade — `min_acks = 1` is satisfied by appending the
+    /// intent's delta locally (same collapse as `MemShardStore`).
+    async fn put_intent_and_fan(
+        &self,
+        _shard_id: ShardId,
+        intent: crate::intent::WriteIntent,
+    ) -> Result<(), LogError> {
+        self.append_chunk_and_delta(intent.append).await.map(|_| ())
+    }
+
     async fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
         // Pre-check state and key range.
         {
