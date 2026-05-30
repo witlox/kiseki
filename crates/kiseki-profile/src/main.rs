@@ -150,6 +150,25 @@ struct RunArgs {
     /// comparison, or `--binding auto` to honor `KISEKI_NATIVE_TRANSPORT`.
     #[arg(long, value_enum, default_value_t = NativeBinding::Tcp)]
     binding: NativeBinding,
+
+    /// Number of `kiseki-server` nodes to spawn. Default 1 (uses the
+    /// historic single-node [`ProfileServer`] code path; no behavioral
+    /// change vs. pre-`--nodes` invocations). When `>1`, spawns an
+    /// N-node local Raft cluster via [`Cluster`], provisions the
+    /// `kiseki-bench` namespace + a multi-shard topology (ADR-033 §1
+    /// formula: `max(min(3*N, 64), 3)`), and drives the bench
+    /// workload against the leader's endpoints. The
+    /// `InProcess`/`InProcessPersistent` protocols ignore this flag —
+    /// they don't spawn a server at all.
+    #[arg(long, default_value_t = 1)]
+    nodes: usize,
+
+    /// Path to the kiseki-admin binary (used by `--nodes >1` to
+    /// provision the bench namespace + shards). Defaults to
+    /// `kiseki-admin` next to `--server-bin`. Ignored for
+    /// single-node runs.
+    #[arg(long)]
+    admin_bin: Option<std::path::PathBuf>,
 }
 
 fn main() {
@@ -207,27 +226,82 @@ fn main() {
     }
 }
 
-async fn run(args: RunArgs) -> Result<(), String> {
-    // The in-process driver doesn't need a spawned server — it
-    // instantiates the gateway directly. Skip the harness for it.
-    let server = if matches!(
+/// Either a single-node `ProfileServer` or an N-node `Cluster`.
+/// Holding the harness here keeps the server(s) alive until `run`
+/// returns; Drop sends SIGTERM and (for `--features pprof` builds)
+/// renders each node's flamegraph. Fields are write-only — the
+/// variants exist to keep Drop deferred until the end of `run()`.
+#[allow(dead_code)]
+enum Harness {
+    Single(harness::ProfileServer),
+    Cluster(harness::Cluster),
+}
+
+/// Spawn the harness for `args.protocol` / `args.nodes` and return
+/// the `(Harness, Endpoints)` pair (or `(None, None)` when the
+/// protocol drives an in-process gateway and doesn't need a server).
+async fn build_harness(
+    args: &RunArgs,
+) -> Result<(Option<Harness>, Option<protocols::Endpoints>), String> {
+    let needs_server = !matches!(
         args.protocol,
         Protocol::InProcess | Protocol::InProcessPersistent
-    ) {
-        None
-    } else {
-        {
-            let s = harness::ProfileServer::start(args.server_bin.as_deref()).await?;
-            eprintln!(
-                "[harness] server up; s3={} nfs={} ds={} metrics={}",
-                s.s3_base,
-                s.nfs_addr,
-                s.ds_addr,
-                s.metrics_url(),
-            );
-            Some(s)
-        }
-    };
+    );
+    if !needs_server {
+        return Ok((None, None));
+    }
+    if args.nodes == 1 {
+        // Single-node path — unchanged from pre-`--nodes` behavior.
+        let s = harness::ProfileServer::start(args.server_bin.as_deref()).await?;
+        eprintln!(
+            "[harness] single-node up; s3={} nfs={} ds={} metrics={}",
+            s.s3_base,
+            s.nfs_addr,
+            s.ds_addr,
+            s.metrics_url(),
+        );
+        let ep = protocols::Endpoints::from_profile_server(&s);
+        return Ok((Some(Harness::Single(s)), Some(ep)));
+    }
+    // Multi-node path. Each node gets a deterministic per-node
+    // pprof output filename when KISEKI_PPROF_OUT is set on the
+    // profile process: e.g. `OUT.node1.svg`, `OUT.node2.svg`.
+    let pprof_base = std::env::var("KISEKI_PPROF_OUT")
+        .ok()
+        .map(std::path::PathBuf::from);
+    let c = harness::Cluster::start(
+        args.nodes,
+        args.server_bin.as_deref(),
+        pprof_base.as_deref(),
+    )
+    .await?;
+    let shard_count = harness::Cluster::shard_count_for(args.nodes);
+    eprintln!(
+        "[harness] cluster up; nodes={} leader_node_id={} leader_s3={} leader_tcp_framed={} metrics={}",
+        c.node_count(),
+        c.leader_node_id(),
+        c.leader_s3_base(),
+        c.leader_tcp_framed(),
+        c.leader_metrics_url(),
+    );
+    eprintln!(
+        "[harness] provisioning bench namespace + {shard_count} shards (ADR-033 §1: max(min(3*N, 64), 3))"
+    );
+    c.provision_bench_topology(args.admin_bin.as_deref(), shard_count)
+        .await?;
+    let ep = protocols::Endpoints::from_cluster_bench(&c);
+    Ok((Some(Harness::Cluster(c)), Some(ep)))
+}
+
+async fn run(args: RunArgs) -> Result<(), String> {
+    if args.nodes == 0 {
+        return Err("--nodes must be at least 1".into());
+    }
+    // _harness_opt: declared so the spawned server(s) live until the
+    // function returns. The Drop impl on ProfileServer / Cluster sends
+    // SIGTERM and (for `--features pprof` builds) renders the
+    // flamegraph SVG, so it MUST survive past the stats output.
+    let (_harness_opt, endpoints) = build_harness(&args).await?;
 
     // Size the NFS connection pool to match concurrency: each
     // worker gets its own session, no FIFO queueing on a shared
@@ -235,7 +309,7 @@ async fn run(args: RunArgs) -> Result<(), String> {
     // session memory if someone runs at extreme concurrency.
     let pool_size = args.concurrency.clamp(1, 32);
     let driver: Arc<dyn protocols::Driver> =
-        protocols::build(args.protocol, args.binding, server.as_ref(), pool_size).await?;
+        protocols::build(args.protocol, args.binding, endpoints.as_ref(), pool_size).await?;
 
     let warmup_keys = if matches!(args.shape, Shape::PutHeavy) {
         Arc::new(Vec::new())

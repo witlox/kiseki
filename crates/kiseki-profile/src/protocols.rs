@@ -17,8 +17,69 @@ use kiseki_gateway::nfs4_server::op;
 use kiseki_gateway::nfs_xdr::{XdrReader, XdrWriter};
 use kiseki_gateway::ops::{GatewayOps, ReadRequest, WriteRequest};
 
-use crate::harness::ProfileServer;
+use crate::harness::{Cluster, ProfileServer};
 use crate::{NativeBinding, Protocol};
+
+/// Endpoints + tenant/namespace identity the per-protocol drivers need.
+/// Single-node mode picks endpoints from [`ProfileServer`]; multi-node
+/// picks them from [`Cluster`]'s leader handle. Same shape either way
+/// — the drivers don't care which spawned the server(s).
+///
+/// The `tenant_id` / `namespace_id` pair is fixed at construction so
+/// the multi-node path can drive a separate bench namespace
+/// (`kiseki-bench`) without colliding with the system `default`
+/// namespace's single-shard topology.
+#[derive(Clone, Debug)]
+pub struct Endpoints {
+    pub s3_base: String,
+    pub nfs_addr: SocketAddr,
+    /// Surface-only — kept for parity with `ProfileServer::ds_addr`
+    /// and for logging. The pNFS driver discovers DS addresses via
+    /// LAYOUTGET at runtime; no driver currently constructs from
+    /// this field directly.
+    #[allow(dead_code)]
+    pub ds_addr: SocketAddr,
+    pub tcp_framed_port: u16,
+    pub grpc_data_port: u16,
+    pub tenant_id: OrgId,
+    pub namespace_id: NamespaceId,
+}
+
+impl Endpoints {
+    /// Single-node — drive the `default` namespace seeded by bootstrap.
+    pub fn from_profile_server(s: &ProfileServer) -> Self {
+        Self {
+            s3_base: s.s3_base.clone(),
+            nfs_addr: s.nfs_addr,
+            ds_addr: s.ds_addr,
+            tcp_framed_port: s.ports.tcp_framed,
+            grpc_data_port: s.ports.grpc_data,
+            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
+            namespace_id: NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default")),
+        }
+    }
+
+    /// Multi-node — drive the `kiseki-bench` namespace provisioned via
+    /// `Cluster::provision_bench_topology`. Same UUIDs as
+    /// `kiseki-client::bench::bench_default_ids`.
+    pub fn from_cluster_bench(c: &Cluster) -> Self {
+        Self {
+            s3_base: c.leader_s3_base().to_owned(),
+            nfs_addr: c.leader_nfs_addr(),
+            ds_addr: c.leader_ds_addr(),
+            tcp_framed_port: c.leader_tcp_framed(),
+            grpc_data_port: c.leader_grpc_data(),
+            tenant_id: OrgId(uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_DNS,
+                b"kiseki-bench-tenant",
+            )),
+            namespace_id: NamespaceId(uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_DNS,
+                b"kiseki-bench",
+            )),
+        }
+    }
+}
 
 /// Opaque per-driver handle for a previously-PUT object. Most drivers
 /// just stash the `composition_id`; FUSE additionally tracks its own
@@ -38,7 +99,7 @@ pub trait Driver: Send + Sync {
 pub async fn build(
     protocol: Protocol,
     binding: NativeBinding,
-    server: Option<&ProfileServer>,
+    endpoints: Option<&Endpoints>,
     pool_size: usize,
 ) -> Result<Arc<dyn Driver>, String> {
     match protocol {
@@ -52,32 +113,53 @@ pub async fn build(
             Ok(Arc::new(InProcessPersistentDriver::new().await?))
         }
         Protocol::S3 => {
-            let s = server.ok_or("S3 driver requires --server-bin (none was passed)")?;
-            Ok(Arc::new(S3Driver::new(&s.s3_base)))
+            let e = endpoints.ok_or("S3 driver requires --server-bin (none was passed)")?;
+            Ok(Arc::new(S3Driver::new(
+                &e.s3_base,
+                e.tenant_id,
+                e.namespace_id,
+            )))
         }
         Protocol::Nfs3 => {
-            let s = server.ok_or("Nfs3 driver requires --server-bin")?;
-            Ok(Arc::new(Nfs3Driver::new(s.nfs_addr, pool_size)))
+            let e = endpoints.ok_or("Nfs3 driver requires --server-bin")?;
+            Ok(Arc::new(Nfs3Driver::new(
+                e.nfs_addr,
+                pool_size,
+                e.tenant_id,
+                e.namespace_id,
+            )))
         }
         Protocol::Nfs4 => {
-            let s = server.ok_or("Nfs4 driver requires --server-bin")?;
-            Ok(Arc::new(Nfs4Driver::new(s.nfs_addr, pool_size)))
+            let e = endpoints.ok_or("Nfs4 driver requires --server-bin")?;
+            Ok(Arc::new(Nfs4Driver::new(
+                e.nfs_addr,
+                pool_size,
+                e.tenant_id,
+                e.namespace_id,
+            )))
         }
         Protocol::Pnfs => {
-            let s = server.ok_or("Pnfs driver requires --server-bin")?;
-            Ok(Arc::new(PnfsDriver::new(s.nfs_addr, pool_size)))
+            let e = endpoints.ok_or("Pnfs driver requires --server-bin")?;
+            Ok(Arc::new(PnfsDriver::new(
+                e.nfs_addr,
+                pool_size,
+                e.tenant_id,
+                e.namespace_id,
+            )))
         }
         Protocol::Fuse => {
-            let s = server.ok_or("Fuse driver requires --server-bin")?;
+            let e = endpoints.ok_or("Fuse driver requires --server-bin")?;
             // ADR-042: FUSE rides the TCP-framed binding directly,
             // not the S3 listener. The S3-over-HTTP path FUSE used
             // to take capped at ~7.6 k op/s; the native binding
             // measures ~70 k op/s on the same hardware.
-            let addr = format!("127.0.0.1:{}", s.ports.tcp_framed);
-            Ok(Arc::new(FuseDriver::new(&addr, pool_size).await?))
+            let addr = format!("127.0.0.1:{}", e.tcp_framed_port);
+            Ok(Arc::new(
+                FuseDriver::new(&addr, pool_size, e.tenant_id, e.namespace_id).await?,
+            ))
         }
         Protocol::Native => {
-            let s = server.ok_or("Native driver requires --server-bin")?;
+            let e = endpoints.ok_or("Native driver requires --server-bin")?;
             // ADR-042 §16.1 phase 7: per-binding driver. `auto`
             // resolves to TCP-framed (the new default after Phase 8
             // measurement showed +70 % PUT / +183 % GET vs gRPC).
@@ -85,14 +167,17 @@ pub async fn build(
             // integration this branch consults it.
             match binding {
                 NativeBinding::Tcp | NativeBinding::Auto => {
-                    let addr = format!("127.0.0.1:{}", s.ports.tcp_framed);
+                    let addr = format!("127.0.0.1:{}", e.tcp_framed_port);
                     Ok(Arc::new(
-                        TcpFramedNativeDriver::new(&addr, pool_size).await?,
+                        TcpFramedNativeDriver::new(&addr, pool_size, e.tenant_id, e.namespace_id)
+                            .await?,
                     ))
                 }
                 NativeBinding::Grpc => {
-                    let addr = format!("127.0.0.1:{}", s.ports.grpc_data);
-                    Ok(Arc::new(NativeDriver::new(&addr).await?))
+                    let addr = format!("127.0.0.1:{}", e.grpc_data_port);
+                    Ok(Arc::new(
+                        NativeDriver::new(&addr, e.tenant_id, e.namespace_id).await?,
+                    ))
                 }
             }
         }
@@ -110,11 +195,11 @@ struct S3Driver {
 }
 
 impl S3Driver {
-    fn new(s3_base: &str) -> Self {
+    fn new(s3_base: &str, tenant_id: OrgId, namespace_id: NamespaceId) -> Self {
         Self {
             inner: RemoteHttpGateway::new(s3_base),
-            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
-            namespace_id: NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default")),
+            tenant_id,
+            namespace_id,
         }
     }
 }
@@ -173,11 +258,16 @@ struct Nfs3Driver {
 }
 
 impl Nfs3Driver {
-    fn new(nfs_addr: SocketAddr, pool_size: usize) -> Self {
+    fn new(
+        nfs_addr: SocketAddr,
+        pool_size: usize,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+    ) -> Self {
         Self {
             inner: Arc::new(Nfs3Client::with_pool(nfs_addr, pool_size)),
-            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
-            namespace_id: NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default")),
+            tenant_id,
+            namespace_id,
         }
     }
 }
@@ -236,11 +326,16 @@ struct Nfs4Driver {
 }
 
 impl Nfs4Driver {
-    fn new(nfs_addr: SocketAddr, pool_size: usize) -> Self {
+    fn new(
+        nfs_addr: SocketAddr,
+        pool_size: usize,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+    ) -> Self {
         Self {
             inner: Arc::new(Nfs4Client::v41_with_pool(nfs_addr, pool_size)),
-            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
-            namespace_id: NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default")),
+            tenant_id,
+            namespace_id,
         }
     }
 }
@@ -390,7 +485,12 @@ struct PnfsDriver {
 }
 
 impl PnfsDriver {
-    fn new(nfs_addr: SocketAddr, pool_size: usize) -> Self {
+    fn new(
+        nfs_addr: SocketAddr,
+        pool_size: usize,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+    ) -> Self {
         Self {
             nfs_addr,
             pool_size,
@@ -398,8 +498,8 @@ impl PnfsDriver {
             mds_session: tokio::sync::Mutex::new(None),
             ds_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
             layout_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
-            namespace_id: NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default")),
+            tenant_id,
+            namespace_id,
         }
     }
 
@@ -674,13 +774,16 @@ struct FuseDriver {
 }
 
 impl FuseDriver {
-    async fn new(addr: &str, pool_size: usize) -> Result<Self, String> {
+    async fn new(
+        addr: &str,
+        pool_size: usize,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+    ) -> Result<Self, String> {
         let gateway =
             kiseki_client::native_remote::NativeRemoteGateway::connect_plaintext(addr, pool_size)
                 .await
                 .map_err(|e| format!("native-remote connect: {e}"))?;
-        let tenant_id = OrgId(uuid::Uuid::from_u128(1));
-        let namespace_id = NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default"));
         // Hand KisekiFuse a peer clone so it satisfies the API but
         // never actually drives the connection pool — the FuseDriver
         // hits `gateway` directly.
@@ -1076,7 +1179,11 @@ pub struct NativeDriver {
 }
 
 impl NativeDriver {
-    pub async fn new(grpc_addr: &str) -> Result<Self, String> {
+    pub async fn new(
+        grpc_addr: &str,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+    ) -> Result<Self, String> {
         // Pool size: matches the typical worker concurrency (16) so
         // every worker gets its own connection. Configurable via
         // KISEKI_NATIVE_DRIVER_POOL.
@@ -1108,8 +1215,8 @@ impl NativeDriver {
         Ok(Self {
             clients,
             next: std::sync::atomic::AtomicUsize::new(0),
-            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
-            namespace_id: NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default")),
+            tenant_id,
+            namespace_id,
         })
     }
 
@@ -1379,7 +1486,12 @@ pub struct TcpFramedNativeDriver {
 }
 
 impl TcpFramedNativeDriver {
-    pub async fn new(addr: &str, pool_size: usize) -> Result<Self, String> {
+    pub async fn new(
+        addr: &str,
+        pool_size: usize,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+    ) -> Result<Self, String> {
         let env_pool: usize = std::env::var("KISEKI_NATIVE_DRIVER_POOL")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1394,8 +1506,8 @@ impl TcpFramedNativeDriver {
         Ok(Self {
             clients,
             next: std::sync::atomic::AtomicUsize::new(0),
-            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
-            namespace_id: NamespaceId(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"default")),
+            tenant_id,
+            namespace_id,
         })
     }
 
