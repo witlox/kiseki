@@ -176,6 +176,13 @@ impl ProfileServer {
             // here so the profile harness can sweep its effect on
             // single-host runs to model real-cluster RTTs.
             "KISEKI_RAFT_FAKE_RTT_US",
+            // Chunk-device backing size (`PersistentChunkStore`).
+            // Default 4 GiB caps the single-node bench at ~65k writes
+            // before silent dedup-hit takes over — see
+            // `specs/escalations/2026-05-30-decoupled-ack-perf-10x-analysis.md`.
+            // Forwarded so a bench run can size the store to its
+            // intended write volume.
+            "KISEKI_CHUNK_DEVICE_BYTES",
         ] {
             if let Ok(v) = std::env::var(var) {
                 cmd.env(var, v);
@@ -183,7 +190,16 @@ impl ProfileServer {
         }
         let child = cmd
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(std::env::var("KISEKI_PROFILE_STDERR").map_or_else(
+                |_| Stdio::null(),
+                |path| {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .map_or_else(|_| Stdio::null(), Stdio::from)
+                },
+            ))
             .spawn()
             .map_err(|e| format!("spawn kiseki-server at {}: {e}", binary.display()))?;
 
@@ -649,6 +665,19 @@ impl Cluster {
         self.leader_metrics_url.clone()
     }
 
+    /// All node metrics URLs as `(node_id, url)` pairs, sorted by
+    /// `node_id`. Used by the perf harness to scrape per-step hot-path
+    /// histograms from every node (the leader-only scrape misses the
+    /// `aux.*` follower side of the intent fan, since the current
+    /// shard placement parks every shard leader on node 1).
+    #[must_use]
+    pub fn all_node_metrics_urls(&self) -> Vec<(u64, String)> {
+        self.nodes
+            .iter()
+            .map(|(id, n)| (*id, format!("http://127.0.0.1:{}/metrics", n.ports.metrics)))
+            .collect()
+    }
+
     #[must_use]
     pub fn leader_node_id(&self) -> u64 {
         self.leader_node_id
@@ -782,6 +811,10 @@ fn spawn_cluster_node(
         // is delayed symmetrically. Same pass-through pattern as the
         // single-node ProfileServer above.
         "KISEKI_RAFT_FAKE_RTT_US",
+        // Chunk-device backing size; matches the ProfileServer
+        // forward list. Lets the bench size a per-node chunk store
+        // to its actual write volume instead of the 4 GiB default.
+        "KISEKI_CHUNK_DEVICE_BYTES",
     ] {
         if let Ok(v) = std::env::var(var) {
             if var == "DHAT_OUTPUT_FILE" {
