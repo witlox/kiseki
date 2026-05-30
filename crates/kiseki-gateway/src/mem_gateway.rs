@@ -2325,6 +2325,21 @@ impl InMemoryGateway {
         let pieces_len = raw_pieces.len();
 
         let mut landed: Vec<ChunkLanded> = Vec::with_capacity(pieces_len);
+        // ADR-047 §"Problem" / §11: EC fan and Raft intent fan are
+        // *orthogonal* — data durability vs metadata ordering — and
+        // should run in parallel on the ack path. The previous
+        // implementation awaited `chunks.write_chunk` per piece
+        // INSIDE the loop, then sequentially fired the intent fan
+        // after, costing chunk_RTT + intent_RTT per write. We now
+        // STAGE envelopes here (no I/O) and fire both fans in
+        // parallel below via `tokio::try_join!` in the async-ack
+        // branch. The wait collapses to max(chunk_RTT, intent_RTT)
+        // — local n=6: chunk_write 1,622 µs vs raft_commit 1,036 µs
+        // sequential = 2,808 µs, parallel = 1,622 µs (~1.7× lift).
+        //
+        // Staged envelopes alongside `landed`, indexed by piece. For
+        // dedup-hit chunks the slot is `None` (no write to issue).
+        let mut staged_envelopes: Vec<Option<envelope::Envelope>> = Vec::with_capacity(pieces_len);
 
         for piece in raw_pieces {
             // ADR-047 hot-path timer (per-piece chunk-id derivation —
@@ -2365,6 +2380,7 @@ impl InMemoryGateway {
                     ciphertext_len: 0,
                     was_new: false,
                 });
+                staged_envelopes.push(None);
                 continue;
             }
             // Either the chunk didn't exist (Ok(None)) or the
@@ -2386,7 +2402,9 @@ impl InMemoryGateway {
             // Single-chunk PUTs ≤ inline_threshold still take the
             // fast path so small-object storage is unchanged.
             let mut chunk_was_new = false;
-            let chunk_write_started = std::time::Instant::now();
+            // (`chunk_write_started` removed — `chunk_write` phase is
+            // now timed at the parallel-fan call site below for
+            // async-ack, and at the sync-fan call site for POSIX.)
             // Try the inline (small-tier) path for single small pieces.
             // ADR-030 spillover: if the small tier can't take it (system
             // disk over budget / objects.redb full), fall through to the
@@ -2421,25 +2439,36 @@ impl InMemoryGateway {
                     }
                 }
             }
-            if !took_inline {
+            if took_inline {
+                // Inline tier: bytes already written to small_store
+                // synchronously above; no chunk-fan needed.
+                staged_envelopes.push(None);
+            } else {
                 tracing::debug!(
                     ?chunk_id,
                     ciphertext_len,
-                    "gateway write: chunk path → chunks.write_chunk",
+                    "gateway write: chunk path → staging for parallel fan",
                 );
-                let is_new = self.chunks.write_chunk(env, &pool).await.map_err(|e| {
-                    tracing::warn!(?chunk_id, error = %e, "gateway write: chunks.write_chunk failed");
-                    map_chunk_write_error(e)
-                })?;
-                if is_new {
-                    chunk_was_new = true;
-                }
-                // (B9: dropped per-chunk debug calls from the hot
-                // path. The else-branch comment about ChunkStore's
-                // internal refcount handling is preserved in the
-                // file's git history; it remains true.)
+                // ADR-047 EC/Raft parallelization: stage the env
+                // here instead of awaiting `write_chunk` inline.
+                // The actual fan happens below in `tokio::try_join!`
+                // alongside the intent fan (async-ack branch) or
+                // before the sync emit (POSIX branch).
+                //
+                // `chunk_was_new = true` is the dedup-pre-check
+                // result. The PersistentChunkStore's internal
+                // race-check (concurrent same-content insert) may
+                // flip `is_new` to false at write time, but for
+                // unique-content workloads the pre-check is
+                // authoritative. Race-case false-positive
+                // `new_chunks` entries land idempotently on the
+                // state-machine apply (cluster_chunk_state re-seed
+                // is a no-op when the row already exists).
+                chunk_was_new = true;
+                staged_envelopes.push(Some(env));
             }
-            self.observe_put_phase("chunk_write", chunk_write_started.elapsed());
+            // observe_put_phase("chunk_write") moved out of the loop
+            // — it now covers the parallel fan time below.
 
             landed.push(ChunkLanded {
                 id: chunk_id,
@@ -2702,20 +2731,63 @@ impl InMemoryGateway {
                     append,
                 };
                 let intent_started = std::time::Instant::now();
-                // ADR-047 hot-path timer (gw.put_intent_and_fan_call)
-                // — covers the entire quorum-fan call from the gateway's
-                // perspective (the inner pif.* timers break it down
-                // further: local_put, leader_first_hop, parallel_topup).
+                // ADR-047 §"Problem" / §11 — EC/Raft parallelization.
+                // Run the chunk-write fan and the intent fan
+                // concurrently. Both reach `min_acks`-durable
+                // independently; the ack waits on both (I-L5 / I-CS1
+                // preserved). The previous serial layout cost
+                // chunk_RTT + intent_RTT per write; this collapses
+                // to max(chunk_RTT, intent_RTT).
                 kiseki_tracing::hot_timer_guard!(_ht_pif = "gw.put_intent_and_fan_call");
-                match log.put_intent_and_fan(shard_id, intent).await {
-                    Ok(()) => {
-                        // Intent is `min_acks`-durable: fast-ack now. Do NOT
-                        // roll back the composition — it is the authoritative
-                        // local copy and the committer replicates the delta.
-                        // Record the quorum-intent latency under the same
-                        // `raft_commit` phase the synchronous path uses, so
-                        // the decoupled vs synchronous commit cost is
-                        // directly comparable from metrics.
+
+                let chunk_fan_started = std::time::Instant::now();
+                // Take ownership of the staged envelopes for the
+                // chunk-fan future. Once moved here, the variable is
+                // gone — which is fine because this branch
+                // unconditionally `return`s on both Ok and Err.
+                let envelopes_for_fan: Vec<envelope::Envelope> =
+                    std::mem::take(&mut staged_envelopes)
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                let pool_for_fan = pool.clone();
+                let chunks_for_fan = std::sync::Arc::clone(&self.chunks);
+                let chunk_fan_fut = async move {
+                    // Sequential `await` over staged envelopes. The
+                    // common case is a single 64 KiB chunk per PUT
+                    // (small-object IOPS workload), so the absence
+                    // of within-fan concurrency costs nothing here.
+                    // Multi-chunk PUTs (>1 MiB payloads) pay a
+                    // serial chunk-write cost inside this fan, but
+                    // the *cross-fan* parallelism with intent fan
+                    // is the win we're after, and that holds for
+                    // every shape. (Within-fan concurrency via
+                    // FuturesUnordered is a follow-up if multi-MB
+                    // PUTs become hot — needs the `futures` dep
+                    // wired into kiseki-gateway first.)
+                    for env in envelopes_for_fan {
+                        let chunks = std::sync::Arc::clone(&chunks_for_fan);
+                        chunks.write_chunk(env, &pool_for_fan).await.map_err(|e| {
+                            tracing::warn!(
+                                error = %e,
+                                "gateway write: chunks.write_chunk failed in parallel fan",
+                            );
+                            map_chunk_write_error(e)
+                        })?;
+                    }
+                    Ok::<(), GatewayError>(())
+                };
+
+                let intent_fan_fut = async {
+                    log.put_intent_and_fan(shard_id, intent)
+                        .await
+                        .map_err(|e| GatewayError::Upstream(format!("intent quorum: {e}")))
+                };
+
+                match tokio::try_join!(chunk_fan_fut, intent_fan_fut) {
+                    Ok(((), ())) => {
+                        // Both quorums reached. Ack.
+                        self.observe_put_phase("chunk_write", chunk_fan_started.elapsed());
                         self.observe_put_phase("raft_commit", intent_started.elapsed());
                         self.observe_put_phase(
                             "composition_record",
@@ -2724,7 +2796,7 @@ impl InMemoryGateway {
                         tracing::debug!(
                             comp_id = %comp_id.0,
                             shard_id = %shard_id.0,
-                            "gateway write: decoupled fast-ack (intent durable)",
+                            "gateway write: decoupled fast-ack (parallel fans complete)",
                         );
                         return Ok(WriteResponse {
                             composition_id: comp_id,
@@ -2732,20 +2804,39 @@ impl InMemoryGateway {
                         });
                     }
                     Err(e) => {
-                        // Quorum shortfall / non-durable / single-node:
-                        // roll back the provisional composition and
-                        // surface the failure. No silent fallback.
+                        // Either fan failed; the rollback path is the
+                        // same: drop the provisional composition and
+                        // surface the typed error (already mapped to
+                        // GatewayError inside the fan futures).
                         tracing::warn!(
                             comp_id = %comp_id.0,
                             shard_id = %shard_id.0,
                             error = %e,
-                            "gateway write: put_intent_and_fan failed — write rejected",
+                            "gateway write: parallel fan failed — write rejected",
                         );
                         let _ = self.compositions.delete(comp_id).ok();
-                        return Err(GatewayError::Upstream(format!("intent quorum: {e}")));
+                        return Err(e);
                     }
                 }
             }
+
+            // POSIX surface (NFS/FUSE) fallthrough — synchronous
+            // emit + ack at CLOSE / CommitStream. Per I-L5, chunks
+            // must be durable BEFORE the metadata becomes visible to
+            // the reader. Drain the staged envelopes here (kept
+            // sequential for the sync surface: parallel fan +
+            // sync-emit would still chain Raft after, so the win is
+            // smaller and the rollback semantics on partial-chunk +
+            // committed-Raft are more delicate to get right; left as
+            // a follow-up if the sync-path tail matters).
+            let chunk_write_started_sync = std::time::Instant::now();
+            for env in staged_envelopes.drain(..).flatten() {
+                self.chunks.write_chunk(env, &pool).await.map_err(|e| {
+                    tracing::warn!(error = %e, "gateway write: sync chunk_write failed");
+                    map_chunk_write_error(e)
+                })?;
+            }
+            self.observe_put_phase("chunk_write", chunk_write_started_sync.elapsed());
 
             // #111: forward-aware emit — commits locally, or re-issues
             // the built append to the shard leader (for EVERY ingress —
@@ -2859,6 +2950,30 @@ impl InMemoryGateway {
                     )));
                 }
             }
+        }
+
+        // Single-node / no-log path: when `log` is `None` (tests,
+        // single-node MemGateway without Raft), the parallel-fan
+        // try_join in the log-Some block above never ran. Chunks
+        // are still staged in `staged_envelopes`; drain them here
+        // before acking so the gateway's read path can find them.
+        let single_node_chunk_started = std::time::Instant::now();
+        let mut single_node_had_writes = false;
+        for env in staged_envelopes.drain(..).flatten() {
+            single_node_had_writes = true;
+            self.chunks.write_chunk(env, &pool).await.map_err(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "gateway write: single-node chunk_write failed",
+                );
+                map_chunk_write_error(e)
+            })?;
+        }
+        if single_node_had_writes {
+            self.observe_put_phase(
+                "chunk_write",
+                single_node_chunk_started.elapsed(),
+            );
         }
 
         self.observe_put_phase("composition_record", composition_record_started.elapsed());

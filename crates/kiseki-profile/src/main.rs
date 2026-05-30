@@ -420,8 +420,8 @@ async fn worker(
         Ok(d) => u64::try_from(d.as_nanos()).unwrap_or(u64::MAX),
         Err(_) => 0,
     };
-    let salt: u64 = salt_nanos
-        .wrapping_mul((worker_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let salt: u64 =
+        salt_nanos.wrapping_mul((worker_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let mut put_n: u64 = 0;
     while Instant::now() < deadline {
         let pick_get = match shape {
