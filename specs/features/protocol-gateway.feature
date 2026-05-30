@@ -42,8 +42,8 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
   # the same key returns 412 Precondition Failed. Backed by the
   # gateway's per-bucket name index (kiseki_composition::
   # CompositionStorage name index — forward + reverse maps,
-  # replicated to followers via the Create delta's v2 payload's
-  # `name` field).
+  # replicated to followers via the Create delta payload's `name`
+  # field).
   @integration
   Scenario: S3 conditional write — If-None-Match
     Given object "results/v2.json" does not exist
@@ -65,9 +65,9 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     And a S3 GET on "alpha/file.bin" returns 404
 
   # Multi-node read-after-write by URL key. The Create delta carries
-  # the name field (v2 payload), the hydrator on every follower
-  # replays it into the redb name index, and a GET on a non-leader
-  # node resolves the same key. Failure here means the v2 payload
+  # the `name` field, the hydrator on every follower replays it into
+  # the persistent name index, and a GET on a non-leader node
+  # resolves the same key. Failure here means the create payload
   # isn't being decoded or the name_inserts batch isn't being
   # committed atomically with the composition put — both of which
   # would silently break key-based addressing on a multi-node cluster.
@@ -77,6 +77,23 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
     When a client S3 PUTs "cross-node-payload" to key "x/replicated.bin" on node-1
     Then a S3 GET for key "x/replicated.bin" on node-2 returns "cross-node-payload"
     And a S3 GET for key "x/replicated.bin" on node-3 returns "cross-node-payload"
+
+  # ADR-047 MF-1 / MF-9: per-name perspective-seq LWW guard.
+  # Concurrent same-name writes ingressing on different nodes must
+  # converge to ONE value across the cluster (no split-brain). The
+  # exact winner depends on HLC ordering at runtime — the test
+  # asserts convergence + identity, not which one. Pre-MF-1 the leader
+  # appends intents in fan-arrival order, so a newer-HLC write could
+  # be applied BEFORE an older-HLC one and then silently lost on the
+  # name-bind step. The per-name seq guard at hydration apply time
+  # closes that hole.
+  @integration @multi-node
+  Scenario: 6-node cluster — concurrent same-name writes converge LWW by perspective-seq
+    Given a 6-node kiseki cluster
+    When a client S3 PUTs "alpha" to key "lww/file.bin" on node-1
+    And a client S3 PUTs "beta" to key "lww/file.bin" on node-2
+    Then within 5 seconds, S3 GETs for key "lww/file.bin" on node-1 and node-2 converge to the same value
+    And the converged value is one of "alpha" or "beta"
 
   @integration
   Scenario: S3 LIST returns bucket contents by URL key
@@ -127,10 +144,10 @@ Feature: Protocol Gateway — Wire protocol translation and tenant-layer encrypt
 
   # Multi-node multipart correctness: the leader's multipart
   # upload's name binding + every part's chunk_state must replicate
-  # to followers via the Raft Create-delta (v2 payload + new_chunks
-  # list). Without that, a GET-by-key on a follower would 404 (no
-  # name binding) or `ChunkLost` (no cluster_chunk_state seed for
-  # the multipart's chunks).
+  # to followers via the Raft Create-delta (payload's `name` field +
+  # the per-chunk `new_chunks` list). Without that, a GET-by-key on
+  # a follower would 404 (no name binding) or `ChunkLost` (no
+  # cluster_chunk_state seed for the multipart's chunks).
   @integration @multi-node
   Scenario: 6-node cluster — multipart upload by key resolves on followers
     Given a 6-node kiseki cluster

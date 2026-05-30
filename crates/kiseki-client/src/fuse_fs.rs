@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
-use kiseki_gateway::ops::{GatewayOps, ReadRequest, WriteRequest, WriteResponse};
+use kiseki_gateway::ops::{GatewayOps, ReadRequest, WriteRequest, WriteResponse, WriteSurface};
 
 /// Inode number type.
 pub type Ino = u64;
@@ -384,6 +384,9 @@ impl<G: GatewayOps> KisekiFuse<G> {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            // ADR-047: FUSE is POSIX close-to-open (ADR-013) — NEVER
+            // decoupled; always synchronous.
+            surface: WriteSurface::Fuse,
         })
     }
 
@@ -478,6 +481,9 @@ impl<G: GatewayOps> KisekiFuse<G> {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            // ADR-047: FUSE is POSIX close-to-open (ADR-013) — NEVER
+            // decoupled; always synchronous.
+            surface: WriteSurface::Fuse,
         })
     }
 

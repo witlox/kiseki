@@ -117,6 +117,9 @@ impl<G: GatewayOps> NfsGateway<G> {
                 forwarded_from_node: None,
                 comp_id_override: req.comp_id_override,
                 tier: None,
+                // ADR-047: NFS is POSIX close-to-open (ADR-013) — NEVER
+                // decoupled; always takes the synchronous commit path.
+                surface: crate::ops::WriteSurface::Nfs,
             })
             .await?;
 

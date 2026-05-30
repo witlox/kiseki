@@ -711,6 +711,9 @@ async fn op_commit_ds<G: GatewayOps + Send + Sync + 'static>(
         forwarded_from_node: None,
         comp_id_override: None,
         tier: None,
+        // ADR-047: pNFS DS COMMIT flush is POSIX close-to-open (ADR-013)
+        // — NEVER decoupled; always synchronous.
+        surface: crate::ops::WriteSurface::Nfs,
     };
     let status = match ctx.block_gateway(ctx.gateway.write(req)) {
         Ok(resp) => {

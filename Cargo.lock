@@ -2359,6 +2359,7 @@ name = "kiseki-log"
 version = "2026.43.0"
 dependencies = [
  "async-trait",
+ "fjall",
  "futures",
  "kiseki-common",
  "kiseki-control",
@@ -2366,8 +2367,11 @@ dependencies = [
  "kiseki-raft",
  "kiseki-tracing",
  "openraft",
+ "postcard",
  "prometheus",
  "proptest",
+ "prost",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",

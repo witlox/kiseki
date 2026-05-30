@@ -303,6 +303,7 @@ async fn then_no_plaintext(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -652,6 +653,7 @@ async fn then_fetch_encrypted(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -709,6 +711,7 @@ async fn then_decrypt_inprocess(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -778,6 +781,7 @@ async fn then_no_plaintext_leak(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -847,6 +851,7 @@ async fn then_ryw(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -927,6 +932,7 @@ async fn then_no_fuse_overhead(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -973,6 +979,7 @@ async fn then_lower_latency(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -1018,6 +1025,7 @@ async fn then_buffer(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -1102,6 +1110,7 @@ async fn then_plaintext_only_mem(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -1148,6 +1157,7 @@ async fn then_encrypted_wire(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -1447,6 +1457,7 @@ async fn then_decrypt_inprocess2(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -1505,6 +1516,7 @@ async fn then_pre_encrypted(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -1558,6 +1570,7 @@ async fn then_committed_durable(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -1615,6 +1628,7 @@ async fn then_others_unaffected(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -1951,6 +1965,7 @@ async fn then_serialized(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -1967,6 +1982,7 @@ async fn then_serialized(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -2005,6 +2021,7 @@ async fn then_total_order(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -2021,6 +2038,7 @@ async fn then_total_order(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -2077,6 +2095,7 @@ async fn then_no_write_loss(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -2093,6 +2112,7 @@ async fn then_no_write_loss(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -2156,6 +2176,7 @@ async fn then_reads_ok(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await
         .unwrap();
@@ -2201,6 +2222,7 @@ async fn then_erofs(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await;
     assert!(result.is_err(), "write to read-only namespace must fail");
@@ -2458,6 +2480,7 @@ async fn then_quota_enforcement(_w: &mut KisekiWorld) {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::ops::WriteSurface::S3,
         })
         .await;
     assert!(result.is_err(), "data path must enforce restrictions");

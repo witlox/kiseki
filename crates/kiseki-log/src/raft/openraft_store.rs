@@ -159,6 +159,14 @@ fn op_to_u8(op: crate::delta::OperationType) -> u8 {
     }
 }
 
+/// Re-export of the operation-code mapper so sibling modules
+/// ([`crate::raft_intent_sink`]) can build `IncorporateItem`s without
+/// duplicating the table.
+#[must_use]
+pub fn op_to_u8_pub(op: crate::delta::OperationType) -> u8 {
+    op_to_u8(op)
+}
+
 impl OpenRaftLogStore {
     /// Create a Raft log store for a shard. **Does not call
     /// `initialize()`** — handle construction is always non-blocking.
@@ -310,6 +318,43 @@ impl OpenRaftLogStore {
     #[must_use]
     pub fn raft_handle(&self) -> Arc<openraft::Raft<C, ShardStateMachine>> {
         Arc::new(self.raft.clone())
+    }
+
+    /// This shard's current Raft **voter** node ids, read from the live
+    /// membership metrics (ADR-047 phase 5b). Learners are excluded — only
+    /// voters carry the durability quorum the recovery gather counts against.
+    /// The set includes this node when it is itself a voter; the caller (the
+    /// [`TransportIntentGatherer`](crate::intent_sync)) drops the local id
+    /// before fanning out. Empty before membership is initialized.
+    #[must_use]
+    pub fn voter_ids(&self) -> Vec<u64> {
+        self.raft
+            .metrics()
+            .borrow_watched()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect()
+    }
+
+    /// Is this node the **established leader** of this shard's Raft group right
+    /// now (ADR-047 `LeaderSink` leadership detection)? Reads
+    /// `ServerState::Leader` from the live metrics watch — a cheap, lock-free
+    /// borrow, safe to poll on the committer supervisor's tick. A deposed
+    /// leader flips to `Candidate`/`Follower` here as soon as openraft sees a
+    /// higher term, which is the supervisor's signal to stop draining.
+    #[must_use]
+    pub fn is_leader(&self) -> bool {
+        self.raft.is_leader()
+    }
+
+    /// The node id this shard's Raft group currently regards as leader, if any
+    /// (ADR-047 `LeaderSink` — the `put_intent_and_fan` fan-includes-leader
+    /// target). `None` during an election (no committed leader). Read from the
+    /// live metrics watch.
+    #[must_use]
+    pub fn current_leader_id(&self) -> Option<u64> {
+        self.raft.metrics().borrow_watched().current_leader
     }
 
     /// Append a delta through Raft consensus.
@@ -491,6 +536,55 @@ impl OpenRaftLogStore {
             new_chunks,
         };
 
+        let resp = self.raft.client_write(cmd).await.map_err(|e| {
+            if matches!(
+                e,
+                openraft::errors::RaftError::APIError(
+                    openraft::error::ClientWriteError::ForwardToLeader(_)
+                )
+            ) {
+                LogError::LeaderUnavailable(self.shard_id)
+            } else {
+                LogError::Unavailable
+            }
+        })?;
+
+        match resp.response() {
+            LogResponse::Appended(seq) => Ok(SequenceNumber(*seq)),
+            LogResponse::Ok | LogResponse::DecrementOutcome(_) => Err(LogError::Unavailable),
+        }
+    }
+
+    /// ADR-047 PART 8 — incorporate a BATCH of async-committed intents into
+    /// the Raft log as a single [`LogCommand::IncorporateIntents`] command.
+    ///
+    /// Replaces the per-intent `append_intent` (Finding U). Each item runs
+    /// through the per-item SM gate (recent set + ancient cutoff); items
+    /// already in the recent set are no-ops, items below the cutoff are
+    /// refused-with-alarm. Atomicity is preserved across the batch — the
+    /// whole apply runs under one SM-lock-held block.
+    ///
+    /// # Errors
+    /// [`LogError::MaintenanceMode`] if the shard is draining;
+    /// [`LogError::LeaderUnavailable`] if this node is not the leader;
+    /// [`LogError::Unavailable`] on any other Raft client-write failure.
+    pub async fn append_intents(
+        &self,
+        items: Vec<crate::raft_store::IncorporateItem>,
+    ) -> Result<SequenceNumber, LogError> {
+        {
+            let inner = self.state.lock().await;
+            if inner.maintenance {
+                return Err(LogError::MaintenanceMode(self.shard_id));
+            }
+        }
+        if items.is_empty() {
+            // Nothing to do — return the current tip so callers can rely on
+            // a SequenceNumber result.
+            return Ok(self.current_tip().await);
+        }
+
+        let cmd = LogCommand::IncorporateIntents { items };
         let resp = self.raft.client_write(cmd).await.map_err(|e| {
             if matches!(
                 e,
@@ -791,6 +885,51 @@ impl OpenRaftLogStore {
     pub async fn current_tip(&self) -> SequenceNumber {
         let inner = self.state.lock().await;
         SequenceNumber(inner.tip)
+    }
+
+    /// ADR-047 PART 8 §T — snapshot the perspective-seqs currently in the SM's
+    /// recent-incorporated set. The supervisor calls this each tick and
+    /// per-intent-prunes the local store so only intents *known to be applied
+    /// on this replica* are removed.
+    pub async fn recent_incorporated_snapshot(
+        &self,
+    ) -> std::collections::HashSet<kiseki_common::time::HybridLogicalClock> {
+        let inner = self.state.lock().await;
+        inner.recent_incorporated_snapshot()
+    }
+
+    /// ADR-047 PART 8 — the SM's ancient cutoff log-index. Recovery uses this
+    /// to filter out re-gathered intents whose intent-store residency is
+    /// suspiciously old (Finding Q).
+    pub async fn ancient_cutoff_log_index(&self) -> u64 {
+        let inner = self.state.lock().await;
+        inner.ancient_cutoff_log_index
+    }
+
+    /// PART 8 §W — the SM's last-applied Raft log index. Used by the
+    /// supervisor's post-promotion wait-for-current: drain does NOT start
+    /// until `applied_log_index >= committed_log_index`, so the recent set is
+    /// guaranteed to cover the just-promoted leader's incoming log.
+    #[must_use]
+    pub fn applied_log_index(&self) -> u64 {
+        self.raft
+            .metrics()
+            .borrow_watched()
+            .last_applied
+            .as_ref()
+            .map_or(0, openraft::LogId::index)
+    }
+
+    /// PART 8 §W — the SM's last-committed Raft log index. Used as the bar the
+    /// applied index must catch up to before draining resumes after promotion.
+    #[must_use]
+    pub fn committed_log_index(&self) -> u64 {
+        self.raft
+            .metrics()
+            .borrow_watched()
+            .committed
+            .as_ref()
+            .map_or(0, openraft::LogId::index)
     }
 
     /// Check whether the shard is in maintenance mode.

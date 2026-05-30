@@ -43,12 +43,13 @@ use kiseki_log::delta::OperationType;
 use kiseki_log::traits::{LogOps, ReadDeltasRequest};
 
 use crate::composition::{
-    decode_composition_create_payload_named, decode_composition_delete_payload,
+    decode_composition_create_payload, decode_composition_delete_payload,
     decode_composition_update_payload, Composition, CompositionStore, INLINE_DATA_THRESHOLD,
 };
 use crate::metrics::{skip_reason, CompositionMetrics};
 use crate::persistent::HydrationBatch;
 use kiseki_common::ids::NamespaceId;
+use kiseki_log::intent::PerspectiveSeq;
 
 /// In-progress staging state for a single poll's batch. Lets staging
 /// functions see the effects of earlier deltas in the same batch
@@ -63,12 +64,16 @@ struct Staging {
     /// Composition ids scheduled for delete in this batch.
     removes: HashSet<CompositionId>,
     /// Name bindings to insert on commit. Populated from Create
-    /// deltas that carry a v2 name field.
-    name_inserts: Vec<(NamespaceId, String, CompositionId)>,
+    /// deltas that carry a name. The fourth tuple element is the
+    /// ingress-assigned `PerspectiveSeq` decoded from the Create
+    /// payload (ADR-047 MF-1): `Some(seq)` for async (decoupled-ack)
+    /// writes, `None` for sync surfaces.
+    name_inserts: Vec<(NamespaceId, String, CompositionId, Option<PerspectiveSeq>)>,
     /// Name bindings to remove on commit. Populated from Delete
     /// deltas — looked up via reverse index since the Delete payload
-    /// itself carries only the `composition_id`.
-    name_removes: Vec<(NamespaceId, String)>,
+    /// itself carries only the `composition_id`. Carries the optional
+    /// `PerspectiveSeq` for the same LWW guard as inserts.
+    name_removes: Vec<(NamespaceId, String, Option<PerspectiveSeq>)>,
     /// ADR-040 Phase 18 — namespaces to register in the in-memory
     /// `CompositionStore` wrapper before applying any Create deltas
     /// that reference them. Populated from
@@ -102,12 +107,43 @@ impl Staging {
         self.removes.insert(id);
     }
 
-    fn bind_name(&mut self, ns: NamespaceId, name: String, id: CompositionId) {
-        self.name_inserts.push((ns, name, id));
+    /// Stage a name bind for the hydration batch.
+    ///
+    /// **Cross-surface seq contract (ADR-047 MF-1 / MF-9):**
+    /// `perspective_seq = Some(seq)` engages the per-name LWW guard
+    /// at apply time — the bind happens only if `Some(seq) >=
+    /// stored_seq` (treating stored `None` as `-∞`). `None` is the
+    /// sync-surface stamp: the bind is unconditional and CLEARS the
+    /// stored seq. Concretely:
+    ///
+    /// - **async vs async (same name, different seqs)**: latest seq wins.
+    /// - **sync after async**: sync wins (unconditional, raft commit
+    ///   order is authoritative); seq stamp cleared.
+    /// - **async after sync**: async wins (`None < Some(_)`); seq
+    ///   stamp set to incoming.
+    /// - **sync after sync**: latest sync wins (raft order).
+    fn bind_name(
+        &mut self,
+        ns: NamespaceId,
+        name: String,
+        id: CompositionId,
+        perspective_seq: Option<PerspectiveSeq>,
+    ) {
+        self.name_inserts.push((ns, name, id, perspective_seq));
     }
 
-    fn unbind_name(&mut self, ns: NamespaceId, name: String) {
-        self.name_removes.push((ns, name));
+    /// Stage a name unbind for the hydration batch with the same
+    /// cross-surface seq contract as [`Self::bind_name`]. An older-seq
+    /// async unbind cannot unbind a newer-seq name (would resurrect a
+    /// stale view). Sync unbinds (`perspective_seq = None`) are
+    /// unconditional.
+    fn unbind_name(
+        &mut self,
+        ns: NamespaceId,
+        name: String,
+        perspective_seq: Option<PerspectiveSeq>,
+    ) {
+        self.name_removes.push((ns, name, perspective_seq));
     }
 }
 
@@ -520,8 +556,8 @@ fn stage_create(
     staging: &mut Staging,
     delta: &kiseki_log::delta::Delta,
 ) -> DeltaOutcome {
-    let Some((comp_id, namespace_id, size, name, chunk_plaintext_lens)) =
-        decode_composition_create_payload_named(&delta.payload.ciphertext)
+    let Some((comp_id, namespace_id, size, name, chunk_plaintext_lens, perspective_seq)) =
+        decode_composition_create_payload(&delta.payload.ciphertext)
     else {
         return DeltaOutcome::PermanentSkip {
             reason: "create_payload_decode",
@@ -530,10 +566,12 @@ fn stage_create(
     // Idempotent: if the comp is already visible (durable or in-batch
     // from a previous create in the same poll), nothing to do — but
     // still re-bind the name so a follower that re-applies a Create
-    // delta after a name index has been wiped converges.
+    // delta after a name index has been wiped converges. The
+    // perspective-seq guard at apply time (MF-1) keeps a stale-seq
+    // re-bind from regressing a newer-seq winner.
     if staging.view(store, comp_id).is_some() {
         if let Some(name) = name {
-            staging.bind_name(namespace_id, name, comp_id);
+            staging.bind_name(namespace_id, name, comp_id, perspective_seq);
         }
         return DeltaOutcome::Applied;
     }
@@ -571,15 +609,16 @@ fn stage_create(
         size,
         has_inline_data,
         content_type: None,
-        // For follower-hydrated compositions, the per-chunk lens
-        // ride along in the v3 create-delta payload (decoded above
-        // into `chunk_plaintext_lens` when present). Regular PUTs
-        // emit a v2-or-earlier payload and the read path falls back
-        // to MAX_PLAINTEXT_PER_CHUNK index math.
+        // Per-chunk plaintext lens ride along in the create-delta
+        // payload when the producer carried them (currently only
+        // S3 multipart `complete_multipart`, where parts have
+        // arbitrary plaintext sizes). Regular PUTs leave the slot
+        // `None` and the read path uses MAX_PLAINTEXT_PER_CHUNK
+        // index math.
         chunk_plaintext_lens: chunk_plaintext_lens.unwrap_or_default(),
     });
     if let Some(name) = name {
-        staging.bind_name(namespace_id, name, comp_id);
+        staging.bind_name(namespace_id, name, comp_id, perspective_seq);
     }
     DeltaOutcome::Applied
 }
@@ -631,8 +670,17 @@ fn stage_delete(
     // unbinds atomically with the composition row. Without this, a
     // GET-by-key after the delete would still resolve to a vanished
     // composition_id until the next compaction.
+    //
+    // **Cross-surface seq contract (ADR-047 MF-1 / MF-9):** Delete
+    // deltas today go through the synchronous gateway path only —
+    // ADR-014 deletes are not async-ack-eligible at the time of
+    // writing — so the unbind here is sync-surface (`None`):
+    // unconditional, raft-commit-order authoritative. If a future
+    // async Delete is added, extend the Delete payload to carry a
+    // `PerspectiveSeq` and thread it here. The current LWW guard at
+    // apply time accepts a `None` unconditionally.
     if let Ok(Some((ns, name))) = store.with_storage_locked(|s| s.name_for(comp_id)) {
-        staging.unbind_name(ns, name);
+        staging.unbind_name(ns, name, None);
     }
     staging.remove(comp_id);
     DeltaOutcome::Applied
@@ -657,6 +705,14 @@ mod tests {
         encode_composition_create_payload, encode_composition_delete_payload,
         encode_composition_update_payload, CompositionOps, CompositionStore,
     };
+
+    /// Test helper: encode a nameless Create payload (no name, no
+    /// per-chunk lens, no perspective-seq). Mirrors the shape the
+    /// internal hydrator-test path needs without forcing every
+    /// call site to repeat `None, &[], None`.
+    fn enc_create(comp_id: CompositionId, ns_id: NamespaceId, bytes_written: u64) -> Vec<u8> {
+        encode_composition_create_payload(comp_id, ns_id, bytes_written, None, &[], None)
+    }
     use crate::namespace::Namespace;
     use kiseki_common::ids::{ChunkId, CompositionId, NamespaceId, NodeId, OrgId, ShardId};
     use kiseki_log::delta::OperationType;
@@ -765,7 +821,7 @@ mod tests {
 
         for i in 0..N {
             let comp_id = CompositionId(uuid::Uuid::from_u128(u128::from(i) + 1));
-            let payload = encode_composition_create_payload(comp_id, ns_id, 64);
+            let payload = enc_create(comp_id, ns_id, 64);
             append_create(&log, shard_id, payload, vec![ChunkId([0u8; 32])]).await;
         }
 
@@ -798,7 +854,7 @@ mod tests {
         let comp_id = CompositionId(uuid::Uuid::new_v4());
         let ns_id = NamespaceId(uuid::Uuid::from_u128(2));
         let chunk_id = ChunkId([7u8; 32]);
-        let payload = encode_composition_create_payload(comp_id, ns_id, 1024);
+        let payload = enc_create(comp_id, ns_id, 1024);
         append_create(&log, shard_id, payload, vec![chunk_id]).await;
 
         let mut hydrator = CompositionHydrator::new(Arc::clone(&store), shard_id);
@@ -817,7 +873,7 @@ mod tests {
         let (log, shard_id) = fresh_log();
         let comp_id = CompositionId(uuid::Uuid::new_v4());
         let ns_id = NamespaceId(uuid::Uuid::from_u128(2));
-        let payload = encode_composition_create_payload(comp_id, ns_id, 42);
+        let payload = enc_create(comp_id, ns_id, 42);
         append_create(&log, shard_id, payload, vec![]).await;
 
         let mut hydrator = CompositionHydrator::new(Arc::clone(&store), shard_id);
@@ -828,14 +884,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hydrator_skips_deltas_with_legacy_payload_shape() {
+    async fn hydrator_skips_deltas_with_malformed_payload() {
         let store = fresh_store_with_default_ns();
         let (log, shard_id) = fresh_log();
-        // Wrong-length payload for a Create op. Hydrator should skip
-        // without crashing and advance past it so the loop doesn't get
-        // stuck. The exact length is unimportant — anything other than
-        // COMPOSITION_CREATE_PAYLOAD_LEN (40) makes the decoder return
-        // None.
+        // Structurally invalid payload for a Create op (shorter than
+        // the fixed prefix). The decoder returns None, the hydrator
+        // emits a permanent skip and advances past the bad delta so
+        // the loop doesn't get stuck.
         append_create(&log, shard_id, vec![0u8; 5], vec![]).await;
 
         let mut hydrator = CompositionHydrator::new(Arc::clone(&store), shard_id);
@@ -855,7 +910,7 @@ mod tests {
         append_create(
             &log,
             shard_id,
-            encode_composition_create_payload(comp_id, ns_id, 100),
+            enc_create(comp_id, ns_id, 100),
             vec![chunk_a],
         )
         .await;
@@ -889,13 +944,7 @@ mod tests {
         let comp_id = CompositionId(uuid::Uuid::new_v4());
         let ns_id = NamespaceId(uuid::Uuid::from_u128(2));
 
-        append_create(
-            &log,
-            shard_id,
-            encode_composition_create_payload(comp_id, ns_id, 64),
-            vec![],
-        )
-        .await;
+        append_create(&log, shard_id, enc_create(comp_id, ns_id, 64), vec![]).await;
         append_delta_op(
             &log,
             shard_id,
@@ -937,13 +986,7 @@ mod tests {
         // Create against an unregistered namespace.
         let comp_id = CompositionId(uuid::Uuid::new_v4());
         let unknown_ns = NamespaceId(uuid::Uuid::from_u128(999));
-        append_create(
-            &log,
-            shard_id,
-            encode_composition_create_payload(comp_id, unknown_ns, 100),
-            vec![],
-        )
-        .await;
+        append_create(&log, shard_id, enc_create(comp_id, unknown_ns, 100), vec![]).await;
 
         let mut hydrator = CompositionHydrator::new(Arc::clone(&store), shard_id);
         // First two polls: transient — last_applied stays at 0, retry
@@ -1142,7 +1185,7 @@ mod tests {
         let log = GapInjectingLog {
             deltas: std::sync::Mutex::new(vec![build_delta_at_seq(
                 10,
-                encode_composition_create_payload(comp_id, ns_id, 1024),
+                enc_create(comp_id, ns_id, 1024),
             )]),
             tip: kiseki_common::ids::SequenceNumber(10),
             // The visible delta starts at seq=10, so the log has GC'd
@@ -1330,13 +1373,7 @@ mod tests {
         let chunk = ChunkId([9u8; 32]);
 
         // Create (size=50, no chunks).
-        append_create(
-            &log,
-            shard_id,
-            encode_composition_create_payload(comp_id, ns_id, 50),
-            vec![],
-        )
-        .await;
+        append_create(&log, shard_id, enc_create(comp_id, ns_id, 50), vec![]).await;
         // Update to (size=50, [chunk]) — first update, bumps version to 2.
         append_delta_op(
             &log,

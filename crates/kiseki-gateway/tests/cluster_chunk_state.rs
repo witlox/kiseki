@@ -232,6 +232,7 @@ async fn fresh_chunk_write_emits_chunk_and_delta_proposal() {
         forwarded_from_node: None,
         comp_id_override: None,
         tier: None,
+        surface: kiseki_gateway::WriteSurface::S3,
     })
     .await
     .expect("write");
@@ -290,6 +291,7 @@ async fn dedup_write_does_not_emit_chunk_and_delta() {
         forwarded_from_node: None,
         comp_id_override: None,
         tier: None,
+        surface: kiseki_gateway::WriteSurface::S3,
     })
     .await
     .expect("write 1");
@@ -307,6 +309,7 @@ async fn dedup_write_does_not_emit_chunk_and_delta() {
         forwarded_from_node: None,
         comp_id_override: None,
         tier: None,
+        surface: kiseki_gateway::WriteSurface::S3,
     })
     .await
     .expect("write 2");
@@ -358,6 +361,7 @@ async fn fresh_chunk_write_carries_configured_placement() {
         forwarded_from_node: None,
         comp_id_override: None,
         tier: None,
+        surface: kiseki_gateway::WriteSurface::S3,
     })
     .await
     .expect("write");
@@ -397,6 +401,7 @@ async fn placement_is_capped_at_target_copies_when_cluster_is_larger() {
         forwarded_from_node: None,
         comp_id_override: None,
         tier: None,
+        surface: kiseki_gateway::WriteSurface::S3,
     })
     .await
     .expect("write");
@@ -438,6 +443,7 @@ async fn single_node_gateway_emits_empty_placement() {
         forwarded_from_node: None,
         comp_id_override: None,
         tier: None,
+        surface: kiseki_gateway::WriteSurface::S3,
     })
     .await
     .expect("write");
@@ -476,6 +482,7 @@ async fn composition_delete_emits_decrement_for_each_chunk() {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::WriteSurface::S3,
         })
         .await
         .expect("write");
@@ -611,6 +618,7 @@ async fn tombstone_decrement_triggers_delete_distributed() {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::WriteSurface::S3,
         })
         .await
         .expect("write");
@@ -657,6 +665,7 @@ async fn non_tombstone_decrement_does_not_fan_out() {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::WriteSurface::S3,
         })
         .await
         .expect("write");
@@ -886,6 +895,7 @@ async fn write_to_remote_led_shard_forwards_to_leader() {
             forwarded_from_node: None,
             comp_id_override: None,
             tier: None,
+            surface: kiseki_gateway::WriteSurface::S3,
         })
         .await
         .expect("write must succeed via leader append-forward, not ForwardToLeader error");

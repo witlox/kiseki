@@ -1,22 +1,76 @@
 //! openraft state machine for Log shards.
 
+#![allow(clippy::doc_markdown)]
+
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use futures::TryStreamExt;
-use kiseki_common::ids::{OrgId, SequenceNumber, ShardId};
+use kiseki_common::ids::{ChunkId, OrgId, SequenceNumber, ShardId};
+use kiseki_common::time::HybridLogicalClock;
 use openraft::alias::{LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf};
 use openraft::storage::{EntryResponder, RaftStateMachine, Snapshot};
 use openraft::{EntryPayload, OptionalSend, RaftSnapshotBuilder, StoredMembership};
+use prometheus::{register_int_counter_vec, IntCounterVec, Opts};
 use serde::{Deserialize, Serialize};
 
 use super::types::{LogResponse, LogTypeConfig};
 use crate::delta::{Delta, DeltaHeader, DeltaPayload, OperationType};
-use crate::raft_store::{LogCommand, NewChunkMeta};
+use crate::raft_store::{IncorporateItem, LogCommand, NewChunkMeta};
 use crate::watermark::ConsumerWatermarks;
-use kiseki_common::ids::ChunkId;
-use std::collections::HashMap;
+
+/// Default cap on the recent-incorporated-seqs window (entries).
+/// PART 8 hybrid bound — whichever fires first.
+const DEFAULT_DEDUP_WINDOW_ENTRIES: usize = 100_000;
+
+/// Default cap on the recent-incorporated-seqs window (milliseconds since the
+/// front entry's `apply_ms`).
+const DEFAULT_DEDUP_WINDOW_MS: u64 = 60_000;
+
+/// Prometheus counter for ancient-cutoff refusals (PART 8, Finding AA).
+/// `OnceLock` so multi-shard processes only register the metric once;
+/// Prometheus disallows duplicate registration.
+fn dedup_ancient_refused_counter() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter_vec!(
+            Opts::new(
+                "kiseki_log_dedup_ancient_refused_total",
+                "Per-shard count of IncorporateIntent entries refused-with-alarm \
+                 because their log_index fell below the SM's ancient cutoff \
+                 (PART 8 Finding AA: long-partition recovery dropping ancient \
+                 intents). Non-zero indicates a recovery path is delivering \
+                 intents whose log-index window has rolled off — investigate."
+            ),
+            &["shard"],
+        )
+        .expect("kiseki-log: failed to register dedup_ancient_refused counter")
+    })
+}
+
+/// Read the entry-cap from `KISEKI_DEDUP_WINDOW_ENTRIES`, defaulting to
+/// [`DEFAULT_DEDUP_WINDOW_ENTRIES`]. Used by `ShardSmInner::new` so every fresh
+/// shard picks up the operator override; tests can flip the env var.
+fn dedup_window_entries() -> usize {
+    std::env::var("KISEKI_DEDUP_WINDOW_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(DEFAULT_DEDUP_WINDOW_ENTRIES)
+}
+
+/// Read the time-cap from `KISEKI_DEDUP_WINDOW_MS`, defaulting to
+/// [`DEFAULT_DEDUP_WINDOW_MS`].
+fn dedup_window_ms() -> u64 {
+    std::env::var("KISEKI_DEDUP_WINDOW_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &u64| *n > 0)
+        .unwrap_or(DEFAULT_DEDUP_WINDOW_MS)
+}
 
 /// `cluster_chunk_state` row — Raft-replicated chunk metadata
 /// (Phase 16a, D-4). Keyed by `(tenant_id, chunk_id)` so cross-
@@ -69,6 +123,37 @@ struct ShardSnapshot {
     shard_id: Option<[u8; 16]>,
     /// Tenant ID bytes (if set).
     tenant_id: Option<[u8; 16]>,
+    /// ADR-047 PART 8 (Finding AA): log-index ancient-cutoff watermark. Any
+    /// `IncorporateIntent` whose Raft log-index falls *below* this is
+    /// refused-with-alarm (the SM increments
+    /// `kiseki_log_dedup_ancient_refused_total` and logs `tracing::error!`).
+    /// Persisted in snapshots so a freshly-installed follower honors the same
+    /// cutoff.
+    ancient_cutoff_log_index: u64,
+    /// ADR-047 PART 8 — the bounded recent-incorporated-seqs window. One
+    /// `RecentIncorporatedEntry` per applied `IncorporateIntent` *strictly above
+    /// the ancient cutoff*, oldest at front. Pruned on push when the entry-cap
+    /// or time-cap fires; eviction advances `ancient_cutoff_log_index`. The
+    /// authoritative gate against duplicate apply for the recent window
+    /// (multi-writer late-arrival / re-fan / replay).
+    recent_incorporated: Vec<RecentIncorporatedEntry>,
+}
+
+/// One entry in the recent-incorporated window. Serializable so it survives
+/// `ShardSnapshot` build/install. Triple `(log_index, perspective_seq,
+/// apply_ms)` per the PART 8 spec — `log_index` for eviction-by-age coupling to
+/// Raft progress, `perspective_seq` for O(log N) membership lookups in the
+/// in-memory `HashSet` mirror, `apply_ms` for time-bound eviction.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(crate) struct RecentIncorporatedEntry {
+    /// The Raft log index of the `IncorporateIntent` apply that recorded this.
+    log_index: u64,
+    /// The committer-assigned perspective-seq the apply gate keys on.
+    perspective_seq: HybridLogicalClock,
+    /// Apply-time wall-clock (ms since Unix epoch) — drives the time-bound
+    /// window eviction. Sourced from the SM apply-loop's clock read, not from
+    /// the delta's HLC (the delta HLC is the log index, not a wall clock).
+    apply_ms: u64,
 }
 
 /// Serializable form of a Delta for snapshots.
@@ -143,6 +228,17 @@ impl SerializableDelta {
     }
 }
 
+/// Apply-time wall-clock in ms since the Unix epoch. Used for the dedup window
+/// time-bound. Read on every IncorporateIntent / IncorporateIntents apply so a
+/// follower's eviction tracks its own apply clock (replication lag does NOT
+/// shrink the window from the leader's perspective). Returns 0 if the system
+/// clock pre-dates the Unix epoch (impossible in practice; defensive).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 fn op_to_u8(op: OperationType) -> u8 {
     match op {
         OperationType::Create => 0,
@@ -204,6 +300,28 @@ pub struct ShardSmInner {
     /// across replicas (otherwise nodes disagree on when a shard
     /// crosses the I-L6 ceiling).
     pub(crate) config: crate::shard::ShardConfig,
+    /// ADR-047 PART 8 (Finding AA): log-index ancient-cutoff watermark. An
+    /// `IncorporateIntent` whose Raft log_index is *strictly below* this
+    /// value is refused-with-alarm — never silently dropped. Advanced when
+    /// the recent-incorporated window evicts its oldest entry.
+    pub(crate) ancient_cutoff_log_index: u64,
+    /// ADR-047 PART 8 — the recent-incorporated window itself, oldest at the
+    /// front. One entry per applied `IncorporateIntent` strictly above the
+    /// ancient cutoff. Bounded by `dedup_window_entries` and `dedup_window_ms`
+    /// (whichever fires first); on eviction the front entry's log_index + 1
+    /// becomes the new ancient cutoff.
+    pub(crate) recent_incorporated: VecDeque<RecentIncorporatedEntry>,
+    /// Mirror of the perspective-seq set in `recent_incorporated`, for O(1)
+    /// membership checks in the apply gate. Kept strictly in sync with the
+    /// deque: every push_back inserts here, every pop_front removes here.
+    /// Rebuilt from the deque in `install_snapshot`.
+    pub(crate) recent_incorporated_seqs: HashSet<HybridLogicalClock>,
+    /// Per-shard cap on `recent_incorporated.len()`. Snapshot at SM
+    /// construction so a deployment-time env-var change picks up on restart;
+    /// not replicated (the cap is a local-policy knob, not consensus state).
+    pub(crate) dedup_window_entries: usize,
+    /// Per-shard cap on `apply_ms` age (ms) before the front entry evicts.
+    pub(crate) dedup_window_ms: u64,
 }
 
 impl ShardSmInner {
@@ -226,7 +344,147 @@ impl ShardSmInner {
             range_end: [0xFFu8; 32],
             state: crate::shard::ShardState::Healthy,
             config: crate::shard::ShardConfig::default(),
+            ancient_cutoff_log_index: 0,
+            recent_incorporated: VecDeque::new(),
+            recent_incorporated_seqs: HashSet::new(),
+            dedup_window_entries: dedup_window_entries(),
+            dedup_window_ms: dedup_window_ms(),
         }
+    }
+
+    /// Construct with explicit dedup-window bounds (test-only constructor).
+    /// Production picks bounds from env vars in [`Self::new`].
+    #[cfg(test)]
+    pub(crate) fn new_with_bounds(
+        shard_id: ShardId,
+        tenant_id: OrgId,
+        window_entries: usize,
+        window_ms: u64,
+    ) -> Self {
+        let mut s = Self::new(shard_id, tenant_id);
+        s.dedup_window_entries = window_entries.max(1);
+        s.dedup_window_ms = window_ms.max(1);
+        s
+    }
+
+    /// O(1) membership check used by the SM apply gate.
+    pub(crate) fn dedup_contains(&self, seq: &HybridLogicalClock) -> bool {
+        self.recent_incorporated_seqs.contains(seq)
+    }
+
+    /// Snapshot the perspective-seqs currently in the recent-incorporated set
+    /// — read by the supervisor's per-intent self-prune so it removes only the
+    /// intents that are *replicated and applied on this node* (PART 8 §T).
+    pub(crate) fn recent_incorporated_snapshot(&self) -> HashSet<HybridLogicalClock> {
+        self.recent_incorporated_seqs.clone()
+    }
+
+    /// PART 8 §1 — push a newly-incorporated entry into the recent window and
+    /// evict the front under the hybrid bound (entries OR time, whichever
+    /// fires). Advances `ancient_cutoff_log_index` to `evicted.log_index + 1`
+    /// so the next ancient check correctly sees `log_idx < cutoff` for the
+    /// just-evicted region.
+    ///
+    /// `now_ms` is the apply-time wall-clock (ms since Unix epoch); pulled
+    /// from `SystemTime::now()` at the apply site for production, supplied by
+    /// the test driver in unit tests.
+    fn push_recent_and_evict(
+        &mut self,
+        log_index: u64,
+        perspective_seq: HybridLogicalClock,
+        now_ms: u64,
+    ) {
+        self.recent_incorporated.push_back(RecentIncorporatedEntry {
+            log_index,
+            perspective_seq,
+            apply_ms: now_ms,
+        });
+        self.recent_incorporated_seqs.insert(perspective_seq);
+
+        // Evict from the front while EITHER cap is exceeded. Each eviction
+        // pushes the ancient cutoff forward to the evicted entry's
+        // log_index + 1, so an ancient intent at that index reads as
+        // strictly-below-cutoff on the next gate check.
+        loop {
+            let evict = if self.recent_incorporated.len() > self.dedup_window_entries {
+                true
+            } else if let Some(front) = self.recent_incorporated.front() {
+                now_ms.saturating_sub(front.apply_ms) > self.dedup_window_ms
+            } else {
+                false
+            };
+            if !evict {
+                break;
+            }
+            // Both length and front existence are checked above so the pop
+            // can never return None — but use `if let` for clippy hygiene.
+            if let Some(front) = self.recent_incorporated.pop_front() {
+                self.recent_incorporated_seqs.remove(&front.perspective_seq);
+                // Cutoff is exclusive — anything at-or-below the evicted index
+                // is now ancient.
+                self.ancient_cutoff_log_index = self
+                    .ancient_cutoff_log_index
+                    .max(front.log_index.saturating_add(1));
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// PART 8 §1 — apply one `IncorporateItem` (single or batch element).
+    /// Returns the assigned tip (the SM's monotonic `tip` after a successful
+    /// append, or the unchanged tip on duplicate/refuse — the SOLE truthful
+    /// `Appended` shape, matching the prior `IncorporateIntent` contract).
+    ///
+    /// The apply order is (atomically in a single SM-lock holding):
+    ///   1. duplicate check via recent_incorporated_seqs (skip if hit),
+    ///   2. ancient cutoff check (refuse-with-alarm if log_idx < cutoff),
+    ///   3. atomic chunk-meta + delta append (same body as ChunkAndDelta),
+    ///   4. recent_incorporated push + evict-and-advance-cutoff.
+    fn apply_one_incorporate(
+        &mut self,
+        item: &IncorporateItem,
+        log_index: u64,
+        now_ms: u64,
+    ) -> u64 {
+        // (1) Duplicate gate — seq already in the recent window. No-op,
+        // return the unchanged tip (matches the pre-PART-8 `Appended(tip)`
+        // contract for replay/duplicate).
+        if self.dedup_contains(&item.perspective_seq) {
+            return self.tip;
+        }
+        // (2) Ancient gate — log_index below the cutoff is suspicious; record
+        // the alarm + log and refuse. This catches a long-partition recovery
+        // delivering a re-gathered intent whose log-index window has rolled
+        // off, per Finding AA.
+        if log_index < self.ancient_cutoff_log_index {
+            dedup_ancient_refused_counter()
+                .with_label_values(&[&self.shard_id.0.to_string()])
+                .inc();
+            tracing::error!(
+                shard = %self.shard_id.0,
+                seq = ?item.perspective_seq,
+                log_index,
+                cutoff = self.ancient_cutoff_log_index,
+                "intent below ancient cutoff — refused (PART 8 Finding AA)",
+            );
+            return self.tip;
+        }
+        // (3) Real apply — chunk_meta + delta, atomic in this SM lock.
+        self.apply_new_chunks(&item.tenant_id_bytes, &item.new_chunks, log_index);
+        let tip = self.append_delta_inner(
+            &item.tenant_id_bytes,
+            item.operation,
+            &item.hashed_key,
+            &item.chunk_refs,
+            &item.payload,
+            item.has_inline_data,
+            log_index,
+        );
+        // (4) Record + evict — same apply block, so a follower applying this
+        // same entry independently arrives at the same set state.
+        self.push_recent_and_evict(log_index, item.perspective_seq, now_ms);
+        tip
     }
 
     /// Set the inline store for small-file content offload.
@@ -347,7 +605,21 @@ impl ShardSmInner {
     }
 
     #[allow(clippy::too_many_lines)] // Big match per LogCommand variant
-    fn apply_command(&mut self, cmd: &LogCommand, log_index: u64) -> LogResponse {
+    pub(crate) fn apply_command(&mut self, cmd: &LogCommand, log_index: u64) -> LogResponse {
+        self.apply_command_at(cmd, log_index, now_ms())
+    }
+
+    /// Same as [`Self::apply_command`] but with an explicit `now_ms` (the
+    /// apply-time wall-clock for the dedup time-bound). Production calls
+    /// [`Self::apply_command`] (reads `SystemTime::now`); tests call this
+    /// directly so the time-bound eviction is deterministic.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn apply_command_at(
+        &mut self,
+        cmd: &LogCommand,
+        log_index: u64,
+        now_ms: u64,
+    ) -> LogResponse {
         match cmd {
             LogCommand::AppendDelta {
                 tenant_id_bytes,
@@ -392,6 +664,56 @@ impl ShardSmInner {
                     log_index,
                 );
                 LogResponse::Appended(tip)
+            }
+            // ADR-047 PART 8 — an async-committed intent. Two complementary
+            // gates run inside the same `apply` lock:
+            //   (1) **Recent set:** if `perspective_seq` is already in the
+            //       bounded recent-incorporated set, SKIP (idempotent on
+            //       re-fan / replay / recovery re-gather).
+            //   (2) **Ancient cutoff:** if this entry's log_index is *strictly
+            //       below* `ancient_cutoff_log_index`, REFUSE-with-alarm
+            //       (`kiseki_log_dedup_ancient_refused_total` + tracing::error!)
+            //       — catches a long-partition recovery delivering an intent
+            //       whose dedup window has rolled off (Finding AA).
+            // Otherwise: atomic chunk_meta + delta append, then push the seq
+            // into the recent window and evict-and-advance-cutoff under the
+            // hybrid bound (Finding Q). Atomicity (PART 8 §P) is preserved
+            // because both the delta append and the set update happen in this
+            // single apply-lock-held block.
+            LogCommand::IncorporateIntent {
+                tenant_id_bytes,
+                operation,
+                hashed_key,
+                chunk_refs,
+                payload,
+                has_inline_data,
+                new_chunks,
+                perspective_seq,
+            } => {
+                let item = IncorporateItem {
+                    tenant_id_bytes: *tenant_id_bytes,
+                    operation: *operation,
+                    hashed_key: *hashed_key,
+                    chunk_refs: chunk_refs.clone(),
+                    payload: payload.clone(),
+                    has_inline_data: *has_inline_data,
+                    new_chunks: new_chunks.clone(),
+                    perspective_seq: *perspective_seq,
+                };
+                let tip = self.apply_one_incorporate(&item, log_index, now_ms);
+                LogResponse::Appended(tip)
+            }
+            // PART 8 §U — the batched variant. Each item runs through the
+            // same per-item gate as the single variant (`apply_one_incorporate`);
+            // the supervisor caps each drain pass at 1 000 items so a single
+            // Raft round absorbs at most 1 000 intents. Returns the final tip
+            // (post-batch), matching the single-variant shape.
+            LogCommand::IncorporateIntents { items } => {
+                let mut last_tip = self.tip;
+                for item in items {
+                    last_tip = self.apply_one_incorporate(item, log_index, now_ms);
+                }
+                LogResponse::Appended(last_tip)
             }
             LogCommand::IncrementChunkRefcount {
                 tenant_id_bytes,
@@ -510,6 +832,15 @@ impl RaftSnapshotBuilder<C> for ShardStateMachine {
                 sd
             })
             .collect();
+        // PART 8 — defensive sanity bound: the recent window must never grow
+        // past 2× its configured entry-cap. Catches a runaway eviction bug
+        // before it floods the snapshot.
+        debug_assert!(
+            inner.recent_incorporated.len() <= inner.dedup_window_entries.saturating_mul(2),
+            "recent_incorporated runaway: len={} > 2x cap={}",
+            inner.recent_incorporated.len(),
+            inner.dedup_window_entries
+        );
         let snap = ShardSnapshot {
             delta_count: inner.delta_count,
             tip: inner.tip,
@@ -518,6 +849,8 @@ impl RaftSnapshotBuilder<C> for ShardStateMachine {
             watermarks: inner.watermarks.as_vec(),
             shard_id: Some(*inner.shard_id.0.as_bytes()),
             tenant_id: Some(*inner.tenant_id.0.as_bytes()),
+            ancient_cutoff_log_index: inner.ancient_cutoff_log_index,
+            recent_incorporated: inner.recent_incorporated.iter().copied().collect(),
         };
         let data = serde_json::to_vec(&snap).map_err(io::Error::other)?;
         let snapshot_id = format!(
@@ -590,6 +923,21 @@ impl RaftStateMachine<C> for ShardStateMachine {
         inner.delta_count = snap.delta_count;
         inner.tip = snap.tip;
         inner.maintenance = snap.maintenance;
+        // PART 8 — restore the ancient cutoff and rebuild the recent-set from
+        // the VecDeque contents. The HashSet mirror is NOT persisted (it is a
+        // derived index); rebuilding it here guarantees the two are in sync at
+        // the snapshot-install boundary.
+        inner.ancient_cutoff_log_index = snap.ancient_cutoff_log_index;
+        inner.recent_incorporated = snap.recent_incorporated.iter().copied().collect();
+        inner.recent_incorporated_seqs = inner
+            .recent_incorporated
+            .iter()
+            .map(|e| e.perspective_seq)
+            .collect();
+        // The dedup-window caps are local-policy knobs not in consensus state
+        // — re-read from env so a deploy-time change takes effect on restart.
+        inner.dedup_window_entries = dedup_window_entries();
+        inner.dedup_window_ms = dedup_window_ms();
         // Restore deltas, offloading inline content to the store if available.
         inner.deltas = snap
             .deltas
@@ -644,6 +992,8 @@ impl RaftStateMachine<C> for ShardStateMachine {
             watermarks: inner.watermarks.as_vec(),
             shard_id: Some(*inner.shard_id.0.as_bytes()),
             tenant_id: Some(*inner.tenant_id.0.as_bytes()),
+            ancient_cutoff_log_index: inner.ancient_cutoff_log_index,
+            recent_incorporated: inner.recent_incorporated.iter().copied().collect(),
         };
         let data = serde_json::to_vec(&snap).map_err(io::Error::other)?;
         let meta = SnapshotMetaOf::<C> {
@@ -903,5 +1253,350 @@ mod tests {
             .expect("entry still present (tombstoned, not removed)");
         assert_eq!(entry.refcount, 0);
         assert!(entry.tombstoned, "refcount=0 must mark entry tombstoned");
+    }
+
+    // -----------------------------------------------------------
+    // ADR-047 PART 8 — ancient cutoff + bounded recent-incorporated set.
+    //
+    // Replaces the broken global `max_incorporated_seq` floor (PART 6).
+    // -----------------------------------------------------------
+
+    fn hlc(physical_ms: u64, logical: u32, node: u64) -> kiseki_common::time::HybridLogicalClock {
+        kiseki_common::time::HybridLogicalClock {
+            physical_ms,
+            logical,
+            node_id: kiseki_common::ids::NodeId(node),
+        }
+    }
+
+    fn mk_incorporate(
+        tenant: [u8; 16],
+        seq: kiseki_common::time::HybridLogicalClock,
+    ) -> LogCommand {
+        LogCommand::IncorporateIntent {
+            tenant_id_bytes: tenant,
+            operation: 0,
+            hashed_key: [0; 32],
+            chunk_refs: vec![],
+            payload: vec![],
+            has_inline_data: false,
+            new_chunks: vec![],
+            perspective_seq: seq,
+        }
+    }
+
+    /// PART 8 / PART 6 §"The bug" — the multi-writer late-arrival case the
+    /// broken global floor silently dropped. Two distinct writes (different
+    /// keys) on different nodes: the newer-seq one arrives first, then the
+    /// older-seq one lands a tick later. Under the broken floor design the
+    /// older write was filtered out / pruned. Under PART 8, BOTH must be
+    /// incorporated (different keys, neither in the recent set, neither below
+    /// the cutoff). This is the test that would have caught the original bug.
+    #[test]
+    fn multi_writer_late_arrival_is_incorporated() {
+        let mut inner = fresh_inner();
+        let tenant = org(1);
+
+        // Newer seq arrives first (a write to K2 on node-B with a later HLC).
+        let mut cmd_b = mk_incorporate(tenant, hlc(10, 0, 2));
+        if let LogCommand::IncorporateIntent {
+            ref mut hashed_key, ..
+        } = cmd_b
+        {
+            *hashed_key = [0xBB; 32];
+        }
+        let _ = inner.apply_command_at(&cmd_b, 1, 1_000);
+        assert_eq!(inner.deltas.len(), 1);
+
+        // Older seq arrives later (a write to K1 on node-A with an earlier
+        // HLC). The fix: this MUST be incorporated; the broken global floor
+        // would have skipped it.
+        let mut cmd_a = mk_incorporate(tenant, hlc(5, 0, 1));
+        if let LogCommand::IncorporateIntent {
+            ref mut hashed_key, ..
+        } = cmd_a
+        {
+            *hashed_key = [0xAA; 32];
+        }
+        let _ = inner.apply_command_at(&cmd_a, 2, 1_010);
+
+        assert_eq!(
+            inner.deltas.len(),
+            2,
+            "both writes must be incorporated; PART 6 bug regressed"
+        );
+        // Both seqs are in the recent set so a future replay is correctly
+        // deduped.
+        assert!(inner.recent_incorporated_seqs.contains(&hlc(10, 0, 2)));
+        assert!(inner.recent_incorporated_seqs.contains(&hlc(5, 0, 1)));
+    }
+
+    /// A replay of the same seq is a no-op: the recent set dedups it. Exactly
+    /// one delta, set carries the seq exactly once.
+    #[test]
+    fn recent_incorporated_dedups_replay() {
+        let mut inner = fresh_inner();
+        let tenant = org(1);
+        let seq = hlc(7, 0, 1);
+
+        let _ = inner.apply_command_at(&mk_incorporate(tenant, seq), 1, 1_000);
+        assert_eq!(inner.deltas.len(), 1);
+        assert!(inner.recent_incorporated_seqs.contains(&seq));
+
+        // Replay: same seq, different log index. Still a no-op.
+        let _ = inner.apply_command_at(&mk_incorporate(tenant, seq), 2, 1_010);
+        assert_eq!(inner.deltas.len(), 1, "replay must not double the delta");
+        assert_eq!(inner.recent_incorporated_seqs.len(), 1);
+        // The seq appears exactly once in the deque.
+        let count = inner
+            .recent_incorporated
+            .iter()
+            .filter(|e| e.perspective_seq == seq)
+            .count();
+        assert_eq!(count, 1, "seq must appear exactly once in the deque");
+    }
+
+    /// PART 8 Finding AA — an intent below the ancient cutoff is REFUSED with
+    /// an alarm (counter increment), NOT silently dropped. With a tiny
+    /// window-entries cap of 3, four ascending seqs evict the oldest; a fifth
+    /// intent issued at the just-evicted log-index is refused.
+    #[test]
+    fn ancient_cutoff_refuses() {
+        // Unique shard id so the per-shard Prometheus counter doesn't
+        // alias another test that also exercises the ancient path.
+        let mut inner = ShardSmInner::new_with_bounds(
+            ShardId(uuid::Uuid::from_u128(0xABC_AA1)),
+            OrgId(uuid::Uuid::from_u128(0xdef)),
+            3,
+            60_000,
+        );
+        let tenant = org(1);
+        let label = inner.shard_id.0.to_string();
+        let before = dedup_ancient_refused_counter()
+            .with_label_values(&[&label])
+            .get();
+
+        // Drive four ascending seqs at four ascending log indices. The 4th
+        // push evicts the 1st (entry-cap = 3), advancing the cutoff to 1 + 1
+        // = 2 (the evicted entry's log index was 1, so cutoff becomes 2).
+        for i in 1..=4u64 {
+            let mut cmd = mk_incorporate(tenant, hlc(i, 0, 1));
+            if let LogCommand::IncorporateIntent {
+                ref mut hashed_key, ..
+            } = cmd
+            {
+                hashed_key[0] = u8::try_from(i).unwrap_or(0xff);
+            }
+            let _ = inner.apply_command_at(&cmd, i, 1_000 + i);
+        }
+        assert!(
+            inner.ancient_cutoff_log_index >= 2,
+            "cutoff must advance past evicted entry; got {}",
+            inner.ancient_cutoff_log_index
+        );
+        let cutoff = inner.ancient_cutoff_log_index;
+
+        // An ancient intent at log_index strictly below the cutoff is REFUSED
+        // — alarm fires, no delta added.
+        let ancient_log_index = cutoff.saturating_sub(1);
+        let pre_delta_count = inner.deltas.len();
+        let mut ancient = mk_incorporate(tenant, hlc(999, 0, 7));
+        if let LogCommand::IncorporateIntent {
+            ref mut hashed_key, ..
+        } = ancient
+        {
+            *hashed_key = [0xDE; 32];
+        }
+        let _ = inner.apply_command_at(&ancient, ancient_log_index, 2_000);
+
+        assert_eq!(
+            inner.deltas.len(),
+            pre_delta_count,
+            "ancient intent must NOT append a delta"
+        );
+        let after = dedup_ancient_refused_counter()
+            .with_label_values(&[&label])
+            .get();
+        assert_eq!(after, before + 1, "ancient counter must increment");
+    }
+
+    /// With window_entries=3 the 4th apply evicts the 1st; cutoff jumps to
+    /// (evicted.log_index + 1). Strict log-index coupling so a stalled shard's
+    /// window does not silently shrink (Finding Q).
+    #[test]
+    fn window_evicts_oldest_advances_cutoff() {
+        let mut inner = ShardSmInner::new_with_bounds(
+            ShardId(uuid::Uuid::from_u128(0xabc)),
+            OrgId(uuid::Uuid::from_u128(0xdef)),
+            3,
+            60_000,
+        );
+        let tenant = org(1);
+
+        // Apply seq(1)..seq(4) at log indices 10, 11, 12, 13.
+        for (i, log_idx) in (1..=4u64).zip(10..=13u64) {
+            let mut cmd = mk_incorporate(tenant, hlc(i, 0, 1));
+            if let LogCommand::IncorporateIntent {
+                ref mut hashed_key, ..
+            } = cmd
+            {
+                hashed_key[0] = u8::try_from(i).unwrap_or(0xff);
+            }
+            let _ = inner.apply_command_at(&cmd, log_idx, 1_000 + log_idx);
+        }
+
+        assert_eq!(
+            inner.recent_incorporated.len(),
+            3,
+            "window must hold exactly entry-cap"
+        );
+        let seqs: Vec<_> = inner
+            .recent_incorporated
+            .iter()
+            .map(|e| e.perspective_seq)
+            .collect();
+        assert_eq!(seqs, vec![hlc(2, 0, 1), hlc(3, 0, 1), hlc(4, 0, 1)]);
+        // The evicted entry's log_index was 10 → cutoff = 11.
+        assert_eq!(inner.ancient_cutoff_log_index, 11);
+    }
+
+    /// PART 8 §1 — both the cutoff and the recent-incorporated window survive
+    /// a `ShardSnapshot` serde round-trip.
+    #[test]
+    fn snapshot_round_trips_recent_and_cutoff() {
+        let recent = vec![
+            RecentIncorporatedEntry {
+                log_index: 100,
+                perspective_seq: hlc(1, 0, 1),
+                apply_ms: 5_000,
+            },
+            RecentIncorporatedEntry {
+                log_index: 101,
+                perspective_seq: hlc(2, 0, 1),
+                apply_ms: 5_010,
+            },
+        ];
+        let snap = ShardSnapshot {
+            delta_count: 0,
+            tip: 0,
+            maintenance: false,
+            deltas: vec![],
+            watermarks: vec![],
+            shard_id: Some([1u8; 16]),
+            tenant_id: Some([2u8; 16]),
+            ancient_cutoff_log_index: 99,
+            recent_incorporated: recent.clone(),
+        };
+        let bytes = serde_json::to_vec(&snap).unwrap();
+        let loaded: ShardSnapshot = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(loaded.ancient_cutoff_log_index, 99);
+        assert_eq!(loaded.recent_incorporated.len(), 2);
+        assert_eq!(loaded.recent_incorporated[0].perspective_seq, hlc(1, 0, 1));
+        assert_eq!(loaded.recent_incorporated[1].perspective_seq, hlc(2, 0, 1));
+    }
+
+    /// PART 8 §U — a batched `IncorporateIntents` runs each item through the
+    /// same gate as the single variant. With one item already in the recent
+    /// set (dedupe-skip), one fresh, and one ancient, exactly one delta is
+    /// appended, one is skipped, one is refused-with-alarm.
+    #[test]
+    fn batched_incorporate_intents_applies_each_with_gate() {
+        // Unique shard id so the per-shard Prometheus counter is read in
+        // isolation from `ancient_cutoff_refuses` (which uses 0xABC_AA1).
+        let mut inner = ShardSmInner::new_with_bounds(
+            ShardId(uuid::Uuid::from_u128(0xABC_BB2)),
+            OrgId(uuid::Uuid::from_u128(0xdef)),
+            3,
+            60_000,
+        );
+        let tenant = org(1);
+
+        // Pre-seed: apply seqs 1..=4 to advance cutoff past 10.
+        for (i, log_idx) in (1..=4u64).zip(10..=13u64) {
+            let mut cmd = mk_incorporate(tenant, hlc(i, 0, 1));
+            if let LogCommand::IncorporateIntent {
+                ref mut hashed_key, ..
+            } = cmd
+            {
+                hashed_key[0] = u8::try_from(i).unwrap_or(0xff);
+            }
+            let _ = inner.apply_command_at(&cmd, log_idx, 1_000 + log_idx);
+        }
+        // Now cutoff = 11; recent_incorporated holds seqs (2),(3),(4).
+
+        let pre_delta_count = inner.deltas.len();
+        let already_seq = hlc(3, 0, 1); // in the recent set → SKIP
+        let fresh_seq = hlc(50, 0, 1); // not in recent, above cutoff → APPLY
+        let _ancient_seq = hlc(99, 0, 1); // log_index < cutoff → REFUSE
+
+        let batch_cmd = LogCommand::IncorporateIntents {
+            items: vec![
+                IncorporateItem {
+                    tenant_id_bytes: tenant,
+                    operation: 0,
+                    hashed_key: [0x11; 32],
+                    chunk_refs: vec![],
+                    payload: vec![],
+                    has_inline_data: false,
+                    new_chunks: vec![],
+                    perspective_seq: already_seq,
+                },
+                IncorporateItem {
+                    tenant_id_bytes: tenant,
+                    operation: 0,
+                    hashed_key: [0x22; 32],
+                    chunk_refs: vec![],
+                    payload: vec![],
+                    has_inline_data: false,
+                    new_chunks: vec![],
+                    perspective_seq: fresh_seq,
+                },
+                // Ancient: log_index for the WHOLE batch is below the cutoff
+                // (the apply uses the entry's log_index for every item — by
+                // design; ancient detection is keyed on log index). We
+                // simulate ancient by applying the batch at a tiny log index.
+                IncorporateItem {
+                    tenant_id_bytes: tenant,
+                    operation: 0,
+                    hashed_key: [0x33; 32],
+                    chunk_refs: vec![],
+                    payload: vec![],
+                    has_inline_data: false,
+                    new_chunks: vec![],
+                    perspective_seq: hlc(60, 0, 1),
+                },
+            ],
+        };
+        // Apply the whole batch at an ANCIENT log_index < cutoff. Now items
+        // run as: (1) already in set → SKIP; (2) fresh seq + ancient
+        // log_index → REFUSE; (3) fresh seq + ancient log_index → REFUSE.
+        let label = inner.shard_id.0.to_string();
+        let alarm_before = dedup_ancient_refused_counter()
+            .with_label_values(&[&label])
+            .get();
+        let _ = inner.apply_command_at(&batch_cmd, 5, 2_000);
+        // already → no-op, fresh → ancient-refuse, last → ancient-refuse
+        assert_eq!(
+            inner.deltas.len(),
+            pre_delta_count,
+            "no item applied: one already-set, two ancient",
+        );
+        let alarm_after = dedup_ancient_refused_counter()
+            .with_label_values(&[&label])
+            .get();
+        assert_eq!(
+            alarm_after,
+            alarm_before + 2,
+            "two ancient items incremented the alarm counter"
+        );
+
+        // Re-apply the batch at a non-ancient log_index. (1) already → SKIP;
+        // (2) fresh → APPLY; (3) fresh → APPLY.
+        let _ = inner.apply_command_at(&batch_cmd, 100, 2_100);
+        assert_eq!(
+            inner.deltas.len(),
+            pre_delta_count + 2,
+            "two fresh items appended on the non-ancient pass",
+        );
     }
 }

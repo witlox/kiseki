@@ -888,6 +888,7 @@ impl GatewayOps for Nfs4Client {
                 forwarded_from_node: None,
                 comp_id_override: None,
                 tier: None,
+                surface: kiseki_gateway::ops::WriteSurface::Nfs,
             })
             .await?;
         Ok(resp.composition_id)

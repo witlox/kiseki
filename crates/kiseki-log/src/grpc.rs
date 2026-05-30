@@ -100,6 +100,120 @@ pub fn append_chunk_and_delta_request_to_proto(
     }
 }
 
+/// Decode a proto `AppendChunkAndDeltaRequest` into its domain form.
+///
+/// The inverse of [`append_chunk_and_delta_request_to_proto`], factored
+/// out of the `LogService::append_chunk_and_delta` handler so the
+/// ADR-047 durable [`crate::intent::FjallIntentStore`] can round-trip an
+/// intent's built append through the proto wire form without depending
+/// on tonic. Returns `Err(String)` (a human-readable reason) so the
+/// handler can map it to `Status::invalid_argument` while non-tonic
+/// callers (the intent decoder) surface it as a codec error.
+///
+/// # Errors
+/// Returns `Err` with a description when a required field is missing or
+/// a fixed-width field (`shard_id`, `tenant_id`, `hashed_key`,
+/// `chunk_id`, `operation`, `timestamp`) is malformed.
+pub fn proto_to_append_chunk_and_delta(
+    req: ProtoChunkAppendReq,
+) -> Result<crate::traits::AppendChunkAndDeltaRequest, String> {
+    let shard_id = {
+        let s = req.shard_id.ok_or("shard_id required")?;
+        let uuid = uuid::Uuid::parse_str(&s.value).map_err(|e| format!("invalid shard_id: {e}"))?;
+        ShardId(uuid)
+    };
+    let tenant_id = req.tenant_id.ok_or("tenant_id required")?;
+    let org_id =
+        uuid::Uuid::parse_str(&tenant_id.value).map_err(|e| format!("invalid tenant_id: {e}"))?;
+    let operation = proto_op_to_domain_str(req.operation)?;
+    let timestamp = from_proto_timestamp_str(req.timestamp)?;
+    let hashed_key: [u8; 32] = req
+        .hashed_key
+        .try_into()
+        .map_err(|_| "hashed_key must be 32 bytes".to_string())?;
+    let chunk_refs: Vec<ChunkId> = req
+        .chunk_refs
+        .into_iter()
+        .map(|c| {
+            let bytes: [u8; 32] = c
+                .value
+                .try_into()
+                .map_err(|_| "chunk_id must be 32 bytes".to_string())?;
+            Ok(ChunkId(bytes))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let new_chunks: Vec<crate::raft_store::NewChunkMeta> = req
+        .new_chunks
+        .into_iter()
+        .map(|n| {
+            let chunk_id: [u8; 32] = n
+                .chunk_id
+                .try_into()
+                .map_err(|_| "new_chunks.chunk_id must be 32 bytes".to_string())?;
+            Ok(crate::raft_store::NewChunkMeta {
+                chunk_id,
+                placement: n.placement,
+                original_len: n.original_len,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(crate::traits::AppendChunkAndDeltaRequest {
+        delta: crate::traits::AppendDeltaRequest {
+            shard_id,
+            tenant_id: OrgId(org_id),
+            operation,
+            timestamp,
+            hashed_key,
+            chunk_refs,
+            payload: req.payload,
+            has_inline_data: req.has_inline_data,
+        },
+        new_chunks,
+    })
+}
+
+/// `proto_op_to_domain` with a `String` error, for the tonic-free
+/// [`proto_to_append_chunk_and_delta`] decode path.
+fn proto_op_to_domain_str(op: i32) -> Result<crate::delta::OperationType, String> {
+    match op {
+        1 => Ok(crate::delta::OperationType::Create),
+        2 => Ok(crate::delta::OperationType::Update),
+        3 => Ok(crate::delta::OperationType::Delete),
+        4 => Ok(crate::delta::OperationType::Rename),
+        5 => Ok(crate::delta::OperationType::SetAttribute),
+        6 => Ok(crate::delta::OperationType::Finalize),
+        7 => Ok(crate::delta::OperationType::NamespaceCreate),
+        _ => Err(format!("unknown operation type: {op}")),
+    }
+}
+
+/// `from_proto_timestamp` with a `String` error, for the tonic-free
+/// [`proto_to_append_chunk_and_delta`] decode path.
+fn from_proto_timestamp_str(
+    ts: Option<kiseki_proto::v1::DeltaTimestamp>,
+) -> Result<kiseki_common::time::DeltaTimestamp, String> {
+    let ts = ts.ok_or("timestamp required")?;
+    let hlc = ts.hlc.ok_or("timestamp.hlc required")?;
+    let wall = ts.wall.ok_or("timestamp.wall required")?;
+    Ok(kiseki_common::time::DeltaTimestamp {
+        hlc: kiseki_common::time::HybridLogicalClock {
+            physical_ms: hlc.physical_ms,
+            logical: hlc.logical,
+            node_id: kiseki_common::ids::NodeId(hlc.node_id),
+        },
+        wall: kiseki_common::time::WallTime {
+            millis_since_epoch: wall.millis_since_epoch,
+            timezone: wall.timezone,
+        },
+        quality: match ts.quality {
+            2 => kiseki_common::time::ClockQuality::Ptp,
+            3 => kiseki_common::time::ClockQuality::Gps,
+            4 => kiseki_common::time::ClockQuality::Unsync,
+            _ => kiseki_common::time::ClockQuality::Ntp,
+        },
+    })
+}
+
 fn domain_op_to_proto(op: crate::delta::OperationType) -> i32 {
     match op {
         crate::delta::OperationType::Create => 1,
@@ -304,59 +418,7 @@ impl LogService for LogGrpc {
     ) -> Result<Response<AppendDeltaResponse>, Status> {
         let _s = kiseki_tracing::span("LogService.AppendChunkAndDelta");
         let req = request.into_inner();
-        let shard_id = extract_shard_id(req.shard_id)?;
-        let tenant_id = req
-            .tenant_id
-            .ok_or_else(|| Status::invalid_argument("tenant_id required"))?;
-        let org_id = uuid::Uuid::parse_str(&tenant_id.value)
-            .map_err(|e| Status::invalid_argument(format!("invalid tenant_id: {e}")))?;
-        let operation = proto_op_to_domain(req.operation)?;
-        let timestamp = from_proto_timestamp(req.timestamp)?;
-        let hashed_key: [u8; 32] = req
-            .hashed_key
-            .try_into()
-            .map_err(|_| Status::invalid_argument("hashed_key must be 32 bytes"))?;
-        let chunk_refs: Vec<ChunkId> = req
-            .chunk_refs
-            .into_iter()
-            .map(|c| {
-                let bytes: [u8; 32] = c
-                    .value
-                    .try_into()
-                    .map_err(|_| "chunk_id must be 32 bytes")?;
-                Ok(ChunkId(bytes))
-            })
-            .collect::<Result<Vec<_>, &str>>()
-            .map_err(Status::invalid_argument)?;
-        let new_chunks: Vec<crate::raft_store::NewChunkMeta> = req
-            .new_chunks
-            .into_iter()
-            .map(|n| {
-                let chunk_id: [u8; 32] = n
-                    .chunk_id
-                    .try_into()
-                    .map_err(|_| "new_chunks.chunk_id must be 32 bytes")?;
-                Ok(crate::raft_store::NewChunkMeta {
-                    chunk_id,
-                    placement: n.placement,
-                    original_len: n.original_len,
-                })
-            })
-            .collect::<Result<Vec<_>, &str>>()
-            .map_err(Status::invalid_argument)?;
-        let domain_req = crate::traits::AppendChunkAndDeltaRequest {
-            delta: crate::traits::AppendDeltaRequest {
-                shard_id,
-                tenant_id: OrgId(org_id),
-                operation,
-                timestamp,
-                hashed_key,
-                chunk_refs,
-                payload: req.payload,
-                has_inline_data: req.has_inline_data,
-            },
-            new_chunks,
-        };
+        let domain_req = proto_to_append_chunk_and_delta(req).map_err(Status::invalid_argument)?;
         let seq = self
             .ops
             .append_chunk_and_delta(domain_req)
