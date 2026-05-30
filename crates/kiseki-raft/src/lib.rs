@@ -68,6 +68,6 @@ pub use node::{KisekiNode, Topology};
 pub use tcp_transport::{
     classify_network_error, run_single_raft_group_listener, DispatchOutcome, DispatchStatus,
     NetworkErrorKind, RaftRpcListener, RegistryHandle, TcpNetwork, TcpNetworkFactory,
-    MAX_RAFT_RPC_SIZE, RAFT_TRANSPORT_PER_PEER_MAX, RAFT_TRANSPORT_VERSION_V1,
+    MAX_RAFT_RPC_SIZE, RAFT_TRANSPORT_PER_PEER_MAX_DEFAULT, RAFT_TRANSPORT_VERSION_V1,
     RESERVED_VERSION_BYTES, WIRE_FRAME_OVERHEAD_RESERVED,
 };

@@ -74,10 +74,23 @@ pub const RESERVED_VERSION_BYTES: [u8; 3] = [0x5b, 0x7b, 0x22];
 /// at the cap fits the framed wire (ADR-041 gate-1 F-M3).
 pub const WIRE_FRAME_OVERHEAD_RESERVED: usize = 1024;
 
-/// Maximum concurrent inbound TCP connections per peer cert
+/// Default maximum concurrent inbound TCP connections per peer cert
 /// fingerprint. Mitigates connection-flood DoS amplified by the
-/// single-port multiplexing (ADR-041 gate-1 F-M5).
-pub const RAFT_TRANSPORT_PER_PEER_MAX: u32 = 16;
+/// single-port multiplexing (ADR-041 gate-1 F-M5). Override with
+/// `KISEKI_RAFT_PER_PEER_MAX` for cluster sizes/shard counts that
+/// legitimately exceed the default.
+pub const RAFT_TRANSPORT_PER_PEER_MAX_DEFAULT: u32 = 16;
+
+/// Resolve the runtime per-peer cap from `KISEKI_RAFT_PER_PEER_MAX`,
+/// falling back to [`RAFT_TRANSPORT_PER_PEER_MAX_DEFAULT`]. Read once
+/// per accept so an operator can tune without a restart.
+fn per_peer_cap() -> u32 {
+    std::env::var("KISEKI_RAFT_PER_PEER_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(RAFT_TRANSPORT_PER_PEER_MAX_DEFAULT)
+}
 
 // ---------------------------------------------------------------------------
 // Response status — ADR-041 §"Response frame"
@@ -825,13 +838,19 @@ impl RaftRpcListener {
             let peer_key = peer_addr.ip().to_string();
             let metrics = self.metrics.clone();
 
-            // Per-peer cap (gate-1 F-M5).
+            // Per-peer cap (gate-1 F-M5). Skipped for loopback: the cap
+            // protects against external connection-flood DoS, but on
+            // loopback the meter key (peer IP) collapses every local
+            // process's connections into one bucket, so dev/test
+            // multi-node-on-127.0.0.1 trips the cap before the cluster
+            // can do useful work. Real peers (≠ loopback) still meter.
             let counter = per_peer
                 .entry(peer_key.clone())
                 .or_insert_with(|| AtomicU32::new(0));
             let active = counter.fetch_add(1, Ordering::Relaxed) + 1;
             drop(counter);
-            if active > RAFT_TRANSPORT_PER_PEER_MAX {
+            let cap_applies = !peer_addr.ip().is_loopback();
+            if cap_applies && active > per_peer_cap() {
                 if let Some(c) = per_peer.get(&peer_key) {
                     c.fetch_sub(1, Ordering::Relaxed);
                 }

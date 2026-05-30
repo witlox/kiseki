@@ -38,7 +38,7 @@ use super::connection::serve_connection;
 use super::principal::TcpFramedPrincipal;
 
 /// Maximum concurrent inbound connections per peer IP. Same shape
-/// as [`kiseki_raft::tcp_transport::RAFT_TRANSPORT_PER_PEER_MAX`];
+/// as [`kiseki_raft::tcp_transport::RAFT_TRANSPORT_PER_PEER_MAX_DEFAULT`];
 /// docked so a single misbehaving peer can't soak up all
 /// connection slots. Configurable via [`TcpFramedListener::with_per_peer_cap`].
 ///
