@@ -464,19 +464,31 @@ async fn rpc_call_tls<Req: Serialize, Resp: DeserializeOwned>(
     rpc_exchange(&mut tls_stream, shard_id, tag, req).await
 }
 
-/// Send one request/response RPC to `addr` for `shard_id` under `tag`,
-/// connecting fresh (no pooling). Plaintext when `tls_config` is `None`,
-/// otherwise mTLS. The request is postcard-encoded and the `Ok` response
-/// body is postcard-decoded against `Resp`.
+/// Send one request/response RPC to `addr` for `shard_id` under `tag`
+/// over a **pooled, long-lived peer connection** (per
+/// `specs/escalations/2026-05-30-decoupled-ack-perf-10x-analysis.md`
+/// finding: 93 % of localhost `pif.leader_first_hop` round-trip was
+/// fresh-`TcpStream::connect` overhead, not actual server work).
+/// Plaintext when `tls_config` is `None`, otherwise mTLS — the inner
+/// `rpc_call_plain` / `rpc_call_tls` helpers remain available for
+/// callers that genuinely want a fresh connection per call.
+///
+/// The pool holds [`raft_pool_size_per_peer()`] slots per
+/// `(addr, tls?)` key; slots reconnect lazily on first use or after
+/// any I/O error. The server side already supports keep-alive (see
+/// [`handle_one_connection`] looping [`serve_one_request`]) — no
+/// wire-format change.
 ///
 /// This is the call seam ADR-047's `TransportIntentGatherer` uses to
-/// reach a peer's auxiliary (non-Raft) `IntentSync` dispatcher — the same
-/// wire path the Raft `vote` / `full_snapshot` calls take.
+/// reach a peer's auxiliary (non-Raft) `IntentSync` dispatcher — the
+/// same wire path the Raft `vote` / `full_snapshot` calls take.
 ///
 /// # Errors
 /// Returns an `io::Error` on connect/transport failure or when the peer
 /// answers with a non-`Ok` status (`UnknownShard` / `ParseError` /
-/// `DispatcherPanic`); classify it with [`classify_network_error`].
+/// `DispatcherPanic`); classify it with [`classify_network_error`]. On
+/// any error the slot's connection is dropped and the next call to that
+/// slot reconnects.
 pub async fn rpc_call<Req: Serialize, Resp: DeserializeOwned>(
     addr: &str,
     shard_id: ShardId,
@@ -484,10 +496,155 @@ pub async fn rpc_call<Req: Serialize, Resp: DeserializeOwned>(
     tls_config: Option<&Arc<rustls::ClientConfig>>,
     req: &Req,
 ) -> io::Result<Resp> {
-    match tls_config {
-        Some(tls) => rpc_call_tls(addr, shard_id, tag, tls, req).await,
-        None => rpc_call_plain(addr, shard_id, tag, req).await,
+    let pool = get_or_create_peer_pool(addr, tls_config);
+    pool.rpc(shard_id, tag, req).await
+}
+
+// ---------------------------------------------------------------------------
+// Peer connection pool — fix for the localhost `pif.leader_first_hop`
+// 93 %-queue-time finding on the n=6 trace (see escalation 2026-05-30).
+// ---------------------------------------------------------------------------
+
+/// One persistent connection in a [`PeerConnPool`] slot. Enum'd so the
+/// pool doesn't need to box a trait object: monomorphised dispatch into
+/// [`rpc_exchange`] keeps the hot path inline.
+enum PooledStream {
+    Plain(TcpStream),
+    // `TlsStream<TcpStream>` is ~1 KiB on the stack (rustls connection
+    // state + buffers); boxing it keeps the enum a normal 8-byte tag +
+    // pointer for the plaintext-localhost hot path. `clippy::large_enum_variant`.
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+/// Per-peer pool of N long-lived TCP/TLS connections. Picked
+/// round-robin by [`Self::rpc`]; each slot serialises its own RPCs
+/// behind a [`tokio::sync::Mutex`] so we stay wire-compatible with the
+/// existing one-frame-at-a-time listener loop without needing
+/// request-id demultiplexing.
+struct PeerConnPool {
+    addr: String,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
+    slots: Vec<tokio::sync::Mutex<Option<PooledStream>>>,
+    next: AtomicU32,
+}
+
+impl PeerConnPool {
+    fn new(addr: String, tls_config: Option<Arc<rustls::ClientConfig>>, slot_count: usize) -> Self {
+        let slots = (0..slot_count)
+            .map(|_| tokio::sync::Mutex::new(None))
+            .collect();
+        Self {
+            addr,
+            tls_config,
+            slots,
+            next: AtomicU32::new(0),
+        }
     }
+
+    async fn dial(&self) -> io::Result<PooledStream> {
+        let tcp = TcpStream::connect(&self.addr).await?;
+        let _ = tcp.set_nodelay(true);
+        match &self.tls_config {
+            None => Ok(PooledStream::Plain(tcp)),
+            Some(cfg) => {
+                let connector = tokio_rustls::TlsConnector::from(Arc::clone(cfg));
+                let ip: std::net::IpAddr = self
+                    .addr
+                    .split(':')
+                    .next()
+                    .and_then(|h| h.parse().ok())
+                    .ok_or_else(|| {
+                        network_error(NetworkErrorKind::Transport, "invalid Raft peer address")
+                    })?;
+                let server_name = ServerName::IpAddress(ip.into());
+                let tls = connector
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(|e| network_error(NetworkErrorKind::Transport, e))?;
+                Ok(PooledStream::Tls(Box::new(tls)))
+            }
+        }
+    }
+
+    async fn rpc<Req: Serialize, Resp: DeserializeOwned>(
+        &self,
+        shard_id: ShardId,
+        tag: &str,
+        req: &Req,
+    ) -> io::Result<Resp> {
+        // Round-robin slot pick. `fetch_add(_, Relaxed)` is enough — we
+        // tolerate hot-collisions on a slot; the per-slot mutex serialises.
+        let idx = (self.next.fetch_add(1, Ordering::Relaxed) as usize) % self.slots.len();
+        let mut guard = self.slots[idx].lock().await;
+
+        // Cancel-safe pattern: TAKE the stream out of the slot for the
+        // RPC; only PUT it back on success. If the caller's outer future
+        // is cancelled mid-`rpc_exchange`, the local `stream` is dropped
+        // (closing the TCP), the slot stays `None`, and the next caller
+        // reconnects — never a desync'd reuse.
+        let mut stream = match guard.take() {
+            Some(s) => s,
+            None => self.dial().await?,
+        };
+
+        maybe_inject_fake_rtt().await;
+        let result = match &mut stream {
+            PooledStream::Plain(s) => rpc_exchange(s, shard_id, tag, req).await,
+            PooledStream::Tls(s) => rpc_exchange(s, shard_id, tag, req).await,
+        };
+        if result.is_ok() {
+            *guard = Some(stream);
+        }
+        // On error: `stream` is dropped here, closing the TCP. Slot stays
+        // `None` → next caller reconnects.
+        result
+    }
+}
+
+/// Slot count per peer for the Raft transport connection pool. Read once
+/// per process via `OnceLock`. Default `16` matches the per-peer inbound
+/// cap [`RAFT_TRANSPORT_PER_PEER_MAX_DEFAULT`] — the client's outbound
+/// pool size doesn't need to exceed what the server side accepts. Tune
+/// up with `KISEKI_RAFT_CONN_POOL_PER_PEER` for very high concurrency
+/// (the fan-out in a leaderless quorum producer scales with bench
+/// `--concurrency` × shard count); tune down with `1` to force serial
+/// per-peer RPCs for diagnostics.
+fn raft_pool_size_per_peer() -> usize {
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("KISEKI_RAFT_CONN_POOL_PER_PEER")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(RAFT_TRANSPORT_PER_PEER_MAX_DEFAULT as usize)
+    })
+}
+
+/// Process-wide registry of [`PeerConnPool`]s, keyed by
+/// `(addr, tls_present)` so a peer reachable via both plaintext and TLS
+/// in the same process (test-only today, but cheap to be safe) gets one
+/// pool per scheme.
+static PEER_POOLS: OnceLock<DashMap<(String, bool), Arc<PeerConnPool>>> = OnceLock::new();
+
+fn get_or_create_peer_pool(
+    addr: &str,
+    tls_config: Option<&Arc<rustls::ClientConfig>>,
+) -> Arc<PeerConnPool> {
+    let pools = PEER_POOLS.get_or_init(DashMap::new);
+    let key = (addr.to_string(), tls_config.is_some());
+    if let Some(p) = pools.get(&key) {
+        return Arc::clone(&p);
+    }
+    let pool = Arc::new(PeerConnPool::new(
+        addr.to_string(),
+        tls_config.cloned(),
+        raft_pool_size_per_peer(),
+    ));
+    pools
+        .entry(key)
+        .or_insert_with(|| Arc::clone(&pool))
+        .value()
+        .clone()
 }
 
 fn to_rpc_error<C: RaftTypeConfig>(e: io::Error) -> RPCError<C> {
