@@ -256,7 +256,7 @@ fn xdr_err(e: &std::io::Error) -> GatewayError {
 /// trip fails. We tolerate `NFS4ERR_BAD_STATEID` at the CLOSE op
 /// level — the compound's top-level status is what matters.
 /// Run a PUTROOTFH+LOOKUP(name)+GETFH compound to recover the real
-/// composition_id from the post-flush directory entry. Returns
+/// `composition_id` from the post-flush directory entry. Returns
 /// `None` on any compound short-circuit (NOENT, etc.) so the caller
 /// can fall back to the pre-flush placeholder.
 fn recover_composition_id_via_lookup(
@@ -622,6 +622,7 @@ impl Nfs4Client {
 
 #[async_trait::async_trait]
 impl GatewayOps for Nfs4Client {
+    #[allow(clippy::too_many_lines)] // OPEN+WRITE+COMMIT+GETFH compound + post-flush LOOKUP, single-purpose
     async fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError> {
         let mut guard = self.ensure_session().await?;
         let sess = guard

@@ -157,6 +157,7 @@ fn xdr_err(e: &std::io::Error) -> GatewayError {
 
 #[async_trait::async_trait]
 impl GatewayOps for Nfs3Client {
+    #[allow(clippy::too_many_lines)] // CREATE+WRITE+COMMIT+LOOKUP wire choreography, single-purpose
     async fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError> {
         let root_fh = self.ensure_root_fh().await?;
         let mut guard = self.ensure_transport().await?;
