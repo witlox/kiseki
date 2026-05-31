@@ -207,6 +207,8 @@ fn write_req(surface: WriteSurface, data: Vec<u8>) -> WriteRequest {
         comp_id_override: None,
         tier: None,
         surface,
+        base_composition_id: None,
+        base_bytes: 0,
     }
 }
 

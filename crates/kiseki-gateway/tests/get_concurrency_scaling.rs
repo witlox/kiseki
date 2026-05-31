@@ -83,6 +83,8 @@ async fn build_warm_gateway() -> (Arc<InMemoryGateway>, CompositionId) {
             comp_id_override: None,
             tier: None,
             surface: kiseki_gateway::WriteSurface::S3,
+            base_composition_id: None,
+            base_bytes: 0,
         })
         .await
         .expect("warm-put");

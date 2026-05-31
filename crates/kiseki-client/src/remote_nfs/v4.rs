@@ -952,6 +952,10 @@ impl GatewayOps for Nfs4Client {
                 comp_id_override: None,
                 tier: None,
                 surface: kiseki_gateway::ops::WriteSurface::Nfs,
+                // #146 — multipart-assembled NFSv4 write commits the
+                // full body at once; no pNFS DS chain.
+                base_composition_id: None,
+                base_bytes: 0,
             })
             .await?;
         Ok(resp.composition_id)

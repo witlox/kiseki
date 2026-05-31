@@ -196,6 +196,8 @@ async fn given_composition_with_size(
         comp_id_override: None,
         tier: None,
         surface: kiseki_gateway::ops::WriteSurface::Nfs,
+        base_composition_id: None,
+        base_bytes: 0,
     };
     let resp = kiseki_gateway::ops::GatewayOps::write(&*world.legacy.gateway, req)
         .await

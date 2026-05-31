@@ -736,6 +736,8 @@ async fn when_client_reads_writes(w: &mut KisekiWorld, _comp: String) {
             comp_id_override: None,
             tier: None,
             surface: kiseki_gateway::ops::WriteSurface::S3,
+            base_composition_id: None,
+            base_bytes: 0,
         })
         .await
         .expect("data-path write must succeed despite advisory outage");

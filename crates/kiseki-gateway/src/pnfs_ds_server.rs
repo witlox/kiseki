@@ -558,6 +558,7 @@ async fn op_read_ds<G: GatewayOps + Send + Sync + 'static>(
 /// write buffer (ADR-038 rev 3 §D5). On overflow returns
 /// `NFS4ERR_NOSPC`; the kernel pNFS client recovers by issuing
 /// COMMIT-then-OPEN-then-WRITE.
+#[allow(clippy::too_many_lines)]
 async fn op_write_ds<G: GatewayOps + Send + Sync + 'static>(
     reader: &mut XdrReader<'_>,
     ctx: &DsContext<G>,
@@ -587,13 +588,59 @@ async fn op_write_ds<G: GatewayOps + Send + Sync + 'static>(
         stripe_base.saturating_add(offset)
     };
 
-    match ctx.write_buffers.buffer_write(
+    // #146 — first attempt the WRITE; if the buffer cap is hit,
+    // perform an INLINE auto-drain (snapshot + gateway.write +
+    // record_redirect + drain_post_commit), then retry the WRITE.
+    // The kernel pNFS client does NOT issue COMMIT on
+    // NFS4ERR_NOSPC — it returns the error to userspace — so the
+    // server has to be the one to drain. With this inline drain
+    // the cap-hit path collapses to "the WRITE takes a few extra
+    // ms (one gateway.write round-trip) instead of failing." All
+    // bytes are preserved via the chain anchor; no kernel COMMIT
+    // is required to make sustained writes work.
+    let mut result = ctx.write_buffers.buffer_write(
         fh.composition_id,
         fh.tenant_id,
         fh.namespace_id,
         abs_offset,
         &data,
-    ) {
+    );
+    if let BufferWriteResult::Nospc {
+        current, cap, ..
+    } = result
+    {
+        tracing::debug!(
+            composition_id = ?fh.composition_id,
+            current_bytes = current,
+            cap_bytes = cap,
+            "DS WRITE hit per-composition buffer cap — auto-draining (#146)",
+        );
+        match flush_buffer_to_gateway(ctx, fh).await {
+            Ok(()) => {
+                // Retry the WRITE — the buffer is now empty with the
+                // chain anchor advanced; this WRITE lands at relative
+                // offset 0 of the freshly-empty buffer.
+                result = ctx.write_buffers.buffer_write(
+                    fh.composition_id,
+                    fh.tenant_id,
+                    fh.namespace_id,
+                    abs_offset,
+                    &data,
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    composition_id = ?fh.composition_id,
+                    error = ?e,
+                    "DS WRITE auto-drain (#146) gateway.write failed — \
+                     surfacing IO error so the client retries cleanly",
+                );
+                w.write_u32(nfs4_status::NFS4ERR_IO);
+                return (nfs4_status::NFS4ERR_IO, w.into_bytes());
+            }
+        }
+    }
+    match result {
         BufferWriteResult::Accepted => {
             #[allow(clippy::cast_possible_truncation)]
             let count = data.len() as u32;
@@ -626,17 +673,108 @@ async fn op_write_ds<G: GatewayOps + Send + Sync + 'static>(
             cap,
             requested,
         } => {
-            tracing::debug!(
+            // Reached only if the auto-drain ABOVE succeeded yet the
+            // retried WRITE still overflows — i.e. a single WRITE
+            // larger than the cap. Surface NOSPC; the kernel will
+            // return EFBIG/ENOSPC to userspace.
+            tracing::warn!(
                 composition_id = ?fh.composition_id,
                 current_bytes = current,
                 cap_bytes = cap,
                 requested_bytes = requested,
-                "DS WRITE rejected NOSPC — per-composition buffer cap hit"
+                "DS WRITE rejected NOSPC after auto-drain — single \
+                 WRITE > buffer cap (#146)"
             );
             w.write_u32(nfs4_status::NFS4ERR_NOSPC);
             (nfs4_status::NFS4ERR_NOSPC, w.into_bytes())
         }
+        BufferWriteResult::BackwardWriteUnsupported {
+            offset: o,
+            base_bytes,
+        } => {
+            // #146 — WRITE at offset < the buffer's drain boundary
+            // would require patching a previously-committed
+            // composition's chunks. We don't have a patch-composition
+            // primitive yet (sequential workloads — fio --rw=write,
+            // append-only NFS — never hit this case). Map to NOSPC
+            // so the kernel surfaces an error rather than silently
+            // dropping the WRITE. Track as a discrete counter so
+            // production can spot a workload that needs the patch
+            // primitive built.
+            tracing::warn!(
+                composition_id = ?fh.composition_id,
+                offset = o,
+                base_bytes,
+                "DS WRITE rejected — backward overwrite of drained region \
+                 not supported (#146 follow-up)"
+            );
+            crate::pnfs_write_buffer::ds_write_bytes_total()
+                .with_label_values(&["rejected_backward"])
+                .inc_by(u64::try_from(data.len()).unwrap_or(0));
+            w.write_u32(nfs4_status::NFS4ERR_NOSPC);
+            (nfs4_status::NFS4ERR_NOSPC, w.into_bytes())
+        }
     }
+}
+
+/// #146 — flush the in-memory buffer for `fh.composition_id` to a new
+/// composition via `gateway.write`, record the redirect, and drain
+/// the buffer. Shared by `op_commit_ds` (the kernel-driven path) and
+/// `op_write_ds` (the inline auto-drain path that fires when the
+/// per-composition cap is hit — the kernel pNFS client does NOT issue
+/// COMMIT on `NFS4ERR_NOSPC`, so the server must drain on its own).
+///
+/// Returns `Ok(())` when the buffer was empty (no-op) or successfully
+/// flushed; `Err(GatewayError)` if `gateway.write` failed. The buffer
+/// is only drained on success — a failed flush leaves the buffer
+/// intact so the kernel can retry without losing bytes.
+async fn flush_buffer_to_gateway<G: GatewayOps + Send + Sync + 'static>(
+    ctx: &DsContext<G>,
+    fh: &PnfsFileHandle,
+) -> Result<(), crate::error::GatewayError> {
+    let Some(entry) = ctx.write_buffers.snapshot_for_commit(fh.composition_id) else {
+        // No buffered writes — nothing to do.
+        return Ok(());
+    };
+    let bound_name = ctx
+        .mds_layout_manager
+        .as_ref()
+        .and_then(|m| m.composition_name(fh.composition_id));
+    let base_composition_id = entry.base_composition_id;
+    let base_bytes = entry.base_bytes;
+    let delta_bytes = u64::try_from(entry.data.len()).unwrap_or(0);
+    let req = crate::ops::WriteRequest {
+        tenant_id: entry.tenant_id,
+        namespace_id: entry.namespace_id,
+        data: entry.data,
+        name: bound_name,
+        conditional: None,
+        workflow_ref: None,
+        idempotency_key: None,
+        forwarded_from_node: None,
+        comp_id_override: None,
+        tier: None,
+        surface: crate::ops::WriteSurface::Nfs,
+        base_composition_id,
+        base_bytes,
+    };
+    let resp = ctx.block_gateway(ctx.gateway.write(req))?;
+    ctx.write_buffers
+        .record_redirect(fh.composition_id, resp.composition_id);
+    ctx.write_buffers.drain_post_commit(
+        fh.composition_id,
+        resp.composition_id,
+        base_bytes.saturating_add(delta_bytes),
+    );
+    tracing::debug!(
+        original = ?fh.composition_id,
+        current = ?resp.composition_id,
+        base_bytes,
+        delta_bytes,
+        total_bytes = resp.bytes_written,
+        "DS flush_buffer_to_gateway: drained buffer + chained (#146)",
+    );
+    Ok(())
 }
 
 /// op::COMMIT handler — drains the per-composition write buffer and
@@ -665,69 +803,31 @@ async fn op_commit_ds<G: GatewayOps + Send + Sync + 'static>(
         return (nfs4_status::NFS4ERR_NOFILEHANDLE, w.into_bytes());
     };
 
-    // #74 — Snapshot the buffer instead of draining it. Linux NFSv4.1
-    // + `O_DIRECT` issues COMMIT after each 1 MiB WRITE; if we drained
-    // the per-composition buffer here, the next COMMIT's new
-    // composition would contain only the latest 1 MiB of bytes (with
-    // zeros at lower offsets), and the redirect would point at it —
-    // silent data loss for prior bytes. With `snapshot_for_commit`
-    // the buffer stays alive across COMMITs; each COMMIT's
-    // `gateway.write` writes the full accumulated content; the
-    // redirect always points at a composition containing every byte
-    // written through this fh. Buffer drains on session/client
-    // teardown via `clear_all` (called from `op_destroy_session_ds`
-    // / `op_destroy_clientid_ds`).
-    let Some(entry) = ctx.write_buffers.snapshot_for_commit(fh.composition_id) else {
-        // No buffered writes for this composition — nothing to flush.
-        // Reads-only path; reply OK with the fixed writeverf (RFC 8435
-        // tightly_coupled mode permits — durability via the underlying
-        // Raft log).
+    // #146 — short-circuit when the buffer is empty. With the
+    // inline auto-drain in `op_write_ds` the buffer drains BEFORE
+    // a kernel COMMIT arrives; subsequent COMMITs on the same fh
+    // hit this no-op branch (no buffered bytes ⇒ no gateway round-
+    // trip needed). Reads-only path also lands here.
+    if ctx
+        .write_buffers
+        .snapshot_for_commit(fh.composition_id)
+        .is_none_or(|e| e.data.is_empty())
+    {
         crate::pnfs_write_buffer::ds_commit_total()
             .with_label_values(&["no_buffer"])
             .inc();
         w.write_u32(nfs4_status::NFS4_OK);
         w.write_opaque_fixed(&[0u8; 8]); // writeverf4
         return (nfs4_status::NFS4_OK, w.into_bytes());
-    };
+    }
 
-    // #127 (pNFS half): name the composition we mint with the filename
-    // the MDS stamped onto the layout at OPEN/LAYOUTGET (keyed by the
-    // pre-COMMIT placeholder composition_id, which is `fh.composition_id`
-    // here). Passing it through `WriteRequest::name` rides the Create
-    // delta → hydrator name_insert → replicated to every node, so the
-    // file is resolvable by name (and cross-node), not just by UUID.
-    let bound_name = ctx
-        .mds_layout_manager
-        .as_ref()
-        .and_then(|m| m.composition_name(fh.composition_id));
-    let req = crate::ops::WriteRequest {
-        tenant_id: entry.tenant_id,
-        namespace_id: entry.namespace_id,
-        data: entry.data,
-        name: bound_name,
-        conditional: None,
-        workflow_ref: None,
-        idempotency_key: None,
-        forwarded_from_node: None,
-        comp_id_override: None,
-        tier: None,
-        // ADR-047: pNFS DS COMMIT flush is POSIX close-to-open (ADR-013)
-        // — NEVER decoupled; always synchronous.
-        surface: crate::ops::WriteSurface::Nfs,
-    };
-    let status = match ctx.block_gateway(ctx.gateway.write(req)) {
-        Ok(resp) => {
-            ctx.write_buffers
-                .record_redirect(fh.composition_id, resp.composition_id);
+    // Buffer has bytes — flush them via the shared helper. Records
+    // redirect, drains the buffer, advances the chain anchor.
+    let status = match flush_buffer_to_gateway(ctx, fh).await {
+        Ok(()) => {
             crate::pnfs_write_buffer::ds_commit_total()
                 .with_label_values(&["ok"])
                 .inc();
-            tracing::debug!(
-                original = ?fh.composition_id,
-                current = ?resp.composition_id,
-                bytes = resp.bytes_written,
-                "DS COMMIT flushed buffer to new composition"
-            );
             w.write_u32(nfs4_status::NFS4_OK);
             w.write_opaque_fixed(&[0u8; 8]); // writeverf4
             nfs4_status::NFS4_OK
@@ -824,6 +924,20 @@ mod tests {
         /// Last `WriteRequest::name` seen — lets the #127 pNFS-half test
         /// assert the DS COMMIT named the composition it minted.
         last_name: std::sync::Mutex<Option<String>>,
+        /// #146 — every (base_composition_id, base_bytes, delta_len)
+        /// triple seen on `write`, in order. Lets the per-commit-
+        /// chain tests verify that COMMITs after a drain pass the
+        /// prior composition as the base and the delta as the new
+        /// data, AND that the gateway sees a cumulatively-growing
+        /// total size (= base_bytes + data.len()).
+        chain_calls: std::sync::Mutex<Vec<ChainCallRecord>>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ChainCallRecord {
+        base: Option<kiseki_common::ids::CompositionId>,
+        base_bytes: u64,
+        delta_len: u64,
     }
 
     #[async_trait::async_trait]
@@ -845,15 +959,34 @@ mod tests {
         ) -> Result<crate::ops::WriteResponse, crate::error::GatewayError> {
             let n = self.writes.fetch_add(1, Ordering::SeqCst);
             *self.last_name.lock().expect("last_name") = req.name.clone();
+            // #146 — record the chain triple so per-commit-chain tests
+            // can verify that COMMITs after a drain pass the prior comp
+            // as the base, and the cumulative size grows as expected.
+            self.chain_calls
+                .lock()
+                .expect("chain_calls")
+                .push(ChainCallRecord {
+                    base: req.base_composition_id,
+                    base_bytes: req.base_bytes,
+                    delta_len: u64::try_from(req.data.len()).unwrap_or(0),
+                });
             // Derive a deterministic new composition_id from the write
             // counter so round-trip tests can assert on the redirect.
             let mut bytes = [0u8; 16];
             bytes[0..8].copy_from_slice(&(n + 1).to_le_bytes());
             bytes[8] = 0xc0;
             bytes[9] = 0xde;
+            // #146 — `bytes_written` reflects the FINAL composition
+            // size (base + delta), mirroring the real gateway's
+            // `WriteResponse` contract. For non-chain calls
+            // (`base_bytes == 0`) this is equivalent to the legacy
+            // shape.
+            let total = req
+                .base_bytes
+                .saturating_add(u64::try_from(req.data.len()).unwrap_or(0));
             Ok(crate::ops::WriteResponse {
                 composition_id: kiseki_common::ids::CompositionId(uuid::Uuid::from_bytes(bytes)),
-                bytes_written: u64::try_from(req.data.len()).unwrap_or(0),
+                bytes_written: total,
             })
         }
     }
@@ -866,6 +999,7 @@ mod tests {
                 writes: AtomicU64::new(0),
                 fixed_response: vec![0xee; 4096],
                 last_name: std::sync::Mutex::new(None),
+                chain_calls: std::sync::Mutex::new(Vec::new()),
             }),
             mac_key: key.clone(),
             stripe_size_bytes: 1_048_576,
@@ -1141,13 +1275,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn commit_writes_to_gateway_keeps_buffer_alive_records_redirect() {
-        // #74 — COMMIT writes the buffer contents through `gateway.write`
-        // and records a redirect, BUT does NOT drain the buffer. The
-        // buffer stays alive across COMMITs so the per-1-MiB-COMMIT
-        // pattern from Linux `O_DIRECT` doesn't lose bytes between
-        // commits (covered by `per_commit_pattern_preserves_all_writes`
-        // below).
+    async fn commit_writes_to_gateway_drains_buffer_records_redirect_and_chain_anchor() {
+        // #146 — COMMIT writes the buffer contents through
+        // `gateway.write`, records a redirect, AND drains the in-memory
+        // buffer (data: Vec::new(), base_composition_id: Some(new_cid),
+        // base_bytes: drained_size). This is the F-1 wedge fix: the
+        // 256-MiB-per-composition cap no longer accumulates forever;
+        // each COMMIT clears it. The #74 cumulative-content property
+        // is preserved by the chain — the next COMMIT's WriteRequest
+        // carries `base_composition_id = Some(new_cid)` so the new
+        // composition still references every byte ever written
+        // through this fh.
         let (ctx, key) = make_ctx();
         let fh = issue_fh(&key, 9_999_999, 0);
         let original_cid = fh.composition_id;
@@ -1167,33 +1305,41 @@ mod tests {
         assert_eq!(st, nfs4_status::NFS4_OK);
         assert_eq!(ctx.gateway.writes.load(Ordering::SeqCst), 1);
 
-        // #74 — buffer stays alive after COMMIT.
+        // #146 — buffer DRAINS after COMMIT (was: stayed alive).
         assert_eq!(
             ctx.write_buffers.total_bytes(),
-            11,
-            "buffer must survive COMMIT so subsequent COMMITs include prior bytes (#74)"
+            0,
+            "buffer must drain on COMMIT — chain anchor preserves cumulative content (#146)"
         );
 
-        // Redirect recorded: original_cid → new composition (whatever
-        // TrackingGateway::write minted, write count = 1).
+        // The first COMMIT had no chain (no prior drain), so the
+        // gateway saw `base_composition_id: None, base_bytes: 0,
+        // delta_len: 11`.
+        let calls = ctx.gateway.chain_calls.lock().expect("chain_calls").clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0],
+            ChainCallRecord {
+                base: None,
+                base_bytes: 0,
+                delta_len: 11,
+            },
+            "first COMMIT has no chain anchor"
+        );
+
+        // Redirect recorded: original_cid → new composition.
         let resolved = ctx.write_buffers.resolve(original_cid);
         assert_ne!(
             resolved, original_cid,
             "redirect must point at new composition"
         );
 
-        // Subsequent READ on the OLD fh4: the read path resolves
-        // fh.composition_id through the redirect (to the new
-        // composition), then queries the buffer using the RESOLVED id.
-        // The buffer is keyed on the ORIGINAL id, so the lookup misses
-        // and gateway.read is invoked with the resolved id — which is
-        // the just-committed composition that has the bytes. Correct
-        // and intentional: post-COMMIT reads land on the durable
-        // gateway state, not the volatile in-memory buffer.
-        //
-        // The fact that the buffer remains alive (asserted above via
-        // total_bytes) is what matters for #74: the NEXT COMMIT will
-        // include the prior bytes.
+        // Post-COMMIT read goes through gateway.read on the resolved
+        // (post-commit) composition_id — the buffer is empty, so the
+        // local read fast-path returns nothing and `op_read_ds` falls
+        // through to gateway.read. Same observable behavior as before
+        // (#74 era) but for the new reason: the buffer is genuinely
+        // empty rather than keyed-on-an-orig-id-that-misses.
         let read = read_args(0, 11);
         let mut r = XdrReader::new(&read);
         let (st, _) = op_read_ds(&mut r, &ctx, &state).await;
@@ -1238,6 +1384,7 @@ mod tests {
             writes: AtomicU64::new(0),
             fixed_response: vec![0xee; 4096],
             last_name: std::sync::Mutex::new(None),
+            chain_calls: std::sync::Mutex::new(Vec::new()),
         });
         let ctx = Arc::new(DsContext {
             gateway: Arc::clone(&gw),
@@ -1309,15 +1456,23 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn per_commit_pattern_preserves_all_writes() {
+    async fn per_commit_pattern_preserves_all_writes_via_chain() {
+        // #146 — Linux NFSv4.1 + `O_DIRECT` issues COMMIT after each
+        // WRITE. With the #146 drain-on-COMMIT fix the buffer drains
+        // each cycle, but the chain anchor on `BufferEntry`
+        // (`base_composition_id`) carries forward so the NEXT COMMIT's
+        // gateway.write request carries `base_composition_id =
+        // Some(prior_cid)` and `base_bytes = cumulative` — the new
+        // composition still contains every byte ever written
+        // (`base.chunks ++ new_chunks`). This is the #74 property
+        // re-expressed: the COMPOSITION (not the in-memory buffer)
+        // is the cumulative-content carrier.
         let (ctx, key) = make_ctx();
         let fh = issue_fh(&key, 9_999_999, 0);
-        let original_cid = fh.composition_id;
         let state = DsCompoundState {
             current_fh: Some(fh),
         };
 
-        // Simulate 4 × (WRITE 1 MiB + COMMIT) like Linux O_DIRECT does.
         let block = vec![0xab; 1024 * 1024];
         for i in 0..4u64 {
             let w = write_args(i * 1024 * 1024, &block);
@@ -1331,36 +1486,131 @@ mod tests {
             assert_eq!(st, nfs4_status::NFS4_OK, "COMMIT {i} failed");
         }
 
-        // 4 COMMITs → 4 gateway.write calls. Buffer total_bytes must
-        // equal 4 MiB (the cumulative content, not just the latest MB).
+        // 4 COMMITs → 4 gateway.write calls.
         assert_eq!(ctx.gateway.writes.load(Ordering::SeqCst), 4);
+
+        // #146 — buffer drains each COMMIT; total_bytes after the
+        // 4th COMMIT is 0 (NOT 4 MiB). The cumulative content lives
+        // in the chained composition, reached via the redirect.
         assert_eq!(
             ctx.write_buffers.total_bytes(),
-            4 * 1024 * 1024,
-            "buffer must contain all 4 MiB after 4 per-1-MiB COMMITs (#74)"
+            0,
+            "buffer drains on every COMMIT — total stays 0 across cycles (#146)"
         );
 
-        // The redirect points to the LATEST composition; reads from
-        // offset 0 through 4 MiB must be served from the still-alive
-        // buffer with the right bytes.
-        let _resolved = ctx.write_buffers.resolve(original_cid);
-        let (buf_bytes, fully_covered) = ctx.write_buffers.read(original_cid, 0, 4 * 1024 * 1024);
-        assert!(fully_covered, "buffer must cover all bytes [0, 4 MiB)");
-        assert_eq!(buf_bytes.len(), 4 * 1024 * 1024);
-        assert!(buf_bytes.iter().all(|&b| b == 0xab), "every byte preserved");
+        // The 4 gateway calls show the chain marching forward by 1
+        // MiB at each step:
+        //   call 0: base=None, base_bytes=0, delta_len=1MiB → comp_v1 (1 MiB)
+        //   call 1: base=Some(v1), base_bytes=1MiB, delta_len=1MiB → comp_v2 (2 MiB)
+        //   call 2: base=Some(v2), base_bytes=2MiB, delta_len=1MiB → comp_v3 (3 MiB)
+        //   call 3: base=Some(v3), base_bytes=3MiB, delta_len=1MiB → comp_v4 (4 MiB)
+        // Each `WriteResponse.bytes_written` from `TrackingGateway` is
+        // `base_bytes + delta_len`, so the final composition's
+        // declared size is 4 MiB — every byte ever written is
+        // reachable through the redirect → chain head.
+        let mib = 1024 * 1024;
+        let calls = ctx.gateway.chain_calls.lock().expect("chain_calls").clone();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(calls[0].base, None);
+        assert_eq!(calls[0].base_bytes, 0);
+        assert_eq!(calls[0].delta_len, mib);
+        for (i, call) in calls.iter().enumerate().skip(1) {
+            assert!(call.base.is_some(), "COMMIT {i} must carry a chain anchor");
+            assert_eq!(
+                call.base_bytes,
+                u64::try_from(i).unwrap() * mib,
+                "COMMIT {i} base_bytes = cumulative prior bytes"
+            );
+            assert_eq!(
+                call.delta_len, mib,
+                "COMMIT {i} delta = the 1 MiB written this cycle"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn write_past_buffer_cap_returns_nospc() {
-        // Force a tiny cap by overriding the buffers field — the
-        // env-var reads-once-per-process so we can't change it
-        // mid-test reliably, but the DsContext is ours to construct.
+    async fn write_past_buffer_cap_auto_drains_and_succeeds() {
+        // #146 — when a WRITE would overflow the per-composition
+        // buffer cap, `op_write_ds` performs an INLINE auto-drain
+        // (snapshot + gateway.write + record_redirect + drain) and
+        // retries the WRITE. The retried WRITE lands at relative
+        // offset 0 of a now-empty buffer; the chain anchor on
+        // BufferEntry preserves the prior bytes for the next COMMIT.
+        // The kernel pNFS client doesn't issue COMMIT on
+        // NFS4ERR_NOSPC, so this server-side drain is what unblocks
+        // sustained writes through a single pNFS file (F-1 wedge fix).
         let (mut_ctx, key) = make_ctx();
-        // Replace write_buffers with an 8-byte cap.
         let arc = Arc::new(crate::pnfs_write_buffer::DsWriteBuffers::with_cap(8));
-        // SAFETY: we created mut_ctx; tests are single-threaded
-        // wrt this Arc. Build a fresh DsContext with the small-cap
-        // buffer and re-wrap.
+        let small_ctx = Arc::new(DsContext {
+            gateway: Arc::clone(&mut_ctx.gateway),
+            mac_key: mut_ctx.mac_key.clone(),
+            stripe_size_bytes: mut_ctx.stripe_size_bytes,
+            rt: mut_ctx.rt.clone(),
+            now_ms: Arc::clone(&mut_ctx.now_ms),
+            mds_layout_manager: mut_ctx.mds_layout_manager.clone(),
+            write_buffers: arc,
+        });
+        let fh = issue_fh(&key, 9_999_999, 0);
+        let fh_cid = fh.composition_id;
+        let state = DsCompoundState {
+            current_fh: Some(fh),
+        };
+
+        // Fill cap.
+        let args = write_args(0, b"AAAAAAAA"); // 8 bytes
+        let mut r = XdrReader::new(&args);
+        let (st, _) = op_write_ds(&mut r, &small_ctx, &state).await;
+        assert_eq!(st, nfs4_status::NFS4_OK);
+        assert_eq!(small_ctx.gateway.writes.load(Ordering::SeqCst), 0);
+
+        // Would-overflow WRITE → triggers inline auto-drain →
+        // retried WRITE succeeds.
+        let args = write_args(8, b"X");
+        let mut r = XdrReader::new(&args);
+        let (st, _) = op_write_ds(&mut r, &small_ctx, &state).await;
+        assert_eq!(
+            st,
+            nfs4_status::NFS4_OK,
+            "WRITE past cap must auto-drain + succeed (#146)"
+        );
+        assert_eq!(
+            small_ctx.gateway.writes.load(Ordering::SeqCst),
+            1,
+            "auto-drain issues exactly one gateway.write"
+        );
+
+        // Buffer state: drained, anchor advanced to comp_v1 / base_bytes=8,
+        // data has the 1 byte at relative offset 0.
+        let snap = small_ctx
+            .write_buffers
+            .snapshot_for_commit(fh_cid)
+            .expect("entry alive");
+        assert!(snap.base_composition_id.is_some());
+        assert_eq!(snap.base_bytes, 8);
+        assert_eq!(snap.data, b"X");
+
+        // Verify the gateway saw chain=None for the auto-drain call
+        // (it was the FIRST flush — no prior chain anchor).
+        let calls = small_ctx
+            .gateway
+            .chain_calls
+            .lock()
+            .expect("chain_calls")
+            .clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].base, None);
+        assert_eq!(calls[0].base_bytes, 0);
+        assert_eq!(calls[0].delta_len, 8);
+    }
+
+    /// #146 — a single WRITE LARGER than the buffer cap (e.g., a
+    /// kernel that issues a 16 MiB WRITE against an 8 MiB cap) still
+    /// surfaces NOSPC: the inline auto-drain can't help when the
+    /// post-drain retry would itself overflow.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn single_write_larger_than_cap_still_returns_nospc() {
+        let (mut_ctx, key) = make_ctx();
+        let arc = Arc::new(crate::pnfs_write_buffer::DsWriteBuffers::with_cap(8));
         let small_ctx = Arc::new(DsContext {
             gateway: Arc::clone(&mut_ctx.gateway),
             mac_key: mut_ctx.mac_key.clone(),
@@ -1375,14 +1625,8 @@ mod tests {
             current_fh: Some(fh),
         };
 
-        // Fill cap.
-        let args = write_args(0, b"AAAAAAAA"); // 8 bytes
-        let mut r = XdrReader::new(&args);
-        let (st, _) = op_write_ds(&mut r, &small_ctx, &state).await;
-        assert_eq!(st, nfs4_status::NFS4_OK);
-
-        // Overflow.
-        let args = write_args(8, b"X");
+        // 9-byte WRITE on an 8-byte cap — even a fresh buffer can't hold it.
+        let args = write_args(0, b"AAAAAAAAA");
         let mut r = XdrReader::new(&args);
         let (st, _) = op_write_ds(&mut r, &small_ctx, &state).await;
         assert_eq!(st, nfs4_status::NFS4ERR_NOSPC);

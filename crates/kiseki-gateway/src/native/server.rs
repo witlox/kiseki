@@ -522,6 +522,10 @@ impl ServerImpl {
                 // ADR-047: native gRPC write is async-ack-eligible (object
                 // semantics, bounded-stale per ADR-014).
                 surface: WriteSurface::Native,
+                // #146 — native PutObject writes the full body in one
+                // shot; no chain.
+                base_composition_id: None,
+                base_bytes: 0,
             };
             match self.ops.write_with_forwarding(wreq).await {
                 Ok(r) => r,
@@ -591,6 +595,10 @@ impl ServerImpl {
                 // ADR-047: native gRPC write is async-ack-eligible (object
                 // semantics, bounded-stale per ADR-014).
                 surface: WriteSurface::Native,
+                // #146 — native PutObject writes the full body in one
+                // shot; no chain.
+                base_composition_id: None,
+                base_bytes: 0,
             };
             self.ops.write(wreq).await.map_err(map_gateway_error)?
         };
