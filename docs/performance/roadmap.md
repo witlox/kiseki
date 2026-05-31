@@ -1,9 +1,11 @@
 # Performance roadmap — closing the gap on the 6-node GCP `default` cluster
 
 Companion to [`targets.md`](targets.md) (what "good" is, derived from
-hardware) and [`README.md`](README.md) (latest measured numbers). This
-doc is the **gap + plan** layer: where each protocol stands on the
-6-node `default` profile, why, and the prioritised work to close it.
+hardware), [`README.md`](README.md) (latest measured numbers), and
+[`competitive-targets.md`](competitive-targets.md) (where those same
+targets sit vs Lustre / Ceph / VAST on identical hardware). This doc
+is the **gap + plan** layer: where each protocol stands on the 6-node
+`default` profile, why, and the prioritised work to close it.
 
 Baseline measurements are the 2026-05-28 `default` matrix (RUN 3) —
 6 × `c3-standard-22-lssd` + 3 clients, EC-4+2,
