@@ -25,6 +25,7 @@ const NFS3_VERSION: u32 = 3;
 
 // NFSv3 procedures (RFC 1813 §3)
 const NFSPROC3_NULL: u32 = 0;
+const NFSPROC3_LOOKUP: u32 = 3;
 const NFSPROC3_READ: u32 = 6;
 const NFSPROC3_WRITE: u32 = 7;
 const NFSPROC3_COMMIT: u32 = 21;
@@ -249,15 +250,59 @@ impl GatewayOps for Nfs3Client {
             )));
         }
 
-        // Skip the post-WRITE LOOKUP — the CREATE-returned fh's first
-        // 16 bytes are the placeholder composition UUID minted by
-        // `create_pending_named`. The server's `HandleRegistry` repoints
-        // that placeholder to the real composition during `flush_writes`
-        // (see `nfs_ops::HandleRegistry::repoint_file`), so a later GET
-        // can deterministically reconstruct the fh as
-        // `[composition_id 16][zeros 16]` and hit the right composition
-        // without a LOOKUP RPC. Saves one RPC per PUT (3 → 2).
-        let composition_id = if file_fh.len() >= 16 {
+        // Post-COMMIT LOOKUP to recover the **real** composition_id.
+        //
+        // The CREATE-returned fh's first 16 bytes are the *placeholder*
+        // UUID minted by `nfs_ops::create_pending_named`. After
+        // COMMIT triggers `flush_writes`, the server's `HandleRegistry`
+        // repoints the placeholder fh's `HandleEntry` to the real
+        // composition_id, but the original fh BYTES are unchanged
+        // (the placeholder lives in `fh[..16]` forever). Same-handle
+        // NFS reads still work via the registry indirection, but
+        // **cross-protocol GET-by-UUID** (S3 / native) needs the
+        // real composition_id since they bypass the fh registry and
+        // look the composition up directly in the composition store.
+        //
+        // The fix is one extra LOOKUP RPC against the parent directory
+        // for the filename used at CREATE. `flush_writes` updates
+        // `dir_index` (`nfs_ops::flush_writes` §"Update dir_index to
+        // point at the latest composition") so the post-COMMIT
+        // LOOKUP returns a fresh fh whose first 16 bytes ARE the
+        // real composition_id. Cost: 1 extra RPC per PUT (3 → 4) on
+        // a path that's traditionally followed by a GET anyway —
+        // bringing us back to the natural NFS round-trip count and
+        // making cross-protocol PUT-then-GET correct (#127 follow-up).
+        let mut args = XdrWriter::new();
+        args.write_opaque(&root_fh);
+        args.write_string(&filename);
+        let reply = t.call(
+            NFS_PROGRAM,
+            NFS3_VERSION,
+            NFSPROC3_LOOKUP,
+            &args.into_bytes(),
+        )?;
+        let mut r = XdrReader::new(&reply);
+        let lookup_status = r.read_u32().map_err(|e| xdr_err(&e))?;
+        let composition_id = if lookup_status == NFS3_OK {
+            let fh_real = r.read_opaque().map_err(|e| xdr_err(&e))?;
+            if fh_real.len() >= 16 {
+                let mut bytes = [0u8; 16];
+                bytes.copy_from_slice(&fh_real[..16]);
+                CompositionId(uuid::Uuid::from_bytes(bytes))
+            } else {
+                // Defensive: malformed reply → fall back to the
+                // placeholder. Cross-protocol GET will still 404 in
+                // this rare case, but the NFS round-trip stays
+                // useful so the caller can at least retry.
+                let mut bytes = [0u8; 16];
+                bytes.copy_from_slice(&file_fh[..16]);
+                CompositionId(uuid::Uuid::from_bytes(bytes))
+            }
+        } else if file_fh.len() >= 16 {
+            // LOOKUP NOENT or any other failure — fall back to the
+            // placeholder so single-protocol clients (NFS-only) still
+            // behave as before. Cross-protocol callers see the
+            // pre-fix behavior in that degenerate case.
             let mut bytes = [0u8; 16];
             bytes.copy_from_slice(&file_fh[..16]);
             CompositionId(uuid::Uuid::from_bytes(bytes))
