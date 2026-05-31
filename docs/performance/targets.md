@@ -15,6 +15,12 @@ likely too pessimistic — update the derivation, don't celebrate.
 > the writes are commit-bound (one Raft round per write, #126), not
 > NIC/disk/CPU-bound — so the per-node ceilings below are not the binding
 > constraint on writes until batched commit (W1) lands.
+>
+> The **competitive view** — these same targets compared against
+> Lustre / Ceph / VAST on identical GCP hardware — lives in
+> [`competitive-targets.md`](competitive-targets.md). Use it to
+> sanity-check whether a re-measurement is in striking distance of
+> what other well-hardened systems achieve on the same shape.
 
 This doc is the missing layer between
 [`specs/architecture/adr/042-native-gateway-data-service.md` §14](https://github.com/witlox/kiseki/blob/main/specs/architecture/adr/042-native-gateway-data-service.md)

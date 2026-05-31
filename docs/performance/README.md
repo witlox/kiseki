@@ -11,6 +11,14 @@ files are immutable snapshots, this file moves with HEAD.
 > are commit-bound (~250 op/s, one Raft round per write — #126);
 > batched commit (W1) is the one lever that matters. Reads scale.
 >
+> **Competitive baseline:**
+> [`competitive-targets.md`](competitive-targets.md) — back-of-napkin
+> comparison vs Lustre / Ceph / VAST on the same GCP hardware. Use it
+> when re-measuring on a 6-node cluster: if kiseki is below a
+> competitor's well-hardened number, the gap is still in our
+> implementation; if at-or-above, the next bottleneck is somewhere
+> else.
+>
 > **Post-#116 correction:** the 2026-05-28 snapshot below predates the
 > #116 merge. #127 (FUSE/NFS/pNFS read-by-name) and #130 (NFSv3 write)
 > are now **fixed + verified live**; #128 (NFSv3 mount) fixed. The
