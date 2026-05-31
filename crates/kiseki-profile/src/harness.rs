@@ -520,25 +520,15 @@ impl Cluster {
     /// Returns Ok on 201 (created) AND on 409 / "already exists"
     /// (idempotent). Errors otherwise so the driver halts before
     /// running against an unconfigured namespace.
-    pub async fn provision_bench_topology(
-        &self,
-        admin_bin: Option<&Path>,
-        shard_count: usize,
-    ) -> Result<(), String> {
-        self.provision_bench_topology_with_pool(admin_bin, shard_count, None)
-            .await
-    }
-
-    /// ADR-048 §"Decision" — same as [`provision_bench_topology`] but
-    /// before creating the bench namespace, creates a `Replication`
-    /// pool with `requires_migration = true` and wires the bench
-    /// namespace's `size_band_pools.replicated` at it. The per-pool
-    /// slab-EC compactor task spawned at boot picks up the bench
-    /// pool and migrates chunks to cold-tier slabs.
-    ///
-    /// `slab_ec_pool_name` is the name to give the migration-eligible
-    /// pool (e.g. `"slab-ec-bench"`). When `None`, this falls through
-    /// to the legacy unflagged path so the same harness drives the
+    /// ADR-048 §"Decision" — provision the bench namespace + shard
+    /// topology by shelling out to `kiseki-admin`. When
+    /// `slab_ec_pool_name` is `Some(name)`, also create a
+    /// `Replication` pool with `requires_migration = true` named
+    /// `name` and wire the bench namespace's
+    /// `size_band_pools.replicated` at it; the per-pool slab-EC
+    /// compactor task spawned at boot picks up the bench pool and
+    /// migrates chunks to cold-tier slabs. `None` falls through to
+    /// the legacy unflagged path so the same harness drives the
     /// baseline run.
     pub async fn provision_bench_topology_with_pool(
         &self,
@@ -558,47 +548,8 @@ impl Cluster {
         };
         let endpoint = format!("http://127.0.0.1:{}", self.leader_node().ports.metrics);
 
-        // ADR-048: when the caller asked for slab-EC, create the
-        // migration-eligible pool BEFORE the namespace. Idempotent —
-        // a fresh cluster always succeeds on first attempt; an
-        // existing pool surfaces "already exists" which the
-        // namespace-create below treats as success.
         if let Some(pool_name) = slab_ec_pool_name {
-            let admin_for_pool = admin.clone();
-            let endpoint_for_pool = endpoint.clone();
-            let pool_name_owned = pool_name.to_string();
-            let pool_res = tokio::task::spawn_blocking(move || -> Result<String, String> {
-                let output = Command::new(&admin_for_pool)
-                    .arg("--endpoint")
-                    .arg(&endpoint_for_pool)
-                    .arg("pool")
-                    .arg("create")
-                    .arg(&pool_name_owned)
-                    .arg("--durability")
-                    .arg("replication")
-                    .arg("--replication-copies")
-                    .arg("3")
-                    .arg("--device-class")
-                    .arg("mixed")
-                    .arg("--initial-capacity")
-                    .arg("100G")
-                    .arg("--slab-ec")
-                    .output()
-                    .map_err(|e| format!("spawn kiseki-admin pool create: {e}"))?;
-                if output.status.success() {
-                    return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
-                }
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let combined = format!("{stdout}\n{stderr}");
-                if combined.contains("already exists") || combined.contains("409") {
-                    return Ok(format!("idempotent (already exists): {combined}"));
-                }
-                Err(format!("rc={:?}: {combined}", output.status.code()))
-            })
-            .await
-            .map_err(|e| format!("spawn_blocking: {e}"))?;
-            pool_res?;
+            create_slab_ec_bench_pool(&admin, &endpoint, pool_name).await?;
         }
 
         // Retry the namespace-create until the control-plane Raft
@@ -989,6 +940,55 @@ async fn wait_for_quorum(
     Err(format!(
         "cluster never converged within {deadline:?}: url={url} last_seen={last_seen:?} expected_n={expected_n}"
     ))
+}
+
+/// ADR-048 §"Decision" — shell out to `kiseki-admin pool create
+/// <name> --slab-ec` to register a Replication pool with
+/// `requires_migration = true`. Idempotent: a fresh cluster always
+/// succeeds on first attempt; an existing pool surfaces "already
+/// exists" which the downstream namespace-create treats as success.
+async fn create_slab_ec_bench_pool(
+    admin: &Path,
+    endpoint: &str,
+    pool_name: &str,
+) -> Result<(), String> {
+    let admin_path = admin.to_path_buf();
+    let endpoint_owned = endpoint.to_string();
+    let pool_owned = pool_name.to_string();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let output = Command::new(&admin_path)
+            .arg("--endpoint")
+            .arg(&endpoint_owned)
+            .arg("pool")
+            .arg("create")
+            .arg(&pool_owned)
+            .arg("--durability")
+            .arg("replication")
+            .arg("--replication-copies")
+            .arg("3")
+            .arg("--device-class")
+            .arg("mixed")
+            .arg("--initial-capacity")
+            .arg("100G")
+            .arg("--slab-ec")
+            .output()
+            .map_err(|e| format!("spawn kiseki-admin pool create: {e}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let combined = format!("{stdout}\n{stderr}");
+        if combined.contains("already exists") || combined.contains("409") {
+            return Ok(());
+        }
+        Err(format!(
+            "kiseki-admin pool create rc={:?}: {combined}",
+            output.status.code()
+        ))
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {e}"))?
 }
 
 fn find_admin_binary() -> Result<PathBuf, String> {
