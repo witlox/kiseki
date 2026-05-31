@@ -402,6 +402,11 @@ fn pool_to_proto_with_overrides(
                 u32::from(data_shards),
                 u32::from(parity_shards),
             ),
+            // ADR-024 amendment: inline pools surface as their own
+            // durability kind. The replicated/EC counts stay 0 — the
+            // bytes live in `small/objects.redb` with the per-shard
+            // Raft topology providing replication.
+            DurabilityStrategy::Inline => ("inline".to_owned(), 0, 0, 0),
         };
     let o = overrides.unwrap_or_default();
     pb::PoolInfo {
@@ -754,6 +759,7 @@ impl StorageAdminService for StorageAdminGrpc {
                 capacity_bytes: r.initial_capacity_bytes,
                 used_bytes: 0,
                 devices: Vec::new(),
+                ..Default::default()
             };
             store.add_pool(pool).await.map_err(|e| {
                 if e.contains("already exists") {
@@ -1898,6 +1904,7 @@ mod tests {
                     online: false,
                 },
             ],
+            ..Default::default()
         });
         store.add_pool(AffinityPool {
             name: "bulk-hdd".into(),
@@ -1909,6 +1916,7 @@ mod tests {
                 id: "hdd-x".into(),
                 online: true,
             }],
+            ..Default::default()
         });
         let async_store: Arc<dyn kiseki_chunk::AsyncChunkOps> = Arc::new(SyncBridge::new(store));
         let tracker = Arc::new(RepairTracker::new());
@@ -2602,6 +2610,7 @@ mod tests {
                 id: "dev-1".into(),
                 online: true,
             }],
+            ..Default::default()
         });
         let chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> = Arc::new(SyncBridge::new(store));
         let evacuations = Arc::new(EvacuationRegistry::new());

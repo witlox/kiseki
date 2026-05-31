@@ -2970,10 +2970,7 @@ impl InMemoryGateway {
             })?;
         }
         if single_node_had_writes {
-            self.observe_put_phase(
-                "chunk_write",
-                single_node_chunk_started.elapsed(),
-            );
+            self.observe_put_phase("chunk_write", single_node_chunk_started.elapsed());
         }
 
         self.observe_put_phase("composition_record", composition_record_started.elapsed());

@@ -299,6 +299,7 @@ mod tests {
             devices: vec![],
             capacity_bytes: 1 << 30,
             used_bytes: 0,
+            ..Default::default()
         });
         Arc::new(SyncBridge::new(store))
     }

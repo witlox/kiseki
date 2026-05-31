@@ -519,6 +519,19 @@ impl ChunkOps for ChunkStore {
                     storage_size = envelope.ciphertext.len() as u64 * u64::from(copies);
                     None
                 }
+                DurabilityStrategy::Inline => {
+                    // ADR-024 amendment: `Inline` durability is a
+                    // routing tag declaring "this pool's writes go
+                    // inline-in-Raft-delta". `ChunkStore::write_chunk`
+                    // is the chunk-fabric path; an inline write
+                    // shouldn't reach here. If it does (mis-routing,
+                    // pre-amendment caller), treat it as a single
+                    // copy on the chunk fabric so the write doesn't
+                    // silently disappear — the gateway should be
+                    // calling the inline path instead.
+                    storage_size = envelope.ciphertext.len() as u64;
+                    None
+                }
             }
         } else {
             storage_size = envelope.ciphertext.len() as u64;
