@@ -81,6 +81,10 @@ pub fn admin_extra_routes() -> Router<UiState> {
             "/admin/storage/pools/thresholds",
             post(api_set_pool_thresholds),
         )
+        // --- Pool CRUD (ADR-024 2026-05-31 amendment) ---
+        .route("/admin/storage/pools", get(api_list_pools_admin))
+        .route("/admin/storage/pools/{pool}", get(api_describe_pool))
+        .route("/admin/storage/pools/create", post(api_create_pool))
         // --- Tenants tab ---
         .route("/admin/tenants/orgs", get(api_list_orgs))
         .route("/admin/tenants/orgs", post(api_create_org))
@@ -1051,6 +1055,177 @@ async fn api_evacuate_device(
             axum::Json(serde_json::json!({ "error": status.message() })),
         ),
     }
+}
+
+/// `GET /admin/storage/pools` — `StorageAdminService.ListPools`. ADR-024
+/// amendment surface; returns a JSON list with each pool's role,
+/// durability, device class, capacity, and the size-band thresholds.
+async fn api_list_pools_admin() -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+    use kiseki_proto::v1::storage_admin_service_client::StorageAdminServiceClient;
+    let channel = match dial_local_storage_admin().await {
+        Ok(ch) => ch,
+        Err(err) => return err,
+    };
+    let mut client = StorageAdminServiceClient::new(channel);
+    match client
+        .list_pools(kiseki_proto::v1::ListPoolsRequest {})
+        .await
+    {
+        Ok(resp) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "pools": resp.into_inner().pools.iter().map(pool_info_to_json).collect::<Vec<_>>(),
+            })),
+        ),
+        Err(status) => (
+            grpc_status_to_http(&status),
+            axum::Json(serde_json::json!({ "error": status.message() })),
+        ),
+    }
+}
+
+/// `GET /admin/storage/pools/{pool}` — `StorageAdminService.GetPool`.
+async fn api_describe_pool(
+    axum::extract::Path(pool): axum::extract::Path<String>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+    use kiseki_proto::v1::storage_admin_service_client::StorageAdminServiceClient;
+    let channel = match dial_local_storage_admin().await {
+        Ok(ch) => ch,
+        Err(err) => return err,
+    };
+    let mut client = StorageAdminServiceClient::new(channel);
+    match client
+        .get_pool(kiseki_proto::v1::GetPoolRequest {
+            pool_name: pool.clone(),
+        })
+        .await
+    {
+        Ok(resp) => (
+            StatusCode::OK,
+            axum::Json(pool_info_to_json(&resp.into_inner())),
+        ),
+        Err(status) => (
+            grpc_status_to_http(&status),
+            axum::Json(serde_json::json!({ "error": status.message() })),
+        ),
+    }
+}
+
+/// `POST /admin/storage/pools/create` — `StorageAdminService.CreatePool`.
+/// Body: `{"pool_name", "role", "device_class", "durability_kind",
+/// "replication_copies"?, "ec_data_shards"?, "ec_parity_shards"?,
+/// "initial_capacity_bytes"?, "inline_threshold_bytes"?,
+/// "replication_ceiling_bytes"?}`.
+async fn api_create_pool(body: String) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+    use kiseki_proto::v1::storage_admin_service_client::StorageAdminServiceClient;
+    let parsed = match parse_json_body(&body) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let pool_name = parsed
+        .get("pool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if pool_name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({ "error": "pool_name is required" })),
+        );
+    }
+    let role = parsed
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let device_class = parsed
+        .get("device_class")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let durability_kind = parsed
+        .get("durability_kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if durability_kind.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "durability_kind is required (replication|erasure_coding|inline)",
+            })),
+        );
+    }
+    let json_u32 = |k: &str| -> u32 {
+        parsed
+            .get(k)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(0)
+    };
+    let json_u64 = |k: &str| -> u64 {
+        parsed
+            .get(k)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    };
+    let channel = match dial_local_storage_admin().await {
+        Ok(ch) => ch,
+        Err(err) => return err,
+    };
+    let mut client = StorageAdminServiceClient::new(channel);
+    match client
+        .create_pool(kiseki_proto::v1::CreatePoolRequest {
+            pool_name: pool_name.clone(),
+            device_class,
+            durability_kind,
+            replication_copies: json_u32("replication_copies"),
+            ec_data_shards: json_u32("ec_data_shards"),
+            ec_parity_shards: json_u32("ec_parity_shards"),
+            initial_capacity_bytes: json_u64("initial_capacity_bytes"),
+            role,
+            inline_threshold_bytes: json_u64("inline_threshold_bytes"),
+            replication_ceiling_bytes: json_u64("replication_ceiling_bytes"),
+        })
+        .await
+    {
+        Ok(resp) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "pool_name": pool_name,
+                "committed_at_log_index": resp.into_inner().committed_at_log_index,
+            })),
+        ),
+        Err(status) => (
+            grpc_status_to_http(&status),
+            axum::Json(serde_json::json!({ "error": status.message() })),
+        ),
+    }
+}
+
+/// Convert a `PoolInfo` proto into a JSON object surfaceable by the
+/// admin CLI's `pool list` / `pool describe`.
+fn pool_info_to_json(info: &kiseki_proto::v1::PoolInfo) -> serde_json::Value {
+    serde_json::json!({
+        "name": info.pool_name,
+        "role": info.role,
+        "durability_kind": info.durability_kind,
+        "replication_copies": info.replication_copies,
+        "ec_data_shards": info.ec_data_shards,
+        "ec_parity_shards": info.ec_parity_shards,
+        "capacity_bytes": info.capacity_bytes,
+        "used_bytes": info.used_bytes,
+        "device_count": info.device_count,
+        "warning_threshold_pct": info.warning_threshold_pct,
+        "critical_threshold_pct": info.critical_threshold_pct,
+        "readonly_threshold_pct": info.readonly_threshold_pct,
+        "target_fill_pct": info.target_fill_pct,
+        "inline_threshold_bytes": info.inline_threshold_bytes,
+        "replication_ceiling_bytes": info.replication_ceiling_bytes,
+    })
 }
 
 /// `POST /admin/storage/pools/rebalance` — `StorageAdminService.RebalancePool`.

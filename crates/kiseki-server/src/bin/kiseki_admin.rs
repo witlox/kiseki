@@ -721,6 +721,31 @@ enum Command {
         readonly: u32,
         target: u32,
     },
+    /// `pool list` — show every pool with role, durability strategy,
+    /// device class, capacity, and the ADR-024 amendment's size-band
+    /// thresholds.
+    PoolList,
+    /// `pool describe <name>` — full pool record.
+    PoolDescribe {
+        pool: String,
+    },
+    /// `pool create <name>` (ADR-024 amendment) — create a pool with
+    /// `--role` (`chunk`|`metadata`|`inline`), `--durability`
+    /// (`replication`|`erasure_coding`|`inline`) + per-strategy counts,
+    /// `--device-class` (`nvme`|`ssd`|`hdd`|`mixed`), `--initial-capacity`
+    /// (bytes), and optional `--inline-threshold` / `--replication-ceiling`.
+    PoolCreate {
+        pool: String,
+        role: String,
+        device_class: String,
+        durability_kind: String,
+        replication_copies: u32,
+        ec_data_shards: u32,
+        ec_parity_shards: u32,
+        initial_capacity_bytes: u64,
+        inline_threshold_bytes: u64,
+        replication_ceiling_bytes: u64,
+    },
     /// `audit query [--tenant T] [--type X] [--limit N] [--from S] [--local-only]`
     AuditQuery {
         tenant: Option<String>,
@@ -1067,7 +1092,7 @@ fn parse_pool(rest: &[String]) -> Result<Command, String> {
     let sub = rest
         .first()
         .map(String::as_str)
-        .ok_or("pool requires a subcommand (rebalance|set-threshold)")?;
+        .ok_or("pool requires a subcommand (list|describe|create|rebalance|set-threshold)")?;
     match sub {
         "rebalance" => {
             let pool = rest
@@ -1105,6 +1130,67 @@ fn parse_pool(rest: &[String]) -> Result<Command, String> {
                 critical: pct("--critical")?,
                 readonly: pct("--readonly")?,
                 target: pct("--target")?,
+            })
+        }
+        "list" => Ok(Command::PoolList),
+        "describe" => {
+            let pool = rest
+                .get(1)
+                .cloned()
+                .ok_or("pool describe requires <pool-name>")?;
+            Ok(Command::PoolDescribe { pool })
+        }
+        "create" => {
+            let pool = rest
+                .get(1)
+                .cloned()
+                .ok_or("pool create requires <pool-name>")?;
+            // String-valued flags.
+            let flag = |name: &str| -> Option<String> {
+                rest.iter()
+                    .position(|a| a == name)
+                    .and_then(|p| rest.get(p + 1).cloned())
+            };
+            // Numeric flags with parse.
+            let num_u64 = |name: &str| -> Result<u64, String> {
+                match flag(name) {
+                    Some(s) => s.parse().map_err(|e| format!("{name}: {e}")),
+                    None => Ok(0),
+                }
+            };
+            let num_u32 = |name: &str| -> Result<u32, String> {
+                match flag(name) {
+                    Some(s) => s.parse().map_err(|e| format!("{name}: {e}")),
+                    None => Ok(0),
+                }
+            };
+            // Allow `--initial-capacity 100GiB` shorthand via parse_size.
+            let initial_capacity_bytes = match flag("--initial-capacity") {
+                Some(s) => parse_size(&s).map_err(|e| format!("--initial-capacity: {e}"))?,
+                None => 0,
+            };
+            let inline_threshold_bytes = match flag("--inline-threshold") {
+                Some(s) => parse_size(&s).map_err(|e| format!("--inline-threshold: {e}"))?,
+                None => 0,
+            };
+            let replication_ceiling_bytes = match flag("--replication-ceiling") {
+                Some(s) => parse_size(&s).map_err(|e| format!("--replication-ceiling: {e}"))?,
+                None => 0,
+            };
+            Ok(Command::PoolCreate {
+                pool,
+                role: flag("--role").unwrap_or_default(),
+                device_class: flag("--device-class").unwrap_or_default(),
+                durability_kind: flag("--durability").unwrap_or_default(),
+                replication_copies: num_u32("--replication-copies")?,
+                ec_data_shards: num_u32("--ec-data")?,
+                ec_parity_shards: num_u32("--ec-parity")?,
+                initial_capacity_bytes,
+                inline_threshold_bytes,
+                replication_ceiling_bytes,
+            })
+            .inspect(|_| {
+                let _ = num_u64; // num_u64 reserved for future numeric flags.
             })
         }
         other => Err(format!("unknown pool subcommand: {other}")),
@@ -1694,6 +1780,32 @@ fn main() {
                 json_escape(&pool),
             );
             http_post(&args.endpoint, "/admin/storage/pools/thresholds", &body)
+        }
+        Command::PoolList => http_get(&args.endpoint, "/admin/storage/pools"),
+        Command::PoolDescribe { pool } => http_get(
+            &args.endpoint,
+            &format!("/admin/storage/pools/{}", url_encode(&pool)),
+        ),
+        Command::PoolCreate {
+            pool,
+            role,
+            device_class,
+            durability_kind,
+            replication_copies,
+            ec_data_shards,
+            ec_parity_shards,
+            initial_capacity_bytes,
+            inline_threshold_bytes,
+            replication_ceiling_bytes,
+        } => {
+            let body = format!(
+                "{{\"pool_name\":\"{}\",\"role\":\"{}\",\"device_class\":\"{}\",\"durability_kind\":\"{}\",\"replication_copies\":{replication_copies},\"ec_data_shards\":{ec_data_shards},\"ec_parity_shards\":{ec_parity_shards},\"initial_capacity_bytes\":{initial_capacity_bytes},\"inline_threshold_bytes\":{inline_threshold_bytes},\"replication_ceiling_bytes\":{replication_ceiling_bytes}}}",
+                json_escape(&pool),
+                json_escape(&role),
+                json_escape(&device_class),
+                json_escape(&durability_kind),
+            );
+            http_post(&args.endpoint, "/admin/storage/pools/create", &body)
         }
         Command::TopologyCreateNamespace {
             namespace_id,

@@ -303,6 +303,12 @@ async fn dispatch(
                     ec_data_shards,
                     ec_parity_shards,
                     initial_capacity_bytes,
+                    // ADR-024 amendment optional fields default to
+                    // "" / 0; the server reads them as Chunk role +
+                    // cluster-default thresholds for back-compat.
+                    role: String::new(),
+                    inline_threshold_bytes: 0,
+                    replication_ceiling_bytes: 0,
                 })
                 .await
                 .map_err(format_status)?
