@@ -34,14 +34,64 @@ mkdir -p ${meta_dir}/{raft,keys,small,chunks}
 # Verify raw devices exist
 echo "Raw devices (${device_class}):"
 IFS=',' read -ra DEVS <<< "${raw_devices}"
+FAST_DEV_COUNT=0
 for dev in "$${DEVS[@]}"; do
   if [ -b "$dev" ]; then
     SIZE=$(blockdev --getsize64 "$dev" 2>/dev/null || echo "?")
     echo "  $dev: $((SIZE / 1024 / 1024 / 1024)) GB — raw (no filesystem)"
+    # Detect fast storage: /sys/block/<dev>/queue/rotational == 0
+    # signals SSD/NVMe (per ADR-030 §1). A node with no fast device is
+    # operationally "boot-disk fallback" — the runtime will warn at
+    # boot per ADR-030 amendment.
+    DEV_BASENAME=$(basename "$dev")
+    ROTATIONAL_PATH="/sys/block/$${DEV_BASENAME}/queue/rotational"
+    if [ -r "$${ROTATIONAL_PATH}" ] && [ "$(cat $${ROTATIONAL_PATH})" = "0" ]; then
+      FAST_DEV_COUNT=$((FAST_DEV_COUNT + 1))
+    fi
   else
     echo "  $dev: NOT FOUND"
   fi
 done
+
+# ADR-030 (2026-05-31 amendment) — admin-driven metadata device role.
+# `setup-raw-storage.sh` does NOT auto-promote any device to the
+# metadata role; every raw device goes to the chunk pool. The runtime
+# emits its own loud `cluster_warnings` ERROR when KISEKI_DATA_DIR
+# lives on the boot disk and no device has been assigned to the
+# metadata role via `kiseki-admin pool add-device metadata-pool ...`.
+#
+# Mirror that warning here at provision time so operators see the
+# guidance early — before the cluster boots and the runtime warning
+# starts firing.
+if [ "$${FAST_DEV_COUNT}" -gt 0 ]; then
+  cat <<WARNING
+==========================================================================
+NOTICE (ADR-030 2026-05-31 amendment): ${FAST_DEV_COUNT} fast (NVMe/SSD)
+device(s) detected, but NONE is currently assigned to the metadata-pool
+role. Metadata + small-tier writes will live on the boot disk until
+operator action.
+
+Recommended for production:
+  kiseki-admin pool add-device metadata-pool <one-of-the-fast-devices>
+
+The runtime will emit a persistent cluster_warning until this is done.
+See specs/architecture/adr/030-dynamic-small-file-placement.md and
+docs/performance/capacity-planning.md.
+==========================================================================
+WARNING
+else
+  cat <<WARNING
+==========================================================================
+WARNING (ADR-030): NO fast (NVMe/SSD) device detected on this node.
+Metadata + small-tier writes will live on the boot disk. This is
+"emergency fallback" mode per ADR-030 amendment and is operationally
+unsuitable for production (boot-disk write latency, capacity ceiling).
+
+Provision at least one NVMe/SSD device per node and assign it to the
+metadata pool via `kiseki-admin pool add-device metadata-pool <dev>`.
+==========================================================================
+WARNING
+fi
 
 # Create Kiseki device config — lists raw block devices for DeviceBackend
 # The server reads this to initialize its device pool

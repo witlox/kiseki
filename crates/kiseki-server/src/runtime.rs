@@ -415,8 +415,10 @@ pub async fn run_main(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // --- Context construction ---
 
-    // System disk detection (ADR-030).
-    if let Some(ref dir) = cfg.data_dir {
+    // System disk detection (ADR-030). Boot-time snapshot — metric
+    // emission happens after the metrics handle exists; here we just
+    // log + warn so operators see the device class in the boot trace.
+    let boot_capacity = cfg.data_dir.as_ref().map(|dir| {
         let capacity = crate::system_disk::compute_capacity(
             dir,
             cfg.meta_soft_limit_pct,
@@ -428,9 +430,12 @@ pub async fn run_main(
             total_gb = capacity.total_bytes / (1024 * 1024 * 1024),
             soft_limit_gb = capacity.soft_limit_bytes / (1024 * 1024 * 1024),
             budget_gb = capacity.small_file_budget_bytes / (1024 * 1024 * 1024),
-            "system disk detected",
+            cluster_max_files_estimate =
+                capacity.soft_limit_bytes / crate::system_disk::PER_FILE_METADATA_FOOTPRINT_BYTES,
+            "system disk detected (ADR-030 metadata-role device)",
         );
-    }
+        capacity
+    });
 
     // Node identity for multi-node Raft.
     if cfg.node_id > 0 {
@@ -505,6 +510,14 @@ pub async fn run_main(
     // gateway, etc.) thread `Arc<...>` clones from this same struct
     // throughout setup.
     let metrics = crate::metrics::KisekiMetrics::new();
+
+    // ADR-030 amendment §"admin-driven metadata device role": seed
+    // the per-node metadata-capacity gauges from the boot-time
+    // snapshot so the cluster aggregator has a real value before the
+    // first periodic tick (30 s default).
+    if let Some(ref cap) = boot_capacity {
+        crate::system_disk::emit_capacity_metrics(&metrics, cap);
+    }
 
     // Observability opt-out for performance benchmarks. Defaults
     // ON for production deployments; the `infra/gcp/transport`
@@ -1042,6 +1055,13 @@ pub async fn run_main(
         let g_dev = metrics.pool_device_capacity_bytes.clone();
         let g_meta = metrics.storage_meta_bytes.clone();
         let g_small = metrics.storage_small_bytes.clone();
+        // ADR-030 2026-05-31 amendment §"admin-driven metadata device
+        // role" — clone the metrics handle + capture data_dir for
+        // periodic NodeMetadataCapacity refresh inside the same tick.
+        let metrics_for_meta = metrics.clone();
+        let meta_data_dir = cfg.data_dir.clone();
+        let meta_soft_pct = cfg.meta_soft_limit_pct;
+        let meta_hard_pct = cfg.meta_hard_limit_pct;
         let g_tier = [
             (
                 metrics.storage_tier_fast_used.clone(),
@@ -1112,11 +1132,142 @@ pub async fn run_main(
                         gt.set(to_i64(tier_total[i]));
                     }
                 }
+                // ADR-030 2026-05-31 amendment — refresh the
+                // metadata-role device's capacity snapshot in the same
+                // tick. `compute_capacity` is df(1) + a sysfs read,
+                // cheap relative to the 30s cadence. used_bytes drifts
+                // as the data_dir fills; total/soft/hard are stable
+                // for any sane mount.
+                if let Some(ref dir) = meta_data_dir {
+                    let cap =
+                        crate::system_disk::compute_capacity(dir, meta_soft_pct, meta_hard_pct);
+                    crate::system_disk::emit_capacity_metrics(&metrics_for_meta, &cap);
+                }
             }
         });
         tracing::info!(
             interval_s,
             "chunk store: capacity/dedup metrics refresher spawned"
+        );
+    }
+
+    // ADR-030 §3 + 2026-05-31 amendment §"throughput guard" —
+    // per-shard inline-threshold recompute task (leader-only). Polls
+    // the metrics handle for the local node's `small_file_budget`,
+    // and per shard the delta_count + current ShardConfig. The
+    // formula clamps to `[inline_floor, inline_ceiling]`; the
+    // throughput guard drops the effective value to floor when the
+    // shard's recent inline write rate exceeds
+    // `KISEKI_RAFT_INLINE_MBPS` (default 10 MB/s, ADR-030 SF-ADV-1).
+    //
+    // Only fires `set_shard_config` when the new value differs from
+    // the current — keeps the Raft log noise-free and avoids spurious
+    // apply-hook work.
+    if let Some(ref shard_store_for_recompute) = raft_shard_store_for_admin {
+        let store = Arc::clone(shard_store_for_recompute);
+        let metrics_for_recompute = metrics.clone();
+        let interval_s = std::env::var("KISEKI_INLINE_THRESHOLD_RECOMPUTE_S")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(60);
+        let mbps_limit = std::env::var("KISEKI_RAFT_INLINE_MBPS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(10);
+        tokio::spawn(async move {
+            use std::collections::HashMap;
+            use std::time::Instant;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_s));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Per-shard throughput guards live for the lifetime of the
+            // task (one entry per shard the leader has seen). On
+            // leadership loss the guard's stale samples are harmless;
+            // they fall out of the 10 s window before this node ever
+            // recomputes again.
+            let mut guards: HashMap<
+                kiseki_common::ids::ShardId,
+                kiseki_log::shard_inline_threshold::InlineThroughputGuard,
+            > = HashMap::new();
+            loop {
+                tick.tick().await;
+                // Snapshot the per-node `soft_limit` gauge as the
+                // available budget. Production deployments will
+                // aggregate this across voters once the heartbeat
+                // delivery is wired (Phase 5 follow-up); for now we
+                // use the local node's value, which is conservative
+                // (smaller available → smaller threshold → safer
+                // budget envelope).
+                let available_bytes = u64::try_from(
+                    metrics_for_recompute
+                        .node_metadata_capacity_bytes
+                        .with_label_values(&["soft_limit"])
+                        .get()
+                        .max(0),
+                )
+                .unwrap_or(0);
+                let now = Instant::now();
+                for shard_id in store.shard_ids() {
+                    if !store.is_shard_leader(shard_id) {
+                        continue;
+                    }
+                    // Need shard_health (config + delta_count) via the
+                    // async API; bridge into the Raft runtime.
+                    let info =
+                        match kiseki_log::traits::LogOps::shard_health(store.as_ref(), shard_id)
+                            .await
+                        {
+                            Ok(i) => i,
+                            Err(e) => {
+                                tracing::debug!(
+                                    shard_id = %shard_id.0,
+                                    error = %e,
+                                    "inline-threshold recompute: shard_health unavailable",
+                                );
+                                continue;
+                            }
+                        };
+                    let raw = kiseki_log::shard_inline_threshold::compute_shard_inline_threshold(
+                        available_bytes,
+                        info.delta_count,
+                        info.config.inline_floor_bytes,
+                        info.config.inline_ceiling_bytes,
+                    );
+                    let guard = guards.entry(shard_id).or_insert_with(|| {
+                        kiseki_log::shard_inline_threshold::InlineThroughputGuard::with_limit(
+                            std::time::Duration::from_secs(10),
+                            mbps_limit,
+                        )
+                    });
+                    let effective =
+                        guard.effective_threshold(now, raw, info.config.inline_floor_bytes);
+                    if effective == info.config.inline_threshold_bytes {
+                        continue;
+                    }
+                    let mut new_config = info.config.clone();
+                    new_config.inline_threshold_bytes = effective;
+                    if let Err(e) = store.submit_shard_config(shard_id, new_config) {
+                        tracing::warn!(
+                            shard_id = %shard_id.0,
+                            error = %e,
+                            "inline-threshold recompute: SetShardConfig failed",
+                        );
+                    } else {
+                        tracing::info!(
+                            shard_id = %shard_id.0,
+                            previous = info.config.inline_threshold_bytes,
+                            effective,
+                            "inline-threshold recompute: SetShardConfig committed",
+                        );
+                    }
+                }
+            }
+        });
+        tracing::info!(
+            interval_s,
+            mbps_limit,
+            "ADR-030 inline-threshold recompute task spawned (leader-only per shard)",
         );
     }
 
@@ -1468,6 +1619,8 @@ pub async fn run_main(
         versioning_enabled: false,
         compliance_tags: Vec::new(),
         tier_policy: Vec::new(),
+
+        size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
     });
     let _ = view_store.write().create_view(kiseki_view::ViewDescriptor {
         view_id: bootstrap_view,

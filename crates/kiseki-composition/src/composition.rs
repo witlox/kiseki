@@ -102,6 +102,40 @@ pub fn encode_namespace_create_payload(ns: &crate::namespace::Namespace) -> Vec<
             out.extend_from_slice(&t.quota_bytes.to_le_bytes());
         }
     }
+    // ADR-024 2026-05-31 amendment §"three-tier durability" — append
+    // the per-namespace size-band pool selector after the tier policy.
+    // Wire shape:
+    //   [bands_flag:1]   bits: 0=inline, 1=replicated, 2=ec
+    //   for each set bit, in band order:
+    //     [name_len:1][name utf8]
+    // A truncated payload (no bands section) decodes to empty
+    // `size_band_pools`, so namespaces created before the amendment
+    // still round-trip cleanly.
+    #[allow(clippy::cast_possible_truncation)] // name len bounded by CLI parsing (admin input)
+    {
+        let mut bands_flag: u8 = 0;
+        if ns.size_band_pools.inline.is_some() {
+            bands_flag |= 0b0000_0001;
+        }
+        if ns.size_band_pools.replicated.is_some() {
+            bands_flag |= 0b0000_0010;
+        }
+        if ns.size_band_pools.ec.is_some() {
+            bands_flag |= 0b0000_0100;
+        }
+        out.push(bands_flag);
+        for band in [
+            ns.size_band_pools.inline.as_deref(),
+            ns.size_band_pools.replicated.as_deref(),
+            ns.size_band_pools.ec.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            out.push(band.len() as u8);
+            out.extend_from_slice(band.as_bytes());
+        }
+    }
     out
 }
 
@@ -150,6 +184,42 @@ pub fn decode_namespace_create_payload(payload: &[u8]) -> Option<crate::namespac
         }
     }
 
+    // Optional per-namespace size-band pool selector (ADR-024 amendment
+    // 2026-05-31). Decoded best-effort — a truncated/malformed bands
+    // section degrades to the default (empty) `NamespaceSizeBandPools`,
+    // never failing the whole decode.
+    let mut size_band_pools = crate::namespace::NamespaceSizeBandPools::default();
+    if let Some(&bands_flag) = payload.get(pos) {
+        pos += 1;
+        for (bit, slot) in [
+            (0b0000_0001u8, 0usize),
+            (0b0000_0010u8, 1usize),
+            (0b0000_0100u8, 2usize),
+        ] {
+            if bands_flag & bit == 0 {
+                continue;
+            }
+            let Some(&name_len) = payload.get(pos) else {
+                break;
+            };
+            pos += 1;
+            let name_end = pos + name_len as usize;
+            if name_end > payload.len() {
+                break;
+            }
+            let Ok(name) = std::str::from_utf8(&payload[pos..name_end]) else {
+                break;
+            };
+            let value = Some(name.to_owned());
+            match slot {
+                0 => size_band_pools.inline = value,
+                1 => size_band_pools.replicated = value,
+                _ => size_band_pools.ec = value,
+            }
+            pos = name_end;
+        }
+    }
+
     Some(crate::namespace::Namespace {
         id: NamespaceId(ns_uuid),
         tenant_id: kiseki_common::ids::OrgId(tenant_uuid),
@@ -158,6 +228,7 @@ pub fn decode_namespace_create_payload(payload: &[u8]) -> Option<crate::namespac
         versioning_enabled: flags & 0b0000_0010 != 0,
         compliance_tags: Vec::new(),
         tier_policy,
+        size_band_pools,
     })
 }
 
@@ -1488,6 +1559,7 @@ mod tests {
             versioning_enabled: false,
             compliance_tags: Vec::new(),
             tier_policy: Vec::new(),
+            size_band_pools: crate::namespace::NamespaceSizeBandPools::default(),
         }
     }
 
@@ -1968,6 +2040,7 @@ mod tests {
             versioning_enabled: false,
             compliance_tags: vec![ComplianceTag::RevFadp],
             tier_policy: Vec::new(),
+            size_band_pools: crate::namespace::NamespaceSizeBandPools::default(),
         };
 
         let effective = ns.effective_compliance_tags(&org_tags);
@@ -1994,6 +2067,7 @@ mod tests {
             versioning_enabled: false,
             compliance_tags: vec![ComplianceTag::Hipaa, ComplianceTag::Gdpr],
             tier_policy: Vec::new(),
+            size_band_pools: crate::namespace::NamespaceSizeBandPools::default(),
         };
 
         let effective = ns.effective_compliance_tags(&org_tags);
@@ -2385,6 +2459,7 @@ mod tests {
                     quota_bytes: 0,
                 },
             ],
+            size_band_pools: crate::namespace::NamespaceSizeBandPools::default(),
         };
         let bytes = encode_namespace_create_payload(&ns);
         let back = decode_namespace_create_payload(&bytes).expect("decode");
@@ -2395,6 +2470,54 @@ mod tests {
         let legacy = &bytes[..NAMESPACE_CREATE_PAYLOAD_LEN];
         let back_legacy = decode_namespace_create_payload(legacy).expect("legacy decode");
         assert!(back_legacy.tier_policy.is_empty());
+    }
+
+    /// ADR-024 2026-05-31 amendment: the per-namespace size-band pool
+    /// selector round-trips through the `NamespaceCreate` payload, and
+    /// pre-amendment payloads (no bands section after `tier_policy`)
+    /// decode to the default empty selector.
+    #[test]
+    fn namespace_size_band_pools_round_trip() {
+        use crate::namespace::{Namespace, NamespaceSizeBandPools, TierQuota};
+        use kiseki_common::ids::{NamespaceId, OrgId, ShardId};
+
+        let ns = Namespace {
+            id: NamespaceId(uuid::Uuid::from_u128(11)),
+            tenant_id: OrgId(uuid::Uuid::from_u128(12)),
+            shard_id: ShardId(uuid::Uuid::from_u128(13)),
+            read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
+            tier_policy: vec![TierQuota {
+                tier: "fast".into(),
+                quota_bytes: 1024,
+            }],
+            size_band_pools: NamespaceSizeBandPools {
+                inline: Some("nvme-meta".into()),
+                replicated: None,
+                ec: Some("bulk-ec".into()),
+            },
+        };
+        let bytes = encode_namespace_create_payload(&ns);
+        let back = decode_namespace_create_payload(&bytes).expect("decode");
+        assert_eq!(back.size_band_pools, ns.size_band_pools);
+        assert_eq!(back.tier_policy, ns.tier_policy);
+
+        // Pre-amendment payload: tier policy present but no bands section.
+        // We truncate at the byte right after the tier-policy section by
+        // re-encoding with empty bands and chopping the trailing 1-byte
+        // flag (which is zero in that case).
+        let mut empty = ns.clone();
+        empty.size_band_pools = NamespaceSizeBandPools::default();
+        let mut empty_bytes = encode_namespace_create_payload(&empty);
+        // The last byte is the bands_flag = 0; drop it to simulate a
+        // record written before the amendment.
+        assert_eq!(empty_bytes.last(), Some(&0u8));
+        empty_bytes.pop();
+        let back_legacy =
+            decode_namespace_create_payload(&empty_bytes).expect("pre-amendment decode");
+        assert!(back_legacy.size_band_pools.is_empty());
+        assert_eq!(back_legacy.tier_policy, empty.tier_policy);
     }
 
     // -- Composition-create payload round-trip (the one wire shape) --------

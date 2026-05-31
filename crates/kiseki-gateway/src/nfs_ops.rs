@@ -1274,6 +1274,8 @@ mod tests {
             versioning_enabled: false,
             compliance_tags: Vec::new(),
             tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         });
         let gw = InMemoryGateway::new(
             store,
@@ -1409,6 +1411,8 @@ mod tests {
             versioning_enabled: false,
             compliance_tags: Vec::new(),
             tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         });
         let gw = Arc::new(InMemoryGateway::new(
             store,

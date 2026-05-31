@@ -255,6 +255,8 @@ impl KisekiWorld {
             versioning_enabled: false,
             compliance_tags: Vec::new(),
             tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         });
         self.namespace_ids.insert(name.to_owned(), ns_id);
         ns_id
@@ -283,6 +285,8 @@ impl KisekiWorld {
                 versioning_enabled: false,
                 compliance_tags: Vec::new(),
                 tier_policy: Vec::new(),
+
+                size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
             })
             .await;
         ns_id
@@ -351,6 +355,8 @@ impl KisekiWorld {
             versioning_enabled: false,
             compliance_tags: Vec::new(),
             tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         };
         self.legacy.gateway.add_namespace(ns.clone()).await;
 
@@ -414,6 +420,8 @@ impl KisekiWorld {
                 versioning_enabled: false,
                 compliance_tags: Vec::new(),
                 tier_policy: Vec::new(),
+
+                size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
             })
             .await;
     }
@@ -583,6 +591,9 @@ impl KisekiWorld {
                     versioning_enabled: false,
                     compliance_tags: Vec::new(),
                     tier_policy: Vec::new(),
+
+                    size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(
+                    ),
                 })
                 .await;
         }

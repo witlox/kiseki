@@ -33,6 +33,7 @@ pub mod raft_shard_store;
 pub mod raft_store;
 pub mod shard;
 pub mod shard_committer;
+pub mod shard_inline_threshold;
 pub mod split;
 pub mod store;
 pub mod traits;

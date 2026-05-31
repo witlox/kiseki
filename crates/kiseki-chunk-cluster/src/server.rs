@@ -844,7 +844,7 @@ fn rust_org_to_proto(o: RustOrgId) -> pb::OrgId {
 fn chunk_err_to_status(e: &ChunkError) -> Status {
     let msg = e.to_string();
     match e {
-        ChunkError::NotFound(_) => Status::not_found(msg),
+        ChunkError::NotFound(_) | ChunkError::SlabNotFound(_) => Status::not_found(msg),
         ChunkError::Corrupted(_) | ChunkError::DeviceUnavailable(_) | ChunkError::ChunkLost => {
             Status::data_loss(msg)
         }

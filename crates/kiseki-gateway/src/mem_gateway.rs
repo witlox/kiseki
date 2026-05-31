@@ -58,6 +58,23 @@ pub const MAX_PLAINTEXT_PER_CHUNK: usize = 64 * 1024 * 1024;
 /// pool has space, which is both wrong and un-actionable. Such errors
 /// fall through to [`GatewayError::Upstream`] (HTTP 5xx, message
 /// preserved) so the real `quorum lost` reason reaches the caller.
+/// ADR-024 §"three-tier durability" cross-ref: map an S3-style
+/// `req.tier` hint or a namespace `tier_policy` entry name into the
+/// chunk-side [`kiseki_chunk::pool::DeviceClass`] the pool selector
+/// honours as `preferred_class`. Recognised labels are the public
+/// pool-class names (`fast`/`bulk`/`cold`) plus the literal device
+/// class names (`nvme`/`ssd`/`hdd`). Anything else returns `None` so
+/// the selector falls back to band-driven auto-routing.
+fn device_class_from_label(label: &str) -> Option<kiseki_chunk::pool::DeviceClass> {
+    use kiseki_chunk::pool::DeviceClass;
+    match label.to_ascii_lowercase().as_str() {
+        "fast" | "nvme" => Some(DeviceClass::NvmeSsd),
+        "bulk" | "ssd" => Some(DeviceClass::Ssd),
+        "cold" | "hdd" => Some(DeviceClass::Hdd),
+        _ => None,
+    }
+}
+
 fn map_chunk_write_error<E: std::fmt::Display>(e: E) -> GatewayError {
     let rendered = e.to_string();
     let lower = rendered.to_ascii_lowercase();
@@ -1308,6 +1325,7 @@ impl InMemoryGateway {
             versioning_enabled: false,
             compliance_tags: Vec::new(),
             tier_policy: Vec::new(),
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         };
         // Phase 1: local mutation + capture log handle. Scope the
         // MutexGuard so it drops before any .await point.
@@ -2194,21 +2212,64 @@ impl InMemoryGateway {
         req: WriteRequest,
         with_forwarding: bool,
     ) -> Result<WriteResponse, GatewayError> {
-        // ADR-045 §D4/D5: placement-tier hint rides the chunk-store
-        // `pool` seam. `fast`/`bulk`/`cold` steer onto a device class;
-        // anything else (incl. the default) is fastest-fit. Resolution
-        // order: explicit request hint → the namespace's primary (first)
-        // tier policy → fastest-fit. Bound early (before `req` is
-        // consumed) so the chunk write below can use it.
-        let pool = req
+        // ADR-024 2026-05-31 amendment §"three-tier durability" +
+        // ADR-045 §D4/D5: pick the pool that should receive this
+        // write. Resolution chain:
+        //
+        //   1. Classify the PUT into a `WriteSizeBand` (Inline /
+        //      Replicated / Erasure) based on `data.len()` against the
+        //      band-leader pool's thresholds (cluster defaults if no
+        //      pool sets them).
+        //   2. If the namespace has a `size_band_pools` override for
+        //      that band, use it (when the pool exists + has capacity).
+        //   3. Otherwise auto-route by band → role + durability shape,
+        //      honouring the legacy `req.tier` / namespace `tier_policy`
+        //      device-class preference where it lines up.
+        //
+        // Fallback: when no pool has been registered (empty list — a
+        // test-only chunk-store stub, or a cluster that hasn't migrated
+        // past `default`), preserve the pre-amendment chain so existing
+        // BDDs / acceptance tests stay green:
+        //   `req.tier` → `namespace.tier_policy[0]` → `"default"`.
+        let ns_for_pool = self.compositions.namespace(req.namespace_id);
+        let preferred_class = req
             .tier
-            .clone()
+            .as_deref()
+            .and_then(device_class_from_label)
             .or_else(|| {
-                self.compositions
-                    .namespace(req.namespace_id)
-                    .and_then(|ns| ns.tier_policy.first().map(|t| t.tier.clone()))
-            })
-            .unwrap_or_else(|| "default".to_string());
+                ns_for_pool.as_ref().and_then(|ns| {
+                    ns.tier_policy
+                        .first()
+                        .and_then(|t| device_class_from_label(&t.tier))
+                })
+            });
+        let tier_policy_for_select =
+            ns_for_pool
+                .as_ref()
+                .map(|ns| kiseki_chunk::pool::NamespaceTierPolicy {
+                    inline: ns.size_band_pools.inline.clone(),
+                    replicated: ns.size_band_pools.replicated.clone(),
+                    ec: ns.size_band_pools.ec.clone(),
+                });
+        let pool_snapshot = self.chunks.snapshot_pools().await;
+        let total_data_size = req.data.len() as u64;
+        let pool = kiseki_chunk::select_pool_for_write(
+            &pool_snapshot,
+            total_data_size,
+            tier_policy_for_select.as_ref(),
+            preferred_class,
+        )
+        .map_or_else(
+            || {
+                req.tier.clone().unwrap_or_else(|| {
+                    ns_for_pool
+                        .as_ref()
+                        .and_then(|ns| ns.tier_policy.first().map(|t| t.tier.clone()))
+                        .unwrap_or_else(|| "default".to_string())
+                })
+            },
+            |p| p.name.clone(),
+        );
         // #111: forwarding now happens inside the forward-aware emit
         // (`emit_chunk_and_delta_forwarding_to`), which re-issues the
         // built append to the leader. The origin request carries

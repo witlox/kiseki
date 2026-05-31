@@ -192,16 +192,46 @@ when it's a problem; they decide when to act.
 
 ## Implementation phasing
 
-Phase 0: this escalation + ADR amendments + ADR-048.
-Phase 1: `kiseki-admin` operational primitives (device role, pool moves, namespace tier-policy).
-Phase 2: runtime media-type detection + `NodeMetadataCapacity` reporting + per-pool capacity accounting.
-Phase 3: gateway write-path tier routing — replace the `"default"` string lookup with `select_pool_for_write`.
-Phase 4: dynamic per-shard threshold formula + throughput guard + per-pool capacity thresholds (Healthy/Warning/Critical).
-Phase 5: slab-EC compactor in the committer.
+Phase 0: this escalation + ADR amendments + ADR-048. **LANDED 2026-05-31.**
+Phase 1: `kiseki-admin` operational primitives (device role, pool moves, namespace tier-policy). **LANDED 2026-05-31.**
+Phase 2: runtime media-type detection + `NodeMetadataCapacity` reporting + per-pool capacity accounting. **LANDED 2026-05-31.**
+Phase 3: gateway write-path tier routing — replace the `"default"` string lookup with `select_pool_for_write`. **LANDED 2026-05-31.**
+Phase 4: dynamic per-shard threshold formula + throughput guard + per-pool capacity thresholds (Healthy/Warning/Critical). **LANDED 2026-05-31.**
+Phase 5: slab-EC compactor in the committer. **KERNEL LANDED 2026-05-31** — see below for the scoping note.
 
 Phases 1–3 deliver the inline path + three-tier routing live, A/B-measurable
 on the next GCP perf run. Phases 4–5 make it cluster-aware, self-tuning,
 and storage-efficient on the medium tier without per-PUT EC tax.
+
+### What "Phase 5 kernel landed" means
+
+ADR-048 expands into eleven sub-phases of integration (5.1 through 5.11)
+covering the type system, the encoder, the storage seam, the compactor
+task scheduler, the Raft delta that flips a composition's
+`chunk_ref.location`, the gateway read-path branch, hot-tier eviction,
+GC, the maintenance rewrite pass, backpressure, and admin reporting.
+
+The 2026-05-31 implementation lands the **kernel** (5.1, 5.2, 5.3a, 5.7):
+
+- `kiseki_chunk::slab` module with `SlabId`, `SlabHeader`, `SlabExtent`,
+  `Slab`, `ChunkRefLocation::{Hot, Cold}`.
+- Pure `encode_slab` (re-uses `crate::ec::encode` so slab parity is
+  identical to per-PUT EC).
+- Pure `extract_chunk` for the cold-tier read path.
+- `SlabBuilder` accumulator with byte/count/age caps + flush semantics.
+- `SlabBacklog` per-pool tracker with soft/hard thresholds for the
+  gateway's `is_async_ack_eligible` gate.
+- `SlabStore` trait + `InMemorySlabStore` impl (dev box + tests).
+- `ChunkError::SlabNotFound` error variant.
+- 10 unit tests covering round-trip, GC, fragmentation, backpressure.
+
+The **runtime wiring** (5.3b production placement-aware SlabStore,
+5.4 compactor task scheduler, 5.5 Raft delta for chunk-ref flip, 5.6
+gateway read-path branch, 5.8 hot-tier eviction, 5.10 maintenance
+rewrite pass, 5.11 admin reporting) lands as a follow-up PR. Tracked
+on the project board as the "ADR-048 runtime integration" series.
+Pre-condition for that PR: the kernel landed here, which is
+self-contained and unit-tested.
 
 ---
 

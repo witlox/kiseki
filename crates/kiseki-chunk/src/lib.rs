@@ -29,6 +29,7 @@ pub mod placement;
 pub mod pool;
 pub mod rebalance;
 pub mod scrub_engine;
+pub mod slab;
 pub mod small_object_store;
 pub mod store;
 pub mod striping;

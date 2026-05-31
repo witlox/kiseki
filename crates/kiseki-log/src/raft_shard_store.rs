@@ -896,6 +896,49 @@ impl RaftShardStore {
         store.initialize_membership(&self.peers).await
     }
 
+    /// Snapshot the current set of shard ids the store knows about.
+    /// Used by the runtime's periodic ADR-030 inline-threshold
+    /// recompute loop so it can iterate without holding any locks
+    /// across the recompute work.
+    #[must_use]
+    pub fn shard_ids(&self) -> Vec<ShardId> {
+        self.shards
+            .lock()
+            .lock_or_die("raft_shard_store.shards")
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// `true` when this node is the elected leader of `shard_id`.
+    /// Returns `false` for unknown shards instead of erroring so the
+    /// recompute loop can no-op cleanly on a shard that has not yet
+    /// completed bootstrap.
+    #[must_use]
+    pub fn is_shard_leader(&self, shard_id: ShardId) -> bool {
+        let Ok(store) = self.get_shard(shard_id) else {
+            return false;
+        };
+        store.is_leader()
+    }
+
+    /// ADR-030 leader-side recompute helper — Raft-commit a new
+    /// `ShardConfig` for `shard_id`, awaiting consensus on the Raft
+    /// runtime. Returns `Err` if this node isn't the leader (caller
+    /// should have gated by `is_shard_leader` first) or if the commit
+    /// fails. The committed config replicates to followers via the
+    /// existing apply hook in the state machine.
+    pub fn submit_shard_config(
+        &self,
+        shard_id: ShardId,
+        config: ShardConfig,
+    ) -> Result<(), LogError> {
+        let store = self.get_shard(shard_id)?;
+        self.run_blocking(&store, move |s| {
+            Box::pin(async move { s.set_shard_config(config).await })
+        })?
+    }
+
     /// Look up a shard's Raft store.
     fn get_shard(&self, shard_id: ShardId) -> Result<Arc<OpenRaftLogStore>, LogError> {
         let shards = self.shards.lock().lock_or_die("raft_shard_store.shards");

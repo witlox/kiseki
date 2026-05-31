@@ -121,6 +121,18 @@ pub struct KisekiMetrics {
     /// Small-object tier on-disk bytes (`KISEKI_DATA_DIR/small` —
     /// ADR-030 inline content tier).
     pub storage_small_bytes: IntGauge,
+    /// ADR-030 amendment §"admin-driven metadata device role" — this
+    /// node's metadata-role device capacity. `kind` is one of `total`
+    /// / `used` / `soft_limit` / `hard_limit` / `small_file_budget`.
+    /// The cluster aggregator sums `kind=soft_limit` across all nodes
+    /// to derive `cluster_max_files` (see `docs/performance/capacity-planning.md`).
+    pub node_metadata_capacity_bytes: IntGaugeVec,
+    /// Media type of this node's metadata-role device. Info-gauge:
+    /// emits `1` for the detected `kind` label only (one of `nvme` /
+    /// `ssd` / `hdd` / `unknown`), zero for the others. Pairs with
+    /// `node_metadata_capacity_bytes` so the admin UI can show the
+    /// media class on the capacity row.
+    pub node_metadata_media_type: IntGaugeVec,
     /// Chunk-pool capacity split by cost/performance tier (ADR-024):
     /// `{used, total}` for fast (`NVMe`), bulk (`SSD`), cold (`HDD`). The
     /// cluster aggregator sums these so `kiseki-admin capacity` can show
@@ -499,6 +511,42 @@ impl KisekiMetrics {
             .register(Box::new(storage_small_bytes.clone()))
             .expect("register");
 
+        // ADR-030 amendment §"admin-driven metadata device role" —
+        // per-node metadata capacity gauge. `kind` labels:
+        //   total            — raw device capacity (bytes)
+        //   used             — bytes currently in use
+        //   soft_limit       — meta_soft_limit_pct of total
+        //   hard_limit       — meta_hard_limit_pct of total
+        //   small_file_budget — soft_limit - used (room for inline)
+        // The cluster aggregator sums `kind=soft_limit` across all
+        // nodes to derive `cluster_max_files`.
+        let node_metadata_capacity_bytes = IntGaugeVec::new(
+            Opts::new(
+                "kiseki_node_metadata_capacity_bytes",
+                "Per-node metadata-role device capacity (kind = total | used | soft_limit | hard_limit | small_file_budget)",
+            ),
+            &["kind"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(node_metadata_capacity_bytes.clone()))
+            .expect("register");
+
+        // Info-gauge: emits 1 for the detected media class, 0 for the
+        // others. Lets the admin UI render the media-class tag next to
+        // the capacity row without a separate API call.
+        let node_metadata_media_type = IntGaugeVec::new(
+            Opts::new(
+                "kiseki_node_metadata_media_type",
+                "Media type of this node's metadata-role device (one-hot)",
+            ),
+            &["kind"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(node_metadata_media_type.clone()))
+            .expect("register");
+
         let mk_tier = |name: &str, help: &str, reg: &Registry| -> IntGauge {
             let g = IntGauge::new(name, help).expect("metric");
             reg.register(Box::new(g.clone())).expect("register");
@@ -671,6 +719,8 @@ impl KisekiMetrics {
             storage_chunk_count,
             storage_meta_bytes,
             storage_small_bytes,
+            node_metadata_capacity_bytes,
+            node_metadata_media_type,
             storage_tier_fast_used,
             storage_tier_fast_total,
             storage_tier_bulk_used,

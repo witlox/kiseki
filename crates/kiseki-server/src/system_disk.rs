@@ -3,12 +3,18 @@
 //! Detects media type (`NVMe`, SSD, HDD) of the system partition via
 //! sysfs on Linux. Falls back to `Unknown` on other platforms.
 //! Computes metadata budget from total capacity and configured limits.
+//!
+//! ADR-030 2026-05-31 amendment §"admin-driven metadata device role":
+//! the result is pushed into the
+//! `kiseki_node_metadata_capacity_bytes{kind=...}` gauge so the cluster
+//! aggregator can derive `cluster_max_files` from
+//! `Σ soft_limit / per-file metadata footprint`. See
+//! `docs/performance/capacity-planning.md`.
 
 use std::path::Path;
 
 /// Storage media type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub enum MediaType {
     /// `NVMe` SSD (non-rotational, nvme device).
     Nvme,
@@ -20,9 +26,21 @@ pub enum MediaType {
     Unknown,
 }
 
+impl MediaType {
+    /// Label string for the prom info gauge. Stable for dashboards.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Nvme => "nvme",
+            Self::Ssd => "ssd",
+            Self::Hdd => "hdd",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Metadata capacity budget for the system disk.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct NodeMetadataCapacity {
     /// Total capacity of the system partition (bytes).
     pub total_bytes: u64,
@@ -157,3 +175,50 @@ pub fn warn_if_rotational(media_type: MediaType) {
         );
     }
 }
+
+/// ADR-030 2026-05-31 amendment — push the
+/// `NodeMetadataCapacity` snapshot into the Prometheus gauges so the
+/// cluster aggregator can derive `cluster_max_files` and surface
+/// per-node media class. Idempotent and cheap; safe to call on a
+/// periodic tick.
+pub fn emit_capacity_metrics(metrics: &crate::metrics::KisekiMetrics, cap: &NodeMetadataCapacity) {
+    // Per-kind capacity gauges. Each label resets cleanly on
+    // re-application, so periodic refresh is correct.
+    let kinds: [(&str, u64); 5] = [
+        ("total", cap.total_bytes),
+        ("used", cap.used_bytes),
+        ("soft_limit", cap.soft_limit_bytes),
+        ("hard_limit", cap.hard_limit_bytes),
+        ("small_file_budget", cap.small_file_budget_bytes),
+    ];
+    for (kind, value) in kinds {
+        // Cast saturates at i64::MAX — exabyte+ scale clamps but never panics.
+        let v = i64::try_from(value).unwrap_or(i64::MAX);
+        metrics
+            .node_metadata_capacity_bytes
+            .with_label_values(&[kind])
+            .set(v);
+    }
+
+    // Media-type info gauge: one-hot. Zero out the others on every
+    // refresh in case the active media class flipped (e.g. operator
+    // remounted onto a different device).
+    for &kind in &["nvme", "ssd", "hdd", "unknown"] {
+        let v = i64::from(cap.media_type.as_label() == kind);
+        metrics
+            .node_metadata_media_type
+            .with_label_values(&[kind])
+            .set(v);
+    }
+}
+
+/// Conservative metadata footprint per file. Used by the cluster
+/// aggregator to derive `cluster_max_files` from the
+/// `Σ soft_limit_bytes` aggregated across nodes.
+///
+/// 512 bytes covers: composition record (~280B), namespace hash key
+/// reservation (32B), name binding (~80B avg), HLC stamps (~16B per
+/// dual-clock entry), and ~104B reserved for fjall LSM overhead and
+/// future fields. Aligns with the planning figure in
+/// `docs/performance/capacity-planning.md`.
+pub const PER_FILE_METADATA_FOOTPRINT_BYTES: u64 = 512;

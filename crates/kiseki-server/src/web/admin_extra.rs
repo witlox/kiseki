@@ -59,6 +59,16 @@ pub fn admin_extra_routes() -> Router<UiState> {
             "/admin/topology/namespaces",
             post(api_create_sharded_namespace),
         )
+        // ADR-024 2026-05-31 amendment §"three-tier durability":
+        // per-namespace size-band pool selector + tier-policy POST.
+        .route(
+            "/admin/topology/namespaces/{namespace_id}/size-band-pools",
+            post(api_set_namespace_size_band_pools),
+        )
+        .route(
+            "/admin/topology/namespaces/{namespace_id}/tier-policy",
+            post(api_set_namespace_tier_policy),
+        )
         .route("/admin/topology/forwarding", get(api_topology_forwarding))
         .route(
             "/ui/fragment/topology-shards",
@@ -71,6 +81,13 @@ pub fn admin_extra_routes() -> Router<UiState> {
         // --- Pools tab ---
         .route("/admin/pools", get(api_pools))
         .route("/ui/fragment/pools-table", get(fragment_pools_table))
+        // ADR-030 amendment §"admin-driven metadata device role" —
+        // cluster-wide aggregation of per-node metadata-capacity
+        // gauges → `cluster_max_files` estimate.
+        .route(
+            "/admin/storage/cluster-capacity",
+            get(api_cluster_metadata_capacity),
+        )
         // --- Device / pool resize (ADR-025 StorageAdminService bridge) ---
         .route("/admin/storage/devices", get(api_list_devices))
         .route("/admin/storage/devices/add", post(api_add_device))
@@ -470,6 +487,30 @@ async fn api_create_sharded_namespace(
         })
         .unwrap_or_default();
 
+    // ADR-024 2026-05-31 amendment §"three-tier durability" — optional
+    // per-namespace size-band pool selector. JSON shape:
+    //   "size_band_pools": { "inline": "<pool>", "replicated": "<pool>",
+    //                        "ec": "<pool>" }
+    // Any missing field falls through to the cluster default chain.
+    // Absent entirely → empty selector (all defaults).
+    let size_band_pools = parsed
+        .get("size_band_pools")
+        .and_then(|v| v.as_object())
+        .map(
+            |obj| kiseki_composition::namespace::NamespaceSizeBandPools {
+                inline: obj
+                    .get("inline")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                replicated: obj
+                    .get("replicated")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                ec: obj.get("ec").and_then(|v| v.as_str()).map(str::to_owned),
+            },
+        )
+        .unwrap_or_default();
+
     // Idempotent re-invocation: if the namespace already exists, echo
     // the current shard count back with 409 so the caller can no-op
     // without parsing an error string.
@@ -589,6 +630,7 @@ async fn api_create_sharded_namespace(
                             versioning_enabled: false,
                             compliance_tags: Vec::new(),
                             tier_policy: tier_policy.clone(),
+                            size_band_pools: size_band_pools.clone(),
                         };
                         comps.add_namespace(ns.clone());
                         if let Err(e) = kiseki_composition::log_bridge::emit_namespace_create(
@@ -694,6 +736,227 @@ fn encode_range_hex(bytes: &[u8; 32]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// ADR-024 2026-05-31 amendment §"three-tier durability" —
+/// `POST /admin/topology/namespaces/{namespace_id}/size-band-pools`
+///
+/// Body JSON shape (any subset of fields):
+/// ```json
+/// { "inline": "<pool>", "replicated": "<pool>", "ec": "<pool>" }
+/// ```
+/// An empty-string value clears that band back to the cluster default.
+/// A missing field leaves that band's selector unchanged. Effects:
+/// 1. Update the namespace record in the leader's `CompositionStore`.
+/// 2. Re-emit a `NamespaceCreate` delta on the namespace's shard so
+///    followers' hydrators replace their in-memory copy (the hydrator
+///    treats a `NamespaceCreate` for a known id as an upsert, see
+///    `hydrator.rs::namespace_inserts`).
+///
+/// Idempotent: posting the same body twice is a no-op. 404 if the
+/// namespace is unknown; 503 if the composition store isn't wired
+/// (degenerate single-node test setup).
+async fn api_set_namespace_size_band_pools(
+    State(state): State<UiState>,
+    axum::extract::Path(namespace_id): axum::extract::Path<String>,
+    body: String,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+    let (Some(comps), Some(log)) = (state.compositions.as_ref(), state.log_store.as_ref()) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": "composition store / log not wired",
+            })),
+        );
+    };
+    let Ok(ns_uuid) = uuid::Uuid::parse_str(&namespace_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "namespace_id must be a UUID",
+            })),
+        );
+    };
+    let ns_id = kiseki_common::ids::NamespaceId(ns_uuid);
+    let Some(mut ns) = comps.namespace(ns_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": "namespace not registered on this node",
+            })),
+        );
+    };
+
+    let parsed: serde_json::Value = if body.trim().is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "error": format!("invalid JSON body: {e}"),
+                    })),
+                );
+            }
+        }
+    };
+
+    // Per-band update: present + non-empty → set, present + empty → clear,
+    // absent → leave alone. The CLI maps the `default` sentinel to empty.
+    let apply = |slot: &mut Option<String>, key: &str| {
+        if let Some(v) = parsed.get(key) {
+            if let Some(s) = v.as_str() {
+                if s.is_empty() {
+                    *slot = None;
+                } else {
+                    *slot = Some(s.to_owned());
+                }
+            }
+        }
+    };
+    apply(&mut ns.size_band_pools.inline, "inline");
+    apply(&mut ns.size_band_pools.replicated, "replicated");
+    apply(&mut ns.size_band_pools.ec, "ec");
+
+    comps.add_namespace(ns.clone());
+    if let Err(e) = kiseki_composition::log_bridge::emit_namespace_create(
+        log.as_ref(),
+        ns.shard_id,
+        ns.tenant_id,
+        &ns,
+    )
+    .await
+    {
+        // Roll back so leader + followers don't diverge. The caller
+        // can retry; we surface the underlying error verbatim.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": format!("failed to replicate size_band_pools update: {e}"),
+            })),
+        );
+    }
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "namespace_id": namespace_id,
+            "size_band_pools": {
+                "inline": ns.size_band_pools.inline,
+                "replicated": ns.size_band_pools.replicated,
+                "ec": ns.size_band_pools.ec,
+            }
+        })),
+    )
+}
+
+/// ADR-045 §D3 + ADR-024 amendment cross-ref —
+/// `POST /admin/topology/namespaces/{namespace_id}/tier-policy`
+///
+/// Body: `{ "tier_policy": [ { "tier": "...", "quota_bytes": N } ... ] }`.
+/// An empty array clears the policy back to "fastest-fit". Same
+/// replication path as `api_set_namespace_size_band_pools`.
+async fn api_set_namespace_tier_policy(
+    State(state): State<UiState>,
+    axum::extract::Path(namespace_id): axum::extract::Path<String>,
+    body: String,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    use axum::http::StatusCode;
+    let (Some(comps), Some(log)) = (state.compositions.as_ref(), state.log_store.as_ref()) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": "composition store / log not wired",
+            })),
+        );
+    };
+    let Ok(ns_uuid) = uuid::Uuid::parse_str(&namespace_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": "namespace_id must be a UUID",
+            })),
+        );
+    };
+    let ns_id = kiseki_common::ids::NamespaceId(ns_uuid);
+    let Some(mut ns) = comps.namespace(ns_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": "namespace not registered on this node",
+            })),
+        );
+    };
+
+    let parsed: serde_json::Value = if body.trim().is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "error": format!("invalid JSON body: {e}"),
+                    })),
+                );
+            }
+        }
+    };
+
+    let tier_policy: Vec<kiseki_composition::namespace::TierQuota> = parsed
+        .get("tier_policy")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let tier = e.get("tier")?.as_str()?.to_owned();
+                    let quota_bytes = e
+                        .get("quota_bytes")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    Some(kiseki_composition::namespace::TierQuota { tier, quota_bytes })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    ns.tier_policy = tier_policy;
+    comps.add_namespace(ns.clone());
+    if let Err(e) = kiseki_composition::log_bridge::emit_namespace_create(
+        log.as_ref(),
+        ns.shard_id,
+        ns.tenant_id,
+        &ns,
+    )
+    .await
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": format!("failed to replicate tier_policy update: {e}"),
+            })),
+        );
+    }
+    let tiers_json: Vec<_> = ns
+        .tier_policy
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "tier": t.tier,
+                "quota_bytes": t.quota_bytes,
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "namespace_id": namespace_id,
+            "tier_policy": tiers_json,
+        })),
+    )
 }
 
 async fn api_topology_forwarding(State(state): State<UiState>) -> impl IntoResponse {
@@ -1333,6 +1596,124 @@ async fn api_set_pool_thresholds(
             axum::Json(serde_json::json!({ "error": status.message() })),
         ),
     }
+}
+
+/// ADR-030 2026-05-31 amendment §"admin-driven metadata device role" —
+/// `GET /admin/storage/cluster-capacity`
+///
+/// Aggregates per-node metadata-capacity gauges
+/// (`kiseki_node_metadata_capacity_bytes{kind=...}`) across every
+/// healthy peer the metrics aggregator has scraped. Returns a JSON
+/// payload with:
+///   - `nodes[]`: per-node breakdown (node_id, total/used/soft/hard,
+///     media_type, per-node `max_files_estimate`).
+///   - `aggregate`: cluster sums + the headline
+///     `cluster_max_files_estimate`
+///     (= `Σ soft_limit / PER_FILE_METADATA_FOOTPRINT_BYTES`,
+///     `docs/performance/capacity-planning.md`).
+async fn api_cluster_metadata_capacity(
+    State(state): State<UiState>,
+) -> axum::Json<serde_json::Value> {
+    let snapshots = state.aggregator.all_snapshots().await;
+
+    // Per-node rows. We accept whatever the aggregator has cached;
+    // unreachable peers degrade to `healthy = false` with zeros.
+    let mut nodes_json = Vec::with_capacity(snapshots.len());
+    let mut sum_total: u64 = 0;
+    let mut sum_used: u64 = 0;
+    let mut sum_soft: u64 = 0;
+    let mut sum_hard: u64 = 0;
+    let mut sum_budget: u64 = 0;
+    let mut healthy_nodes: u64 = 0;
+    let footprint = crate::system_disk::PER_FILE_METADATA_FOOTPRINT_BYTES;
+    for s in &snapshots {
+        let cap_rows = parse_gauge_with_labels(
+            &s.metrics_text,
+            "kiseki_node_metadata_capacity_bytes",
+            &["kind"],
+        );
+        let mut total = 0u64;
+        let mut used = 0u64;
+        let mut soft = 0u64;
+        let mut hard = 0u64;
+        let mut budget = 0u64;
+        for row in &cap_rows {
+            let kind = row.labels.get("kind").map(String::as_str).unwrap_or("");
+            // Saturating cast: prom samples are f64; any value beyond
+            // u64::MAX clamps rather than overflowing into nonsense.
+            let v = row.value.max(0.0) as u64;
+            match kind {
+                "total" => total = v,
+                "used" => used = v,
+                "soft_limit" => soft = v,
+                "hard_limit" => hard = v,
+                "small_file_budget" => budget = v,
+                _ => {}
+            }
+        }
+        let media_rows = parse_gauge_with_labels(
+            &s.metrics_text,
+            "kiseki_node_metadata_media_type",
+            &["kind"],
+        );
+        let media_type = media_rows
+            .iter()
+            .find(|r| (r.value - 1.0).abs() < f64::EPSILON)
+            .and_then(|r| r.labels.get("kind").cloned())
+            .unwrap_or_else(|| "unknown".to_owned());
+
+        let node_max_files = soft.saturating_div(footprint.max(1));
+        let used_pct = if total > 0 {
+            (used as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
+        let breach = if hard > 0 && used >= hard {
+            "hard"
+        } else if soft > 0 && used >= soft {
+            "soft"
+        } else {
+            "ok"
+        };
+        if s.healthy {
+            healthy_nodes += 1;
+            sum_total = sum_total.saturating_add(total);
+            sum_used = sum_used.saturating_add(used);
+            sum_soft = sum_soft.saturating_add(soft);
+            sum_hard = sum_hard.saturating_add(hard);
+            sum_budget = sum_budget.saturating_add(budget);
+        }
+        nodes_json.push(serde_json::json!({
+            "node_id": s.node_id,
+            "address": s.address,
+            "healthy": s.healthy,
+            "media_type": media_type,
+            "total_bytes": total,
+            "used_bytes": used,
+            "soft_limit_bytes": soft,
+            "hard_limit_bytes": hard,
+            "small_file_budget_bytes": budget,
+            "used_pct": format!("{used_pct:.1}"),
+            "max_files_estimate": node_max_files,
+            "breach": breach,
+        }));
+    }
+    let cluster_max_files = sum_soft.saturating_div(footprint.max(1));
+    let aggregate = serde_json::json!({
+        "healthy_nodes": healthy_nodes,
+        "total_nodes": snapshots.len(),
+        "total_bytes": sum_total,
+        "used_bytes": sum_used,
+        "soft_limit_bytes": sum_soft,
+        "hard_limit_bytes": sum_hard,
+        "small_file_budget_bytes": sum_budget,
+        "cluster_max_files_estimate": cluster_max_files,
+        "per_file_metadata_footprint_bytes": footprint,
+    });
+    axum::Json(serde_json::json!({
+        "nodes": nodes_json,
+        "aggregate": aggregate,
+    }))
 }
 
 async fn api_pools(State(state): State<UiState>) -> impl IntoResponse {
