@@ -203,22 +203,34 @@ impl OpenRaftLogStore {
         let state_machine = ShardStateMachine::new(Arc::clone(&state_inner));
 
         // Select log store backend: persistent (fjall) or in-memory.
+        // Errors are surfaced as `LogError::StoreConstruction(<source>)`
+        // so operators see the underlying fjall / openraft failure
+        // instead of the prior opaque `Unavailable`. Each call site
+        // tags its phase so the message reads e.g.
+        // "fjall open at /data/raft/shard-…: <fjall::Error>".
         let raft = if let Some(dir) = data_dir {
             let raft_dir = dir.join("raft");
-            std::fs::create_dir_all(&raft_dir).ok();
+            std::fs::create_dir_all(&raft_dir).map_err(|e| {
+                LogError::StoreConstruction(format!("create_dir_all({}): {e}", raft_dir.display()))
+            })?;
             let log_path = raft_dir.join(format!("shard-{}", shard_id.0));
-            let log_store =
-                FjallRaftLogStore::<C>::open(&log_path).map_err(|_| LogError::Unavailable)?;
+            let log_store = FjallRaftLogStore::<C>::open(&log_path).map_err(|e| {
+                LogError::StoreConstruction(format!("fjall open at {}: {e}", log_path.display()))
+            })?;
             if peers.len() > 1 {
                 let network = TcpNetworkFactory::<C>::new(shard_id);
                 Raft::new(node_id, config, network, log_store, state_machine)
                     .await
-                    .map_err(|_e| LogError::Unavailable)?
+                    .map_err(|e| {
+                        LogError::StoreConstruction(format!("Raft::new multi-node: {e}"))
+                    })?
             } else {
                 let network = StubNetworkFactory::<C>::new();
                 Raft::new(node_id, config, network, log_store, state_machine)
                     .await
-                    .map_err(|_e| LogError::Unavailable)?
+                    .map_err(|e| {
+                        LogError::StoreConstruction(format!("Raft::new single-node: {e}"))
+                    })?
             }
         } else {
             let log_store = MemLogStore::<C>::new();
@@ -226,12 +238,20 @@ impl OpenRaftLogStore {
                 let network = TcpNetworkFactory::<C>::new(shard_id);
                 Raft::new(node_id, config, network, log_store, state_machine)
                     .await
-                    .map_err(|_e| LogError::Unavailable)?
+                    .map_err(|e| {
+                        LogError::StoreConstruction(format!(
+                            "Raft::new multi-node (mem-store): {e}"
+                        ))
+                    })?
             } else {
                 let network = StubNetworkFactory::<C>::new();
                 Raft::new(node_id, config, network, log_store, state_machine)
                     .await
-                    .map_err(|_e| LogError::Unavailable)?
+                    .map_err(|e| {
+                        LogError::StoreConstruction(format!(
+                            "Raft::new single-node (mem-store): {e}"
+                        ))
+                    })?
             }
         };
 

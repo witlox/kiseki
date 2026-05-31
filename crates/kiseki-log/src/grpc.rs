@@ -40,7 +40,11 @@ fn to_status(e: &LogError) -> Status {
         | LogError::Unavailable => Status::unavailable(e.to_string()),
         LogError::KeyOutOfRange(_) => Status::out_of_range(e.to_string()),
         LogError::InvalidRange(_) => Status::invalid_argument(e.to_string()),
-        LogError::Io(_) => Status::internal(e.to_string()),
+        // ADR-026 — StoreConstruction is a boot-fatal error (fjall
+        // unopenable, openraft init failed). Surface as `internal` so
+        // clients see a clear server-side failure, not a transient
+        // `unavailable` they'd otherwise retry against forever.
+        LogError::StoreConstruction(_) | LogError::Io(_) => Status::internal(e.to_string()),
     }
 }
 

@@ -656,21 +656,62 @@ impl RaftShardStore {
         let handle = self.rt.handle().clone();
         let store = std::thread::spawn(move || {
             handle.block_on(async {
-                let store = OpenRaftLogStore::new(
-                    node_id,
-                    shard_id,
-                    tenant_id,
-                    &peers,
-                    data_dir.as_deref(),
-                    inline_store,
-                )
-                .await
-                .expect("failed to create Raft log store");
-                Arc::new(store)
+                // Bounded retry on `StoreConstruction` errors. The
+                // failure modes we've actually seen in CI / e2e are
+                // transient: fjall's open() can race against a
+                // sibling process tearing down a stale lock; openraft's
+                // multi-node `Raft::new` can race against the
+                // multiplexed listener's binding when 3 nodes spawn at
+                // once in docker compose. A small retry budget (5
+                // attempts × 500 ms = 2.5 s) covers both without
+                // masking a genuinely broken on-disk state, which
+                // would still fail every attempt and surface the
+                // underlying error in the final panic message.
+                //
+                // Boot-fatal errors (out of memory, openraft config
+                // bug) still panic — but with the real cause in the
+                // message instead of the opaque "failed to create
+                // Raft log store" the call site used to print.
+                const MAX_ATTEMPTS: u32 = 5;
+                const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+                let mut last_err: Option<LogError> = None;
+                for attempt in 1..=MAX_ATTEMPTS {
+                    match OpenRaftLogStore::new(
+                        node_id,
+                        shard_id,
+                        tenant_id,
+                        &peers,
+                        data_dir.as_deref(),
+                        inline_store.clone(),
+                    )
+                    .await
+                    {
+                        Ok(s) => return Arc::new(s),
+                        Err(e) => {
+                            tracing::warn!(
+                                shard_id = %shard_id.0,
+                                attempt,
+                                max = MAX_ATTEMPTS,
+                                error = %e,
+                                "OpenRaftLogStore::new failed — retrying",
+                            );
+                            last_err = Some(e);
+                            tokio::time::sleep(RETRY_INTERVAL).await;
+                        }
+                    }
+                }
+                // Exhausted — fail-stop with the real error in the
+                // message so operators don't need to dig through
+                // container logs.
+                panic!(
+                    "OpenRaftLogStore::new failed after {MAX_ATTEMPTS} attempts for shard {}: {}",
+                    shard_id.0,
+                    last_err.map_or_else(|| "no error recorded".to_string(), |e| e.to_string()),
+                );
             })
         })
         .join()
-        .expect("Raft shard creation thread panicked");
+        .expect("Raft shard creation thread panicked (system failure — see prior panic)");
 
         // ADR-047: create this shard's IntentStore so peers can SERVE their
         // intent state via the IntentSync aux dispatcher AND the local
