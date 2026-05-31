@@ -255,6 +255,39 @@ fn xdr_err(e: &std::io::Error) -> GatewayError {
 /// the stateid, so the flush still lands even if the stateid round
 /// trip fails. We tolerate `NFS4ERR_BAD_STATEID` at the CLOSE op
 /// level — the compound's top-level status is what matters.
+/// Run a PUTROOTFH+LOOKUP(name)+GETFH compound to recover the real
+/// `composition_id` from the post-flush directory entry. Returns
+/// `None` on any compound short-circuit (NOENT, etc.) so the caller
+/// can fall back to the pre-flush placeholder.
+fn recover_composition_id_via_lookup(
+    sess: &mut Nfs4Session,
+    minor_version: u32,
+    ops: &[(u32, Vec<u8>)],
+) -> Option<CompositionId> {
+    let reply = sess.sequenced_compound(minor_version, ops).ok()?;
+    let mut r = XdrReader::new(&reply);
+    // Walk each op result: 4-byte op tag + 4-byte status. PUTROOTFH
+    // and LOOKUP are empty after the status; GETFH appends an opaque
+    // file handle. The compound short-circuits on any non-OK status,
+    // so we abort and return `None` on the first miss.
+    for (i, (expected_op, _)) in ops.iter().enumerate() {
+        let _op = r.read_u32().ok()?;
+        let st = r.read_u32().ok()?;
+        if st != NFS4_OK {
+            return None;
+        }
+        if *expected_op == op::GETFH && i + 1 == ops.len() {
+            let fh_real = r.read_opaque().ok()?;
+            if fh_real.len() < 16 {
+                return None;
+            }
+            let uuid = uuid::Uuid::from_slice(&fh_real[..16]).ok()?;
+            return Some(CompositionId(uuid));
+        }
+    }
+    None
+}
+
 fn flush_via_close(
     sess: &mut Nfs4Session,
     minor_version: u32,
@@ -589,6 +622,7 @@ impl Nfs4Client {
 
 #[async_trait::async_trait]
 impl GatewayOps for Nfs4Client {
+    #[allow(clippy::too_many_lines)] // OPEN+WRITE+COMMIT+GETFH compound + post-flush LOOKUP, single-purpose
     async fn write(&self, req: WriteRequest) -> Result<WriteResponse, GatewayError> {
         let mut guard = self.ensure_session().await?;
         let sess = guard
@@ -723,6 +757,35 @@ impl GatewayOps for Nfs4Client {
             stateid_seqid,
             &stateid_other_bytes,
         )?;
+
+        // Post-flush LOOKUP+GETFH to recover the **real**
+        // composition_id. The earlier GETFH inside the OPEN compound
+        // returned the placeholder fh that `create_pending_named`
+        // minted — its first 16 bytes are a fresh UUID never bound
+        // to a composition row. `op_close` above triggered
+        // `flush_writes`, which updates `dir_index` (in
+        // `nfs_ops::flush_writes` §"Update dir_index to point at the
+        // latest composition") to point at the real composition.
+        // PUTROOTFH+LOOKUP(filename)+GETFH returns a fresh fh whose
+        // first 16 bytes ARE the real composition_id. Cross-protocol
+        // GET-by-UUID (S3 / native) then succeeds against the
+        // composition store. Same-handle NFS reads on the original
+        // fh still resolve via the `HandleRegistry::repoint_file`
+        // indirection that ran during flush; this LOOKUP only affects
+        // what the caller sees as `WriteResponse.composition_id`.
+        let composition_id = {
+            let putrootfh = (op::PUTROOTFH, Vec::new());
+            let mut w = XdrWriter::new();
+            w.write_string(&filename);
+            let lookup = (op::LOOKUP, w.into_bytes());
+            let getfh_op = (op::GETFH, Vec::new());
+            recover_composition_id_via_lookup(
+                sess,
+                self.minor_version,
+                &[putrootfh, lookup, getfh_op],
+            )
+            .unwrap_or(composition_id)
+        };
 
         Ok(WriteResponse {
             composition_id,

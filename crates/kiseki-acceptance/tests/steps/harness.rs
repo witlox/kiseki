@@ -194,7 +194,21 @@ impl ServerHarness {
                 Ok(ch) => break ch,
                 Err(_) if Instant::now() < deadline => {
                     if let Ok(Some(status)) = harness.process.try_wait() {
-                        return Err(format!("kiseki-server exited early: {status}"));
+                        // Drain stderr so CI failures point at the
+                        // real reason instead of "exit status: 1".
+                        let mut stderr_buf = String::new();
+                        if let Some(mut s) = harness.process.stderr.take() {
+                            use std::io::Read;
+                            let _ = s.read_to_string(&mut stderr_buf);
+                        }
+                        let tail = if stderr_buf.len() > 4096 {
+                            &stderr_buf[stderr_buf.len() - 4096..]
+                        } else {
+                            &stderr_buf
+                        };
+                        return Err(format!(
+                            "kiseki-server exited early: {status}\nstderr tail:\n{tail}"
+                        ));
                     }
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
