@@ -1255,6 +1255,33 @@ impl Drop for RaftShardStore {
     }
 }
 
+/// #123 — log `ForwardToLeader` / `LeaderUnavailable` returns from the
+/// per-shard append paths at DEBUG, not WARN.
+///
+/// Both variants are routine control flow on the #111 forwarding write
+/// path: when a write reaches a follower, the openraft store maps the
+/// `ClientWriteError::ForwardToLeader` hint onto either
+/// [`LogError::ForwardToLeader`] (the `*_with_forwarding` methods —
+/// surfaces the leader's node id so the caller can re-issue) or
+/// [`LogError::LeaderUnavailable`] (the legacy methods — collapses the
+/// hint per back-compat). The gateway's `log_bridge` re-issues against
+/// the leader via the `AppendForwarder`; the write then commits cleanly.
+/// Emitting WARN for this case produced ~22 k log lines per benchmark on
+/// the 2026-05-27 GCP run, polluting signal on the hot path.
+///
+/// Genuine errors (shard busy, key out of range, quorum lost, I/O, etc.)
+/// still emit WARN.
+fn log_append_err(e: &LogError, ctx: &str) {
+    match e {
+        LogError::ForwardToLeader { .. } | LogError::LeaderUnavailable(_) => {
+            tracing::debug!(error = %e, ctx, "log append: routine forward to leader");
+        }
+        _ => {
+            tracing::warn!(error = %e, ctx, "log append failed");
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl LogOps for RaftShardStore {
     /// ADR-047 decoupled-ack — the real quorum intent-write. Delegates to the
@@ -1273,7 +1300,7 @@ impl LogOps for RaftShardStore {
             tracing::warn!(error = %e, "log append_delta: shard lookup failed");
         })?;
         store.append_delta(req).await.inspect_err(|e| {
-            tracing::warn!(error = %e, "log append_delta: shard append failed");
+            log_append_err(e, "log append_delta");
         })
     }
 
@@ -1294,7 +1321,7 @@ impl LogOps for RaftShardStore {
             .append_delta_with_forwarding(req)
             .await
             .inspect_err(|e| {
-                tracing::warn!(error = %e, "log append_delta_with_forwarding: shard append failed");
+                log_append_err(e, "log append_delta_with_forwarding");
             })
     }
 
@@ -1310,7 +1337,7 @@ impl LogOps for RaftShardStore {
             .append_chunk_and_delta(req.delta, req.new_chunks)
             .await
             .inspect_err(|e| {
-                tracing::warn!(error = %e, "log append_chunk_and_delta: shard append failed");
+                log_append_err(e, "log append_chunk_and_delta");
             })
     }
 
@@ -1331,10 +1358,7 @@ impl LogOps for RaftShardStore {
             .append_chunk_and_delta_with_forwarding(req.delta, req.new_chunks)
             .await
             .inspect_err(|e| {
-                tracing::warn!(
-                    error = %e,
-                    "log append_chunk_and_delta_with_forwarding: shard append failed",
-                );
+                log_append_err(e, "log append_chunk_and_delta_with_forwarding");
             })
     }
 
