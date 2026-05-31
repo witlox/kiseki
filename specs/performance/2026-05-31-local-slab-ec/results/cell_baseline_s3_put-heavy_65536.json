@@ -1,0 +1,16 @@
+{
+  "label": "baseline_s3_put-heavy_65536",
+  "pool_type": "baseline",
+  "protocol": "s3",
+  "shape": "put-heavy",
+  "object_size": 65536,
+  "ok": true,
+  "rc": 0,
+  "wall_s": 30.817018964036833,
+  "ops": 49070,
+  "ops_per_s": 4907.0,
+  "mib_per_s": 306.69,
+  "p50_us": 2535,
+  "p95_us": 4015,
+  "p99_us": 7301
+}

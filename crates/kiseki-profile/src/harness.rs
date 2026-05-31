@@ -525,6 +525,27 @@ impl Cluster {
         admin_bin: Option<&Path>,
         shard_count: usize,
     ) -> Result<(), String> {
+        self.provision_bench_topology_with_pool(admin_bin, shard_count, None)
+            .await
+    }
+
+    /// ADR-048 §"Decision" — same as [`provision_bench_topology`] but
+    /// before creating the bench namespace, creates a `Replication`
+    /// pool with `requires_migration = true` and wires the bench
+    /// namespace's `size_band_pools.replicated` at it. The per-pool
+    /// slab-EC compactor task spawned at boot picks up the bench
+    /// pool and migrates chunks to cold-tier slabs.
+    ///
+    /// `slab_ec_pool_name` is the name to give the migration-eligible
+    /// pool (e.g. `"slab-ec-bench"`). When `None`, this falls through
+    /// to the legacy unflagged path so the same harness drives the
+    /// baseline run.
+    pub async fn provision_bench_topology_with_pool(
+        &self,
+        admin_bin: Option<&Path>,
+        shard_count: usize,
+        slab_ec_pool_name: Option<&str>,
+    ) -> Result<(), String> {
         // bench_default_ids — same values as
         // `kiseki-client::bench::bench_default_ids`. Inlined here so
         // kiseki-profile doesn't grow a dep on kiseki-client's `bench`
@@ -536,6 +557,49 @@ impl Cluster {
             None => find_admin_binary()?,
         };
         let endpoint = format!("http://127.0.0.1:{}", self.leader_node().ports.metrics);
+
+        // ADR-048: when the caller asked for slab-EC, create the
+        // migration-eligible pool BEFORE the namespace. Idempotent —
+        // a fresh cluster always succeeds on first attempt; an
+        // existing pool surfaces "already exists" which the
+        // namespace-create below treats as success.
+        if let Some(pool_name) = slab_ec_pool_name {
+            let admin_for_pool = admin.clone();
+            let endpoint_for_pool = endpoint.clone();
+            let pool_name_owned = pool_name.to_string();
+            let pool_res = tokio::task::spawn_blocking(move || -> Result<String, String> {
+                let output = Command::new(&admin_for_pool)
+                    .arg("--endpoint")
+                    .arg(&endpoint_for_pool)
+                    .arg("pool")
+                    .arg("create")
+                    .arg(&pool_name_owned)
+                    .arg("--durability")
+                    .arg("replication")
+                    .arg("--replication-copies")
+                    .arg("3")
+                    .arg("--device-class")
+                    .arg("mixed")
+                    .arg("--initial-capacity")
+                    .arg("100G")
+                    .arg("--slab-ec")
+                    .output()
+                    .map_err(|e| format!("spawn kiseki-admin pool create: {e}"))?;
+                if output.status.success() {
+                    return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+                }
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let combined = format!("{stdout}\n{stderr}");
+                if combined.contains("already exists") || combined.contains("409") {
+                    return Ok(format!("idempotent (already exists): {combined}"));
+                }
+                Err(format!("rc={:?}: {combined}", output.status.code()))
+            })
+            .await
+            .map_err(|e| format!("spawn_blocking: {e}"))?;
+            pool_res?;
+        }
 
         // Retry the namespace-create until the control-plane Raft
         // group has elected a leader. The bootstrap-shard leader (what
@@ -553,9 +617,10 @@ impl Cluster {
         loop {
             let admin_path = admin_path.clone();
             let endpoint = endpoint.clone();
+            let slab_pool_for_ns = slab_ec_pool_name.map(str::to_owned);
             let res = tokio::task::spawn_blocking(move || -> Result<String, String> {
-                let output = Command::new(&admin_path)
-                    .arg("--endpoint")
+                let mut cmd = Command::new(&admin_path);
+                cmd.arg("--endpoint")
                     .arg(&endpoint)
                     .arg("topology")
                     .arg("namespace-create")
@@ -563,7 +628,11 @@ impl Cluster {
                     .arg("--tenant")
                     .arg(BENCH_TENANT_ID)
                     .arg("--shards")
-                    .arg(shard_count.to_string())
+                    .arg(shard_count.to_string());
+                if let Some(ref pool) = slab_pool_for_ns {
+                    cmd.arg("--replicated-pool").arg(pool);
+                }
+                let output = cmd
                     .output()
                     .map_err(|e| format!("spawn kiseki-admin {}: {e}", admin_path.display()))?;
                 if output.status.success() {

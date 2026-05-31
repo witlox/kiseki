@@ -1,0 +1,16 @@
+{
+  "label": "baseline_nfs4_mixed_4194304",
+  "pool_type": "baseline",
+  "protocol": "nfs4",
+  "shape": "mixed",
+  "object_size": 4194304,
+  "ok": true,
+  "rc": 0,
+  "wall_s": 33.83335178496782,
+  "ops": 1309,
+  "ops_per_s": 130.9,
+  "mib_per_s": 523.6,
+  "p50_us": 132644,
+  "p95_us": 220875,
+  "p99_us": 273872
+}

@@ -1,0 +1,16 @@
+{
+  "label": "slabec_nfs3_mixed_65536",
+  "pool_type": "slabec",
+  "protocol": "nfs3",
+  "shape": "mixed",
+  "object_size": 65536,
+  "ok": true,
+  "rc": 0,
+  "wall_s": 30.784491110011004,
+  "ops": 58680,
+  "ops_per_s": 5868.0,
+  "mib_per_s": 366.75,
+  "p50_us": 2171,
+  "p95_us": 4824,
+  "p99_us": 19777
+}

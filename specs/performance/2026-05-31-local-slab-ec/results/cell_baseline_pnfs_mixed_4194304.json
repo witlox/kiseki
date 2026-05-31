@@ -1,0 +1,16 @@
+{
+  "label": "baseline_pnfs_mixed_4194304",
+  "pool_type": "baseline",
+  "protocol": "pnfs",
+  "shape": "mixed",
+  "object_size": 4194304,
+  "ok": true,
+  "rc": 0,
+  "wall_s": 33.08214716700604,
+  "ops": 1152,
+  "ops_per_s": 115.2,
+  "mib_per_s": 460.8,
+  "p50_us": 144093,
+  "p95_us": 219774,
+  "p99_us": 307854
+}

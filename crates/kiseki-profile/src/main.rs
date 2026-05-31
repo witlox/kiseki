@@ -169,6 +169,17 @@ struct RunArgs {
     /// single-node runs.
     #[arg(long)]
     admin_bin: Option<std::path::PathBuf>,
+
+    /// ADR-048 §"Decision" — when set, create a Replication pool
+    /// with `requires_migration = true` named
+    /// `slab-ec-bench` BEFORE provisioning the bench namespace,
+    /// and wire `namespace.size_band_pools.replicated` at that
+    /// pool. The runtime's per-pool slab-EC compactor task picks
+    /// it up at boot and migrates chunks to cold-tier slabs
+    /// while the workload runs. Ignored on single-node clusters
+    /// (`--nodes 1`).
+    #[arg(long, default_value_t = false)]
+    slab_ec: bool,
 }
 
 fn main() {
@@ -294,7 +305,12 @@ async fn build_harness(
     eprintln!(
         "[harness] provisioning bench namespace + {shard_count} shards (ADR-033 §1: max(min(3*N, 64), 3))"
     );
-    c.provision_bench_topology(args.admin_bin.as_deref(), shard_count)
+    let slab_pool: Option<&str> = if args.slab_ec {
+        Some("slab-ec-bench")
+    } else {
+        None
+    };
+    c.provision_bench_topology_with_pool(args.admin_bin.as_deref(), shard_count, slab_pool)
         .await?;
     let ep = protocols::Endpoints::from_cluster_bench(&c);
     Ok((Some(Harness::Cluster(c)), Some(ep)))

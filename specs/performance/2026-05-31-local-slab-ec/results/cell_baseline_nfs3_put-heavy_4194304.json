@@ -1,0 +1,16 @@
+{
+  "label": "baseline_nfs3_put-heavy_4194304",
+  "pool_type": "baseline",
+  "protocol": "nfs3",
+  "shape": "put-heavy",
+  "object_size": 4194304,
+  "ok": true,
+  "rc": 0,
+  "wall_s": 30.921960839012172,
+  "ops": 824,
+  "ops_per_s": 82.4,
+  "mib_per_s": 329.6,
+  "p50_us": 157964,
+  "p95_us": 223664,
+  "p99_us": 256401
+}

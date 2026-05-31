@@ -1,0 +1,305 @@
+[matrix] 60 cells, duration 10s/cell, nodes=3
+[matrix] out=specs/performance/2026-05-31-local-slab-ec/results
+
+[matrix] 1/60
+
+[cell] baseline_s3_put-heavy_65536 ...
+[cell] baseline_s3_put-heavy_65536 OK  4907 op/s 306.7 MiB/s p99=7301µs (30.8s)
+
+[matrix] 2/60
+
+[cell] baseline_s3_put-heavy_4194304 ...
+[cell] baseline_s3_put-heavy_4194304 OK  83 op/s 333.2 MiB/s p99=217011µs (28.1s)
+
+[matrix] 3/60
+
+[cell] baseline_s3_get-heavy_65536 ...
+[cell] baseline_s3_get-heavy_65536 OK  70044 op/s 4377.8 MiB/s p99=600µs (30.6s)
+
+[matrix] 4/60
+
+[cell] baseline_s3_get-heavy_4194304 ...
+[cell] baseline_s3_get-heavy_4194304 OK  611 op/s 2442.8 MiB/s p99=37339µs (32.2s)
+
+[matrix] 5/60
+
+[cell] baseline_s3_mixed_65536 ...
+[cell] baseline_s3_mixed_65536 OK  8329 op/s 520.6 MiB/s p99=5165µs (31.5s)
+
+[matrix] 6/60
+
+[cell] baseline_s3_mixed_4194304 ...
+[cell] baseline_s3_mixed_4194304 OK  128 op/s 512.4 MiB/s p99=213525µs (30.0s)
+
+[matrix] 7/60
+
+[cell] baseline_nfs3_put-heavy_65536 ...
+[cell] baseline_nfs3_put-heavy_65536 OK  4704 op/s 294.0 MiB/s p99=37529µs (31.8s)
+
+[matrix] 8/60
+
+[cell] baseline_nfs3_put-heavy_4194304 ...
+[cell] baseline_nfs3_put-heavy_4194304 OK  82 op/s 329.6 MiB/s p99=256401µs (30.9s)
+
+[matrix] 9/60
+
+[cell] baseline_nfs3_get-heavy_65536 ...
+[cell] baseline_nfs3_get-heavy_65536 OK  108905 op/s 6806.6 MiB/s p99=550µs (31.4s)
+
+[matrix] 10/60
+
+[cell] baseline_nfs3_get-heavy_4194304 ...
+[cell] baseline_nfs3_get-heavy_4194304 OK  605 op/s 2420.8 MiB/s p99=36912µs (33.0s)
+
+[matrix] 11/60
+
+[cell] baseline_nfs3_mixed_65536 ...
+[cell] baseline_nfs3_mixed_65536 OK  6104 op/s 381.5 MiB/s p99=19500µs (31.8s)
+
+[matrix] 12/60
+
+[cell] baseline_nfs3_mixed_4194304 ...
+[cell] baseline_nfs3_mixed_4194304 OK  118 op/s 471.2 MiB/s p99=262043µs (32.5s)
+
+[matrix] 13/60
+
+[cell] baseline_nfs4_put-heavy_65536 ...
+[cell] baseline_nfs4_put-heavy_65536 OK  4780 op/s 298.8 MiB/s p99=35371µs (30.9s)
+
+[matrix] 14/60
+
+[cell] baseline_nfs4_put-heavy_4194304 ...
+[cell] baseline_nfs4_put-heavy_4194304 OK  113 op/s 453.6 MiB/s p99=301681µs (31.9s)
+
+[matrix] 15/60
+
+[cell] baseline_nfs4_get-heavy_65536 ...
+[cell] baseline_nfs4_get-heavy_65536 OK  69078 op/s 4317.4 MiB/s p99=662µs (31.4s)
+
+[matrix] 16/60
+
+[cell] baseline_nfs4_get-heavy_4194304 ...
+[cell] baseline_nfs4_get-heavy_4194304 OK  428 op/s 1712.8 MiB/s p99=67810µs (31.9s)
+
+[matrix] 17/60
+
+[cell] baseline_nfs4_mixed_65536 ...
+[cell] baseline_nfs4_mixed_65536 OK  6048 op/s 378.0 MiB/s p99=18996µs (32.1s)
+
+[matrix] 18/60
+
+[cell] baseline_nfs4_mixed_4194304 ...
+[cell] baseline_nfs4_mixed_4194304 OK  131 op/s 523.6 MiB/s p99=273872µs (33.8s)
+
+[matrix] 19/60
+
+[cell] baseline_pnfs_put-heavy_65536 ...
+[cell] baseline_pnfs_put-heavy_65536 OK  4618 op/s 288.6 MiB/s p99=34657µs (31.9s)
+
+[matrix] 20/60
+
+[cell] baseline_pnfs_put-heavy_4194304 ...
+[cell] baseline_pnfs_put-heavy_4194304 OK  115 op/s 460.0 MiB/s p99=316002µs (31.0s)
+
+[matrix] 21/60
+
+[cell] baseline_pnfs_get-heavy_65536 ...
+[cell] baseline_pnfs_get-heavy_65536 OK  0 op/s 0.0 MiB/s p99=0µs (31.5s)
+
+[matrix] 22/60
+
+[cell] baseline_pnfs_get-heavy_4194304 ...
+[cell] baseline_pnfs_get-heavy_4194304 OK  0 op/s 0.0 MiB/s p99=0µs (32.6s)
+
+[matrix] 23/60
+
+[cell] baseline_pnfs_mixed_65536 ...
+[cell] baseline_pnfs_mixed_65536 OK  1031 op/s 64.4 MiB/s p99=8303µs (31.5s)
+
+[matrix] 24/60
+
+[cell] baseline_pnfs_mixed_4194304 ...
+[cell] baseline_pnfs_mixed_4194304 OK  115 op/s 460.8 MiB/s p99=307854µs (33.1s)
+
+[matrix] 25/60
+
+[cell] baseline_fuse_put-heavy_65536 ...
+[cell] baseline_fuse_put-heavy_65536 OK  4918 op/s 307.4 MiB/s p99=5551µs (31.4s)
+
+[matrix] 26/60
+
+[cell] baseline_fuse_put-heavy_4194304 ...
+[cell] baseline_fuse_put-heavy_4194304 OK  82 op/s 330.0 MiB/s p99=220785µs (31.8s)
+
+[matrix] 27/60
+
+[cell] baseline_fuse_get-heavy_65536 ...
+[cell] baseline_fuse_get-heavy_65536 OK  147948 op/s 9246.7 MiB/s p99=380µs (31.4s)
+
+[matrix] 28/60
+
+[cell] baseline_fuse_get-heavy_4194304 ...
+[cell] baseline_fuse_get-heavy_4194304 OK  897 op/s 3586.8 MiB/s p99=25365µs (32.3s)
+
+[matrix] 29/60
+
+[cell] baseline_fuse_mixed_65536 ...
+[cell] baseline_fuse_mixed_65536 OK  9049 op/s 565.6 MiB/s p99=4744µs (31.6s)
+
+[matrix] 30/60
+
+[cell] baseline_fuse_mixed_4194304 ...
+[cell] baseline_fuse_mixed_4194304 OK  128 op/s 510.4 MiB/s p99=233829µs (31.8s)
+
+[matrix] 31/60
+
+[cell] slabec_s3_put-heavy_65536 ...
+[cell] slabec_s3_put-heavy_65536 OK  4906 op/s 306.6 MiB/s p99=7409µs (31.8s)
+
+[matrix] 32/60
+
+[cell] slabec_s3_put-heavy_4194304 ...
+[cell] slabec_s3_put-heavy_4194304 OK  82 op/s 330.0 MiB/s p99=210253µs (30.8s)
+
+[matrix] 33/60
+
+[cell] slabec_s3_get-heavy_65536 ...
+[cell] slabec_s3_get-heavy_65536 OK  70554 op/s 4409.6 MiB/s p99=605µs (31.4s)
+
+[matrix] 34/60
+
+[cell] slabec_s3_get-heavy_4194304 ...
+[cell] slabec_s3_get-heavy_4194304 OK  619 op/s 2474.4 MiB/s p99=37083µs (30.7s)
+
+[matrix] 35/60
+
+[cell] slabec_s3_mixed_65536 ...
+[cell] slabec_s3_mixed_65536 OK  7913 op/s 494.6 MiB/s p99=5597µs (31.6s)
+
+[matrix] 36/60
+
+[cell] slabec_s3_mixed_4194304 ...
+[cell] slabec_s3_mixed_4194304 OK  127 op/s 507.6 MiB/s p99=209053µs (32.7s)
+
+[matrix] 37/60
+
+[cell] slabec_nfs3_put-heavy_65536 ...
+[cell] slabec_nfs3_put-heavy_65536 OK  4605 op/s 287.8 MiB/s p99=34033µs (31.5s)
+
+[matrix] 38/60
+
+[cell] slabec_nfs3_put-heavy_4194304 ...
+[cell] slabec_nfs3_put-heavy_4194304 OK  83 op/s 331.2 MiB/s p99=256733µs (31.7s)
+
+[matrix] 39/60
+
+[cell] slabec_nfs3_get-heavy_65536 ...
+[cell] slabec_nfs3_get-heavy_65536 OK  109698 op/s 6856.1 MiB/s p99=551µs (30.7s)
+
+[matrix] 40/60
+
+[cell] slabec_nfs3_get-heavy_4194304 ...
+[cell] slabec_nfs3_get-heavy_4194304 OK  604 op/s 2417.6 MiB/s p99=39668µs (32.9s)
+
+[matrix] 41/60
+
+[cell] slabec_nfs3_mixed_65536 ...
+[cell] slabec_nfs3_mixed_65536 OK  5868 op/s 366.8 MiB/s p99=19777µs (30.8s)
+
+[matrix] 42/60
+
+[cell] slabec_nfs3_mixed_4194304 ...
+[cell] slabec_nfs3_mixed_4194304 OK  118 op/s 470.0 MiB/s p99=276388µs (32.3s)
+
+[matrix] 43/60
+
+[cell] slabec_nfs4_put-heavy_65536 ...
+[cell] slabec_nfs4_put-heavy_65536 OK  4724 op/s 295.2 MiB/s p99=34683µs (30.9s)
+
+[matrix] 44/60
+
+[cell] slabec_nfs4_put-heavy_4194304 ...
+[cell] slabec_nfs4_put-heavy_4194304 OK  113 op/s 450.8 MiB/s p99=288112µs (30.2s)
+
+[matrix] 45/60
+
+[cell] slabec_nfs4_get-heavy_65536 ...
+[cell] slabec_nfs4_get-heavy_65536 OK  68394 op/s 4274.6 MiB/s p99=669µs (31.4s)
+
+[matrix] 46/60
+
+[cell] slabec_nfs4_get-heavy_4194304 ...
+[cell] slabec_nfs4_get-heavy_4194304 OK  430 op/s 1718.4 MiB/s p99=64107µs (33.5s)
+
+[matrix] 47/60
+
+[cell] slabec_nfs4_mixed_65536 ...
+[cell] slabec_nfs4_mixed_65536 OK  6018 op/s 376.2 MiB/s p99=19809µs (30.2s)
+
+[matrix] 48/60
+
+[cell] slabec_nfs4_mixed_4194304 ...
+[cell] slabec_nfs4_mixed_4194304 OK  134 op/s 534.8 MiB/s p99=269245µs (33.9s)
+
+[matrix] 49/60
+
+[cell] slabec_pnfs_put-heavy_65536 ...
+[cell] slabec_pnfs_put-heavy_65536 OK  4674 op/s 292.1 MiB/s p99=32520µs (31.6s)
+
+[matrix] 50/60
+
+[cell] slabec_pnfs_put-heavy_4194304 ...
+[cell] slabec_pnfs_put-heavy_4194304 OK  114 op/s 457.6 MiB/s p99=307335µs (31.2s)
+
+[matrix] 51/60
+
+[cell] slabec_pnfs_get-heavy_65536 ...
+[cell] slabec_pnfs_get-heavy_65536 OK  0 op/s 0.0 MiB/s p99=0µs (30.7s)
+
+[matrix] 52/60
+
+[cell] slabec_pnfs_get-heavy_4194304 ...
+[cell] slabec_pnfs_get-heavy_4194304 OK  0 op/s 0.0 MiB/s p99=0µs (32.6s)
+
+[matrix] 53/60
+
+[cell] slabec_pnfs_mixed_65536 ...
+[cell] slabec_pnfs_mixed_65536 OK  1031 op/s 64.4 MiB/s p99=8796µs (30.7s)
+
+[matrix] 54/60
+
+[cell] slabec_pnfs_mixed_4194304 ...
+[cell] slabec_pnfs_mixed_4194304 OK  116 op/s 464.0 MiB/s p99=251681µs (33.9s)
+
+[matrix] 55/60
+
+[cell] slabec_fuse_put-heavy_65536 ...
+[cell] slabec_fuse_put-heavy_65536 OK  4918 op/s 307.4 MiB/s p99=5518µs (30.9s)
+
+[matrix] 56/60
+
+[cell] slabec_fuse_put-heavy_4194304 ...
+[cell] slabec_fuse_put-heavy_4194304 OK  83 op/s 332.4 MiB/s p99=214650µs (30.9s)
+
+[matrix] 57/60
+
+[cell] slabec_fuse_get-heavy_65536 ...
+[cell] slabec_fuse_get-heavy_65536 OK  138509 op/s 8656.8 MiB/s p99=417µs (31.4s)
+
+[matrix] 58/60
+
+[cell] slabec_fuse_get-heavy_4194304 ...
+[cell] slabec_fuse_get-heavy_4194304 OK  899 op/s 3594.4 MiB/s p99=25806µs (31.7s)
+
+[matrix] 59/60
+
+[cell] slabec_fuse_mixed_65536 ...
+[cell] slabec_fuse_mixed_65536 OK  9361 op/s 585.0 MiB/s p99=4612µs (31.7s)
+
+[matrix] 60/60
+
+[cell] slabec_fuse_mixed_4194304 ...
+[cell] slabec_fuse_mixed_4194304 OK  129 op/s 514.4 MiB/s p99=236311µs (32.4s)
+
+[matrix] DONE in 31.6 min
+[matrix] cells 60/60 ok

@@ -1,0 +1,16 @@
+{
+  "label": "slabec_pnfs_mixed_4194304",
+  "pool_type": "slabec",
+  "protocol": "pnfs",
+  "shape": "mixed",
+  "object_size": 4194304,
+  "ok": true,
+  "rc": 0,
+  "wall_s": 33.877327447989956,
+  "ops": 1160,
+  "ops_per_s": 116.0,
+  "mib_per_s": 464.0,
+  "p50_us": 147450,
+  "p95_us": 218240,
+  "p99_us": 251681
+}

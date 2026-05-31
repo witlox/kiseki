@@ -1,0 +1,16 @@
+{
+  "label": "baseline_nfs3_mixed_65536",
+  "pool_type": "baseline",
+  "protocol": "nfs3",
+  "shape": "mixed",
+  "object_size": 65536,
+  "ok": true,
+  "rc": 0,
+  "wall_s": 31.789368900004774,
+  "ops": 61035,
+  "ops_per_s": 6103.5,
+  "mib_per_s": 381.47,
+  "p50_us": 2109,
+  "p95_us": 4519,
+  "p99_us": 19500
+}
