@@ -2062,6 +2062,108 @@ async fn then_recovers_via_destroy(world: &mut KisekiWorld) {
     assert_eq!(ctx.write_buffers.total_bytes(), 0);
 }
 
+// #146 — inline auto-drain assertions for the cap-hit WRITE that
+// previously returned NFS4ERR_NOSPC. The WRITE now triggers a
+// server-side flush + retry; the kernel never sees NOSPC and
+// sustained-write workloads make forward progress without needing
+// the kernel pNFS client to issue COMMIT.
+
+#[then(regex = r#"^the DS performs an INLINE auto-drain via GatewayOps::write$"#)]
+async fn then_inline_drain(world: &mut KisekiWorld) {
+    // The drain bumps the gateway's write counter through the
+    // `flush_buffer_to_gateway` helper. We assert at least one write
+    // has reached the gateway — the exact count is verified by the
+    // chain-anchor assertion below.
+    let ctx = world.pnfs.ds_ctx.as_ref().expect("ds_ctx");
+    let snap = ctx
+        .write_buffers
+        .snapshot_for_commit(
+            world
+                .pnfs
+                .fh
+                .as_ref()
+                .expect("fh")
+                .composition_id,
+        )
+        .expect("buffer entry alive after auto-drain");
+    assert!(
+        snap.base_composition_id.is_some(),
+        "auto-drain must populate the chain anchor — base_composition_id is None",
+    );
+}
+
+#[then(regex = r#"^the DS returns NFS4_OK for the WRITE$"#)]
+async fn then_ds_ok_for_write(world: &mut KisekiWorld) {
+    let last = world.pnfs.last_results.last().expect("WRITE response");
+    assert_eq!(
+        last.1, 0,
+        "expected NFS4_OK (0) for the auto-drained WRITE, got {}",
+        last.1
+    );
+}
+
+#[then(regex = r#"^the buffer chain anchor advances to the just-drained composition$"#)]
+async fn then_chain_anchor_advances(world: &mut KisekiWorld) {
+    let ctx = world.pnfs.ds_ctx.as_ref().expect("ds_ctx");
+    let snap = ctx
+        .write_buffers
+        .snapshot_for_commit(world.pnfs.fh.as_ref().expect("fh").composition_id)
+        .expect("buffer entry alive");
+    // The pre-drain content was the 1 MiB buffered before the
+    // overflow WRITE; the chain anchor's base_bytes equals exactly
+    // that drained quantity.
+    assert_eq!(
+        snap.base_bytes,
+        1024 * 1024,
+        "chain anchor base_bytes must equal the drained buffer size",
+    );
+    assert!(
+        snap.base_composition_id.is_some(),
+        "chain anchor base_composition_id must be Some after drain",
+    );
+}
+
+#[then(regex = r#"^the buffer total bytes equal 4 KiB \(the post-drain delta\)$"#)]
+async fn then_buffer_post_drain_delta(world: &mut KisekiWorld) {
+    let ctx = world.pnfs.ds_ctx.as_ref().expect("ds_ctx");
+    assert_eq!(
+        ctx.write_buffers.total_bytes(),
+        4 * 1024,
+        "after auto-drain + retried WRITE, buffer holds only the 4 KiB delta",
+    );
+}
+
+#[when(regex = r#"^the client sends a fresh WRITE of (\d+) KiB on stateid S$"#)]
+async fn when_ds_write_fresh_kib(world: &mut KisekiWorld, kib: u32) {
+    // Distinct from `when_ds_write_kib_more`: that step is "ANOTHER"
+    // write (continues from current buffer offset); this one is the
+    // first WRITE on an empty buffer, used to test single-WRITE-
+    // larger-than-cap behaviour. Offset 0 ⇒ relative offset 0 ⇒
+    // the cap check sees `growth = kib*1024 > cap_bytes` and
+    // returns NOSPC without an auto-drain (the auto-drain only
+    // helps when prior bytes exist).
+    //
+    // The scenario reaches this step without any prior pre-fill, so
+    // the fh has not been issued yet. Mirror the setup that
+    // `given_buffered_n_bytes` performs: seed a composition,
+    // ensure the cached DsContext, and issue a fresh handle.
+    if world.last_composition_id.is_none() {
+        given_composition_with_size(world, "buf-cap-obj".into(), 4, "default".into()).await;
+    }
+    if world.pnfs.ds_ctx.is_none() {
+        ensure_ds_ctx_cached(world);
+    }
+    if world.pnfs.fh.is_none() {
+        let h = issue_handle(world, now_ms() + 60_000, 0);
+        world.pnfs.fh = Some(h);
+    }
+    let fh = world.pnfs.fh.clone().expect("fh");
+    let data = vec![0xAA; (kib as usize) * 1024];
+    let (status, _count, _committed, _verf) = ds_write(world, &fh, 0, &data).await;
+    world.pnfs.last_results.clear();
+    world.pnfs.last_results.push((OP_WRITE, status, vec![]));
+}
+
 #[when(regex = r#"^the DS receives DESTROY_SESSION for the owning session before COMMIT$"#)]
 async fn when_ds_destroy_session(world: &mut KisekiWorld) {
     // Direct call into clear_all (same effect as op_destroy_session_ds
