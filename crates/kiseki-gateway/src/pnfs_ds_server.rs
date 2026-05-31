@@ -605,10 +605,7 @@ async fn op_write_ds<G: GatewayOps + Send + Sync + 'static>(
         abs_offset,
         &data,
     );
-    if let BufferWriteResult::Nospc {
-        current, cap, ..
-    } = result
-    {
+    if let BufferWriteResult::Nospc { current, cap, .. } = result {
         tracing::debug!(
             composition_id = ?fh.composition_id,
             current_bytes = current,
