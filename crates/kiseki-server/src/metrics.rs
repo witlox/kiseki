@@ -133,6 +133,12 @@ pub struct KisekiMetrics {
     /// `node_metadata_capacity_bytes` so the admin UI can show the
     /// media class on the capacity row.
     pub node_metadata_media_type: IntGaugeVec,
+    /// ADR-048 §"Backpressure" + I-SE6 — per-pool slab-EC compactor
+    /// backlog age (seconds). Reflects the oldest pending-migration
+    /// chunk's queue residency. Operators watch this for sustained
+    /// growth; values > 60 s correlate with `async_ack_eligible =
+    /// false` on the gateway path.
+    pub compactor_backlog_seconds: IntGaugeVec,
     /// Chunk-pool capacity split by cost/performance tier (ADR-024):
     /// `{used, total}` for fast (`NVMe`), bulk (`SSD`), cold (`HDD`). The
     /// cluster aggregator sums these so `kiseki-admin capacity` can show
@@ -547,6 +553,19 @@ impl KisekiMetrics {
             .register(Box::new(node_metadata_media_type.clone()))
             .expect("register");
 
+        // ADR-048 §"Backpressure" — per-pool compactor backlog age.
+        let compactor_backlog_seconds = IntGaugeVec::new(
+            Opts::new(
+                "kiseki_compactor_backlog_seconds",
+                "Slab-EC compactor backlog age (seconds), per pool",
+            ),
+            &["pool"],
+        )
+        .expect("metric");
+        registry
+            .register(Box::new(compactor_backlog_seconds.clone()))
+            .expect("register");
+
         let mk_tier = |name: &str, help: &str, reg: &Registry| -> IntGauge {
             let g = IntGauge::new(name, help).expect("metric");
             reg.register(Box::new(g.clone())).expect("register");
@@ -721,6 +740,7 @@ impl KisekiMetrics {
             storage_small_bytes,
             node_metadata_capacity_bytes,
             node_metadata_media_type,
+            compactor_backlog_seconds,
             storage_tier_fast_used,
             storage_tier_fast_total,
             storage_tier_bulk_used,

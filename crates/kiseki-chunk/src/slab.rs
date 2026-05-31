@@ -43,6 +43,7 @@ use crate::ec::{self, EcEncoded};
 use crate::error::ChunkError;
 use crate::pool::DEFAULT_REPLICATION_CEILING_BYTES;
 use kiseki_common::ids::ChunkId;
+pub use kiseki_common::storage_location::{ChunkRefLocation, SlabId};
 
 /// Default per-slab byte budget — ADR-048 §"Compactor task" 64 MiB.
 /// Picked to amortise EC fan-out across many chunks while staying
@@ -65,26 +66,6 @@ pub const DEFAULT_SLAB_AGE_TIMEOUT: Duration = Duration::from_secs(30);
 /// so a downgraded binary fails fast instead of returning corrupt
 /// bytes (ADR-024 amendment §"durability" defense-in-depth).
 pub const SLAB_FORMAT_VERSION: u16 = 1;
-
-/// Unique identifier for a slab. UUIDv4-based, like `ChunkId`, so the
-/// slab placement rendezvous hash (`pick_placement`) hits the same
-/// device set deterministically across nodes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
-pub struct SlabId(pub uuid::Uuid);
-
-impl SlabId {
-    /// Mint a fresh random slab id.
-    #[must_use]
-    pub fn new() -> Self {
-        Self(uuid::Uuid::new_v4())
-    }
-}
-
-impl Default for SlabId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Fixed-size slab header serialised at the start of every slab.
 /// Layout (32 B):
@@ -211,65 +192,9 @@ impl Slab {
     }
 }
 
-/// Locator on a composition's `chunk_ref`. ADR-048 amendment to the
-/// chunk-ref model — every chunk is either in the **hot** tier (a
-/// named chunk-fabric pool) or **cold** (migrated into a slab).
-///
-/// Reads branch on this tag (ADR-048 §"Read path"); writes always
-/// land Hot and the compactor flips the location after a slab is
-/// durable (I-SE1).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ChunkRefLocation {
-    /// Chunk lives in the hot tier (existing chunk fabric). Reads
-    /// take the existing `read_chunk(pool_name)` path.
-    Hot {
-        /// Pool name within the chunk fabric.
-        pool_name: String,
-    },
-    /// Chunk has been migrated into a cold-tier slab. Reads
-    /// reconstruct the slab from EC fragments, then extract the
-    /// chunk's bytes from the slab data buffer at
-    /// `offset_in_slab..offset_in_slab+length`.
-    Cold {
-        /// Pool name the slab lives in (used by placement +
-        /// per-pool capacity accounting).
-        pool_name: String,
-        /// Owning slab.
-        slab_id: SlabId,
-        /// Byte offset inside the slab data buffer.
-        offset_in_slab: u64,
-        /// Length of the chunk in bytes — duplicates the slab's
-        /// extent table but lets the read path bound the reconstruct
-        /// I/O without first decoding the header.
-        length: u32,
-    },
-}
-
-impl ChunkRefLocation {
-    /// Pool name the chunk lives in — same for Hot and Cold, lets the
-    /// caller drive per-pool capacity / GC logic without matching
-    /// each time.
-    #[must_use]
-    pub fn pool_name(&self) -> &str {
-        match self {
-            Self::Hot { pool_name } | Self::Cold { pool_name, .. } => pool_name,
-        }
-    }
-
-    /// `true` when the chunk has been migrated to cold tier.
-    #[must_use]
-    pub const fn is_cold(&self) -> bool {
-        matches!(self, Self::Cold { .. })
-    }
-}
-
-impl Default for ChunkRefLocation {
-    fn default() -> Self {
-        Self::Hot {
-            pool_name: String::new(),
-        }
-    }
-}
+// ChunkRefLocation + SlabId live in `kiseki_common::storage_location`
+// (re-exported above) so kiseki-composition can persist the tag without
+// taking a dep on kiseki-chunk. ADR-048 §"ChunkRef extends".
 
 /// Build a slab from a set of `(chunk_id, bytes)` pairs and EC-encode it.
 ///

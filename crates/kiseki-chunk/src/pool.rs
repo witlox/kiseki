@@ -180,6 +180,15 @@ pub struct AffinityPool {
     /// default. Set on a `Chunk` pool to be its own write-band ceiling.
     #[serde(default = "default_replication_ceiling")]
     pub replication_ceiling_bytes: u64,
+    /// ADR-048 §"Decision" — when `true`, the slab-EC compactor
+    /// picks up chunks landed in this pool and migrates them into
+    /// cold-tier slabs. Only meaningful for `Replication` pools
+    /// (replicating then migrating to EC is the win); `false` for
+    /// EC pools (already EC, nothing to migrate) and `Inline` pools
+    /// (no chunk fabric copy to begin with). Default `false` for
+    /// back-compat with pre-amendment records.
+    #[serde(default)]
+    pub requires_migration: bool,
 }
 
 const fn default_inline_threshold() -> u64 {
@@ -214,6 +223,7 @@ impl AffinityPool {
             role: PoolRole::default(),
             inline_threshold_bytes: DEFAULT_INLINE_THRESHOLD_BYTES,
             replication_ceiling_bytes: DEFAULT_REPLICATION_CEILING_BYTES,
+            requires_migration: false,
         }
     }
 

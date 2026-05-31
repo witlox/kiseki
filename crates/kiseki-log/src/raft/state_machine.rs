@@ -248,6 +248,7 @@ fn op_to_u8(op: OperationType) -> u8 {
         OperationType::SetAttribute => 4,
         OperationType::Finalize => 5,
         OperationType::NamespaceCreate => 6,
+        OperationType::MigrateChunkLocations => 7,
     }
 }
 
@@ -259,7 +260,8 @@ fn u8_to_op(v: u8) -> OperationType {
         3 => OperationType::Rename,
         4 => OperationType::SetAttribute,
         5 => OperationType::Finalize,
-        _ => OperationType::NamespaceCreate,
+        6 => OperationType::NamespaceCreate,
+        _ => OperationType::MigrateChunkLocations,
     }
 }
 

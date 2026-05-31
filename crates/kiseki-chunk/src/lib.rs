@@ -35,6 +35,7 @@ pub mod store;
 pub mod striping;
 
 pub use async_ops::{arc_async, AsyncChunkOps, SyncBridge};
+pub use ec::EcEncoded;
 pub use error::ChunkError;
 #[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm", test))]
 pub use gpu_direct::{GpuBackend, GpuDmaAllocator, GpuDmaBuffer, MockDmaAllocator};

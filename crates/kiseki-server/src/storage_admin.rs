@@ -435,6 +435,7 @@ fn pool_to_proto_with_overrides(
         role,
         inline_threshold_bytes: pool.inline_threshold_bytes,
         replication_ceiling_bytes: pool.replication_ceiling_bytes,
+        requires_migration: pool.requires_migration,
     }
 }
 
@@ -786,6 +787,7 @@ impl StorageAdminService for StorageAdminGrpc {
                 role,
                 inline_threshold_bytes,
                 replication_ceiling_bytes,
+                requires_migration: r.requires_migration,
             };
             store.add_pool(pool).await.map_err(|e| {
                 if e.contains("already exists") {
@@ -1949,6 +1951,7 @@ mod tests {
                     online: false,
                 },
             ],
+            requires_migration: false,
             ..Default::default()
         });
         store.add_pool(AffinityPool {
@@ -1961,6 +1964,7 @@ mod tests {
                 id: "hdd-x".into(),
                 online: true,
             }],
+            requires_migration: false,
             ..Default::default()
         });
         let async_store: Arc<dyn kiseki_chunk::AsyncChunkOps> = Arc::new(SyncBridge::new(store));
@@ -2655,6 +2659,7 @@ mod tests {
                 id: "dev-1".into(),
                 online: true,
             }],
+            requires_migration: false,
             ..Default::default()
         });
         let chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> = Arc::new(SyncBridge::new(store));
@@ -2784,6 +2789,7 @@ mod tests {
             role: String::new(),
             inline_threshold_bytes: 0,
             replication_ceiling_bytes: 0,
+            requires_migration: false,
         }))
         .await
         .expect("ok");
@@ -2813,6 +2819,7 @@ mod tests {
                 role: String::new(),
                 inline_threshold_bytes: 0,
                 replication_ceiling_bytes: 0,
+                requires_migration: false,
             }))
             .await;
         assert_eq!(r.expect_err("err").code(), Code::AlreadyExists);
@@ -2833,6 +2840,7 @@ mod tests {
                 role: String::new(),
                 inline_threshold_bytes: 0,
                 replication_ceiling_bytes: 0,
+                requires_migration: false,
             }))
             .await;
         assert_eq!(r.expect_err("err").code(), Code::InvalidArgument);
@@ -2855,6 +2863,7 @@ mod tests {
             role: "inline".into(),
             inline_threshold_bytes: 16 * 1024,
             replication_ceiling_bytes: 0,
+            requires_migration: false,
         }))
         .await
         .expect("ok");
@@ -2884,6 +2893,7 @@ mod tests {
             role: "chunk".into(),
             inline_threshold_bytes: 0,
             replication_ceiling_bytes: 4 * 1024 * 1024,
+            requires_migration: false,
         }))
         .await
         .expect("ok");
@@ -2915,6 +2925,7 @@ mod tests {
                 role: "frobnicator".into(),
                 inline_threshold_bytes: 0,
                 replication_ceiling_bytes: 0,
+                requires_migration: false,
             }))
             .await;
         assert_eq!(r.expect_err("err").code(), Code::InvalidArgument);
@@ -2934,6 +2945,7 @@ mod tests {
             role: String::new(),
             inline_threshold_bytes: 0,
             replication_ceiling_bytes: 0,
+            requires_migration: false,
         }))
         .await
         .expect("ok");

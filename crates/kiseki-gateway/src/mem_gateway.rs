@@ -65,6 +65,72 @@ pub const MAX_PLAINTEXT_PER_CHUNK: usize = 64 * 1024 * 1024;
 /// pool-class names (`fast`/`bulk`/`cold`) plus the literal device
 /// class names (`nvme`/`ssd`/`hdd`). Anything else returns `None` so
 /// the selector falls back to band-driven auto-routing.
+/// ADR-048 §"Hot-tier eviction" — bridges the sync hydrator-commit
+/// thread (which calls `ChunkEvictionSink::release_migrated_chunks`)
+/// to the async chunk store's `decrement_refcount` API.
+///
+/// Implementation: spawn one dedicated tokio task at gateway
+/// construction; the sink trait method does a non-blocking
+/// `try_send` on an `mpsc` channel; the task drains the channel and
+/// awaits `decrement_refcount` on each id. A full channel logs a
+/// warning + drops the eviction (the chunk-GC scrub eventually
+/// reclaims any leaked bytes, so dropping is a soft failure).
+struct ChunkEvictionPump {
+    tx: tokio::sync::mpsc::Sender<kiseki_common::ids::ChunkId>,
+}
+
+impl ChunkEvictionPump {
+    fn spawn(chunks: Arc<dyn AsyncChunkOps>) -> Self {
+        // Bounded so a runaway compactor doesn't unbounded-queue
+        // pending decrements during a chunk-store stall. 16 384
+        // entries × 32 B/id ≈ 512 KiB worst-case memory.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<kiseki_common::ids::ChunkId>(16_384);
+        // The pump task needs a tokio runtime. Tests that build the
+        // gateway outside an async context (sync setup, no current
+        // runtime) skip the spawn — sink calls in that mode just
+        // try_send into the channel, which drains when the pump is
+        // never started; harmless for tests, and a real deployment
+        // always constructs the gateway inside `#[tokio::main]`.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                while let Some(id) = rx.recv().await {
+                    match chunks.decrement_refcount(&id).await {
+                        Ok(_) => {
+                            tracing::debug!(
+                                ?id,
+                                "ADR-048 hot-tier eviction: refcount decremented",
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                ?id,
+                                error = %e,
+                                "ADR-048 hot-tier eviction: decrement_refcount failed",
+                            );
+                        }
+                    }
+                }
+                tracing::debug!("ADR-048 hot-tier eviction pump: channel closed, exiting");
+            });
+        }
+        Self { tx }
+    }
+}
+
+impl kiseki_composition::composition::ChunkEvictionSink for ChunkEvictionPump {
+    fn release_migrated_chunks(&self, chunk_ids: &[kiseki_common::ids::ChunkId]) {
+        for id in chunk_ids {
+            if let Err(e) = self.tx.try_send(*id) {
+                tracing::warn!(
+                    ?id,
+                    error = %e,
+                    "ADR-048 hot-tier eviction: channel full or closed, eviction dropped (scrub will reclaim)",
+                );
+            }
+        }
+    }
+}
+
 fn device_class_from_label(label: &str) -> Option<kiseki_chunk::pool::DeviceClass> {
     use kiseki_chunk::pool::DeviceClass;
     match label.to_ascii_lowercase().as_str() {
@@ -162,6 +228,15 @@ pub trait NamespaceProvisioner: Send + Sync {
     ) -> Result<(), GatewayError>;
 }
 
+/// ADR-048 §"Backpressure" — type alias for the per-pool slab-backlog
+/// tracker registry. Boxes the deeply-nested map so the field type on
+/// [`InMemoryGateway`] stays readable.
+pub type SlabBacklogRegistry = Arc<
+    parking_lot::RwLock<
+        std::collections::HashMap<String, Arc<parking_lot::Mutex<kiseki_chunk::slab::SlabBacklog>>>,
+    >,
+>;
+
 /// In-memory gateway backed by composition store, chunk store, and crypto.
 ///
 /// Uses `tokio::sync::Mutex` for interior mutability so `GatewayOps` methods can
@@ -221,6 +296,26 @@ pub struct InMemoryGateway {
     /// at or below this size are stored inline in the delta payload
     /// instead of as chunk extents. 0 = disable inline.
     inline_threshold: u64,
+    /// ADR-048 — optional cold-tier `SlabStore`. When wired, the
+    /// gateway's read path branches on `Composition.location_for(i)`
+    /// and serves Cold chunks through this store; Hot chunks
+    /// continue through the chunk fabric. Empty by default; the
+    /// runtime registers a `FabricSlabStore` after constructing the
+    /// chunk-cluster fabric.
+    slab_store: std::sync::RwLock<Option<Arc<dyn kiseki_chunk::slab::SlabStore>>>,
+    /// ADR-048 §"Backpressure" — per-pool slab-backlog tracker the
+    /// compactor maintains. The gateway reads
+    /// `is_over_threshold(now)` to gate `is_async_ack_eligible`.
+    slab_backlog: std::sync::RwLock<Option<SlabBacklogRegistry>>,
+    /// ADR-030 §3 + 2026-05-31 amendment — per-shard live inline
+    /// threshold map. Populated by the runtime's per-shard recompute
+    /// task (`shard_inline_threshold`) on every `SetShardConfig`
+    /// commit. When present for a shard, this value overrides
+    /// `inline_threshold` on the write path; absent → fall back to
+    /// the global value (test fixtures, fresh shard before first
+    /// recompute). Read on every write via `effective_inline_threshold`.
+    per_shard_inline_threshold:
+        Arc<parking_lot::RwLock<std::collections::HashMap<kiseki_common::ids::ShardId, u64>>>,
     /// Inline content store for small-file reads (ADR-030).
     small_store: Option<Arc<dyn kiseki_common::inline_store::InlineStore>>,
     /// Shard map store for multi-shard routing (ADR-033).
@@ -575,8 +670,18 @@ impl InMemoryGateway {
                 .iter()
                 .map(|ns| (ns.id, NamespaceMeta::from_namespace(ns)))
                 .collect();
+        // ADR-048 §"Hot-tier eviction" — register the chunk-eviction
+        // sink so a successful `MigrateChunkLocations` apply triggers
+        // a refcount-decrement on the local chunk store. The sink
+        // bridges the sync hydrator-commit thread to the async chunk
+        // store via the dedicated eviction tokio handle (one bounded
+        // queue per gateway). Unwired stores (test fixtures) leave
+        // the sink absent and the hydrator no-ops.
+        let eviction_sink = Arc::new(ChunkEvictionPump::spawn(Arc::clone(&chunks)));
+        compositions.set_eviction_sink(eviction_sink);
+        let compositions = Arc::new(compositions);
         Self {
-            compositions: Arc::new(compositions),
+            compositions,
             chunks,
             aead: Aead::new(),
             master_key,
@@ -589,6 +694,11 @@ impl InMemoryGateway {
             bytes_read: AtomicU64::new(0),
             last_written_seq: std::sync::Mutex::new(std::collections::HashMap::new()),
             inline_threshold: 0, // disabled by default; set via with_inline_threshold
+            slab_store: std::sync::RwLock::new(None),
+            slab_backlog: std::sync::RwLock::new(None),
+            per_shard_inline_threshold: Arc::new(parking_lot::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             small_store: None,
             shard_map: std::sync::RwLock::new(None),
             telemetry_bus: std::sync::RwLock::new(None),
@@ -883,6 +993,91 @@ impl InMemoryGateway {
         self.inline_threshold = threshold;
         self.small_store = Some(store);
         self
+    }
+
+    /// ADR-048 — wire the cold-tier [`SlabStore`]. Once set, the
+    /// gateway's read path branches on `Composition.location_for(i)`:
+    /// `Cold` chunks are reconstructed via this store, `Hot` chunks
+    /// continue through the chunk fabric.
+    pub fn set_slab_store(&self, store: Arc<dyn kiseki_chunk::slab::SlabStore>) {
+        *self
+            .slab_store
+            .write()
+            .lock_or_die("mem_gateway.slab_store") = Some(store);
+    }
+
+    /// ADR-048 §"Backpressure" — wire the per-pool slab-backlog
+    /// registry. The gateway reads through this when answering
+    /// `is_async_ack_eligible` for a pool.
+    pub fn set_slab_backlog_registry(&self, registry: SlabBacklogRegistry) {
+        *self
+            .slab_backlog
+            .write()
+            .lock_or_die("mem_gateway.slab_backlog") = Some(registry);
+    }
+
+    /// ADR-048 §"Backpressure" — `false` when the named pool's
+    /// compactor backlog has crossed its hard threshold (chunks
+    /// queued for migration > 60 s by default). The gateway uses
+    /// this to gate async-ack eligibility — clients fall back to
+    /// sync ack until the compactor catches up.
+    #[must_use]
+    pub fn pool_is_async_ack_eligible(&self, pool: &str) -> bool {
+        let Some(registry) = self
+            .slab_backlog
+            .read()
+            .lock_or_die("mem_gateway.slab_backlog")
+            .clone()
+        else {
+            // No registry wired → pool isn't tracked → ack-eligible.
+            return true;
+        };
+        let bp_opt = {
+            let g = registry.read();
+            g.get(pool).cloned()
+        };
+        let Some(bp) = bp_opt else {
+            return true;
+        };
+        let over = bp.lock().is_over_threshold(std::time::Instant::now());
+        !over
+    }
+
+    /// ADR-030 §3 — set the live inline threshold for `shard_id`.
+    /// Called by the runtime's per-shard recompute task on every
+    /// `SetShardConfig` commit. The gateway's write path reads from
+    /// the per-shard map; an unset shard falls back to the global
+    /// `inline_threshold`.
+    pub fn set_shard_inline_threshold(
+        &self,
+        shard_id: kiseki_common::ids::ShardId,
+        threshold: u64,
+    ) {
+        self.per_shard_inline_threshold
+            .write()
+            .insert(shard_id, threshold);
+    }
+
+    /// Effective inline threshold for `shard_id`: the per-shard
+    /// value if set, otherwise the global default. Surfaced for
+    /// tests and the band-classifier; called inside the PUT critical
+    /// path so kept tiny.
+    #[must_use]
+    pub fn effective_inline_threshold(&self, shard_id: kiseki_common::ids::ShardId) -> u64 {
+        if let Some(v) = self.per_shard_inline_threshold.read().get(&shard_id) {
+            return *v;
+        }
+        self.inline_threshold
+    }
+
+    /// Snapshot of the per-shard inline threshold map. Used by the
+    /// admin endpoint to surface what's currently in effect across
+    /// the cluster.
+    #[must_use]
+    pub fn per_shard_inline_thresholds(
+        &self,
+    ) -> std::collections::HashMap<kiseki_common::ids::ShardId, u64> {
+        self.per_shard_inline_threshold.read().clone()
     }
 
     /// Register a namespace in the gateway's composition store.
@@ -1688,8 +1883,14 @@ impl GatewayOps for InMemoryGateway {
 
         let mut data = Vec::with_capacity(end - start);
 
-        for (_i, chunk_id, chunk_start_in_file, chunk_plaintext_len) in chunks_to_read {
+        for (chunk_idx, chunk_id, chunk_start_in_file, chunk_plaintext_len) in chunks_to_read {
             let chunk_id = &chunk_id;
+            // ADR-048 §"Read path" — per-chunk Hot/Cold branch. When
+            // the composition's `chunk_locations[i]` says Cold, we
+            // ignore the chunk fabric and reconstruct via the slab
+            // store. Hot (or the empty/legacy sentinel) falls
+            // through to the existing path.
+            let chunk_location = comp.location_for(chunk_idx);
 
             // Cache lookup first — `get` returns `Arc<Zeroizing<Vec<u8>>>`,
             // so the work under the cache mutex is one refcount bump.
@@ -1708,7 +1909,67 @@ impl GatewayOps for InMemoryGateway {
             // Cache miss — read from inline store first (ADR-030),
             // then block device.
             let chunk_fetch_started = std::time::Instant::now();
-            let inline_hit = if let Some(ref store) = self.small_store {
+            // ADR-048 cold-path branch: when the chunk lives in a
+            // slab, fetch the slab + extract the chunk's envelope
+            // bytes + open as usual. Same `Envelope` shape the hot
+            // path produces; the compactor packed the full
+            // serialised envelope into the slab specifically so the
+            // read path can re-use `envelope::open_envelope` here.
+            let cold_envelope: Option<envelope::Envelope> =
+                if let kiseki_common::ChunkRefLocation::Cold {
+                    slab_id,
+                    offset_in_slab,
+                    length,
+                    ..
+                } = chunk_location
+                {
+                    let slab_handle = self
+                        .slab_store
+                        .read()
+                        .lock_or_die("mem_gateway.slab_store_read")
+                        .clone();
+                    if let Some(store) = slab_handle {
+                        let slab_opt = tokio::task::spawn_blocking(move || store.get_slab(slab_id))
+                            .await
+                            .ok()
+                            .and_then(Result::ok);
+                        if let Some(slab) = slab_opt {
+                            let offset_usize =
+                                usize::try_from(offset_in_slab).unwrap_or(usize::MAX);
+                            let end = offset_usize.saturating_add(length as usize);
+                            if end <= slab.data.len() {
+                                serde_json::from_slice::<envelope::Envelope>(
+                                    &slab.data[offset_usize..end],
+                                )
+                                .ok()
+                            } else {
+                                tracing::warn!(
+                                    ?chunk_id,
+                                    slab_id = %slab_id.0,
+                                    offset_in_slab,
+                                    length,
+                                    slab_len = slab.data.len(),
+                                    "gateway read: slab extract out of range",
+                                );
+                                None
+                            }
+                        } else {
+                            tracing::warn!(
+                                ?chunk_id,
+                                slab_id = %slab_id.0,
+                                "gateway read: slab fetch failed",
+                            );
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+            let inline_hit = if cold_envelope.is_some() {
+                None
+            } else if let Some(ref store) = self.small_store {
                 store
                     .get(&chunk_id.0)
                     .ok()
@@ -1718,7 +1979,9 @@ impl GatewayOps for InMemoryGateway {
                 None
             };
 
-            let env = if let Some(env) = inline_hit {
+            let env = if let Some(env) = cold_envelope {
+                env
+            } else if let Some(env) = inline_hit {
                 env
             } else {
                 // Fall back to chunk store (block device). Pass the exact
@@ -2253,13 +2516,21 @@ impl InMemoryGateway {
                 });
         let pool_snapshot = self.chunks.snapshot_pools().await;
         let total_data_size = req.data.len() as u64;
-        let pool = kiseki_chunk::select_pool_for_write(
+        let selected_pool = kiseki_chunk::select_pool_for_write(
             &pool_snapshot,
             total_data_size,
             tier_policy_for_select.as_ref(),
             preferred_class,
-        )
-        .map_or_else(
+        );
+        // ADR-048 §"Decision" + ADR-024 amendment §"three-tier" —
+        // when the selector picks an Inline-durability pool, the
+        // gateway short-circuits to the small_store inline path
+        // BELOW. We surface the flag here so the chunking loop can
+        // honour it without re-querying the snapshot. Pools whose
+        // durability is Replication / EC stay on the chunk fabric.
+        let pool_is_inline = selected_pool
+            .is_some_and(|p| matches!(p.durability, kiseki_chunk::DurabilityStrategy::Inline));
+        let pool = selected_pool.map_or_else(
             || {
                 req.tier.clone().unwrap_or_else(|| {
                     ns_for_pool
@@ -2472,7 +2743,37 @@ impl InMemoryGateway {
             // chunk tier rather than failing the write — the small tier
             // is an optimization, not the only home for the bytes.
             let mut took_inline = false;
-            if pieces_len == 1 && piece_len <= self.inline_threshold && self.small_store.is_some() {
+            // ADR-048 §"Decision" + ADR-024 amendment §"three-tier":
+            // route to the small_store inline path when EITHER
+            //   (a) the band-aware pool selector picked an
+            //       Inline-durability pool (`pool_is_inline`), OR
+            //   (b) we're in the pre-amendment fallback mode (no
+            //       pool registered, `pool == "default"`) AND the
+            //       legacy per-shard / global `inline_threshold`
+            //       gate fires.
+            // The strict inversion — "pool selector returned a
+            // Replicated/EC pool → never inline, even for small
+            // chunks" — is what makes the three-tier routing
+            // actually behavior-changing instead of a relabel.
+            //
+            // ADR-030 §3: the threshold consulted in (b) is the
+            // **per-shard** value the leader committed via
+            // `SetShardConfig`. The Phase 4 recompute task pushes
+            // updates into `per_shard_inline_threshold`; the
+            // gateway reads through `effective_inline_threshold`
+            // which falls back to the global default for shards
+            // that haven't been recomputed yet (cold start,
+            // tests).
+            let pool_selector_ran = !pool_snapshot.is_empty();
+            let shard_inline_threshold = ns_for_pool.as_ref().map_or(self.inline_threshold, |ns| {
+                self.effective_inline_threshold(ns.shard_id)
+            });
+            let inline_eligible = if pool_selector_ran {
+                pool_is_inline
+            } else {
+                piece_len <= shard_inline_threshold
+            };
+            if pieces_len == 1 && inline_eligible && self.small_store.is_some() {
                 let env_bytes = serde_json::to_vec(&env).map_err(|e| {
                     tracing::warn!(?chunk_id, error = %e, "gateway write: inline encode failed");
                     GatewayError::Upstream(e.to_string())
@@ -3149,6 +3450,7 @@ mod halt_mode_tests {
                 new_last_applied_seq: kiseki_common::ids::SequenceNumber(0),
                 stuck_state: Some(None),
                 halted: Some(true),
+                migrated_chunk_evictions: Vec::new(),
             })
             .expect("apply halt batch");
         CompositionStore::with_storage(Box::new(storage))

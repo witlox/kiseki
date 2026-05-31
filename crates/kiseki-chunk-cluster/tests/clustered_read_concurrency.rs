@@ -61,6 +61,7 @@ fn local_bridge(pool: &str, capacity: u64) -> Arc<dyn AsyncChunkOps> {
         devices: vec![],
         capacity_bytes: capacity,
         used_bytes: 0,
+        requires_migration: false,
         ..Default::default()
     });
     Arc::new(SyncBridge::new(store))

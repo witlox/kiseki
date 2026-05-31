@@ -54,6 +54,7 @@ fn proto_op_to_domain(op: i32) -> Result<crate::delta::OperationType, Status> {
         5 => Ok(crate::delta::OperationType::SetAttribute),
         6 => Ok(crate::delta::OperationType::Finalize),
         7 => Ok(crate::delta::OperationType::NamespaceCreate),
+        8 => Ok(crate::delta::OperationType::MigrateChunkLocations),
         _ => Err(Status::invalid_argument(format!(
             "unknown operation type: {op}"
         ))),
@@ -183,6 +184,7 @@ fn proto_op_to_domain_str(op: i32) -> Result<crate::delta::OperationType, String
         5 => Ok(crate::delta::OperationType::SetAttribute),
         6 => Ok(crate::delta::OperationType::Finalize),
         7 => Ok(crate::delta::OperationType::NamespaceCreate),
+        8 => Ok(crate::delta::OperationType::MigrateChunkLocations),
         _ => Err(format!("unknown operation type: {op}")),
     }
 }
@@ -223,6 +225,7 @@ fn domain_op_to_proto(op: crate::delta::OperationType) -> i32 {
         crate::delta::OperationType::SetAttribute => 5,
         crate::delta::OperationType::Finalize => 6,
         crate::delta::OperationType::NamespaceCreate => 7,
+        crate::delta::OperationType::MigrateChunkLocations => 8,
     }
 }
 

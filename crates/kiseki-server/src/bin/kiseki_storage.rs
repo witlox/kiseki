@@ -309,6 +309,7 @@ async fn dispatch(
                     role: String::new(),
                     inline_threshold_bytes: 0,
                     replication_ceiling_bytes: 0,
+                    requires_migration: false,
                 })
                 .await
                 .map_err(format_status)?

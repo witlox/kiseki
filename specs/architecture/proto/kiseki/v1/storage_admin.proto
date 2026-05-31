@@ -142,6 +142,9 @@ message PoolInfo {
   // Write size at or below which the medium-tier (replicated)
   // pool is selected. 0 → server applies cluster default (4 MiB).
   uint64 replication_ceiling_bytes = 15;
+  // ADR-048 §"Decision" — slab-EC compactor eligibility (see
+  // CreatePoolRequest.requires_migration).
+  bool requires_migration = 16;
 }
 
 message CreatePoolRequest {
@@ -159,6 +162,11 @@ message CreatePoolRequest {
   string role = 8;
   uint64 inline_threshold_bytes = 9;
   uint64 replication_ceiling_bytes = 10;
+  // ADR-048 §"Decision" — when true, the slab-EC compactor picks up
+  // chunks landed in this pool and migrates them into cold-tier
+  // slabs. Only meaningful for Replication pools (replicating then
+  // migrating to EC is the win). Default false.
+  bool requires_migration = 11;
 }
 message CreatePoolResponse { uint64 committed_at_log_index = 1; }
 

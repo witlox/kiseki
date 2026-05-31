@@ -88,6 +88,9 @@ pub fn admin_extra_routes() -> Router<UiState> {
             "/admin/storage/cluster-capacity",
             get(api_cluster_metadata_capacity),
         )
+        // ADR-048 §"Backpressure" + I-SE6 — slab-EC compactor
+        // backlog per pool; gateway gates async-ack on this.
+        .route("/admin/storage/compactor", get(api_compactor_backlog))
         // --- Device / pool resize (ADR-025 StorageAdminService bridge) ---
         .route("/admin/storage/devices", get(api_list_devices))
         .route("/admin/storage/devices/add", post(api_add_device))
@@ -1452,6 +1455,10 @@ async fn api_create_pool(body: String) -> (axum::http::StatusCode, axum::Json<se
             role,
             inline_threshold_bytes: json_u64("inline_threshold_bytes"),
             replication_ceiling_bytes: json_u64("replication_ceiling_bytes"),
+            requires_migration: parsed
+                .get("requires_migration")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
         })
         .await
     {
@@ -1713,6 +1720,38 @@ async fn api_cluster_metadata_capacity(
     axum::Json(serde_json::json!({
         "nodes": nodes_json,
         "aggregate": aggregate,
+    }))
+}
+
+/// ADR-048 §"Backpressure" — surface the per-pool compactor backlog
+/// gauges so operators can see whether the slab-EC migrator is
+/// keeping up. Returns the parsed
+/// `kiseki_compactor_backlog_seconds{pool=...}` rows from the local
+/// node's `/metrics`.
+async fn api_compactor_backlog(State(state): State<UiState>) -> axum::Json<serde_json::Value> {
+    let metrics_text = (state.metrics_encode)();
+    let rows =
+        parse_gauge_with_labels(&metrics_text, "kiseki_compactor_backlog_seconds", &["pool"]);
+    let pools: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            let pool = r
+                .labels
+                .get("pool")
+                .cloned()
+                .unwrap_or_else(|| "default".into());
+            let age_s = r.value.max(0.0) as i64;
+            serde_json::json!({
+                "pool": pool,
+                "backlog_seconds": age_s,
+                // ADR-048 §"Backpressure" defaults — 30 s soft, 60 s hard.
+                "soft_breach": age_s >= 30,
+                "hard_breach": age_s >= 60,
+            })
+        })
+        .collect();
+    axum::Json(serde_json::json!({
+        "pools": pools,
     }))
 }
 

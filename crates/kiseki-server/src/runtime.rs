@@ -218,6 +218,67 @@ fn fabric_addr_from_raft_peer(raft_peer: &str, data_port: u16) -> String {
     )
 }
 
+/// ADR-030 §3 multi-voter aggregation: convert a Raft-peer address
+/// (`host:raft_port`) into the canonical metrics scrape URL. The
+/// metrics port follows `KISEKI_METRICS_PORT` (default 9090, which is
+/// the prom convention used elsewhere in the codebase). The Raft port
+/// itself doesn't serve `/metrics` — the metrics server runs on a
+/// distinct port managed by `run_metrics_server`.
+fn metrics_url_from_raft_peer(raft_peer: &str) -> String {
+    let metrics_port: u16 = std::env::var("KISEKI_METRICS_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9090);
+    let host = raft_peer
+        .rsplit_once(':')
+        .map_or(raft_peer, |(host, _)| host);
+    format!("http://{host}:{metrics_port}/metrics")
+}
+
+/// Parse the `kiseki_node_metadata_capacity_bytes{kind="soft_limit"}`
+/// gauge from a Prometheus text exposition payload. Returns the
+/// integer byte value, or `None` if the line isn't present (the peer
+/// hasn't run the Phase 2 capacity emitter yet — older binary or
+/// mid-startup).
+fn parse_node_metadata_soft_limit_from_metrics(text: &str) -> Option<u64> {
+    const METRIC: &str = "kiseki_node_metadata_capacity_bytes";
+    for line in text.lines() {
+        let line = line.trim_start();
+        if !line.starts_with(METRIC) {
+            continue;
+        }
+        // Quickly skip TYPE/HELP comment lines and prefix-extended
+        // metric names (e.g. `..._sum`).
+        if line.starts_with('#') {
+            continue;
+        }
+        let after = &line[METRIC.len()..];
+        // The labels start with `{`; bail on any other prefix
+        // (a `_total` suffixed counter, e.g.).
+        if !after.starts_with('{') {
+            continue;
+        }
+        let close = after.find('}')?;
+        let labels = &after[1..close];
+        if !labels.contains("kind=\"soft_limit\"") {
+            continue;
+        }
+        let value = after[close + 1..].split_whitespace().next()?;
+        if let Ok(v) = value.parse::<u64>() {
+            return Some(v);
+        }
+        // Some Prom encoders emit `1.23e9` floats; fall back to f64.
+        if let Ok(v) = value.parse::<f64>() {
+            if v.is_finite() && v >= 0.0 {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let truncated = v as u64;
+                return Some(truncated);
+            }
+        }
+    }
+    None
+}
+
 /// `NamespaceProvisioner` impl backed by the control-plane Raft group.
 ///
 /// Called from the gateway's `ensure_namespace_exists` on the first
@@ -1163,9 +1224,32 @@ pub async fn run_main(
     // Only fires `set_shard_config` when the new value differs from
     // the current — keeps the Raft log noise-free and avoids spurious
     // apply-hook work.
+    // ADR-030 §3 — gateway slot the recompute task pushes the
+    // committed per-shard threshold into. Constructed here so the
+    // task can capture a clone; the gateway-build block below stores
+    // a `Weak<InMemoryGateway>` once the gateway exists. Until then
+    // the slot holds `None` and the per-shard push step no-ops
+    // (still drives the Raft commit + multi-voter aggregation).
+    let gateway_for_threshold_push: Arc<
+        parking_lot::RwLock<Option<std::sync::Weak<kiseki_gateway::InMemoryGateway>>>,
+    > = Arc::new(parking_lot::RwLock::new(None));
     if let Some(ref shard_store_for_recompute) = raft_shard_store_for_admin {
         let store = Arc::clone(shard_store_for_recompute);
         let metrics_for_recompute = metrics.clone();
+        let gateway_slot = Arc::clone(&gateway_for_threshold_push);
+        // ADR-030 §3 multi-voter aggregation: scrape every peer's
+        // `/metrics` endpoint over the cfg-known address list and
+        // compute `min(soft_limit)` across the voter set. An
+        // unreachable peer falls back to its last successful scrape
+        // for the duration of `voter_soft_limit_stale_after`; beyond
+        // that we treat its budget as `u64::MAX` (don't bind below
+        // the local node's view on a transient flap).
+        let peer_metrics_urls: Vec<String> = cfg
+            .raft_peers
+            .iter()
+            .filter(|(id, _)| *id != cfg.node_id)
+            .map(|(_, addr)| metrics_url_from_raft_peer(addr))
+            .collect();
         let interval_s = std::env::var("KISEKI_INLINE_THRESHOLD_RECOMPUTE_S")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -1190,16 +1274,18 @@ pub async fn run_main(
                 kiseki_common::ids::ShardId,
                 kiseki_log::shard_inline_threshold::InlineThroughputGuard,
             > = HashMap::new();
+            // Per-peer last-good soft_limit cache for the multi-voter
+            // `min(soft_limit)` aggregation. Survives scrape errors
+            // up to `voter_soft_limit_stale_after`; beyond that the
+            // stale value is dropped.
+            let voter_soft_limit_stale_after = std::time::Duration::from_secs(interval_s * 3);
+            let mut peer_soft_limit_cache: HashMap<String, (u64, Instant)> = HashMap::new();
             loop {
                 tick.tick().await;
-                // Snapshot the per-node `soft_limit` gauge as the
-                // available budget. Production deployments will
-                // aggregate this across voters once the heartbeat
-                // delivery is wired (Phase 5 follow-up); for now we
-                // use the local node's value, which is conservative
-                // (smaller available → smaller threshold → safer
-                // budget envelope).
-                let available_bytes = u64::try_from(
+                let now = Instant::now();
+                // Local node's soft_limit, surfaced via the gauge the
+                // Phase 2 capacity-emit task feeds.
+                let local_soft_limit = u64::try_from(
                     metrics_for_recompute
                         .node_metadata_capacity_bytes
                         .with_label_values(&["soft_limit"])
@@ -1207,13 +1293,56 @@ pub async fn run_main(
                         .max(0),
                 )
                 .unwrap_or(0);
-                let now = Instant::now();
-                for shard_id in store.shard_ids() {
-                    if !store.is_shard_leader(shard_id) {
-                        continue;
+                // ADR-030 SF-ADV-4 emergency reduction: when the
+                // local node's used > hard_limit, force the formula
+                // to clamp at the configured floor. The Raft commit
+                // on the leader path below picks this up; followers
+                // see it via their own gauge readings on the next
+                // tick.
+                let local_used = u64::try_from(
+                    metrics_for_recompute
+                        .node_metadata_capacity_bytes
+                        .with_label_values(&["used"])
+                        .get()
+                        .max(0),
+                )
+                .unwrap_or(0);
+                let local_hard_limit = u64::try_from(
+                    metrics_for_recompute
+                        .node_metadata_capacity_bytes
+                        .with_label_values(&["hard_limit"])
+                        .get()
+                        .max(0),
+                )
+                .unwrap_or(u64::MAX);
+                let force_floor = local_hard_limit > 0 && local_used >= local_hard_limit;
+                // ADR-030 §3 multi-voter min. Scrape every peer's
+                // `/metrics` over HTTP; parse the
+                // `kiseki_node_metadata_capacity_bytes{kind="soft_limit"}`
+                // sample. Fold the local value in too.
+                let mut budgets: Vec<u64> = vec![local_soft_limit];
+                for url in &peer_metrics_urls {
+                    if let Some(text) = crate::web::aggregator::reqwest_get_body(url).await {
+                        if let Some(v) = parse_node_metadata_soft_limit_from_metrics(&text) {
+                            budgets.push(v);
+                            peer_soft_limit_cache.insert(url.clone(), (v, now));
+                            continue;
+                        }
                     }
-                    // Need shard_health (config + delta_count) via the
-                    // async API; bridge into the Raft runtime.
+                    // Fall through: use cached value if still fresh.
+                    if let Some(&(v, when)) = peer_soft_limit_cache.get(url) {
+                        if now.duration_since(when) <= voter_soft_limit_stale_after {
+                            budgets.push(v);
+                        }
+                    }
+                }
+                let available_bytes = budgets.iter().copied().min().unwrap_or(local_soft_limit);
+                for shard_id in store.shard_ids() {
+                    // Read shard_health on every node so each can
+                    // update its own gateway from the Raft-committed
+                    // config. Leader is additionally responsible for
+                    // recomputing + committing a new value when the
+                    // formula + guard say so.
                     let info =
                         match kiseki_log::traits::LogOps::shard_health(store.as_ref(), shard_id)
                             .await
@@ -1228,12 +1357,36 @@ pub async fn run_main(
                                 continue;
                             }
                         };
-                    let raw = kiseki_log::shard_inline_threshold::compute_shard_inline_threshold(
-                        available_bytes,
-                        info.delta_count,
-                        info.config.inline_floor_bytes,
-                        info.config.inline_ceiling_bytes,
-                    );
+                    // Push the committed threshold into the local
+                    // gateway's per-shard map. Every node does this
+                    // (leader OR follower) so the gateway-side write
+                    // path consults the live value instead of the
+                    // boot-time global.
+                    if let Some(weak) = gateway_slot.read().clone() {
+                        if let Some(gw) = weak.upgrade() {
+                            gw.set_shard_inline_threshold(
+                                shard_id,
+                                info.config.inline_threshold_bytes,
+                            );
+                        }
+                    }
+                    if !store.is_shard_leader(shard_id) {
+                        continue;
+                    }
+                    let raw = if force_floor {
+                        // SF-ADV-4 emergency reduction overrides the
+                        // formula; the leader still goes through Raft
+                        // so followers' gateways converge after their
+                        // next recompute tick.
+                        info.config.inline_floor_bytes
+                    } else {
+                        kiseki_log::shard_inline_threshold::compute_shard_inline_threshold(
+                            available_bytes,
+                            info.delta_count,
+                            info.config.inline_floor_bytes,
+                            info.config.inline_ceiling_bytes,
+                        )
+                    };
                     let guard = guards.entry(shard_id).or_insert_with(|| {
                         kiseki_log::shard_inline_threshold::InlineThroughputGuard::with_limit(
                             std::time::Duration::from_secs(10),
@@ -1762,6 +1915,11 @@ pub async fn run_main(
         }
     }
     let gw = Arc::new(gw_builder);
+    // ADR-030 §3 — register the gateway with the inline-threshold
+    // recompute task so it can push committed per-shard values back
+    // into `set_shard_inline_threshold`. Stored as `Weak` so the
+    // task doesn't keep the gateway alive past shutdown.
+    *gateway_for_threshold_push.write() = Some(Arc::downgrade(&gw));
     // Wire the shared workflow table + Prometheus counter so the
     // gateway's `x-kiseki-workflow-ref` header validation
     // (mem_gateway::write) is fully observable end-to-end. Without

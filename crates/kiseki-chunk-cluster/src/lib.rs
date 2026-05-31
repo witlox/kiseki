@@ -78,6 +78,8 @@ pub mod scrub;
 pub mod scrub_adapters;
 pub mod scrub_scheduler;
 pub mod server;
+pub mod slab_compactor;
+pub mod slab_store;
 
 pub use auth::{verify_fabric_san, FabricAuthError};
 pub use defaults::{defaults_for, ClusterDurabilityDefaults};
@@ -1103,6 +1105,7 @@ mod tests {
             devices: vec![],
             capacity_bytes: 1 << 30,
             used_bytes: 0,
+            requires_migration: false,
             ..Default::default()
         });
         Arc::new(SyncBridge::new(store))

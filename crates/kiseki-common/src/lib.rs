@@ -47,6 +47,11 @@ pub mod advisory;
 // structured tracing so the upstream panic is observable).
 pub mod locks;
 
+// ADR-048 storage-location tag (Hot / Cold). Lives here so the
+// composition crate can persist it without taking a dep on
+// kiseki-chunk.
+pub mod storage_location;
+
 // Re-export the flat public surface for convenience. Match
 // ubiquitous-language.md names exactly.
 pub use error::{KisekiError, PermanentError, RetriableError, SecurityError};
@@ -63,3 +68,5 @@ pub use advisory::{
     AccessPattern, AffinityPreference, ClientId, DedupIntent, OperationAdvisory, PhaseId,
     PoolDescriptor, PoolHandle, Priority, RetentionIntent, WorkflowRef, WorkloadProfile,
 };
+
+pub use storage_location::{ChunkRefLocation, SlabId};

@@ -770,6 +770,9 @@ enum Command {
         initial_capacity_bytes: u64,
         inline_threshold_bytes: u64,
         replication_ceiling_bytes: u64,
+        /// ADR-048 §"Decision" — slab-EC compactor migrates chunks
+        /// from this pool. Default `false`; `--slab-ec` sets `true`.
+        requires_migration: bool,
     },
     /// `metadata-capacity` — ADR-030 amendment §"admin-driven
     /// metadata device role" — show per-node + cluster-aggregate
@@ -1213,6 +1216,7 @@ fn parse_pool(rest: &[String]) -> Result<Command, String> {
                 Some(s) => parse_size(&s).map_err(|e| format!("--replication-ceiling: {e}"))?,
                 None => 0,
             };
+            let requires_migration = rest.iter().any(|a| a == "--slab-ec");
             Ok(Command::PoolCreate {
                 pool,
                 role: flag("--role").unwrap_or_default(),
@@ -1224,6 +1228,7 @@ fn parse_pool(rest: &[String]) -> Result<Command, String> {
                 initial_capacity_bytes,
                 inline_threshold_bytes,
                 replication_ceiling_bytes,
+                requires_migration,
             })
             .inspect(|_| {
                 let _ = num_u64; // num_u64 reserved for future numeric flags.
@@ -1968,9 +1973,10 @@ fn main() {
             initial_capacity_bytes,
             inline_threshold_bytes,
             replication_ceiling_bytes,
+            requires_migration,
         } => {
             let body = format!(
-                "{{\"pool_name\":\"{}\",\"role\":\"{}\",\"device_class\":\"{}\",\"durability_kind\":\"{}\",\"replication_copies\":{replication_copies},\"ec_data_shards\":{ec_data_shards},\"ec_parity_shards\":{ec_parity_shards},\"initial_capacity_bytes\":{initial_capacity_bytes},\"inline_threshold_bytes\":{inline_threshold_bytes},\"replication_ceiling_bytes\":{replication_ceiling_bytes}}}",
+                "{{\"pool_name\":\"{}\",\"role\":\"{}\",\"device_class\":\"{}\",\"durability_kind\":\"{}\",\"replication_copies\":{replication_copies},\"ec_data_shards\":{ec_data_shards},\"ec_parity_shards\":{ec_parity_shards},\"initial_capacity_bytes\":{initial_capacity_bytes},\"inline_threshold_bytes\":{inline_threshold_bytes},\"replication_ceiling_bytes\":{replication_ceiling_bytes},\"requires_migration\":{requires_migration}}}",
                 json_escape(&pool),
                 json_escape(&role),
                 json_escape(&device_class),
