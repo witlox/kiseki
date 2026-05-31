@@ -290,6 +290,101 @@ pub enum DeviceState {
 }
 ```
 
+## Amendment (2026-05-31) — Three-tier durability by size band
+
+**Status of amendment**: Accepted.
+**Trigger**: `specs/escalations/2026-05-31-tiered-storage-three-tier-and-slab-ec.md`.
+**Crosses**: ADR-030 (inline path), ADR-045 (namespace tier-policy), ADR-047
+(intent log as durable hot tier), new ADR-048 (slab-EC compactor).
+
+### Motivation
+
+The original ADR specified per-pool `DurabilityStrategy` (Replication N
+or ErasureCoding M+K) and let the runtime pick a pool at write time.
+Production runtime never wires the size-aware selector
+([`select_pool_for_write`](../../../crates/kiseki-chunk/src/pool.rs)); every PUT
+routes to a hardcoded `"default"` pool. Measurement on 2026-05-30 GCP
+n=6 default profile: native put-heavy at 2.8 k op/s, ~2 % of ADR-042
+§14 cluster-aggregate target. The 50× gap traces to applying the EC-4+2
+strategy's 5-fragment fan-out to every PUT, including 16 KiB / 64 KiB
+small-object writes where storage saving doesn't justify the per-RPC tax.
+
+EC-4+2 is mathematically RAID 6 with 4 data drives + 2 parity, distributed
+across nodes for failure-domain isolation. The Reed-Solomon code is the
+same. Its only value is **storage efficiency on large objects** where the
+per-PUT fan amortises over many bytes. For small/medium objects the
+1+5 fan-out fixed cost dominates and replication (1+(N-1) fan) wins on
+both latency and throughput.
+
+### Decision — explicit size bands
+
+Every write picks a pool from one of three durability strategies, by
+encrypted-payload size:
+
+| size band | durability strategy | per-PUT fan | rationale |
+|---|---|---:|---|
+| `0 ≤ size ≤ inline_threshold` | inline-in-Raft (no chunk store) | 1+2 (R-3 Raft intent) | latency-critical; capacity-bounded; no chunk fan |
+| `inline_threshold < size ≤ replication_ceiling` | `Replication { factor: N }` | 1+(N-1) | per-PUT fan cost dominates byte cost; storage saving doesn't pay |
+| `size > replication_ceiling` | `ErasureCoding { data, parity }` | 1+(data+parity−1) | RTT amortises over bytes; storage saving real |
+
+**Defaults**:
+
+| parameter | default | tunable via |
+|---|---|---|
+| `inline_threshold` | 16 KB | per-pool config, ADR-030 §3 formula |
+| `inline_ceiling` (hard cap) | 64 KB | per-pool config |
+| `replication_ceiling` | 4 MB | per-pool config |
+| Default replicated `factor` | 3 | per-pool config |
+| Default EC `data + parity` | 4 + 2 | per-pool config |
+
+The bench-namespace small-object workload that drives the 2026-05-30
+measurement falls in band 2 (replication path) under these defaults at
+64 KiB. The inline path engages for ≤ 16 KB workloads (xattrs, symlinks,
+small JSON, headers); the EC path engages for ≥ 4 MB workloads (bulk
+data, archival, ML training shards).
+
+### Implementation contract
+
+The runtime MUST:
+
+1. Maintain at least one pool per size band that the cluster's
+   declared namespaces use (or a global fallback chain). A namespace
+   without a `tier_policy` inherits the cluster default chain
+   `[inline, replicated, ec]` resolved against the highest-class
+   pools available.
+2. Route each PUT to a pool by calling `select_pool_for_write(pools,
+   size, namespace.tier_policy)`. The hardcoded `"default"` string
+   lookup is **deprecated** and the gateway hot path stops emitting
+   it after this amendment lands.
+3. Surface the active size-band → pool routing in
+   `kiseki-admin namespace describe <ns>` so operators see exactly
+   which pool will receive a write of a given size.
+
+### Read-path implication
+
+Reads are unchanged: the composition's `chunk_refs` carry pool +
+chunk_id (or pool + slab_id + offset post-ADR-048). The gateway's
+read path consults the chunk's source pool to know whether to read
+inline (`small/objects.redb`), via replication ladder, or via EC
+reconstruction.
+
+### Migration
+
+This is **pre-production**. No deployed clusters; no migration owed.
+Existing test fixtures that hardcode `pool: "default"` are updated in
+the Phase 3 wire-up.
+
+### What this does NOT change
+
+- The pool model itself (`AffinityPool`, `DurabilityStrategy`,
+  `DeviceClass`) is unchanged — already supports R-N and EC variants.
+- Per-class capacity thresholds (Healthy / Warning / Critical) are
+  unchanged.
+- EC-4+2 stays as the default for the cold tier (band 3 above
+  `replication_ceiling`).
+- ADR-047's intent log durability semantics are unchanged; the
+  inline band rides on top of the existing per-shard Raft.
+
 ## Consequences
 
 - Device diversity now first-class (HDD, SSD, NVMe, PMem)
@@ -298,12 +393,21 @@ pub enum DeviceState {
 - Device health monitoring enables proactive replacement
 - Tiering is future work; static placement for MVP
 - Cluster admin must provision devices and assign to pools at setup time
+- **(2026-05-31 amendment)** Three durability strategies routed by size
+  band. Default chain delivers inline / replicated / EC for the three
+  workload regimes. Per-PUT EC fan-out tax limited to objects ≥
+  `replication_ceiling` (default 4 MB).
 
 ## References
 
 - ADR-005: EC and chunk durability (per pool)
 - ADR-022: Storage backend (redb on system partition)
+- ADR-030: Inline path for the small-object band
+- ADR-045: Namespace tier-policy declares per-size-band pool choice
+- ADR-047: Intent log durability — the substrate the inline band rides on
+- ADR-048: Slab-EC compactor — amortises EC fan-out across many writes
 - Assumption A4: ClusterStor hardware
 - Assumption A8: Reactive tiering
 - Failure mode F-I2: Storage node failure
 - Failure mode F-I4: Disk/device failure
+- Escalation 2026-05-31: tiered storage + slab-EC
