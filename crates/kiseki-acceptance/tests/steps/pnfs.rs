@@ -2077,14 +2077,7 @@ async fn then_inline_drain(world: &mut KisekiWorld) {
     let ctx = world.pnfs.ds_ctx.as_ref().expect("ds_ctx");
     let snap = ctx
         .write_buffers
-        .snapshot_for_commit(
-            world
-                .pnfs
-                .fh
-                .as_ref()
-                .expect("fh")
-                .composition_id,
-        )
+        .snapshot_for_commit(world.pnfs.fh.as_ref().expect("fh").composition_id)
         .expect("buffer entry alive after auto-drain");
     assert!(
         snap.base_composition_id.is_some(),
