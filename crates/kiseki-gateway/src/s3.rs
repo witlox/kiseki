@@ -143,6 +143,10 @@ impl<G: GatewayOps> S3Gateway<G> {
                 // ADR-047: S3 PutObject is async-ack-eligible (object
                 // semantics, bounded-stale per ADR-014).
                 surface: crate::ops::WriteSurface::S3,
+                // #146 — S3 PUT writes the full body in one shot;
+                // no chain.
+                base_composition_id: None,
+                base_bytes: 0,
             })
             .await?;
 

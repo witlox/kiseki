@@ -58,6 +58,8 @@ async fn write_then_read_roundtrip() {
             comp_id_override: None,
             tier: None,
             surface: kiseki_gateway::WriteSurface::S3,
+            base_composition_id: None,
+            base_bytes: 0,
         })
         .await
         .unwrap();
@@ -99,6 +101,8 @@ async fn read_with_offset_and_length() {
             comp_id_override: None,
             tier: None,
             surface: kiseki_gateway::WriteSurface::S3,
+            base_composition_id: None,
+            base_bytes: 0,
         })
         .await
         .unwrap();
@@ -137,6 +141,8 @@ async fn read_past_eof_returns_empty() {
             comp_id_override: None,
             tier: None,
             surface: kiseki_gateway::WriteSurface::S3,
+            base_composition_id: None,
+            base_bytes: 0,
         })
         .await
         .unwrap();
@@ -174,6 +180,8 @@ async fn tenant_mismatch_rejected() {
             comp_id_override: None,
             tier: None,
             surface: kiseki_gateway::WriteSurface::S3,
+            base_composition_id: None,
+            base_bytes: 0,
         })
         .await
         .unwrap();
@@ -246,6 +254,8 @@ async fn bucket_isolation_list_returns_only_own_objects() {
         comp_id_override: None,
         tier: None,
         surface: kiseki_gateway::WriteSurface::S3,
+        base_composition_id: None,
+        base_bytes: 0,
     })
     .await
     .unwrap();
@@ -264,6 +274,8 @@ async fn bucket_isolation_list_returns_only_own_objects() {
         comp_id_override: None,
         tier: None,
         surface: kiseki_gateway::WriteSurface::S3,
+        base_composition_id: None,
+        base_bytes: 0,
     })
     .await
     .unwrap();

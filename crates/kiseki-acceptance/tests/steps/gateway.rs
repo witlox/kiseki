@@ -274,6 +274,8 @@ async fn given_s3_getobject(w: &mut KisekiWorld, _key: String) {
             comp_id_override: None,
             tier: None,
             surface: kiseki_gateway::ops::WriteSurface::S3,
+            base_composition_id: None,
+            base_bytes: 0,
         })
         .await
         .expect("S3 write");
@@ -381,6 +383,8 @@ async fn then_gw_write_pipeline(w: &mut KisekiWorld) {
             comp_id_override: None,
             tier: None,
             surface: kiseki_gateway::ops::WriteSurface::S3,
+            base_composition_id: None,
+            base_bytes: 0,
         })
         .await
         .expect("S3 write");

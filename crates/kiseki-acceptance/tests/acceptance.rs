@@ -613,6 +613,8 @@ impl KisekiWorld {
                 comp_id_override: None,
                 tier: None,
                 surface: kiseki_gateway::ops::WriteSurface::S3,
+                base_composition_id: None,
+                base_bytes: 0,
             })
             .await
             .map_err(|e| e.to_string())

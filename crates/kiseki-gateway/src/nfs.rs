@@ -120,6 +120,11 @@ impl<G: GatewayOps> NfsGateway<G> {
                 // ADR-047: NFS is POSIX close-to-open (ADR-013) — NEVER
                 // decoupled; always takes the synchronous commit path.
                 surface: crate::ops::WriteSurface::Nfs,
+                // #146 — only the pNFS DS COMMIT path chains; this
+                // surface (NFSv4 MDS flush-on-CLOSE, NFSv3) always
+                // writes the full buffer in one shot.
+                base_composition_id: None,
+                base_bytes: 0,
             })
             .await?;
 

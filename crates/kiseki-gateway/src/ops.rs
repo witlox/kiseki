@@ -146,6 +146,31 @@ pub struct WriteRequest {
     /// construction site sets this explicitly; `Default` is `S3` for the
     /// few literal-with-default test sites.
     pub surface: WriteSurface,
+    /// #146 — chain root for a pNFS DS COMMIT that drains its in-memory
+    /// buffer after a cap-hit. When `Some(prior_id)`, the gateway
+    /// constructs the new composition as `prior_id`'s chunks +
+    /// chunks-derived-from-`data`, total size = `base_bytes + data.len()`.
+    /// The prior chunks are NOT re-encrypted / re-uploaded — they already
+    /// exist in the chunk store (refcount > 0 via `prior_id`); the new
+    /// composition just references them. This collapses the
+    /// "buffer-cap-NOSPC ↔ kernel-COMMIT-retry" loop that caused the
+    /// F-1 wedge into a normal flush-then-drain cycle while preserving
+    /// the `snapshot_for_commit` correctness from #74 (the new
+    /// composition still contains every byte ever written through this
+    /// fh, because the chain prepends them).
+    ///
+    /// `None` for all other callers — S3 PUT, native, FUSE flush, `NFSv3`
+    /// CLOSE flush — they always write the full buffer.
+    pub base_composition_id: Option<CompositionId>,
+    /// #146 — cumulative size of `base_composition_id` when chaining.
+    /// Used to compute the final composition size as `base_bytes +
+    /// data.len()` without re-reading the prior composition. The
+    /// gateway trusts this value; the only producer is
+    /// `op_commit_ds`, which sources it from the buffer's `base_bytes`
+    /// field after a successful inline drain.
+    ///
+    /// Ignored when `base_composition_id` is `None`.
+    pub base_bytes: u64,
 }
 
 /// HTTP-derived conditional check applied to a `WriteRequest` against
@@ -557,6 +582,8 @@ mod tests {
             comp_id_override: None,
             tier: None,
             surface: WriteSurface::S3,
+            base_composition_id: None,
+            base_bytes: 0,
         };
         let cloned = req.clone();
         assert_eq!(
@@ -586,6 +613,8 @@ mod tests {
             comp_id_override: None,
             tier: None,
             surface: WriteSurface::S3,
+            base_composition_id: None,
+            base_bytes: 0,
         };
         assert_eq!(req.clone().forwarded_from_node, Some(7));
     }

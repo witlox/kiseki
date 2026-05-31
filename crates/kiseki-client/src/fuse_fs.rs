@@ -387,6 +387,11 @@ impl<G: GatewayOps> KisekiFuse<G> {
             // ADR-047: FUSE is POSIX close-to-open (ADR-013) — NEVER
             // decoupled; always synchronous.
             surface: WriteSurface::Fuse,
+            // #146 — FUSE writes the full dirty buffer in one shot;
+            // no pNFS-style chain (FUSE has its own per-inode dirty
+            // tracking in `self.dirty`).
+            base_composition_id: None,
+            base_bytes: 0,
         })
     }
 
@@ -484,6 +489,11 @@ impl<G: GatewayOps> KisekiFuse<G> {
             // ADR-047: FUSE is POSIX close-to-open (ADR-013) — NEVER
             // decoupled; always synchronous.
             surface: WriteSurface::Fuse,
+            // #146 — FUSE writes the full dirty buffer in one shot;
+            // no pNFS-style chain (FUSE has its own per-inode dirty
+            // tracking in `self.dirty`).
+            base_composition_id: None,
+            base_bytes: 0,
         })
     }
 

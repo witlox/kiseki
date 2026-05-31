@@ -2838,7 +2838,46 @@ impl InMemoryGateway {
                 was_new: chunk_was_new,
             });
         }
-        let chunk_ids: Vec<kiseki_common::ids::ChunkId> = landed.iter().map(|l| l.id).collect();
+        let new_chunk_ids: Vec<kiseki_common::ids::ChunkId> = landed.iter().map(|l| l.id).collect();
+
+        // #146 — pNFS DS COMMIT chain: when `base_composition_id` is
+        // set, the new composition is `base.chunks ++ new_chunk_ids`
+        // and the total size is `base_bytes + req.data.len()`. The
+        // base composition's chunks already live in the chunk store
+        // (refcounted via the prior CompositionCreate delta); the
+        // chain just references them. This is what makes COMMIT
+        // drain safe — the next composition still contains every
+        // byte ever written through this fh, because the prior
+        // bytes ride along as the chunk prefix. F-1 (sustained NFS
+        // writes > buffer cap) and any "write > 256 MiB into a
+        // single file via pNFS" workload exercises this path; S3 /
+        // FUSE / NFSv3 callers pass `None` and take the
+        // pre-existing legacy path.
+        let (chunk_ids, final_bytes_written) = if let Some(base_id) = req.base_composition_id {
+            let base = self.compositions.as_ref().get(base_id).map_err(|e| {
+                tracing::warn!(
+                    base_composition_id = ?base_id,
+                    error = %e,
+                    "gateway write: base composition lookup failed (#146 chain)"
+                );
+                GatewayError::Upstream(format!("base composition lookup ({base_id:?}): {e}"))
+            })?;
+            let mut combined = base.chunks.clone();
+            combined.extend(new_chunk_ids.iter().copied());
+            let total = req.base_bytes.saturating_add(bytes_written);
+            tracing::debug!(
+                base_composition_id = ?base_id,
+                base_chunks = base.chunks.len(),
+                new_chunks = new_chunk_ids.len(),
+                base_bytes = req.base_bytes,
+                delta_bytes = bytes_written,
+                total_bytes = total,
+                "gateway write: #146 chain — prepending base chunks"
+            );
+            (combined, total)
+        } else {
+            (new_chunk_ids.clone(), bytes_written)
+        };
 
         // Create composition (sync, fast) — lock released before Raft.
         // Log emission happens after lock release to avoid holding the
@@ -2894,7 +2933,7 @@ impl InMemoryGateway {
                             target_id,
                             req.namespace_id,
                             chunk_ids.clone(),
-                            bytes_written,
+                            final_bytes_written,
                         )
                         .map(|()| target_id),
                     (Some(name), None) => {
@@ -2908,11 +2947,11 @@ impl InMemoryGateway {
                             name.to_owned(),
                             check_ref,
                             chunk_ids.clone(),
-                            bytes_written,
+                            final_bytes_written,
                         )
                     }
                     (None, None) => {
-                        comps.create(req.namespace_id, chunk_ids.clone(), bytes_written)
+                        comps.create(req.namespace_id, chunk_ids.clone(), final_bytes_written)
                     }
                 }
             };
@@ -3015,7 +3054,10 @@ impl InMemoryGateway {
             let comp_payload = kiseki_composition::encode_composition_create_payload(
                 comp_id,
                 emit_params.2,
-                bytes_written,
+                // #146 — for the chain case, the composition's size
+                // is base_bytes + new bytes. Non-chain callers pass
+                // `base_bytes = 0` so this equals `bytes_written`.
+                final_bytes_written,
                 req.name.as_deref(),
                 // Regular PUTs always follow the MAX_PLAINTEXT_PER_CHUNK
                 // grid; readers derive per-chunk offsets via index math
@@ -3056,7 +3098,11 @@ impl InMemoryGateway {
                     kiseki_composition::encode_composition_create_payload(
                         comp_id,
                         emit_params.2,
-                        bytes_written,
+                        // #146 — see sync branch above. S3 / Native
+                        // callers don't chain (`base_composition_id`
+                        // is None) so this is equivalent to
+                        // `bytes_written` for them.
+                        final_bytes_written,
                         req.name.as_deref(),
                         &[],
                         Some(seq),
@@ -3162,7 +3208,7 @@ impl InMemoryGateway {
                         );
                         return Ok(WriteResponse {
                             composition_id: comp_id,
-                            bytes_written,
+                            bytes_written: final_bytes_written,
                         });
                     }
                     Err(e) => {
@@ -3336,10 +3382,18 @@ impl InMemoryGateway {
         }
 
         self.observe_put_phase("composition_record", composition_record_started.elapsed());
-        tracing::debug!(comp_id = %comp_id.0, bytes_written, "gateway write: success");
+        tracing::debug!(
+            comp_id = %comp_id.0,
+            delta_bytes = bytes_written,
+            total_bytes = final_bytes_written,
+            "gateway write: success",
+        );
         Ok(WriteResponse {
             composition_id: comp_id,
-            bytes_written,
+            // #146 — for chained writes, return the full composition
+            // size; for non-chained writes `final_bytes_written ==
+            // bytes_written` so callers see no behavior change.
+            bytes_written: final_bytes_written,
         })
     }
 }
@@ -3696,6 +3750,8 @@ mod chunking_tests {
                 comp_id_override: None,
                 tier: None,
                 surface: WriteSurface::S3,
+                base_composition_id: None,
+                base_bytes: 0,
             })
             .await
             .expect("write must succeed");
@@ -3745,6 +3801,8 @@ mod chunking_tests {
                 comp_id_override: None,
                 tier: None,
                 surface: WriteSurface::S3,
+                base_composition_id: None,
+                base_bytes: 0,
             })
             .await
             .unwrap();
@@ -3796,6 +3854,8 @@ mod chunking_tests {
                 comp_id_override: None,
                 tier: None,
                 surface: WriteSurface::S3,
+                base_composition_id: None,
+                base_bytes: 0,
             })
             .await
             .unwrap();
@@ -3846,6 +3906,8 @@ mod chunking_tests {
                 comp_id_override: None,
                 tier: None,
                 surface: WriteSurface::S3,
+                base_composition_id: None,
+                base_bytes: 0,
             })
             .await
             .unwrap();
@@ -3889,6 +3951,8 @@ mod chunking_tests {
                 comp_id_override: None,
                 tier: None,
                 surface: WriteSurface::S3,
+                base_composition_id: None,
+                base_bytes: 0,
             })
             .await
             .unwrap();
@@ -3938,6 +4002,8 @@ mod chunking_tests {
                 comp_id_override: None,
                 tier: None,
                 surface: WriteSurface::S3,
+                base_composition_id: None,
+                base_bytes: 0,
             })
             .await
             .unwrap();
@@ -3976,6 +4042,8 @@ mod chunking_tests {
                 comp_id_override: None,
                 tier: None,
                 surface: WriteSurface::S3,
+                base_composition_id: None,
+                base_bytes: 0,
             })
             .await
             .unwrap();
@@ -4013,6 +4081,8 @@ mod chunking_tests {
                 comp_id_override: None,
                 tier: None,
                 surface: WriteSurface::S3,
+                base_composition_id: None,
+                base_bytes: 0,
             })
             .await
             .unwrap();
@@ -4050,6 +4120,8 @@ mod chunking_tests {
                 comp_id_override: None,
                 tier: None,
                 surface: WriteSurface::S3,
+                base_composition_id: None,
+                base_bytes: 0,
             })
             .await
             .unwrap();
@@ -4213,6 +4285,8 @@ mod phase_duration_tests {
                 comp_id_override: None,
                 tier: None,
                 surface: WriteSurface::S3,
+                base_composition_id: None,
+                base_bytes: 0,
             })
             .await
             .expect("write must succeed");
