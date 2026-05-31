@@ -223,6 +223,24 @@ where
         staged_by_comp.clear();
         return 0;
     }
+    // ADR-048 rewrite cross-ref: record `(comp_id, chunk_idx,
+    // chunk_id)` per extent so the maintenance pass can identify
+    // owners when it rewrites a fragmented slab. Failure here is
+    // non-fatal — the slab is durable, the migration deltas below
+    // still fire; a missing owner record just means the rewrite
+    // pass for this slab won't fan deltas (it'll fall through to
+    // the GC path when refcount hits zero).
+    let owner_records: Vec<(kiseki_common::ids::CompositionId, u32, ChunkId)> = staged_by_comp
+        .iter()
+        .flat_map(|(cid, entries)| {
+            entries
+                .iter()
+                .map(move |(idx, _off, _len, chunk_id)| (*cid, *idx, *chunk_id))
+        })
+        .collect();
+    if let Err(e) = slab_store.record_owners(slab_id, &owner_records) {
+        tracing::warn!(error = %e, "slab compactor: record_owners failed (maintenance fan disabled)");
+    }
     // Emit one MigrateChunkLocations delta per composition that
     // contributed chunks to this slab.
     let drained_staged = std::mem::take(staged_by_comp);
@@ -267,7 +285,7 @@ where
 /// MigrateChunkLocations apply lands).
 ///
 /// Returns the number of slabs rewritten in this pass.
-#[allow(clippy::too_many_arguments)] // direct args avoid a tiny config struct.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // direct args avoid a tiny config struct.
 pub async fn run_maintenance_pass<L>(
     pool: &str,
     data_shards: u16,
@@ -317,19 +335,24 @@ where
                 continue;
             }
         };
-        let live_chunks: Vec<(kiseki_common::ids::ChunkId, Vec<u8>)> = slab
-            .extents
-            .iter()
-            .filter(|e| e.refcount > 0)
-            .filter_map(|e| {
-                let start = e.offset as usize;
-                let end = start + e.length as usize;
-                if end > slab.data.len() {
-                    return None;
-                }
-                Some((e.chunk_id, slab.data[start..end].to_vec()))
-            })
-            .collect();
+        // Collect (chunk_id, bytes) for every LIVE extent in arrival
+        // order — preserved from the old slab so the fresh-slab
+        // offsets map deterministically (live_extents[i] in the new
+        // slab is at offset Σ length of live_extents[0..i]).
+        let mut live_extent_meta: Vec<(kiseki_common::ids::ChunkId, u32)> = Vec::new();
+        let mut live_chunks: Vec<(kiseki_common::ids::ChunkId, Vec<u8>)> = Vec::new();
+        for e in &slab.extents {
+            if e.refcount == 0 {
+                continue;
+            }
+            let start = e.offset as usize;
+            let end = start + e.length as usize;
+            if end > slab.data.len() {
+                continue;
+            }
+            live_extent_meta.push((e.chunk_id, e.length));
+            live_chunks.push((e.chunk_id, slab.data[start..end].to_vec()));
+        }
         if live_chunks.is_empty() {
             // Every extent dead — the regular GC path handles this,
             // not the rewrite path.
@@ -348,19 +371,92 @@ where
             tracing::warn!(error = %e, "slab maintenance: put_slab failed");
             continue;
         }
-        // Build the per-composition migrate-payload from the new
-        // slab's offsets. We don't know which compositions own
-        // which live extents without a reverse index; the maintenance
-        // path is best-effort and the operator can run
-        // `kiseki-admin compactor` to confirm. As a defensive
-        // strategy we emit one MigrateChunkLocations per live
-        // extent's *owning composition* by scanning all
-        // namespaces' compositions for the chunk_ids; for v1 we
-        // emit a single migration delta keyed by a synthetic
-        // comp_id (the slab_id), and operators wire the cross-ref
-        // separately. This is a known limitation — the proper
-        // reverse index lands in a follow-up PR.
-        let _ = (tenant_id, shard_id, pool, new_slab_id, log);
+        // ADR-048 §"Slab GC" — look up the owner cross-ref the
+        // compactor stamped at original-flush time + emit
+        // MigrateChunkLocations against the actual owning
+        // compositions. Compute fresh offsets from `live_chunks` in
+        // arrival order so the (offset_in_slab, length) tuples
+        // point at where each chunk now lives in the rewritten slab.
+        let owners = match slab_store.owners_for(slab_id) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(
+                    slab_id = %slab_id.0,
+                    error = %e,
+                    "slab maintenance: owners_for failed — rewrite landed without migrate deltas",
+                );
+                rewritten += 1;
+                continue;
+            }
+        };
+        if owners.is_empty() {
+            tracing::debug!(
+                slab_id = %slab_id.0,
+                "slab maintenance: no owner cross-ref recorded — rewrite landed without migrate deltas",
+            );
+            rewritten += 1;
+            continue;
+        }
+        // Build chunk_id → (new_offset, length) for every chunk in
+        // the rewritten slab.
+        let mut new_offset_for: std::collections::HashMap<kiseki_common::ids::ChunkId, (u64, u32)> =
+            std::collections::HashMap::with_capacity(live_extent_meta.len());
+        let mut running: u64 = 0;
+        for (cid, len) in &live_extent_meta {
+            new_offset_for.insert(*cid, (running, *len));
+            running += u64::from(*len);
+        }
+        // Group surviving owners by composition.
+        let mut by_comp: std::collections::HashMap<
+            kiseki_common::ids::CompositionId,
+            Vec<(u32, u64, u32)>,
+        > = std::collections::HashMap::new();
+        for (comp_id, chunk_idx, chunk_id) in &owners {
+            if let Some((off, len)) = new_offset_for.get(chunk_id) {
+                by_comp
+                    .entry(*comp_id)
+                    .or_default()
+                    .push((*chunk_idx, *off, *len));
+            }
+        }
+        // Record the owner cross-ref on the rewritten slab so a
+        // future rewrite pass against the new slab can find the
+        // same compositions.
+        let new_owner_records: Vec<(
+            kiseki_common::ids::CompositionId,
+            u32,
+            kiseki_common::ids::ChunkId,
+        )> = owners
+            .iter()
+            .filter(|(_c, _i, cid)| new_offset_for.contains_key(cid))
+            .copied()
+            .collect();
+        if let Err(e) = slab_store.record_owners(new_slab_id, &new_owner_records) {
+            tracing::warn!(
+                error = %e,
+                new_slab_id = %new_slab_id.0,
+                "slab maintenance: record_owners failed for rewritten slab",
+            );
+        }
+        for (comp_id, entries) in by_comp {
+            if let Err(e) = kiseki_composition::log_bridge::emit_migrate_chunk_locations(
+                log,
+                shard_id,
+                tenant_id,
+                comp_id,
+                pool,
+                new_slab_id,
+                &entries,
+            )
+            .await
+            {
+                tracing::warn!(
+                    comp_id = %comp_id.0,
+                    error = %e,
+                    "slab maintenance: emit_migrate_chunk_locations failed",
+                );
+            }
+        }
         rewritten += 1;
     }
     rewritten

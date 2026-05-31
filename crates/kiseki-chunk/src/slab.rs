@@ -508,6 +508,21 @@ pub trait SlabStore: Send + Sync {
     /// Idempotent: a no-op when the slab isn't present or still has
     /// referenced extents.
     fn gc_slab(&self, slab_id: SlabId) -> Result<(), ChunkError>;
+
+    /// ADR-048 §"Slab GC" rewrite-pass cross-ref. Record the
+    /// `(composition_id, chunk_idx, chunk_id)` tuples that own each
+    /// extent in the slab so the maintenance pass can emit
+    /// `MigrateChunkLocations` deltas against the right
+    /// compositions when it rewrites a fragmented slab. Default
+    /// impl is a no-op so [`InMemorySlabStore`] and test stubs
+    /// don't have to implement it.
+    fn record_owners(
+        &self,
+        _slab_id: SlabId,
+        _owners: &[(kiseki_common::ids::CompositionId, u32, ChunkId)],
+    ) -> Result<(), ChunkError> {
+        Ok(())
+    }
 }
 
 /// In-process slab store — backed by a `BTreeMap<SlabId, Slab>`. Used

@@ -1546,7 +1546,11 @@ pub async fn run_main(
     } else {
         kiseki_chunk_cluster::ChunkEnvelopeRegistry::default()
     };
-    let chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> = Arc::new(
+    // ADR-048 §"Decision" — keep a typed Arc to the ClusteredChunkStore
+    // so we can hand it to `FabricSlabStore::open` after the gateway is
+    // built (the trait-object form below can't be down-cast back to the
+    // concrete type).
+    let clustered_chunk_store: Arc<kiseki_chunk_cluster::ClusteredChunkStore> = Arc::new(
         kiseki_chunk_cluster::ClusteredChunkStore::new(
             Arc::clone(&local_chunk_store),
             fabric_peers,
@@ -1555,6 +1559,8 @@ pub async fn run_main(
         .with_metrics(Arc::clone(&metrics.fabric))
         .with_envelope_registry(envelope_registry.clone()),
     );
+    let chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> =
+        Arc::clone(&clustered_chunk_store) as Arc<dyn kiseki_chunk::AsyncChunkOps>;
 
     // Phase 16d step 4: spawn the periodic scrub scheduler when
     // running on a real cluster (>=1 peer; in single-node mode
@@ -1860,35 +1866,36 @@ pub async fn run_main(
             }
         }
     }
-    let mut gw_builder = kiseki_gateway::InMemoryGateway::new(comp_store, chunk_store, master_key)
-        // ADR-047: this node's id seeds the per-node perspective clock
-        // (the PerspectiveSeq tie-breaker). Decoupled-ack is THE path for
-        // async-eligible surfaces (no capability gate).
-        .with_node_id(cfg.node_id)
-        .with_view_store(Arc::clone(&view_store))
-        // ADR-044: tenant-isolated content-addressed dedup.
-        .with_dedup_policy(
-            kiseki_common::tenancy::DedupPolicy::TenantIsolated,
-            Some(tenant_dedup_key),
-        )
-        // #111: forward a remote-led shard's metadata mutation to the
-        // leader's LogService (write/delete/multipart, every ingress).
-        .with_append_forwarder(std::sync::Arc::new(
-            kiseki_gateway::native::append_forwarder::ProxyAppendForwarder::new(
-                std::sync::Arc::clone(&proxy_client_for_native),
-            ),
-        ))
-        .with_cluster_placement(cluster_placement)
-        // Phase 16c step 2: cap per-chunk placement at the
-        // size-derived `copies` so a 6-node Replication-3 cluster
-        // doesn't list all 6 nodes in every cluster_chunk_state row.
-        .with_target_copies(usize::from(durability.copies))
-        // ADR-040 §D7 + §D10 / F-4 closure: thread the read-path
-        // retry counters (`kiseki_gateway_read_retry_total` and
-        // `kiseki_gateway_read_retry_exhausted_total`) into the
-        // gateway so operators can see whether they're hitting
-        // the configurable budget.
-        .with_retry_metrics(Arc::clone(&metrics.gateway_retry));
+    let mut gw_builder =
+        kiseki_gateway::InMemoryGateway::new(comp_store, Arc::clone(&chunk_store), master_key)
+            // ADR-047: this node's id seeds the per-node perspective clock
+            // (the PerspectiveSeq tie-breaker). Decoupled-ack is THE path for
+            // async-eligible surfaces (no capability gate).
+            .with_node_id(cfg.node_id)
+            .with_view_store(Arc::clone(&view_store))
+            // ADR-044: tenant-isolated content-addressed dedup.
+            .with_dedup_policy(
+                kiseki_common::tenancy::DedupPolicy::TenantIsolated,
+                Some(tenant_dedup_key),
+            )
+            // #111: forward a remote-led shard's metadata mutation to the
+            // leader's LogService (write/delete/multipart, every ingress).
+            .with_append_forwarder(std::sync::Arc::new(
+                kiseki_gateway::native::append_forwarder::ProxyAppendForwarder::new(
+                    std::sync::Arc::clone(&proxy_client_for_native),
+                ),
+            ))
+            .with_cluster_placement(cluster_placement)
+            // Phase 16c step 2: cap per-chunk placement at the
+            // size-derived `copies` so a 6-node Replication-3 cluster
+            // doesn't list all 6 nodes in every cluster_chunk_state row.
+            .with_target_copies(usize::from(durability.copies))
+            // ADR-040 §D7 + §D10 / F-4 closure: thread the read-path
+            // retry counters (`kiseki_gateway_read_retry_total` and
+            // `kiseki_gateway_read_retry_exhausted_total`) into the
+            // gateway so operators can see whether they're hitting
+            // the configurable budget.
+            .with_retry_metrics(Arc::clone(&metrics.gateway_retry));
     // The inline path (mem_gateway.rs PUT path: writes ≤ inline_threshold
     // go to local small_store keyed by chunk_id) is single-node-only. In a
     // multi-node cluster the inline write lands on one node's redb and the
@@ -1915,6 +1922,198 @@ pub async fn run_main(
         }
     }
     let gw = Arc::new(gw_builder);
+
+    // ADR-048 boot wiring — for every pool flagged
+    // `requires_migration`, construct a `FabricSlabStore`, register
+    // the per-pool backlog tracker, and spawn the slab-EC compactor
+    // task on every node that has a Raft shard. The gateway's
+    // cold-path read branch consults the slab store; the gateway's
+    // `pool_is_async_ack_eligible` consults the backlog registry;
+    // the compactor task emits `MigrateChunkLocations` deltas as it
+    // flushes slabs.
+    //
+    // Wired AFTER `gw` exists so the per-pool calls below can
+    // attach. Skipped entirely when no peer fabric is configured
+    // (`fabric_peers_for_scrub.is_empty()`) — slab-EC requires the
+    // fabric for fragment distribution, and a single-node cluster
+    // has nothing to scatter across.
+    let slab_backlog_registry: Arc<
+        parking_lot::RwLock<
+            std::collections::HashMap<
+                String,
+                Arc<parking_lot::Mutex<kiseki_chunk::slab::SlabBacklog>>,
+            >,
+        >,
+    > = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+    if let Some(ref data_dir) = cfg.data_dir {
+        if fabric_peers_for_scrub.is_empty() {
+            tracing::debug!("slab-EC boot: skipped (single-node cluster, no fabric peers)");
+        } else {
+            let pool_snapshot = chunk_store.snapshot_pools().await;
+            let placement_nodes_for_slab: Vec<u64> =
+                cfg.raft_peers.iter().map(|(id, _)| *id).collect();
+            // Register the backlog tracker on the gateway eagerly —
+            // the registry is shared between every pool's
+            // compactor and the gateway's `is_async_ack_eligible`
+            // gate.
+            gw.set_slab_backlog_registry(Arc::clone(&slab_backlog_registry));
+            let mut migration_pools: Vec<String> = Vec::new();
+            for pool in &pool_snapshot {
+                if !pool.requires_migration {
+                    continue;
+                }
+                migration_pools.push(pool.name.clone());
+                let ec_strategy = match pool.durability {
+                    kiseki_chunk::DurabilityStrategy::ErasureCoding {
+                        data_shards,
+                        parity_shards,
+                    } => kiseki_chunk_cluster::ec::EcStrategy::Ec {
+                        data: data_shards,
+                        parity: parity_shards,
+                    },
+                    // Replication pools migrate to EC by default —
+                    // the cold tier is EC-4+2 regardless of the
+                    // hot-tier replication factor.
+                    _ => kiseki_chunk_cluster::ec::EcStrategy::Ec { data: 4, parity: 2 },
+                };
+                let slab_data_dir = data_dir.join("slab_pools").join(&pool.name);
+                let slab_store = match kiseki_chunk_cluster::slab_store::FabricSlabStore::open(
+                    Arc::clone(&clustered_chunk_store),
+                    placement_nodes_for_slab.clone(),
+                    ec_strategy,
+                    &slab_data_dir,
+                    pool.name.clone(),
+                ) {
+                    Ok(s) => Arc::new(s),
+                    Err(e) => {
+                        tracing::warn!(
+                            pool = %pool.name,
+                            error = %e,
+                            "slab-EC boot: FabricSlabStore::open failed (compactor skipped for this pool)",
+                        );
+                        continue;
+                    }
+                };
+                // Hand the FIRST migration-eligible pool's store to
+                // the gateway as the cold-tier resolver. The
+                // gateway today routes by chunk_locations' embedded
+                // pool name, but it only holds one SlabStore handle;
+                // a per-pool handle map is a follow-up if a single
+                // cluster runs multiple migration-eligible pools.
+                gw.set_slab_store(
+                    Arc::clone(&slab_store) as Arc<dyn kiseki_chunk::slab::SlabStore>,
+                );
+                // Register backlog tracker in the shared registry so
+                // the gateway sees it on `pool_is_async_ack_eligible`.
+                let backlog = Arc::new(parking_lot::Mutex::new(
+                    kiseki_chunk::slab::SlabBacklog::new(),
+                ));
+                slab_backlog_registry
+                    .write()
+                    .insert(pool.name.clone(), Arc::clone(&backlog));
+
+                // Spawn the compactor task. `namespaces` is filled
+                // by the runtime's namespace-discovery hook at
+                // startup; until then the compactor scans the
+                // bootstrap namespace (UUIDv4 0..0 + 1 from the
+                // bootstrap_view setup at the top of run_main).
+                // Subsequent namespaces register dynamically via
+                // the control-plane apply path; a periodic
+                // namespace-snapshot refresh inside the compactor
+                // loop is a follow-up.
+                let compositions_for_task = gw.compositions_handle();
+                let cfg_for_task = kiseki_chunk_cluster::slab_compactor::CompactorCfg {
+                    pool: pool.name.clone(),
+                    sweep_interval: std::time::Duration::from_secs(5),
+                    data_shards: 4,
+                    parity_shards: 2,
+                    namespaces: compositions_for_task
+                        .list_namespaces()
+                        .into_iter()
+                        .map(|n| n.id)
+                        .collect(),
+                    tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)),
+                    shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
+                };
+                // Carve out a slab-store handle the compactor owns
+                // (separate Arc from the one passed to the gateway).
+                let slab_store_for_task: Arc<dyn kiseki_chunk::slab::SlabStore> =
+                    Arc::clone(&slab_store) as _;
+                let log_for_task: Arc<dyn kiseki_log::traits::LogOps + Send + Sync> =
+                    Arc::clone(&log_store) as _;
+                let registry_for_task =
+                    Arc::new(kiseki_chunk_cluster::slab_store::SlabBacklogRegistry::new());
+                // Seed the registry with the per-pool backlog so
+                // `get_or_insert(pool)` returns the same handle the
+                // gateway is reading from. The compactor's `spawn`
+                // helper does its own `get_or_insert`; we mirror
+                // the entry here.
+                {
+                    let _ = registry_for_task.get_or_insert(&pool.name);
+                }
+                let local_for_task: Arc<dyn kiseki_chunk::AsyncChunkOps> =
+                    Arc::clone(&local_chunk_store);
+                kiseki_chunk_cluster::slab_compactor::spawn(
+                    cfg_for_task,
+                    compositions_for_task,
+                    local_for_task,
+                    Arc::clone(&slab_store_for_task),
+                    Arc::clone(&log_for_task),
+                    registry_for_task,
+                );
+
+                // ADR-048 §"Slab GC" maintenance rewrite pass.
+                // Runs at 50 s cadence (10× the compactor sweep) —
+                // rewrites a fragmented slab is heavier than
+                // flushing a fresh one, so the pass is deliberately
+                // slow.
+                let maintenance_pool = pool.name.clone();
+                let maintenance_store = Arc::clone(&slab_store);
+                let maintenance_log = Arc::clone(&log_for_task);
+                let maintenance_tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
+                let maintenance_shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
+                let maintenance_threshold = std::env::var("KISEKI_SLAB_REWRITE_RATIO")
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|r| (0.0..=1.0).contains(r))
+                    .unwrap_or(0.5);
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(50));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tick.tick().await;
+                        let rewritten = kiseki_chunk_cluster::slab_compactor::run_maintenance_pass(
+                            &maintenance_pool,
+                            4,
+                            2,
+                            maintenance_tenant,
+                            maintenance_shard,
+                            &*maintenance_store,
+                            maintenance_log.as_ref(),
+                            maintenance_threshold,
+                        )
+                        .await;
+                        if rewritten > 0 {
+                            tracing::info!(
+                                pool = %maintenance_pool,
+                                rewritten,
+                                "slab-EC maintenance: rewrite pass complete",
+                            );
+                        }
+                    }
+                });
+
+                tracing::info!(
+                    pool = %pool.name,
+                    "slab-EC boot: compactor + maintenance spawned (sweep 5s, rewrite 50s)",
+                );
+            }
+            if migration_pools.is_empty() {
+                tracing::debug!("slab-EC boot: no pools flagged requires_migration");
+            }
+        }
+    }
+
     // ADR-030 §3 — register the gateway with the inline-threshold
     // recompute task so it can push committed per-shard values back
     // into `set_shard_inline_threshold`. Stored as `Weak` so the

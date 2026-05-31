@@ -173,9 +173,21 @@ fn slab_id_as_chunk_id(slab_id: SlabId) -> ChunkId {
 struct SlabRefIndex {
     db: fjall::Database,
     table: fjall::Keyspace,
+    /// ADR-048 §"Slab GC" rewrite-pass cross-ref: per-slab list of
+    /// `(composition_id, chunk_idx, chunk_id)`. The compactor
+    /// records this at slab-flush time; the maintenance rewrite pass
+    /// reads it to emit `MigrateChunkLocations` deltas against the
+    /// actual owning compositions when it rewrites a fragmented
+    /// slab.
+    owners_table: fjall::Keyspace,
 }
 
 const KS_SLAB_REFS: &str = "slab_refs";
+const KS_SLAB_OWNERS: &str = "slab_owners";
+
+/// Wire size of one `(composition_id, chunk_idx, chunk_id)` owner
+/// record on disk: 16 (UUID) + 4 (chunk_idx u32 LE) + 32 (chunk id).
+const SLAB_OWNER_RECORD_LEN: usize = 16 + 4 + 32;
 
 impl SlabRefIndex {
     fn open(data_dir: &Path) -> Result<Self, ChunkError> {
@@ -187,7 +199,81 @@ impl SlabRefIndex {
         let table = db
             .keyspace(KS_SLAB_REFS, fjall::KeyspaceCreateOptions::default)
             .map_err(ChunkError::Fjall)?;
-        Ok(Self { db, table })
+        let owners_table = db
+            .keyspace(KS_SLAB_OWNERS, fjall::KeyspaceCreateOptions::default)
+            .map_err(ChunkError::Fjall)?;
+        Ok(Self {
+            db,
+            table,
+            owners_table,
+        })
+    }
+
+    /// Record the per-slab owner index. Idempotent: subsequent calls
+    /// with the same `slab_id` overwrite, which is the right semantic
+    /// — the compactor only calls this on a fresh slab id.
+    fn put_owners(&self, slab_id: SlabId, owners: &[SlabOwnerRecord]) -> Result<(), ChunkError> {
+        let mut buf = Vec::with_capacity(owners.len() * SLAB_OWNER_RECORD_LEN);
+        for (cid, idx, chunk_id) in owners {
+            buf.extend_from_slice(cid.0.as_bytes());
+            buf.extend_from_slice(&idx.to_le_bytes());
+            buf.extend_from_slice(&chunk_id.0);
+        }
+        self.owners_table
+            .insert(slab_id.0.as_bytes(), buf)
+            .map_err(ChunkError::Fjall)?;
+        self.db
+            .persist(fjall::PersistMode::SyncAll)
+            .map_err(ChunkError::Fjall)?;
+        Ok(())
+    }
+
+    /// Read the per-slab owner index. Returns `None` when no record
+    /// has been written (pre-amendment slabs or maintenance running
+    /// against a slab the compactor didn't tag).
+    fn get_owners(&self, slab_id: SlabId) -> Result<Option<Vec<SlabOwnerRecord>>, ChunkError> {
+        let raw = self
+            .owners_table
+            .get(slab_id.0.as_bytes())
+            .map_err(ChunkError::Fjall)?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        if raw.len() % SLAB_OWNER_RECORD_LEN != 0 {
+            return Ok(None);
+        }
+        let mut out = Vec::with_capacity(raw.len() / SLAB_OWNER_RECORD_LEN);
+        let mut pos = 0;
+        while pos + SLAB_OWNER_RECORD_LEN <= raw.len() {
+            let comp_uuid =
+                uuid::Uuid::from_slice(&raw[pos..pos + 16]).unwrap_or_else(|_| uuid::Uuid::nil());
+            pos += 16;
+            let idx = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            let mut cid = [0u8; 32];
+            cid.copy_from_slice(&raw[pos..pos + 32]);
+            pos += 32;
+            out.push((
+                kiseki_common::ids::CompositionId(comp_uuid),
+                idx,
+                ChunkId(cid),
+            ));
+        }
+        Ok(Some(out))
+    }
+
+    /// Remove the per-slab owner index. Called from
+    /// [`SlabRefIndex::delete`] so a GC'd slab leaves no orphan
+    /// owner rows behind.
+    #[allow(dead_code)] // surfaced for symmetry; SlabRefIndex::delete inlines the same removal.
+    fn delete_owners(&self, slab_id: SlabId) -> Result<(), ChunkError> {
+        self.owners_table
+            .remove(slab_id.0.as_bytes())
+            .map_err(ChunkError::Fjall)?;
+        self.db
+            .persist(fjall::PersistMode::SyncAll)
+            .map_err(ChunkError::Fjall)?;
+        Ok(())
     }
 
     fn put(&self, slab_id: SlabId, extents: &[SlabExtent]) -> Result<(), ChunkError> {
@@ -243,6 +329,11 @@ impl SlabRefIndex {
 
     fn delete(&self, slab_id: SlabId) -> Result<(), ChunkError> {
         self.table
+            .remove(slab_id.0.as_bytes())
+            .map_err(ChunkError::Fjall)?;
+        // Clear the owner cross-ref so a GC'd slab leaves no orphan
+        // rows in the secondary index.
+        self.owners_table
             .remove(slab_id.0.as_bytes())
             .map_err(ChunkError::Fjall)?;
         self.db
@@ -312,6 +403,25 @@ impl FabricSlabStore {
         Ok(out)
     }
 
+    /// Record the per-slab owner cross-ref. Called by the compactor
+    /// after a successful `put_slab` so the maintenance rewrite pass
+    /// can emit `MigrateChunkLocations` against the right
+    /// compositions when it rewrites a fragmented slab.
+    pub fn record_owners(
+        &self,
+        slab_id: SlabId,
+        owners: &[SlabOwnerRecord],
+    ) -> Result<(), ChunkError> {
+        self.refs.put_owners(slab_id, owners)
+    }
+
+    /// Read the per-slab owner cross-ref. Returns an empty vec when
+    /// the slab has no recorded owners (pre-amendment record or test
+    /// fixture).
+    pub fn owners_for(&self, slab_id: SlabId) -> Result<Vec<SlabOwnerRecord>, ChunkError> {
+        Ok(self.refs.get_owners(slab_id)?.unwrap_or_default())
+    }
+
     /// Build the synthetic [`Envelope`] the fabric layer expects.
     /// `auth_tag` / `nonce` are zeroed — the slab payload is *not*
     /// AEAD-sealed at this layer (the chunks inside the slab are
@@ -334,6 +444,21 @@ impl FabricSlabStore {
 /// maintenance pass needs (`refcount_snapshot`, `get_slab`,
 /// `put_slab_dyn`) so it can run against a `&dyn` without the
 /// generic-laden full [`SlabStore`] trait.
+/// Owner record on the maintenance-pass cross-ref: `(composition_id,
+/// chunk_idx, chunk_id)` — the surviving extents' Composition owners
+/// the rewrite pass uses to address `MigrateChunkLocations` deltas.
+pub type SlabOwnerRecord = (
+    kiseki_common::ids::CompositionId,
+    u32,
+    kiseki_common::ids::ChunkId,
+);
+
+/// ADR-048 §"Slab GC" rewrite-pass surface — the bits the
+/// maintenance pass needs behind a `&dyn` so it can run against
+/// either the production [`FabricSlabStore`] or a test stub. Splits
+/// out from the chunk-store-side [`SlabStore`] trait whose default
+/// `record_owners` is a no-op; the maintenance pass needs the real
+/// implementation.
 pub trait SlabStoreMaintainable: Send + Sync {
     /// Snapshot the live refcount table — `(slab_id, extents)` for
     /// every slab known to the local node.
@@ -355,6 +480,26 @@ pub trait SlabStoreMaintainable: Send + Sync {
         slab: kiseki_chunk::slab::Slab,
         encoded: kiseki_chunk::EcEncoded,
     ) -> Result<(), ChunkError>;
+
+    /// Per-slab owner cross-ref, populated by the compactor's
+    /// `record_owners` call after a successful `put_slab`. Empty
+    /// vec when no record exists (pre-amendment slab or test fixture).
+    /// The maintenance rewrite pass uses this to emit
+    /// `MigrateChunkLocations` against the actual owning
+    /// compositions.
+    fn owners_for(
+        &self,
+        slab_id: kiseki_common::SlabId,
+    ) -> Result<Vec<SlabOwnerRecord>, ChunkError>;
+
+    /// Record the per-slab owner cross-ref. Idempotent overwrite on
+    /// the same `slab_id` (compactor only calls this on a fresh
+    /// id).
+    fn record_owners(
+        &self,
+        slab_id: kiseki_common::SlabId,
+        owners: &[SlabOwnerRecord],
+    ) -> Result<(), ChunkError>;
 }
 
 impl SlabStoreMaintainable for FabricSlabStore {
@@ -375,6 +520,19 @@ impl SlabStoreMaintainable for FabricSlabStore {
         encoded: kiseki_chunk::EcEncoded,
     ) -> Result<(), ChunkError> {
         <Self as SlabStore>::put_slab(self, slab, encoded)
+    }
+    fn owners_for(
+        &self,
+        slab_id: kiseki_common::SlabId,
+    ) -> Result<Vec<SlabOwnerRecord>, ChunkError> {
+        FabricSlabStore::owners_for(self, slab_id)
+    }
+    fn record_owners(
+        &self,
+        slab_id: kiseki_common::SlabId,
+        owners: &[SlabOwnerRecord],
+    ) -> Result<(), ChunkError> {
+        FabricSlabStore::record_owners(self, slab_id, owners)
     }
 }
 
@@ -491,6 +649,10 @@ impl SlabStore for FabricSlabStore {
         });
         self.refs.delete(slab_id)?;
         Ok(())
+    }
+
+    fn record_owners(&self, slab_id: SlabId, owners: &[SlabOwnerRecord]) -> Result<(), ChunkError> {
+        FabricSlabStore::record_owners(self, slab_id, owners)
     }
 }
 
