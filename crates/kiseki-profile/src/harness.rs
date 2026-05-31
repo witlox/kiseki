@@ -176,6 +176,13 @@ impl ProfileServer {
             // here so the profile harness can sweep its effect on
             // single-host runs to model real-cluster RTTs.
             "KISEKI_RAFT_FAKE_RTT_US",
+            // Chunk-device backing size (`PersistentChunkStore`).
+            // Default 4 GiB caps the single-node bench at ~65k writes
+            // before silent dedup-hit takes over — see
+            // `specs/escalations/2026-05-30-decoupled-ack-perf-10x-analysis.md`.
+            // Forwarded so a bench run can size the store to its
+            // intended write volume.
+            "KISEKI_CHUNK_DEVICE_BYTES",
         ] {
             if let Ok(v) = std::env::var(var) {
                 cmd.env(var, v);
@@ -183,7 +190,16 @@ impl ProfileServer {
         }
         let child = cmd
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(std::env::var("KISEKI_PROFILE_STDERR").map_or_else(
+                |_| Stdio::null(),
+                |path| {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .map_or_else(|_| Stdio::null(), Stdio::from)
+                },
+            ))
             .spawn()
             .map_err(|e| format!("spawn kiseki-server at {}: {e}", binary.display()))?;
 
@@ -504,10 +520,21 @@ impl Cluster {
     /// Returns Ok on 201 (created) AND on 409 / "already exists"
     /// (idempotent). Errors otherwise so the driver halts before
     /// running against an unconfigured namespace.
-    pub async fn provision_bench_topology(
+    /// ADR-048 §"Decision" — provision the bench namespace + shard
+    /// topology by shelling out to `kiseki-admin`. When
+    /// `slab_ec_pool_name` is `Some(name)`, also create a
+    /// `Replication` pool with `requires_migration = true` named
+    /// `name` and wire the bench namespace's
+    /// `size_band_pools.replicated` at it; the per-pool slab-EC
+    /// compactor task spawned at boot picks up the bench pool and
+    /// migrates chunks to cold-tier slabs. `None` falls through to
+    /// the legacy unflagged path so the same harness drives the
+    /// baseline run.
+    pub async fn provision_bench_topology_with_pool(
         &self,
         admin_bin: Option<&Path>,
         shard_count: usize,
+        slab_ec_pool_name: Option<&str>,
     ) -> Result<(), String> {
         // bench_default_ids — same values as
         // `kiseki-client::bench::bench_default_ids`. Inlined here so
@@ -520,6 +547,10 @@ impl Cluster {
             None => find_admin_binary()?,
         };
         let endpoint = format!("http://127.0.0.1:{}", self.leader_node().ports.metrics);
+
+        if let Some(pool_name) = slab_ec_pool_name {
+            create_slab_ec_bench_pool(&admin, &endpoint, pool_name).await?;
+        }
 
         // Retry the namespace-create until the control-plane Raft
         // group has elected a leader. The bootstrap-shard leader (what
@@ -537,9 +568,10 @@ impl Cluster {
         loop {
             let admin_path = admin_path.clone();
             let endpoint = endpoint.clone();
+            let slab_pool_for_ns = slab_ec_pool_name.map(str::to_owned);
             let res = tokio::task::spawn_blocking(move || -> Result<String, String> {
-                let output = Command::new(&admin_path)
-                    .arg("--endpoint")
+                let mut cmd = Command::new(&admin_path);
+                cmd.arg("--endpoint")
                     .arg(&endpoint)
                     .arg("topology")
                     .arg("namespace-create")
@@ -547,7 +579,11 @@ impl Cluster {
                     .arg("--tenant")
                     .arg(BENCH_TENANT_ID)
                     .arg("--shards")
-                    .arg(shard_count.to_string())
+                    .arg(shard_count.to_string());
+                if let Some(ref pool) = slab_pool_for_ns {
+                    cmd.arg("--replicated-pool").arg(pool);
+                }
+                let output = cmd
                     .output()
                     .map_err(|e| format!("spawn kiseki-admin {}: {e}", admin_path.display()))?;
                 if output.status.success() {
@@ -647,6 +683,19 @@ impl Cluster {
     #[must_use]
     pub fn leader_metrics_url(&self) -> String {
         self.leader_metrics_url.clone()
+    }
+
+    /// All node metrics URLs as `(node_id, url)` pairs, sorted by
+    /// `node_id`. Used by the perf harness to scrape per-step hot-path
+    /// histograms from every node (the leader-only scrape misses the
+    /// `aux.*` follower side of the intent fan, since the current
+    /// shard placement parks every shard leader on node 1).
+    #[must_use]
+    pub fn all_node_metrics_urls(&self) -> Vec<(u64, String)> {
+        self.nodes
+            .iter()
+            .map(|(id, n)| (*id, format!("http://127.0.0.1:{}/metrics", n.ports.metrics)))
+            .collect()
     }
 
     #[must_use]
@@ -782,6 +831,10 @@ fn spawn_cluster_node(
         // is delayed symmetrically. Same pass-through pattern as the
         // single-node ProfileServer above.
         "KISEKI_RAFT_FAKE_RTT_US",
+        // Chunk-device backing size; matches the ProfileServer
+        // forward list. Lets the bench size a per-node chunk store
+        // to its actual write volume instead of the 4 GiB default.
+        "KISEKI_CHUNK_DEVICE_BYTES",
     ] {
         if let Ok(v) = std::env::var(var) {
             if var == "DHAT_OUTPUT_FILE" {
@@ -887,6 +940,55 @@ async fn wait_for_quorum(
     Err(format!(
         "cluster never converged within {deadline:?}: url={url} last_seen={last_seen:?} expected_n={expected_n}"
     ))
+}
+
+/// ADR-048 §"Decision" — shell out to `kiseki-admin pool create
+/// <name> --slab-ec` to register a Replication pool with
+/// `requires_migration = true`. Idempotent: a fresh cluster always
+/// succeeds on first attempt; an existing pool surfaces "already
+/// exists" which the downstream namespace-create treats as success.
+async fn create_slab_ec_bench_pool(
+    admin: &Path,
+    endpoint: &str,
+    pool_name: &str,
+) -> Result<(), String> {
+    let admin_path = admin.to_path_buf();
+    let endpoint_owned = endpoint.to_string();
+    let pool_owned = pool_name.to_string();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let output = Command::new(&admin_path)
+            .arg("--endpoint")
+            .arg(&endpoint_owned)
+            .arg("pool")
+            .arg("create")
+            .arg(&pool_owned)
+            .arg("--durability")
+            .arg("replication")
+            .arg("--replication-copies")
+            .arg("3")
+            .arg("--device-class")
+            .arg("mixed")
+            .arg("--initial-capacity")
+            .arg("100G")
+            .arg("--slab-ec")
+            .output()
+            .map_err(|e| format!("spawn kiseki-admin pool create: {e}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let combined = format!("{stdout}\n{stderr}");
+        if combined.contains("already exists") || combined.contains("409") {
+            return Ok(());
+        }
+        Err(format!(
+            "kiseki-admin pool create rc={:?}: {combined}",
+            output.status.code()
+        ))
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking: {e}"))?
 }
 
 fn find_admin_binary() -> Result<PathBuf, String> {

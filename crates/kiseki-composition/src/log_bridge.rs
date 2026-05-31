@@ -42,6 +42,42 @@ pub async fn emit_delta<L: LogOps + ?Sized>(
     log.append_delta(req).await
 }
 
+/// ADR-048 — emit a `MigrateChunkLocations` delta after the
+/// slab-EC compactor has confirmed a slab is durable on `min_acks`
+/// placement nodes. The hydrator-side apply mutates
+/// `Composition.chunk_locations` and triggers hot-tier eviction on
+/// the migrated chunks (I-SE1 + I-SE4).
+pub async fn emit_migrate_chunk_locations<L: LogOps + ?Sized>(
+    log: &L,
+    shard_id: ShardId,
+    tenant_id: OrgId,
+    composition_id: kiseki_common::ids::CompositionId,
+    pool_name: &str,
+    slab_id: kiseki_common::SlabId,
+    entries: &[(u32, u64, u32)],
+) -> Result<SequenceNumber, LogError> {
+    // Key the delta by the composition id so per-shard compaction
+    // groups migrations against the same object together.
+    let mut hashed_key = [0u8; 32];
+    hashed_key[..16].copy_from_slice(composition_id.0.as_bytes());
+    let payload = crate::composition::encode_migrate_chunk_locations_payload(
+        composition_id,
+        pool_name,
+        slab_id,
+        entries,
+    );
+    emit_delta(
+        log,
+        shard_id,
+        tenant_id,
+        OperationType::MigrateChunkLocations,
+        hashed_key,
+        Vec::new(),
+        payload,
+    )
+    .await
+}
+
 /// ADR-040 Phase 18 — emit a `NamespaceCreate` delta to replicate a
 /// namespace registration to followers. The leader's caller has
 /// already added the namespace locally (so the follow-on PUT of the

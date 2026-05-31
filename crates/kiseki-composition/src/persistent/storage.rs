@@ -406,6 +406,12 @@ pub struct HydrationBatch {
     pub stuck_state: Option<Option<(SequenceNumber, u32)>>,
     /// Update the halt flag. `None` leaves it unchanged.
     pub halted: Option<bool>,
+    /// ADR-048 — chunk IDs migrated to a slab in this batch. The
+    /// commit hook (gateway-side eviction sink) decrements the local
+    /// chunk store's refcount on each; when refcount hits zero the
+    /// chunk-GC sweep reclaims the bytes (I-SE4). Empty on every
+    /// pre-ADR-048 batch.
+    pub migrated_chunk_evictions: Vec<kiseki_common::ids::ChunkId>,
 }
 
 impl HydrationBatch {
@@ -423,6 +429,7 @@ impl HydrationBatch {
             new_last_applied_seq,
             stuck_state: Some(None),
             halted: None,
+            migrated_chunk_evictions: Vec::new(),
         }
     }
 
@@ -936,6 +943,7 @@ mod lww_guard_tests {
             new_last_applied_seq: SequenceNumber(0),
             stuck_state: None,
             halted: None,
+            migrated_chunk_evictions: Vec::new(),
         };
         store.apply_hydration_batch(batch).unwrap();
         // Binding survives.
@@ -962,6 +970,7 @@ mod lww_guard_tests {
             new_last_applied_seq: SequenceNumber(0),
             stuck_state: None,
             halted: None,
+            migrated_chunk_evictions: Vec::new(),
         };
         store.apply_hydration_batch(batch).unwrap();
         assert_eq!(store.name_lookup(ns, "k").unwrap(), Some(id(1)));

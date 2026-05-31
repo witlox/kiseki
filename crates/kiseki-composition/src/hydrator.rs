@@ -82,6 +82,12 @@ struct Staging {
     /// storage trait) since the namespace map lives outside the
     /// per-composition durable layer.
     namespace_inserts: Vec<crate::namespace::Namespace>,
+    /// ADR-048 — chunk IDs whose hot-tier copy can be released after
+    /// this batch commits. Populated by `stage_migrate_chunk_locations`
+    /// when it flips a composition's `chunk_locations[i]` from `Hot`
+    /// to `Cold`. The eviction hook reads this on commit + decrements
+    /// the local chunk-store refcount on each id (I-SE4).
+    migrated_chunk_evictions: Vec<kiseki_common::ids::ChunkId>,
 }
 
 impl Staging {
@@ -352,6 +358,9 @@ impl CompositionHydrator {
                 OperationType::Update => stage_update(store, &mut staging, delta),
                 OperationType::Delete => stage_delete(store, &mut staging, delta),
                 OperationType::NamespaceCreate => stage_namespace_create(&mut staging, delta),
+                OperationType::MigrateChunkLocations => {
+                    stage_migrate_chunk_locations(store, &mut staging, delta)
+                }
                 // Rename, SetAttribute, Finalize aren't installed by
                 // the hydrator. Treat as Applied so the seq advances
                 // and we don't infinite-loop.
@@ -455,6 +464,7 @@ impl CompositionHydrator {
             new_last_applied_seq: last_applied_in_batch,
             stuck_state: stuck_state_update,
             halted: None,
+            migrated_chunk_evictions: std::mem::take(&mut staging.migrated_chunk_evictions),
         };
 
         // §D10: time the atomic backend commit, labeled by shard. The
@@ -473,6 +483,11 @@ impl CompositionHydrator {
         // holds the post-batch values but the LRU still has a
         // pre-batch entry. Same lock-ordering invariant the
         // leader-side mutators (`update`, `delete`, `rename`) follow.
+        // Capture the eviction list before `batch` moves into the
+        // closure. Empty on every pre-ADR-048 batch (the common
+        // case). Invoked after the storage commit so a failed batch
+        // doesn't release chunks that are still hot-tier-only.
+        let migrated_for_eviction = batch.migrated_chunk_evictions.clone();
         let apply_result = store.with_storage_locked(|s| {
             // ADR-047 hot-path timer (hydrator.persistent_apply_batch)
             // — the backend's atomic commit. On fjall this is one
@@ -499,6 +514,15 @@ impl CompositionHydrator {
             // layer's record_commit_error helper.
             tracing::warn!(error=%e, "composition hydrator: apply batch failed");
             return 0;
+        }
+
+        // ADR-048 §"Hot-tier eviction" — drop the migrated chunks'
+        // hot-tier refcount NOW that the cold-tier metadata flip is
+        // durable. The sink is wired by the gateway; tests run with
+        // no sink and this is a no-op. I-SE4.
+        if !migrated_for_eviction.is_empty() {
+            self.compositions
+                .invoke_eviction_sink(&migrated_for_eviction);
         }
 
         // Refresh in-memory caches from the durable state we just
@@ -543,6 +567,7 @@ impl CompositionHydrator {
             new_last_applied_seq: self.last_applied_cache,
             stuck_state: None,
             halted: Some(true),
+            migrated_chunk_evictions: Vec::new(),
         };
         let _ = self
             .compositions
@@ -636,6 +661,11 @@ fn stage_create(
         // `None` and the read path uses MAX_PLAINTEXT_PER_CHUNK
         // index math.
         chunk_plaintext_lens: chunk_plaintext_lens.unwrap_or_default(),
+        // ADR-048 §"ChunkRef extends": fresh creates start with all
+        // chunks implicit Hot in the pool the write landed in. The
+        // slab-EC compactor flips entries to Cold via
+        // `MigrateChunkLocations` after a slab is durable.
+        chunk_locations: Vec::new(),
     });
     if let Some(name) = name {
         // ADR-047 hot-path timer (hydrator.bind_name) — fresh-create
@@ -712,6 +742,86 @@ fn stage_delete(
     DeltaOutcome::Applied
 }
 
+/// ADR-048 — apply a `MigrateChunkLocations` delta. Flips the
+/// composition's `chunk_locations[idx]` entries to
+/// `ChunkRefLocation::Cold { pool_name, slab_id, offset_in_slab,
+/// length }` for every entry in the payload, and stages the migrated
+/// chunk IDs for hot-tier eviction (I-SE4) — the commit hook walks
+/// `migrated_chunk_evictions` and decrements the local chunk store's
+/// refcount.
+///
+/// Operates against the staged-or-durable view so an in-batch Create
+/// followed by a migration applies correctly. An unknown composition
+/// or an out-of-range chunk index degrades to `PermanentSkip` — the
+/// compactor only emits this op against compositions it observed in
+/// the store, but defense-in-depth on the apply side keeps the state
+/// machine deterministic if a malformed delta ever lands.
+fn stage_migrate_chunk_locations(
+    store: &CompositionStore,
+    staging: &mut Staging,
+    delta: &kiseki_log::delta::Delta,
+) -> DeltaOutcome {
+    let Some(decoded) =
+        crate::composition::decode_migrate_chunk_locations_payload(&delta.payload.ciphertext)
+    else {
+        return DeltaOutcome::PermanentSkip {
+            reason: "migrate_chunk_locations_payload_decode",
+        };
+    };
+    // Apply against the staged-or-durable view; the same composition
+    // can appear in an earlier Create + this Migrate in one batch.
+    let Some(mut comp) = staging.view(store, decoded.composition_id) else {
+        return DeltaOutcome::PermanentSkip {
+            reason: "migrate_chunk_locations_unknown_composition",
+        };
+    };
+    // Promote `chunk_locations` to a same-length-as-chunks vec on
+    // first migration. The default empty vec is the
+    // "everything-Hot-in-the-creation-pool" sentinel; once we record
+    // even one Cold entry we must carry a full per-chunk vec so the
+    // read path can branch correctly.
+    if comp.chunk_locations.len() != comp.chunks.len() {
+        let default_pool = comp
+            .chunk_locations
+            .iter()
+            .map(|loc| match loc {
+                kiseki_common::ChunkRefLocation::Hot { pool_name }
+                | kiseki_common::ChunkRefLocation::Cold { pool_name, .. } => pool_name.clone(),
+            })
+            .next()
+            .unwrap_or_default();
+        comp.chunk_locations = vec![
+            kiseki_common::ChunkRefLocation::Hot {
+                pool_name: default_pool,
+            };
+            comp.chunks.len()
+        ];
+    }
+    for (chunk_idx, offset_in_slab, length) in &decoded.entries {
+        let idx = *chunk_idx as usize;
+        if idx >= comp.chunk_locations.len() {
+            tracing::warn!(
+                comp_id = %comp.id.0,
+                chunk_idx = idx,
+                len = comp.chunk_locations.len(),
+                "migrate_chunk_locations: chunk_idx out of range",
+            );
+            continue;
+        }
+        comp.chunk_locations[idx] = kiseki_common::ChunkRefLocation::Cold {
+            pool_name: decoded.pool_name.clone(),
+            slab_id: decoded.slab_id,
+            offset_in_slab: *offset_in_slab,
+            length: *length,
+        };
+        if let Some(chunk_id) = comp.chunks.get(idx).copied() {
+            staging.migrated_chunk_evictions.push(chunk_id);
+        }
+    }
+    staging.puts.insert(comp.id, comp);
+    DeltaOutcome::Applied
+}
+
 /// ADR-040 Phase 18 — register a namespace on this follower.
 fn stage_namespace_create(staging: &mut Staging, delta: &kiseki_log::delta::Delta) -> DeltaOutcome {
     let Some(ns) = crate::composition::decode_namespace_create_payload(&delta.payload.ciphertext)
@@ -759,6 +869,7 @@ mod tests {
             versioning_enabled: false,
             compliance_tags: Vec::new(),
             tier_policy: Vec::new(),
+            size_band_pools: crate::namespace::NamespaceSizeBandPools::default(),
         });
         Arc::new(store)
     }
@@ -1375,6 +1486,7 @@ mod tests {
                         new_last_applied_seq: kiseki_common::ids::SequenceNumber(5),
                         stuck_state: Some(None),
                         halted: None,
+                        migrated_chunk_evictions: Vec::new(),
                     })
                 })
                 .unwrap();

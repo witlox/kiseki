@@ -1,0 +1,16 @@
+{
+  "label": "slabec_pnfs_get-heavy_4194304",
+  "pool_type": "slabec",
+  "protocol": "pnfs",
+  "shape": "get-heavy",
+  "object_size": 4194304,
+  "ok": true,
+  "rc": 0,
+  "wall_s": 32.62800960399909,
+  "ops": 0,
+  "ops_per_s": 0.0,
+  "mib_per_s": 0.0,
+  "p50_us": 0,
+  "p95_us": 0,
+  "p99_us": 0
+}

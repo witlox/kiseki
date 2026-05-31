@@ -844,7 +844,7 @@ fn rust_org_to_proto(o: RustOrgId) -> pb::OrgId {
 fn chunk_err_to_status(e: &ChunkError) -> Status {
     let msg = e.to_string();
     match e {
-        ChunkError::NotFound(_) => Status::not_found(msg),
+        ChunkError::NotFound(_) | ChunkError::SlabNotFound(_) => Status::not_found(msg),
         ChunkError::Corrupted(_) | ChunkError::DeviceUnavailable(_) | ChunkError::ChunkLost => {
             Status::data_loss(msg)
         }
@@ -955,6 +955,8 @@ mod tests {
             devices: vec![],
             capacity_bytes: 1 << 30,
             used_bytes: 0,
+            requires_migration: false,
+            ..Default::default()
         });
         Arc::new(SyncBridge::new(store))
     }

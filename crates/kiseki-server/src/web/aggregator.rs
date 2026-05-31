@@ -261,7 +261,7 @@ async fn reqwest_get_ok(url: &str) -> bool {
 
 /// Simple HTTP GET that returns the body as a string.
 #[allow(clippy::items_after_statements)]
-async fn reqwest_get_body(url: &str) -> Option<String> {
+pub(crate) async fn reqwest_get_body(url: &str) -> Option<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let stream = tokio::time::timeout(

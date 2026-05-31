@@ -102,7 +102,150 @@ pub fn encode_namespace_create_payload(ns: &crate::namespace::Namespace) -> Vec<
             out.extend_from_slice(&t.quota_bytes.to_le_bytes());
         }
     }
+    // ADR-024 2026-05-31 amendment §"three-tier durability" — append
+    // the per-namespace size-band pool selector after the tier policy.
+    // Wire shape:
+    //   [bands_flag:1]   bits: 0=inline, 1=replicated, 2=ec
+    //   for each set bit, in band order:
+    //     [name_len:1][name utf8]
+    // A truncated payload (no bands section) decodes to empty
+    // `size_band_pools`, so namespaces created before the amendment
+    // still round-trip cleanly.
+    #[allow(clippy::cast_possible_truncation)] // name len bounded by CLI parsing (admin input)
+    {
+        let mut bands_flag: u8 = 0;
+        if ns.size_band_pools.inline.is_some() {
+            bands_flag |= 0b0000_0001;
+        }
+        if ns.size_band_pools.replicated.is_some() {
+            bands_flag |= 0b0000_0010;
+        }
+        if ns.size_band_pools.ec.is_some() {
+            bands_flag |= 0b0000_0100;
+        }
+        out.push(bands_flag);
+        for band in [
+            ns.size_band_pools.inline.as_deref(),
+            ns.size_band_pools.replicated.as_deref(),
+            ns.size_band_pools.ec.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            out.push(band.len() as u8);
+            out.extend_from_slice(band.as_bytes());
+        }
+    }
     out
+}
+
+/// ADR-048 — encode a `MigrateChunkLocations` delta payload.
+///
+/// Wire layout:
+/// ```text
+/// [comp_id          : 16]  composition UUID
+/// [pool_name_len u8 : 1 ]
+/// [pool_name utf8   : N ]
+/// [slab_id          : 16]  shared across every migrated chunk
+/// [entry_count u32 LE: 4 ]
+///   per entry:
+///     [chunk_idx u32 LE    : 4 ]
+///     [offset_in_slab u64 LE: 8 ]
+///     [length u32 LE       : 4 ]
+/// ```
+/// All migrated chunks in one payload share the same destination
+/// `pool_name + slab_id` — the compactor flushes one slab at a time,
+/// so this is the natural batch. A composition that has chunks
+/// landing in different slabs gets one delta per slab.
+#[must_use]
+pub fn encode_migrate_chunk_locations_payload(
+    comp_id: CompositionId,
+    pool_name: &str,
+    slab_id: kiseki_common::SlabId,
+    entries: &[(u32, u64, u32)], // (chunk_idx, offset_in_slab, length)
+) -> Vec<u8> {
+    let name_bytes = pool_name.as_bytes();
+    let cap = 16 + 1 + name_bytes.len() + 16 + 4 + entries.len() * 16;
+    let mut out = Vec::with_capacity(cap);
+    out.extend_from_slice(comp_id.0.as_bytes());
+    #[allow(clippy::cast_possible_truncation)] // pool names bounded by admin CLI parsing
+    out.push(name_bytes.len() as u8);
+    out.extend_from_slice(name_bytes);
+    out.extend_from_slice(slab_id.0.as_bytes());
+    #[allow(clippy::cast_possible_truncation)]
+    // entry counts bounded by per-slab cap (≤ DEFAULT_SLAB_MAX_CHUNKS)
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (idx, off, len) in entries {
+        out.extend_from_slice(&idx.to_le_bytes());
+        out.extend_from_slice(&off.to_le_bytes());
+        out.extend_from_slice(&len.to_le_bytes());
+    }
+    out
+}
+
+/// ADR-048 — decoded `MigrateChunkLocations` payload returned by
+/// [`decode_migrate_chunk_locations_payload`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodedMigrateChunkLocations {
+    /// Target composition.
+    pub composition_id: CompositionId,
+    /// Pool that owns the slab.
+    pub pool_name: String,
+    /// Slab the migrated chunks now live in.
+    pub slab_id: kiseki_common::SlabId,
+    /// `(chunk_idx, offset_in_slab, length)` per migrated entry. The
+    /// hydrator uses these to overwrite the corresponding entries in
+    /// `Composition.chunk_locations`.
+    pub entries: Vec<(u32, u64, u32)>,
+}
+
+/// Decode a `MigrateChunkLocations` payload. Returns `None` on a
+/// truncated or malformed payload — the apply path treats the delta
+/// as a no-op rather than crashing the state machine (defense in
+/// depth; the encoder shouldn't ever emit a malformed payload, but
+/// the hydrator is one of the few places where a corrupt delta
+/// reaches user-visible state).
+#[must_use]
+pub fn decode_migrate_chunk_locations_payload(
+    payload: &[u8],
+) -> Option<DecodedMigrateChunkLocations> {
+    if payload.len() < 16 + 1 {
+        return None;
+    }
+    let comp_uuid = uuid::Uuid::from_slice(&payload[0..16]).ok()?;
+    let name_len = payload[16] as usize;
+    let mut pos = 17;
+    let name_end = pos + name_len;
+    if name_end + 16 + 4 > payload.len() {
+        return None;
+    }
+    let pool_name = std::str::from_utf8(&payload[pos..name_end])
+        .ok()?
+        .to_owned();
+    pos = name_end;
+    let slab_uuid = uuid::Uuid::from_slice(&payload[pos..pos + 16]).ok()?;
+    pos += 16;
+    let count = u32::from_le_bytes(payload[pos..pos + 4].try_into().ok()?) as usize;
+    pos += 4;
+    if pos + count * 16 > payload.len() {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let idx = u32::from_le_bytes(payload[pos..pos + 4].try_into().ok()?);
+        pos += 4;
+        let off = u64::from_le_bytes(payload[pos..pos + 8].try_into().ok()?);
+        pos += 8;
+        let len = u32::from_le_bytes(payload[pos..pos + 4].try_into().ok()?);
+        pos += 4;
+        entries.push((idx, off, len));
+    }
+    Some(DecodedMigrateChunkLocations {
+        composition_id: CompositionId(comp_uuid),
+        pool_name,
+        slab_id: kiseki_common::SlabId(slab_uuid),
+        entries,
+    })
 }
 
 /// Decode a `NamespaceCreate` delta payload. Returns `None` if the
@@ -150,6 +293,42 @@ pub fn decode_namespace_create_payload(payload: &[u8]) -> Option<crate::namespac
         }
     }
 
+    // Optional per-namespace size-band pool selector (ADR-024 amendment
+    // 2026-05-31). Decoded best-effort — a truncated/malformed bands
+    // section degrades to the default (empty) `NamespaceSizeBandPools`,
+    // never failing the whole decode.
+    let mut size_band_pools = crate::namespace::NamespaceSizeBandPools::default();
+    if let Some(&bands_flag) = payload.get(pos) {
+        pos += 1;
+        for (bit, slot) in [
+            (0b0000_0001u8, 0usize),
+            (0b0000_0010u8, 1usize),
+            (0b0000_0100u8, 2usize),
+        ] {
+            if bands_flag & bit == 0 {
+                continue;
+            }
+            let Some(&name_len) = payload.get(pos) else {
+                break;
+            };
+            pos += 1;
+            let name_end = pos + name_len as usize;
+            if name_end > payload.len() {
+                break;
+            }
+            let Ok(name) = std::str::from_utf8(&payload[pos..name_end]) else {
+                break;
+            };
+            let value = Some(name.to_owned());
+            match slot {
+                0 => size_band_pools.inline = value,
+                1 => size_band_pools.replicated = value,
+                _ => size_band_pools.ec = value,
+            }
+            pos = name_end;
+        }
+    }
+
     Some(crate::namespace::Namespace {
         id: NamespaceId(ns_uuid),
         tenant_id: kiseki_common::ids::OrgId(tenant_uuid),
@@ -158,6 +337,7 @@ pub fn decode_namespace_create_payload(payload: &[u8]) -> Option<crate::namespac
         versioning_enabled: flags & 0b0000_0010 != 0,
         compliance_tags: Vec::new(),
         tier_policy,
+        size_band_pools,
     })
 }
 
@@ -473,6 +653,31 @@ pub struct Composition {
     /// `chunk_plaintext_lens[0..i].sum()`.
     #[serde(default)]
     pub chunk_plaintext_lens: Vec<u32>,
+    /// ADR-048 §"`ChunkRef` extends" per-chunk `Hot`/`Cold` tag. Empty (the
+    /// serde default) means every chunk is implicit `Hot` in the
+    /// pool the composition was created in — preserves backwards
+    /// compatibility with pre-ADR-048 records. A non-empty vec must
+    /// have the same length as `chunks`; entries flip to
+    /// `ChunkRefLocation::Cold { slab_id, offset_in_slab, length }`
+    /// when the slab-EC compactor migrates the chunk to a slab.
+    #[serde(default)]
+    pub chunk_locations: Vec<kiseki_common::ChunkRefLocation>,
+}
+
+impl Composition {
+    /// ADR-048 §"Read path" — resolve the storage location of
+    /// `chunks[i]`. When `chunk_locations` is empty (the
+    /// pre-amendment case), returns an implicit Hot in the empty
+    /// pool — callers fall through to the existing single-pool path.
+    /// Out-of-range index returns the same implicit Hot.
+    #[must_use]
+    pub fn location_for(&self, chunk_idx: usize) -> kiseki_common::ChunkRefLocation {
+        self.chunk_locations.get(chunk_idx).cloned().unwrap_or(
+            kiseki_common::ChunkRefLocation::Hot {
+                pool_name: String::new(),
+            },
+        )
+    }
 }
 
 /// Result of a delete operation.
@@ -660,6 +865,32 @@ pub struct CompositionStore {
     /// after a mutation either misses the cache (re-fetches from
     /// storage) or hits a fresh post-mutation entry.
     read_cache: parking_lot::Mutex<LruCache<CompositionId, Composition>>,
+    /// ADR-048 — hot-tier eviction hook invoked after a successful
+    /// hydration batch commit when `migrated_chunk_evictions` is
+    /// non-empty. The gateway wires this to the chunk store's
+    /// refcount-decrement path so chunks freshly migrated into a
+    /// slab can release their hot-tier copy (I-SE4). `None` on a
+    /// store that hasn't been wired (single-node test fixtures); the
+    /// commit path no-ops in that case.
+    eviction_sink: parking_lot::RwLock<Option<Arc<dyn ChunkEvictionSink + Send + Sync>>>,
+}
+
+/// ADR-048 hook the gateway implements to release a migrated chunk's
+/// hot-tier copy after the cold-tier slab is durable + the
+/// `MigrateChunkLocations` delta has applied.
+///
+/// `decrement_refcount` is called exactly once per `chunk_id` per
+/// committed migration batch on the hydrator-commit thread. The sink
+/// MUST be non-blocking — a blocking implementation back-pressures
+/// the hydrator loop. The chunk-GC sweep does the actual reclaim
+/// when refcount hits zero (I-SE4).
+pub trait ChunkEvictionSink: Send + Sync {
+    /// Decrement the local chunk store's refcount on every id in
+    /// `chunk_ids`. Implementations should treat unknown ids as a
+    /// silent no-op (deduped chunks that this node never persisted
+    /// surface as unknown here — and that's fine; some other
+    /// placement node persisted the bytes).
+    fn release_migrated_chunks(&self, chunk_ids: &[kiseki_common::ids::ChunkId]);
 }
 
 /// Number of shards in the per-name lock array. 256 keeps the
@@ -731,6 +962,33 @@ impl CompositionStore {
             multiparts: parking_lot::Mutex::new(HashMap::new()),
             log: parking_lot::RwLock::new(None),
             read_cache: parking_lot::Mutex::new(LruCache::new(read_cache_capacity())),
+            eviction_sink: parking_lot::RwLock::new(None),
+        }
+    }
+
+    /// ADR-048 — register the gateway-side chunk eviction sink. Called
+    /// once at startup. Subsequent registrations replace the previous
+    /// sink (useful for tests that swap a stub sink in mid-run).
+    pub fn set_eviction_sink(&self, sink: Arc<dyn ChunkEvictionSink + Send + Sync>) {
+        *self.eviction_sink.write() = Some(sink);
+    }
+
+    /// ADR-048 — list compositions in a namespace. Surfaced from the
+    /// storage trait so the slab-EC compactor can scan candidates
+    /// without taking a dep on the persistent layer.
+    pub fn list_namespace_compositions(&self, ns: NamespaceId) -> Vec<Composition> {
+        self.storage.list_in_namespace(ns).unwrap_or_default()
+    }
+
+    /// ADR-048 — invoke the eviction sink with the given chunk IDs.
+    /// No-op when no sink is wired. Called by the hydrator's commit
+    /// path after a successful `apply_hydration_batch`.
+    pub fn invoke_eviction_sink(&self, chunk_ids: &[kiseki_common::ids::ChunkId]) {
+        if chunk_ids.is_empty() {
+            return;
+        }
+        if let Some(sink) = self.eviction_sink.read().clone() {
+            sink.release_migrated_chunks(chunk_ids);
         }
     }
 
@@ -928,6 +1186,7 @@ impl CompositionStore {
             has_inline_data,
             content_type: None,
             chunk_plaintext_lens,
+            chunk_locations: Vec::new(),
         };
         self.storage.put(comp)?;
         Ok(id)
@@ -979,6 +1238,7 @@ impl CompositionStore {
             has_inline_data,
             content_type: None,
             chunk_plaintext_lens: Vec::new(),
+            chunk_locations: Vec::new(),
         };
         self.storage.put(comp)?;
         Ok(())
@@ -1093,6 +1353,7 @@ impl CompositionStore {
             has_inline_data,
             content_type: None,
             chunk_plaintext_lens: Vec::new(),
+            chunk_locations: Vec::new(),
         };
 
         // Per-name shard lock holds across the lookup + (optional)
@@ -1257,6 +1518,7 @@ impl CompositionOps for CompositionStore {
             has_inline_data,
             content_type: None,
             chunk_plaintext_lens: Vec::new(),
+            chunk_locations: Vec::new(),
         };
         self.storage.put(comp)?;
         Ok(id)
@@ -1488,6 +1750,7 @@ mod tests {
             versioning_enabled: false,
             compliance_tags: Vec::new(),
             tier_policy: Vec::new(),
+            size_band_pools: crate::namespace::NamespaceSizeBandPools::default(),
         }
     }
 
@@ -1968,6 +2231,7 @@ mod tests {
             versioning_enabled: false,
             compliance_tags: vec![ComplianceTag::RevFadp],
             tier_policy: Vec::new(),
+            size_band_pools: crate::namespace::NamespaceSizeBandPools::default(),
         };
 
         let effective = ns.effective_compliance_tags(&org_tags);
@@ -1994,6 +2258,7 @@ mod tests {
             versioning_enabled: false,
             compliance_tags: vec![ComplianceTag::Hipaa, ComplianceTag::Gdpr],
             tier_policy: Vec::new(),
+            size_band_pools: crate::namespace::NamespaceSizeBandPools::default(),
         };
 
         let effective = ns.effective_compliance_tags(&org_tags);
@@ -2385,6 +2650,7 @@ mod tests {
                     quota_bytes: 0,
                 },
             ],
+            size_band_pools: crate::namespace::NamespaceSizeBandPools::default(),
         };
         let bytes = encode_namespace_create_payload(&ns);
         let back = decode_namespace_create_payload(&bytes).expect("decode");
@@ -2395,6 +2661,77 @@ mod tests {
         let legacy = &bytes[..NAMESPACE_CREATE_PAYLOAD_LEN];
         let back_legacy = decode_namespace_create_payload(legacy).expect("legacy decode");
         assert!(back_legacy.tier_policy.is_empty());
+    }
+
+    /// ADR-048 — the `MigrateChunkLocations` payload round-trips
+    /// chunk-index → `(offset_in_slab, length)` entries through the
+    /// log delta encoding so followers see exactly the same
+    /// composition-state mutation the leader committed.
+    #[test]
+    fn migrate_chunk_locations_payload_round_trip() {
+        let comp = CompositionId(uuid::Uuid::from_u128(99));
+        let slab = kiseki_common::SlabId(uuid::Uuid::from_u128(77));
+        let entries = vec![(0u32, 0u64, 16u32), (1, 16, 32), (5, 1024, 65_536)];
+        let payload = encode_migrate_chunk_locations_payload(comp, "cold-ec", slab, &entries);
+        let decoded = decode_migrate_chunk_locations_payload(&payload).expect("decode");
+        assert_eq!(decoded.composition_id, comp);
+        assert_eq!(decoded.pool_name, "cold-ec");
+        assert_eq!(decoded.slab_id, slab);
+        assert_eq!(decoded.entries, entries);
+        // Truncated payload → None, never panics.
+        assert!(decode_migrate_chunk_locations_payload(&payload[..10]).is_none());
+        // Empty entries section is valid.
+        let empty = encode_migrate_chunk_locations_payload(comp, "p", slab, &[]);
+        let decoded = decode_migrate_chunk_locations_payload(&empty).expect("decode-empty");
+        assert!(decoded.entries.is_empty());
+    }
+
+    /// ADR-024 2026-05-31 amendment: the per-namespace size-band pool
+    /// selector round-trips through the `NamespaceCreate` payload, and
+    /// pre-amendment payloads (no bands section after `tier_policy`)
+    /// decode to the default empty selector.
+    #[test]
+    fn namespace_size_band_pools_round_trip() {
+        use crate::namespace::{Namespace, NamespaceSizeBandPools, TierQuota};
+        use kiseki_common::ids::{NamespaceId, OrgId, ShardId};
+
+        let ns = Namespace {
+            id: NamespaceId(uuid::Uuid::from_u128(11)),
+            tenant_id: OrgId(uuid::Uuid::from_u128(12)),
+            shard_id: ShardId(uuid::Uuid::from_u128(13)),
+            read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
+            tier_policy: vec![TierQuota {
+                tier: "fast".into(),
+                quota_bytes: 1024,
+            }],
+            size_band_pools: NamespaceSizeBandPools {
+                inline: Some("nvme-meta".into()),
+                replicated: None,
+                ec: Some("bulk-ec".into()),
+            },
+        };
+        let bytes = encode_namespace_create_payload(&ns);
+        let back = decode_namespace_create_payload(&bytes).expect("decode");
+        assert_eq!(back.size_band_pools, ns.size_band_pools);
+        assert_eq!(back.tier_policy, ns.tier_policy);
+
+        // Pre-amendment payload: tier policy present but no bands section.
+        // We truncate at the byte right after the tier-policy section by
+        // re-encoding with empty bands and chopping the trailing 1-byte
+        // flag (which is zero in that case).
+        let mut empty = ns.clone();
+        empty.size_band_pools = NamespaceSizeBandPools::default();
+        let mut empty_bytes = encode_namespace_create_payload(&empty);
+        // The last byte is the bands_flag = 0; drop it to simulate a
+        // record written before the amendment.
+        assert_eq!(empty_bytes.last(), Some(&0u8));
+        empty_bytes.pop();
+        let back_legacy =
+            decode_namespace_create_payload(&empty_bytes).expect("pre-amendment decode");
+        assert!(back_legacy.size_band_pools.is_empty());
+        assert_eq!(back_legacy.tier_policy, empty.tier_policy);
     }
 
     // -- Composition-create payload round-trip (the one wire shape) --------

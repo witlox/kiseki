@@ -141,6 +141,8 @@ async fn given_other_ns(w: &mut KisekiWorld, ns: String) {
         versioning_enabled: false,
         compliance_tags: Vec::new(),
         tier_policy: Vec::new(),
+
+        size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
     });
     w.namespace_ids.insert(ns, ns_id);
 }
@@ -185,6 +187,8 @@ async fn given_readonly(w: &mut KisekiWorld, ns: String) {
         versioning_enabled: false,
         compliance_tags: Vec::new(),
         tier_policy: Vec::new(),
+
+        size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
     });
     w.namespace_ids.insert(ns, ns_id);
 }
@@ -487,6 +491,8 @@ async fn when_posix_rename_targets(w: &mut KisekiWorld, ns: String, shard: Strin
         versioning_enabled: false,
         compliance_tags: Vec::new(),
         tier_policy: Vec::new(),
+
+        size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
     });
     w.namespace_ids.insert(ns.clone(), ns_id);
 

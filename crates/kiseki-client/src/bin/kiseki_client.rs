@@ -492,6 +492,8 @@ fn handle_mount(args: &[String]) {
             versioning_enabled: false,
             compliance_tags: Vec::new(),
             tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         });
         let master_key = kiseki_crypto::keys::SystemMasterKey::new(
             [0x42; 32],

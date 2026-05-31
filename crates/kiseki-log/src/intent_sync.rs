@@ -160,6 +160,19 @@ pub fn build_intent_dispatcher(store: Arc<dyn IntentStore>) -> ShardDispatch {
                         }
                     },
                     INTENT_PUT_TAG => {
+                        // ADR-047 hot-path timer (aux.handle_intent_put_total)
+                        // — total server-side processing budget for one fanned
+                        // intent, from the moment this handler task starts
+                        // running to the moment the response is encoded.
+                        // Paired with the leader-side `pif.leader_first_hop` /
+                        // `pif.parallel_topup` totals so we can split the round
+                        // trip into (wire + scheduler queue) vs (server proc).
+                        // The follower's contribution to the leader's measured
+                        // RPC time is bounded by this number; the remainder is
+                        // network and listener-queue time.
+                        kiseki_tracing::hot_timer_guard!(
+                            _ht_aux_total = "aux.handle_intent_put_total"
+                        );
                         // Decode the fanned WireIntent → reconstruct the
                         // WriteIntent → durably record it. A decode fault or a
                         // store error degrades to ParseError, which the producer
@@ -189,9 +202,8 @@ pub fn build_intent_dispatcher(store: Arc<dyn IntentStore>) -> ShardDispatch {
                         // Mirrors `pif.local_put` on the producer side
                         // so we can compare in-process vs across-the-
                         // wire local-store cost.
-                        let put_res = kiseki_tracing::hot_span!("aux.store_put", {
-                            store.put(intent)
-                        });
+                        let put_res =
+                            kiseki_tracing::hot_span!("aux.store_put", { store.put(intent) });
                         match put_res {
                             // Recorded OR Duplicate both mean the intent is now
                             // durable on this replica — credit the ack either
@@ -203,9 +215,7 @@ pub fn build_intent_dispatcher(store: Arc<dyn IntentStore>) -> ShardDispatch {
                                 // Trivial but split so any future ack-body
                                 // bloat shows up here, not buried in the
                                 // total round-trip cost.
-                                kiseki_tracing::hot_span!("aux.encode_response", {
-                                    encode_ok(&())
-                                })
+                                kiseki_tracing::hot_span!("aux.encode_response", { encode_ok(&()) })
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, tag = %tag, "IntentSync intent_put store write failed");

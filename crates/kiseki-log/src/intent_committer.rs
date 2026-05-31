@@ -163,9 +163,7 @@ impl Committer {
         // ADR-047 hot-path timer (committer.read_pending) — wraps
         // the store.pending() read. On fjall this is one snapshot
         // scan of the WAL; on a cold store it's a no-op early-out.
-        let pending_res = kiseki_tracing::hot_span!("committer.read_pending", {
-            store.pending()
-        });
+        let pending_res = kiseki_tracing::hot_span!("committer.read_pending", { store.pending() });
         let mut pending = pending_res?;
         if pending.is_empty() {
             return Ok(0);

@@ -412,7 +412,8 @@ impl RaftLogStore {
                     3 => crate::delta::OperationType::Rename,
                     4 => crate::delta::OperationType::SetAttribute,
                     5 => crate::delta::OperationType::Finalize,
-                    _ => crate::delta::OperationType::NamespaceCreate,
+                    6 => crate::delta::OperationType::NamespaceCreate,
+                    _ => crate::delta::OperationType::MigrateChunkLocations,
                 };
 
                 // Construct a minimal timestamp for the state machine.
@@ -505,7 +506,8 @@ impl RaftLogStore {
                     3 => crate::delta::OperationType::Rename,
                     4 => crate::delta::OperationType::SetAttribute,
                     5 => crate::delta::OperationType::Finalize,
-                    _ => crate::delta::OperationType::NamespaceCreate,
+                    6 => crate::delta::OperationType::NamespaceCreate,
+                    _ => crate::delta::OperationType::MigrateChunkLocations,
                 };
                 let timestamp = kiseki_common::time::DeltaTimestamp {
                     hlc: kiseki_common::time::HybridLogicalClock {
@@ -566,7 +568,8 @@ impl RaftLogStore {
                         3 => crate::delta::OperationType::Rename,
                         4 => crate::delta::OperationType::SetAttribute,
                         5 => crate::delta::OperationType::Finalize,
-                        _ => crate::delta::OperationType::NamespaceCreate,
+                        6 => crate::delta::OperationType::NamespaceCreate,
+                        _ => crate::delta::OperationType::MigrateChunkLocations,
                     };
                     let timestamp = kiseki_common::time::DeltaTimestamp {
                         hlc: kiseki_common::time::HybridLogicalClock {
@@ -676,6 +679,7 @@ fn op_to_u8(op: crate::delta::OperationType) -> u8 {
         crate::delta::OperationType::SetAttribute => 4,
         crate::delta::OperationType::Finalize => 5,
         crate::delta::OperationType::NamespaceCreate => 6,
+        crate::delta::OperationType::MigrateChunkLocations => 7,
     }
 }
 

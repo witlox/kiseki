@@ -234,6 +234,70 @@ per-tier used / quota / % for that namespace, mirroring the cluster view.
    `DurabilityStrategy` is already per-pool; exposing it per tier on the
    create command is a small follow-up.
 
+## Amendment (2026-05-31) — Cross-ref ADR-024 three-tier durability
+
+**Status of amendment**: Accepted.
+**Trigger**: `specs/escalations/2026-05-31-tiered-storage-three-tier-and-slab-ec.md`.
+
+### What changes
+
+ADR-045 §D5 (the tiering decision) chose a tier per object based on
+the namespace's `tier_policy`. The 2026-05-31 amendment to ADR-024
+adds an orthogonal axis: **size-band → durability strategy**.
+
+The two interact:
+
+- ADR-045's `StorageTier` chooses *which device class* a chunk
+  lands on (fast NVMe vs. bulk NVMe vs. HDD vs. cold).
+- ADR-024 (2026-05-31) chooses *which durability strategy* a chunk
+  is written under (inline / replication / EC), keyed by size band.
+
+A namespace's `tier_policy` may now declare a per-size-band tier
+mapping, e.g.:
+
+```
+kiseki-admin namespace set-tier-policy <ns> \
+  --inline       inline-meta \
+  --replicated   fast-r3 \
+  --ec           cold-ec
+```
+
+Where `inline-meta`, `fast-r3`, `cold-ec` are pool names. Their
+`DurabilityStrategy` (inline / replication / EC) is set at pool
+creation (ADR-024 amendment) and the namespace's tier-policy line
+declares which pool handles each size band.
+
+A namespace without a tier-policy inherits the cluster default chain
+`[inline, replicated, ec]` resolved against the highest-class pools
+available, falling back through the class chain `Nvme → Ssd → Hdd`.
+
+### Per-(namespace, tier) quota
+
+The existing §D6 quota accounting becomes per-(namespace, tier,
+durability-strategy) — durability multiplier still applies (R-3 = 3×,
+EC-4+2 = 1.5×, inline = 1× for the small-tier accounting). The
+quota envelope expresses the **physical bytes** budget, accounting
+for the strategy's overhead.
+
+### What this does NOT change
+
+- §D1 (StorageTier as placement unit) — unchanged.
+- §D2 (auto-derived class pools) — unchanged; admins can still create
+  custom pools per ADR-024.
+- §D5 (tiering decision) — semantics unchanged; the routing now
+  has two orthogonal axes (size-band, tier) instead of one (tier).
+- §D6 (quota accounting) — multiplier extended to include inline (×1)
+  alongside replication (×N) and EC (×(data+parity)/data).
+- §D7 (capacity reporting) — unchanged.
+
+### Spec reference
+
+- ADR-024 (2026-05-31 amendment) — size-band → durability strategy
+  defaults; per-pool inline/replication ceilings.
+- ADR-048 — slab-EC compactor; affects the medium-tier band's
+  long-run storage overhead.
+- Escalation 2026-05-31: three-tier + slab-EC.
+
 ## Adversary review
 
 Required before §D6 (quota accounting/enforcement) implementation lands.

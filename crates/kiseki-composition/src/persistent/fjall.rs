@@ -751,6 +751,7 @@ mod tests {
             has_inline_data: false,
             content_type: None,
             chunk_plaintext_lens: Vec::new(),
+            chunk_locations: Vec::new(),
         }
     }
 

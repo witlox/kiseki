@@ -183,6 +183,8 @@ fn setup(log: Arc<dyn LogOps + Send + Sync>) -> InMemoryGateway {
         versioning_enabled: false,
         compliance_tags: Vec::new(),
         tier_policy: Vec::new(),
+
+        size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
     });
     let chunks = ChunkStore::new();
     let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));

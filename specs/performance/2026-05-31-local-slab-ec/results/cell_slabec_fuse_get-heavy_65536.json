@@ -1,0 +1,16 @@
+{
+  "label": "slabec_fuse_get-heavy_65536",
+  "pool_type": "slabec",
+  "protocol": "fuse",
+  "shape": "get-heavy",
+  "object_size": 65536,
+  "ok": true,
+  "rc": 0,
+  "wall_s": 31.399284049053676,
+  "ops": 1385088,
+  "ops_per_s": 138508.8,
+  "mib_per_s": 8656.8,
+  "p50_us": 95,
+  "p95_us": 230,
+  "p99_us": 417
+}

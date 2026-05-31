@@ -1,0 +1,16 @@
+{
+  "label": "baseline_fuse_mixed_65536",
+  "pool_type": "baseline",
+  "protocol": "fuse",
+  "shape": "mixed",
+  "object_size": 65536,
+  "ok": true,
+  "rc": 0,
+  "wall_s": 31.575987612013705,
+  "ops": 90494,
+  "ops_per_s": 9049.4,
+  "mib_per_s": 565.59,
+  "p50_us": 1533,
+  "p95_us": 3549,
+  "p99_us": 4744
+}

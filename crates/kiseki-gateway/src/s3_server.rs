@@ -2053,6 +2053,7 @@ mod tests {
                 new_last_applied_seq: kiseki_common::ids::SequenceNumber(0),
                 stuck_state: Some(None),
                 halted: Some(true),
+                migrated_chunk_evictions: Vec::new(),
             })
             .unwrap();
         let comp_store = CompositionStore::with_storage(Box::new(storage));

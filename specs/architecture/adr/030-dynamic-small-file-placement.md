@@ -377,10 +377,107 @@ change.
 | I-SF6 | GC (truncate_log, compact_shard) must delete corresponding entries from `small/objects.redb` when removing deltas that reference inline objects. Orphan redb entries are a capacity leak. |
 | I-SF7 | Per-shard Raft inline throughput must not exceed `KISEKI_RAFT_INLINE_MBPS` (default 10 MB/s). When exceeded, effective inline threshold drops to floor until rate subsides. |
 
+## Amendment (2026-05-31) — Admin-driven metadata device role; default 16 KB inline
+
+**Status of amendment**: Accepted.
+**Trigger**: `specs/escalations/2026-05-31-tiered-storage-three-tier-and-slab-ec.md`.
+
+### What changes
+
+Two things in this ADR's original framing turned out to be wrong for
+the runtime to implement directly:
+
+1. **§1 implies metadata + small/objects.redb live on the system
+   partition, full stop.** That fails at scale (10 B-file deployments
+   need 168 GB/node metadata at 50 nodes per ADR-024 amendment's
+   capacity table; 256 GB boot disks insufficient).
+2. **§3 specifies the per-shard formula but leaves "where the
+   metadata partition is mounted" to ADR-024 §"system partition"**,
+   which also says boot-disk RAID-1. There is no path from "fast NVMe
+   present in cluster" to "fast NVMe holds metadata + small_store" in
+   either ADR.
+
+The fix: **admin-driven device role assignment**. Default for every
+NVMe at boot is the chunk pool. The runtime warns loudly if no device
+is currently assigned to the metadata role and metadata lives on the
+boot disk. Admin promotes one (or more) device to the metadata role
+via `kiseki-admin pool add-device <metadata-pool> <device>` (Phase 1
+of the escalation rollout).
+
+### Revised default sequence at boot
+
+```
+1. stat KISEKI_DATA_DIR → record total_bytes, used_bytes, fs_type, media_type
+2. detect KISEKI_RAW_DEVICES devices → media_type per device
+3. if any raw device's media_type ≥ Ssd AND no device currently
+   in metadata-pool role:
+      emit WARN: "metadata tier on boot disk; production deployments
+      should `kiseki-admin pool add-device metadata-pool <nvme>`.
+      See ADR-030."
+      record cluster_warning so kiseki-admin status surfaces it
+   else if metadata-pool role is filled:
+      continue with KISEKI_DATA_DIR pointing at the metadata device
+      mount
+4. NodeMetadataCapacity computed from the active mount's stat output,
+   not from raw-device sum
+```
+
+### Default inline_threshold
+
+Original §3 defaulted to the per-shard formula's clamped output.
+Updated default is a **static cluster-default of 16 KB**, overridable
+per-pool via the ADR-024 amendment's per-pool `inline_threshold`
+config. The dynamic per-shard formula (§3 still applies) refines this
+default once Phase 4 lands; until then a clean static default
+covers production usage. 16 KB:
+
+- Captures the workload-shape "small" (xattrs, symlinks, small JSON,
+  header objects, FS metadata) without paying the per-shard Raft
+  throughput cap for medium files.
+- Under `KISEKI_RAFT_INLINE_MBPS = 10 MB/s` cap gives ~640 inline
+  files/s/shard, well above what small-file workloads typically need.
+- Leaves the 16 KB → 64 KB band on the replicated chunk-path tier
+  (ADR-024 amendment) — faster than EC for that size; storage saving
+  doesn't pay there either.
+
+### Operational warning escalation
+
+The "metadata on boot disk" cluster_warning persists in
+`kiseki-admin status` output until the admin promotes a device. The
+warning escalates to `ERROR` (visible in health endpoints and
+metrics) once `NodeMetadataCapacity.used_bytes > soft_limit_bytes`
+on any node. If `used_bytes > hard_limit_bytes`, the runtime
+refuses new inline writes (drops effective threshold to floor) per
+the original §3 emergency override.
+
+### What this does NOT change
+
+- The per-shard formula and clamps (`INLINE_FLOOR = 128 B`,
+  `INLINE_CEILING = 64 KB`) are unchanged.
+- The throughput guard (`KISEKI_RAFT_INLINE_MBPS = 10 MB/s`) is
+  unchanged.
+- The two-tier redb layout under `KISEKI_DATA_DIR` (raft + keys +
+  chunks/meta + small/objects) is unchanged — only the mount point
+  is now admin-controlled.
+- Inline content still flows through Raft per §4 — the data path
+  doesn't change, only where the bytes land on disk.
+
+### Invariant impact
+
+Existing I-SF1 through I-SF7 are unchanged. New invariant in this
+amendment:
+
+| ID | Statement |
+|---|---|
+| I-SF8 | Production deployments MUST have at least one device assigned to the metadata-pool role. The runtime emits a persistent ERROR-level cluster warning when no such device exists. The warning escalates to write-refusal (inline path drops to floor) when `NodeMetadataCapacity.used_bytes > hard_limit_bytes` on any voter of any shard. |
+
 ## Spec references
 
-- `specs/invariants.md` — I-L9, I-C5, I-C8, I-K3
-- `specs/architecture/adr/024-device-management-and-capacity.md` — device classes, server disk layout
+- `specs/invariants.md` — I-L9, I-C5, I-C8, I-K3, I-SF8 (new)
+- `specs/architecture/adr/024-device-management-and-capacity.md` — device classes, server disk layout, **2026-05-31 amendment: three-tier durability**
 - `specs/architecture/adr/029-raw-block-device-allocator.md` — DeviceBackend trait, extent allocation
 - `specs/architecture/adr/026-raft-topology.md` — Raft membership, multi-Raft pattern
+- `specs/architecture/adr/045-tiered-namespaces-and-per-class-quotas.md` — namespace tier-policy
+- `specs/architecture/adr/048-slab-ec-compactor.md` — slab-EC for the medium tier
+- `specs/escalations/2026-05-31-tiered-storage-three-tier-and-slab-ec.md` — drives this amendment
 - `specs/implementation/phase-7-9-assessment.md` — open design question on small files

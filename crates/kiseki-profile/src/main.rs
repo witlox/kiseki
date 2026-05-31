@@ -169,6 +169,17 @@ struct RunArgs {
     /// single-node runs.
     #[arg(long)]
     admin_bin: Option<std::path::PathBuf>,
+
+    /// ADR-048 §"Decision" — when set, create a Replication pool
+    /// with `requires_migration = true` named
+    /// `slab-ec-bench` BEFORE provisioning the bench namespace,
+    /// and wire `namespace.size_band_pools.replicated` at that
+    /// pool. The runtime's per-pool slab-EC compactor task picks
+    /// it up at boot and migrates chunks to cold-tier slabs
+    /// while the workload runs. Ignored on single-node clusters
+    /// (`--nodes 1`).
+    #[arg(long, default_value_t = false)]
+    slab_ec: bool,
 }
 
 fn main() {
@@ -284,10 +295,22 @@ async fn build_harness(
         c.leader_tcp_framed(),
         c.leader_metrics_url(),
     );
+    // Per-node metrics URLs — needed by the perf harness to scrape
+    // `aux.*` follower histograms (every shard leader currently sits
+    // on node 1 per the GH #99 fix, so a leader-only scrape sees no
+    // follower work).
+    for (nid, url) in c.all_node_metrics_urls() {
+        eprintln!("[harness] node {nid} metrics={url}");
+    }
     eprintln!(
         "[harness] provisioning bench namespace + {shard_count} shards (ADR-033 §1: max(min(3*N, 64), 3))"
     );
-    c.provision_bench_topology(args.admin_bin.as_deref(), shard_count)
+    let slab_pool: Option<&str> = if args.slab_ec {
+        Some("slab-ec-bench")
+    } else {
+        None
+    };
+    c.provision_bench_topology_with_pool(args.admin_bin.as_deref(), shard_count, slab_pool)
         .await?;
     let ep = protocols::Endpoints::from_cluster_bench(&c);
     Ok((Some(Harness::Cluster(c)), Some(ep)))
@@ -399,6 +422,23 @@ async fn worker(
 ) {
     use std::cell::Cell;
     let counter: Cell<u64> = Cell::new(worker_id as u64);
+    // Per-worker mutable PUT buffer. Pre-prod the harness used a
+    // single shared `Arc<[u8]>` of `0xa5` bytes for every worker on
+    // every PUT — same content, same `chunk_id = SHA-256(plaintext)`,
+    // and the chunk-store's dedup short-circuit then fires on
+    // 99.99 % of writes (replication mode) or skips silently
+    // (EC mode pre-`register_ec_chunk` fix). Either way the bench
+    // wasn't measuring real writes. We stamp a 16-byte
+    // `(worker_id, op_counter, salt)` prefix into a fresh per-worker
+    // buffer to make every PUT's content distinct.
+    let mut put_buf: Vec<u8> = (*payload).to_vec();
+    let salt_nanos: u64 = match std::time::UNIX_EPOCH.elapsed() {
+        Ok(d) => u64::try_from(d.as_nanos()).unwrap_or(u64::MAX),
+        Err(_) => 0,
+    };
+    let salt: u64 =
+        salt_nanos.wrapping_mul((worker_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let mut put_n: u64 = 0;
     while Instant::now() < deadline {
         let pick_get = match shape {
             Shape::PutHeavy => false,
@@ -421,7 +461,17 @@ async fn worker(
             let key = &warmup_keys[usize::try_from(n).unwrap_or(0) % warmup_keys.len()];
             driver.get(key).await.map(|_| ())
         } else {
-            driver.put(&payload).await.map(|_| ())
+            // Stamp a unique (worker, op, salt) prefix so each PUT's
+            // chunk_id is unique. 16 bytes is sufficient for SHA-256
+            // to produce a different output even on a 64 KiB buffer
+            // whose remaining bytes are identical.
+            if put_buf.len() >= 16 {
+                put_buf[0..8]
+                    .copy_from_slice(&((worker_id as u64).wrapping_shl(40) ^ put_n).to_le_bytes());
+                put_buf[8..16].copy_from_slice(&salt.to_le_bytes());
+            }
+            put_n = put_n.wrapping_add(1);
+            driver.put(&put_buf).await.map(|_| ())
         };
         let dt = start.elapsed();
         match result {

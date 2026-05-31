@@ -130,6 +130,29 @@ pub trait ChunkOps {
         }
     }
 
+    /// Register a `chunk_id` in the dedup index without doing any device
+    /// I/O. Called by the cluster wrapper after a successful
+    /// `write_chunk_ec`: EC fragment writes don't go through
+    /// [`Self::write_chunk`] (they populate the fragments index only),
+    /// so without this hook the dedup index stays empty in EC mode and
+    /// the gateway's `try_increment_if_exists` always misses → every
+    /// PUT re-encrypts + re-fans the same content. On second call for
+    /// the same `chunk_id` this bumps refcount, matching the
+    /// dedup-hit semantics of [`Self::write_chunk`].
+    ///
+    /// Default returns `Err(Io("register_ec_chunk not supported on this
+    /// backend"))` so backends that don't see EC writes don't have to
+    /// implement it.
+    ///
+    /// # Errors
+    /// Backends may return `ChunkError::Io` on refcount overflow or
+    /// meta-store persistence failure.
+    fn register_ec_chunk(&self, _envelope: &Envelope, _pool: &str) -> Result<bool, ChunkError> {
+        Err(ChunkError::Io(
+            "register_ec_chunk not supported on this backend".into(),
+        ))
+    }
+
     /// Decrement refcount. Returns the new refcount.
     fn decrement_refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError>;
 
@@ -494,6 +517,19 @@ impl ChunkOps for ChunkStore {
                 }
                 DurabilityStrategy::Replication { copies } => {
                     storage_size = envelope.ciphertext.len() as u64 * u64::from(copies);
+                    None
+                }
+                DurabilityStrategy::Inline => {
+                    // ADR-024 amendment: `Inline` durability is a
+                    // routing tag declaring "this pool's writes go
+                    // inline-in-Raft-delta". `ChunkStore::write_chunk`
+                    // is the chunk-fabric path; an inline write
+                    // shouldn't reach here. If it does (mis-routing,
+                    // pre-amendment caller), treat it as a single
+                    // copy on the chunk fabric so the write doesn't
+                    // silently disappear — the gateway should be
+                    // calling the inline path instead.
+                    storage_size = envelope.ciphertext.len() as u64;
                     None
                 }
             }
