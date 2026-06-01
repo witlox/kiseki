@@ -221,6 +221,27 @@ Environment=KISEKI_RAFT_FLUSH_INTERVAL_MS=100
 Environment=KISEKI_COMPOSITION_FLUSH_INTERVAL_MS=100
 Environment=KISEKI_CHUNK_FLUSH_INTERVAL_MS=100
 
+# 2026-06-01 — Raft TCP transport per-peer connection cap. The in-code
+# default was raised to 256 in the same commit that added these lines;
+# they are written here explicitly so future operators see the choice
+# in the systemd unit and can tune without rebuilding.
+#
+# Why this matters: on the 2026-06-01 instrumented run (default cap = 16
+# at the time), `raft_transport_rpc{op=append_entries}` mean ballooned
+# to 129 ms (vs ~150 µs same-zone GCP RTT floor). Journals showed
+# `rejecting Raft RPC connection — per-peer cap exceeded peer=… active=17`.
+# 18 shards × min_acks=2 fan = up to 36 inflight per follower; the
+# 16-slot cap rejected, leader retried, AppendEntries RTT exploded.
+# See specs/performance/2026-06-01-gcp-instrumented-single-client.md.
+#
+#   * KISEKI_RAFT_PER_PEER_MAX — server-side inbound cap.
+#   * KISEKI_RAFT_CONN_POOL_PER_PEER — client-side outbound pool size.
+#
+# 128 is double the typical 18-shard fan × 2 followers = 36 with
+# headroom for retransmits + the leaderless quorum-write producer.
+Environment=KISEKI_RAFT_PER_PEER_MAX=128
+Environment=KISEKI_RAFT_CONN_POOL_PER_PEER=128
+
 # 2026-05-09: bump kiseki_chunk_cluster to debug so wrapper-layer
 # warnings (peer GetFragment timeouts → surfaced as ChunkError::Io
 # per the wrapper fix in commit a69e490) land in the journal. Lets
