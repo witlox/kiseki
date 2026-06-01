@@ -2445,6 +2445,7 @@ dependencies = [
  "futures",
  "kiseki-common",
  "openraft",
+ "parking_lot 0.12.5",
  "postcard",
  "prometheus",
  "rustls",

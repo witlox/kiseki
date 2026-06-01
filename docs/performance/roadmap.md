@@ -25,33 +25,90 @@ Baseline measurements are the 2026-05-28 `default` matrix (RUN 3) —
 (vs derived targets 5.2 GB/s S3 / 10 GB/s pNFS / 360 k op/s native);
 reads scale (23 k op/s · 1.4 GiB/s).
 
-**2026-05-29 — the cause is NOT the consensus round** (this supersedes
-the "commit-bound / batched-commit is the lever" framing kept below for
-history). The isolated openraft `client_write` round is **~1 ms** (2-node
-loopback, no server load — `multi_shard_transport::
-measure_openraft_round_latency`, mean 973 µs). The single-node full write
-path is **240 µs**. Yet the full multi-node path is **~15 ms (local) /
-~42 ms (GCP)**. That delta is a **stacked off-CPU wait** in the commit
-pipeline under full-server load — and its mechanism is **NOT yet proven**:
-it is *not* the openraft round (1 ms), *not* the gateway work (240 µs),
-and *not* cleanly co-location (GCP on dedicated HW was also lowball, and a
-CPU flamegraph shows idle, not hot stacks). The right probe is **off-CPU /
-async-aware** (tokio-console per-task poll/wait, or per-step timing spans
-in the loaded server) — NOT a flamegraph.
+**2026-06-01 — three GCP passes settled the "where's the time"
+question** (this supersedes both the "stacked off-CPU wait of unknown
+mechanism" and the "client-side route-to-leader saves 41 ms" framings
+that lived in earlier revisions of this doc — both were wrong):
+
+> **The per-write floor under aggregate load is ~8 ms.** That's
+> ~3-4 ms fjall WAL fsync + ~3-4 ms quorum-replication RTT.
+> Under-loaded clusters look slower (12 ms mean at 1 client / 16 conc)
+> because each openraft AppendEntries round amortises over too few
+> entries. Optimally-loaded clusters approach the 8 ms floor — proven
+> by mean dropping 12.3 → 8.1 ms when load went from 1 client to
+> 3 clients × distinct leaders. openraft's `max_payload_entries: 300`
+> batching is doing its job.
+
+**There is no "stacked off-CPU wait" to hunt.** The off-CPU profile
+under aggregate load is dominated by `kiseki-raft` threads
+processing inbound AppendEntries — which is what we want them
+doing — and the 47× DROP in sched-switches between 1-client and
+3-client runs proves threads stay on CPU under more load. No
+contention, no idle puzzle, no hidden serialisation. See
+[`specs/performance/2026-06-01-gcp-partial.md`](../../specs/performance/2026-06-01-gcp-partial.md)
+for the actual numbers.
+
+**There is no 9-ms / 41-ms client-side-route-to-leader headroom.**
+The "Pass 1 4 ms direct vs 42 ms forwarded = 10× lift available"
+framing was a comparison across binaries (the 42 ms came from
+2026-05-28's pre-#149 binary, the 4 ms from current main with the
+WARN→DEBUG demote). When measured against the same binary under
+the same load, the forward hop adds ~30% — fully amortised by
+openraft batching at aggregate concurrency. **Client-side
+route-to-leader would help native + FUSE only, by a small amount,
+while leaving NFS / pNFS / S3 unchanged.** Don't ship that as
+"the headline fix."
 
 **W1 (batched Raft commit) was built and REJECTED.** openraft already
 auto-batches concurrent `client_write`s (`max_payload_entries: 300`),
-proven by 13× throughput scaling conc-1→16 *without* W1 — so coalescing
-adds nothing against a 1 ms round. Reverted; ADR-046 kept as a rejected
-record.
+proven by 13× throughput scaling conc-1→16 *without* W1 — so
+coalescing adds nothing against a 1 ms round. Reverted; ADR-046 kept
+as a rejected record.
 
-**Path to target (no consensus changes):** one server per box (removes
-the co-located-test contention that produced the local 15 ms) +
-**client-side route-to-leader** (removes the ~9 ms forward hop the GCP run
-paid on 5/6 of writes) + concurrency × shards. Per-write floor ≈ round
-(1 ms) + gateway work (240 µs) ≈ **~1.5 ms** → 18 shards × ~30 conc /
-1.5 ms ≈ 360 k. **First prove the stacked-wait mechanism** (off-CPU
-profile) before building the route-to-leader change.
+**The actual multi-protocol lever is log group-commit / fsync
+coalescing.** Pass 1's off-CPU profile under sustained load: 12.2 %
+of all sched-switch events were `kiseki-committer` in D state
+(uninterruptible kernel wait on local NVMe fsync completion). Each
+shard has its own `fjall::Database` today → each shard's per-AE-round
+fsync hits the device queue independently. Coalesce N fsync requests
+within a small window (500 µs / 32 entries) into **one** physical
+`Database::persist(SyncAll)` call. **Benefits every protocol equally**
+because all of NFS / S3 / pNFS / native / FUSE land on the same
+`emit_chunk_and_delta` → openraft `client_write` →
+`FjallRaftLogStore::append` path.
+
+Expected lift: 8 ms server floor → ~3 ms (replication RTT alone with
+fsync ~1 ms inside the same window). 5–8 ms p50 → ~2 ms p50. p99 75 ms
+→ ~10-15 ms. **All protocols benefit by the same factor.**
+
+**Path to target:** log group-commit (fixes the fsync floor for all
+protocols) + concurrency × shards (already pipelined via openraft's
+batching). Per-write floor with group-commit ≈ ~3 ms → 6 shards × ~30
+conc × 6 nodes / 3 ms ≈ 360 k aggregate, matching the ADR-042 §14
+native target without consensus changes. Tracked at the "Write fix
+plan" section below.
+
+---
+
+### Historical TL;DR (superseded 2026-06-01, kept for context)
+
+The pre-2026-06-01 framing said:
+
+> "The cause is not the consensus round … the delta is a stacked
+> off-CPU wait … mechanism not yet proven … client-side
+> route-to-leader removes the ~9 ms forward hop the GCP run paid on
+> 5/6 of writes … per-write floor ≈ 1.5 ms → 18 shards × 30 conc /
+> 1.5 ms ≈ 360 k. First prove the stacked-wait mechanism (off-CPU
+> profile) before building the route-to-leader change."
+
+The "stacked wait" theory was the right next step at the time (we
+hadn't profiled). When we did profile (Pass 1 + Pass 3 of the
+2026-06-01 GCP run), the mechanism turned out to be fjall WAL fsync
+in the committer thread — a known I/O wait, not an unidentified
+scheduler bug. The 41 ms was an artefact of comparing two binaries
+with different log-line costs on the hot path; the same-binary
+forward hop is ~30 % and gets amortised by openraft's batching at
+aggregate concurrency.
 
 ---
 
@@ -161,15 +218,75 @@ flush window) the way composition group-commit already does
 - **Expected lift:** ~5–10 ms/chunk → amortised; matters most for
   multi-chunk (>64 MiB) objects.
 
-### W5 — Forward-to-leader logged at WARN · **#123** (cheap)
-The per-write forward logs at WARN (22 k lines/run). WARN→DEBUG. Pure
-hygiene but it's on the hot path and pollutes signal.
+### W5 — Forward-to-leader logged at WARN · **#123** ✅ LANDED 2026-05-31
+PR #149 — `log_append_err` demotes routine `ForwardToLeader` /
+`LeaderUnavailable` to DEBUG. 22 k WARN lines/run → 0. Unblocks
+profiling signal but only ~0.05 % per-write CPU back (not a perf lever
+on its own — the headline win is signal clarity).
 
-**Write target trajectory (6-node):** today ~250 op/s → **W1 ≈ 10 k
-op/s** → W3+W4 sustain it under load and cut p99 → the native 360 k
-gate needs the in-process backlog (B1 DashMap etc.) *on top of* batched
-commit, and is realistically a post-W1 re-measure decision, not a
-near-term number.
+### W6 — Log fsync coalescing (group-commit at the openraft log layer) · NEW 2026-06-01
+**This is the multi-protocol unblock the 2026-06-01 GCP run pointed at.**
+
+Pass 1's off-CPU profile of node-1 under sustained PUT load:
+**12.2 % of sched-switch events were `kiseki-committer` in D state**
+(uninterruptible kernel wait on local NVMe fsync completion).
+Bench A vs Bench B in Pass 3 confirmed the per-write floor is
+~8 ms server-side under aggregate load, with the fsync contributing
+~3-4 ms of that. Pass 3 also confirmed openraft batching is doing
+its job (mean 12.3 ms → 8.1 ms when load tripled); the remaining
+fsync cost is **intra-shard** — even with batched AppendEntries
+rounds, each round still does ONE physical `Database::persist(SyncAll)`
+on its per-shard fjall instance.
+
+**The fix:** add an `FsyncCoalescer` on `FjallLogStore`. Concurrent
+`flush()` callers join a small window (e.g. 500 µs / 32 entries,
+whichever fires first); one physical `db.persist(SyncAll)` covers
+all waiters. The openraft `IOFlushed::io_completed(Ok(()))` callback
+fires for every waiter when the merged fsync returns.
+
+This is **opt-in via `with_fsync_coalescing(window_us, max_batch)`**
+on `FjallLogStore`. Off by default until benchmarked.
+
+**Where it lands:**
+- `crates/kiseki-raft/src/fjall_log_store.rs` — coalescer + opt-in
+  constructor
+- `crates/kiseki-raft/src/fjall_raft_log_store.rs` — pass through
+  the coalescer options
+- `crates/kiseki-log/src/raft/openraft_store.rs` — read window /
+  batch size from env vars (`KISEKI_RAFT_FSYNC_WINDOW_US`,
+  `KISEKI_RAFT_FSYNC_BATCH`) for tunability without rebuild
+
+**Expected lift:**
+- Per-write fsync cost: ~3 ms → ~0.1-0.5 ms (one fsync covers N writes)
+- Server-side floor: 8 ms → ~3-4 ms (replication RTT dominates)
+- p50: 4 ms → ~2 ms
+- p99: 75 ms → ~10-15 ms (fewer tail-of-fsync-queue waits)
+
+**Crucially, benefits every protocol equally** — NFS, S3, pNFS,
+native, FUSE all funnel through the same
+`emit_chunk_and_delta` → openraft `client_write` →
+`FjallRaftLogStore::append` path. Unlike client-side route-to-leader
+(which only helps native + FUSE), W6 is the multi-protocol win.
+
+**Risk:** introduces a small latency floor under low load (the
+window timer waits for stragglers). Mitigated by setting the
+window to 500 µs (≤ 1 % of an 8 ms write at the worst case).
+Off by default, env-var-gated for tuning.
+
+### W7 — Forward-path decomposition · **profile pass, not landed**
+Pass 3's data says the forward hop adds ~30 % under aggregate load
+(amortised by openraft batching, not the 9-ms-per-write earlier
+reading). Still worth profiling once W6 lands to see if there's a
+config-tune left (channel-pool reuse, etc). One follow-up GCP
+mini-pass (~30 min, ~$2). Probably not the headline lever; capture
+the numbers to confirm.
+
+**Write target trajectory (6-node):** today ~3 k op/s aggregate
+(Pass 3 measured)
+→ **W6 ≈ 8–12 k op/s aggregate** (fsync coalesced, floor drops to
+~3 ms) → W3 sustains it under burst → the native 360 k gate needs
+heavier sharding (6 shards × ~30 concurrency × 6 nodes × 1.5 ms
+post-W6 floor ≈ 360 k), realistically post-W6 re-measure.
 
 ---
 

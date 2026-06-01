@@ -24,6 +24,7 @@ pub mod config;
     deprecated
 )]
 pub mod fjall_log_store;
+pub mod fsync_coalescer;
 pub mod log_store;
 pub mod mem_transport;
 pub mod membership;

@@ -66,7 +66,7 @@ done
 if [ "$${FAST_DEV_COUNT}" -gt 0 ]; then
   cat <<WARNING
 ==========================================================================
-NOTICE (ADR-030 2026-05-31 amendment): ${FAST_DEV_COUNT} fast (NVMe/SSD)
+NOTICE (ADR-030 2026-05-31 amendment): $${FAST_DEV_COUNT} fast (NVMe/SSD)
 device(s) detected, but NONE is currently assigned to the metadata-pool
 role. Metadata + small-tier writes will live on the boot disk until
 operator action.
