@@ -32,6 +32,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsConnector;
 
 use crate::peer::tcp_framed::wire::{
     DeleteFragmentMeta, DeleteFragmentResponse, EnvelopeMeta, GetFragmentMeta,
@@ -73,21 +74,44 @@ struct Inner {
 pub struct TcpFramedFabricPeer {
     name: String,
     addr: String,
+    /// Optional TLS posture: `Some((connector, server_name))` →
+    /// rustls handshake at connect; `None` → plaintext (dev mode).
+    tls: Option<(TlsConnector, rustls::pki_types::ServerName<'static>)>,
     inner: AsyncMutex<Option<Inner>>,
 }
 
 impl TcpFramedFabricPeer {
-    /// Build a peer without connecting. The first `call()` connects;
-    /// subsequent calls reuse the connection until a transport error
-    /// invalidates it, at which point the next call reconnects.
-    /// Matches the tonic `Channel` lazy-on-build pattern so a peer
-    /// not yet listening at startup doesn't block the cluster from
-    /// coming up.
+    /// Build a plaintext peer without connecting. The first `call()`
+    /// connects; subsequent calls reuse the connection until a
+    /// transport error invalidates it, at which point the next call
+    /// reconnects. Matches the tonic `Channel` lazy-on-build pattern
+    /// so a peer not yet listening at startup doesn't block the
+    /// cluster from coming up.
     #[must_use]
     pub fn new_lazy(name: String, addr: String) -> Arc<Self> {
         Arc::new(Self {
             name,
             addr,
+            tls: None,
+            inner: AsyncMutex::new(None),
+        })
+    }
+
+    /// Build an mTLS-enforcing peer without connecting. Same lazy
+    /// semantics as [`Self::new_lazy`]; the rustls handshake runs
+    /// on first call (and on each reconnect after a transport
+    /// error). Production deployments use this form.
+    #[must_use]
+    pub fn new_lazy_tls(
+        name: String,
+        addr: String,
+        client_config: Arc<rustls::ClientConfig>,
+        server_name: rustls::pki_types::ServerName<'static>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            name,
+            addr,
+            tls: Some((TlsConnector::from(client_config), server_name)),
             inner: AsyncMutex::new(None),
         })
     }
@@ -110,38 +134,54 @@ impl TcpFramedFabricPeer {
         &self.addr
     }
 
-    /// Open a fresh TCP connection and spawn its reader loop.
-    /// Caller holds the `inner` mutex while calling this and stores
-    /// the result.
+    /// Open a fresh TCP connection (and run the TLS handshake if
+    /// configured) and spawn the reader loop. Caller holds the
+    /// `inner` mutex while calling this and stores the result.
     async fn establish_connection(&self) -> io::Result<Inner> {
-        let stream =
-            tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(&self.addr))
-                .await
-                .map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!(
-                            "fabric TCP-framed connect timed out after {}s",
-                            CONNECT_TIMEOUT.as_secs()
-                        ),
-                    )
-                })??;
+        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(&self.addr))
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "fabric TCP-framed connect timed out after {}s",
+                        CONNECT_TIMEOUT.as_secs()
+                    ),
+                )
+            })??;
         // TCP_NODELAY — vectored writes (header + meta + bulk) hit a
         // Nagle 40 ms timer without it. Same gotcha as the gateway
         // client (`project_tcp_nodelay_pattern` memory).
-        if let Err(e) = stream.set_nodelay(true) {
+        if let Err(e) = tcp.set_nodelay(true) {
             tracing::warn!(error = %e, "fabric TCP-framed client: TCP_NODELAY failed; perf may regress");
         }
-        let (read_half, write_half) = tokio::io::split(stream);
         let pending: Arc<PendingMap> = Arc::new(DashMap::new());
         let pending_for_reader = Arc::clone(&pending);
-        let reader_task = tokio::spawn(reader_loop(read_half, pending_for_reader));
-        Ok(Inner {
-            write_half: Box::new(write_half),
-            pending,
-            next_request_id: AtomicU64::new(1),
-            _reader_task: reader_task,
-        })
+
+        // Branch on TLS posture. Same multiplex shape afterwards.
+        match &self.tls {
+            Some((connector, server_name)) => {
+                let tls = connector.connect(server_name.clone(), tcp).await?;
+                let (read_half, write_half) = tokio::io::split(tls);
+                let reader_task = tokio::spawn(reader_loop(read_half, pending_for_reader));
+                Ok(Inner {
+                    write_half: Box::new(write_half),
+                    pending,
+                    next_request_id: AtomicU64::new(1),
+                    _reader_task: reader_task,
+                })
+            }
+            None => {
+                let (read_half, write_half) = tokio::io::split(tcp);
+                let reader_task = tokio::spawn(reader_loop(read_half, pending_for_reader));
+                Ok(Inner {
+                    write_half: Box::new(write_half),
+                    pending,
+                    next_request_id: AtomicU64::new(1),
+                    _reader_task: reader_task,
+                })
+            }
+        }
     }
 
     /// Make sure the inner connection exists. Connects if absent,

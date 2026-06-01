@@ -218,6 +218,24 @@ fn fabric_addr_from_raft_peer(raft_peer: &str, data_port: u16) -> String {
     )
 }
 
+/// 2026-06-01: read the cluster CA + node cert + key off disk and
+/// build a `rustls::ServerConfig` for the fabric TCP-framed listener.
+/// Delegates to `kiseki_transport::TlsConfig::server_config` so the
+/// rustls posture matches the cluster's mTLS chain (same root the
+/// gRPC fabric service trusts). Returns the rustls error verbatim
+/// so an operator sees the same diagnostic regardless of which
+/// transport asked.
+fn build_fabric_tls_server_config(tls_files: &TlsFiles) -> Result<rustls::ServerConfig, String> {
+    let ca_pem = std::fs::read(&tls_files.ca_path)
+        .map_err(|e| format!("read CA {}: {e}", tls_files.ca_path.display()))?;
+    let cert_pem = std::fs::read(&tls_files.cert_path)
+        .map_err(|e| format!("read cert {}: {e}", tls_files.cert_path.display()))?;
+    let key_pem = std::fs::read(&tls_files.key_path)
+        .map_err(|e| format!("read key {}: {e}", tls_files.key_path.display()))?;
+    kiseki_transport::TlsConfig::server_config(&ca_pem, &cert_pem, &key_pem)
+        .map_err(|e| format!("rustls server_config: {e}"))
+}
+
 /// 2026-06-01: derive the TCP-framed-postcard fabric address from the
 /// gRPC fabric address by adding a fixed port offset. ADR-042 §2.2
 /// reserves the gRPC port for back-compat; the TCP-framed listener
@@ -2964,7 +2982,35 @@ pub async fn run_main(
             .parse()
             .expect("valid fabric TCP-framed addr");
         let handler = std::sync::Arc::new(cluster_chunk_server.clone_for_tcp_framed_handler());
-        let listener = kiseki_chunk_cluster::TcpFramedFabricListener::new(fabric_tcp_addr, handler);
+        // TLS posture matches the gateway TCP-framed listener: API is
+        // wired (`TcpFramedFabricListener::with_tls`) but the runtime
+        // builds a rustls::ServerConfig from cfg.tls only when set.
+        // Plaintext development mode otherwise — same posture the
+        // gRPC fabric service takes when cfg.tls is None.
+        let listener = match cfg.tls.as_ref() {
+            Some(tls_files) => match build_fabric_tls_server_config(tls_files) {
+                Ok(sc) => {
+                    tracing::info!(
+                        addr = %fabric_tcp_addr,
+                        "fabric TCP-framed: mTLS enabled (cluster CA chain)",
+                    );
+                    kiseki_chunk_cluster::TcpFramedFabricListener::with_tls(
+                        fabric_tcp_addr,
+                        handler,
+                        std::sync::Arc::new(sc),
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        addr = %fabric_tcp_addr,
+                        error = %e,
+                        "fabric TCP-framed: TLS build failed, falling back to plaintext",
+                    );
+                    kiseki_chunk_cluster::TcpFramedFabricListener::new(fabric_tcp_addr, handler)
+                }
+            },
+            None => kiseki_chunk_cluster::TcpFramedFabricListener::new(fabric_tcp_addr, handler),
+        };
         tokio::spawn(async move {
             if let Err(e) = listener.run().await {
                 tracing::error!(error = %e, addr = %fabric_tcp_addr, "fabric TCP-framed listener exited");
