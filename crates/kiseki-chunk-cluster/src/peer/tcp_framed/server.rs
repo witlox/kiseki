@@ -126,8 +126,8 @@ async fn serve_connection(stream: TcpStream, handler: Arc<ClusterChunkServer>) -
             if !resp_meta.is_empty() && guard.write_all(&resp_meta).await.is_err() {
                 return;
             }
-            if !resp_bulk.is_empty() && guard.write_all(&resp_bulk).await.is_err() {
-                return;
+            if !resp_bulk.is_empty() {
+                let _ = guard.write_all(&resp_bulk).await;
             }
         });
     }
