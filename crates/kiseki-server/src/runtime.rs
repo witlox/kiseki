@@ -218,6 +218,22 @@ fn fabric_addr_from_raft_peer(raft_peer: &str, data_port: u16) -> String {
     )
 }
 
+/// 2026-06-01: derive the TCP-framed-postcard fabric address from the
+/// gRPC fabric address by adding a fixed port offset. ADR-042 §2.2
+/// reserves the gRPC port for back-compat; the TCP-framed listener
+/// binds a separate port (default = `data_port + 50`). Same host,
+/// different port — so the existing per-peer hostname derivation
+/// (gRPC) feeds straight into this with no new resolver step.
+fn derive_tcp_fabric_addr(grpc_fabric_addr: &str, offset: u16) -> String {
+    grpc_fabric_addr.rsplit_once(':').map_or_else(
+        || grpc_fabric_addr.to_owned(),
+        |(host, port_s)| {
+            let port: u16 = port_s.parse().unwrap_or(0);
+            format!("{host}:{}", port.saturating_add(offset))
+        },
+    )
+}
+
 /// ADR-030 §3 multi-voter aggregation: convert a Raft-peer address
 /// (`host:raft_port`) into the canonical metrics scrape URL. The
 /// metrics port follows `KISEKI_METRICS_PORT` (default 9090, which is
@@ -1437,6 +1453,32 @@ pub async fn run_main(
     let bootstrap_tenant_for_cluster = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
     let mut fabric_peers: Vec<Arc<dyn kiseki_chunk_cluster::FabricPeer>> = Vec::new();
     let data_port = cfg.data_addr.port();
+    // 2026-06-01 fabric transport selection. ADR-042 §2.2 calls for
+    // TCP-framed-postcard as the default to escape the gRPC/h2 tax;
+    // the 2026-06-01 3-node loopback profile confirmed the fabric edge
+    // was paying ~14× the receiver-work cost in gRPC overhead alone.
+    // **DEFAULT IS TCP** — gRPC stays only as an explicit fallback so
+    // a future implementer cannot regress this silently:
+    //
+    //   KISEKI_FABRIC_TRANSPORT=tcp     (default; ADR-042 §2.2)
+    //   KISEKI_FABRIC_TRANSPORT=grpc    (explicit fallback)
+    //
+    // The TCP-framed fabric listener binds on `data_port + 50`; the
+    // gRPC fabric service stays on `data_port` for back-compat during
+    // rolling upgrades. Peers chosen at startup based on this flag.
+    let fabric_transport_is_tcp = std::env::var("KISEKI_FABRIC_TRANSPORT")
+        .ok()
+        .map(|v| v.to_ascii_lowercase())
+        .is_none_or(|v| !matches!(v.as_str(), "grpc" | "g"));
+    let fabric_tcp_port_offset: u16 = 50;
+    tracing::info!(
+        transport = if fabric_transport_is_tcp {
+            "tcp-framed-postcard (ADR-042 §2.2 default)"
+        } else {
+            "grpc (KISEKI_FABRIC_TRANSPORT=grpc fallback)"
+        },
+        "fabric peer transport selected",
+    );
     // Build a peer-id → fabric address map. `KISEKI_FABRIC_PEERS`
     // (cfg.fabric_peers) overrides the per-port derivation below,
     // which is the only path that works when every node binds a
@@ -1454,24 +1496,45 @@ pub async fn run_main(
             || fabric_addr_from_raft_peer(raft_peer_addr, data_port),
             |s| (*s).to_owned(),
         );
-        match build_fabric_channel(&fabric_addr, cfg.tls.as_ref()) {
-            Ok(channel) => {
-                let name = format!("node-{peer_id}");
-                fabric_peers.push(Arc::new(
-                    kiseki_chunk_cluster::GrpcFabricPeer::new(name, channel)
-                        .with_metrics(Arc::clone(&metrics.fabric)),
-                ));
-                tracing::info!(
-                    peer_id,
-                    fabric_addr,
-                    "fabric peer registered for cross-node chunks",
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    peer_id, fabric_addr, error = %e,
-                    "fabric peer channel build failed — peer skipped (cluster may run degraded)",
-                );
+        let name = format!("node-{peer_id}");
+        if fabric_transport_is_tcp {
+            // TCP-framed-postcard fabric (ADR-042 §2.2 default).
+            // Derive the TCP-framed address by adding the port
+            // offset to the gRPC fabric address; same host, port+50.
+            // Lazy construction — the connect happens on first call,
+            // matching tonic Channel semantics. The runtime can come
+            // up regardless of peer reachability at startup.
+            let tcp_addr = derive_tcp_fabric_addr(&fabric_addr, fabric_tcp_port_offset);
+            let peer =
+                kiseki_chunk_cluster::TcpFramedFabricPeer::new_lazy(name.clone(), tcp_addr.clone());
+            fabric_peers.push(peer);
+            tracing::info!(
+                peer_id,
+                fabric_addr = %tcp_addr,
+                transport = "tcp-framed-postcard (lazy connect)",
+                "fabric peer registered for cross-node chunks",
+            );
+        } else {
+            // gRPC fabric (legacy fallback).
+            match build_fabric_channel(&fabric_addr, cfg.tls.as_ref()) {
+                Ok(channel) => {
+                    fabric_peers.push(Arc::new(
+                        kiseki_chunk_cluster::GrpcFabricPeer::new(name, channel)
+                            .with_metrics(Arc::clone(&metrics.fabric)),
+                    ));
+                    tracing::info!(
+                        peer_id,
+                        fabric_addr,
+                        transport = "grpc",
+                        "fabric peer registered for cross-node chunks",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        peer_id, fabric_addr, error = %e,
+                        "fabric peer channel build failed — peer skipped (cluster may run degraded)",
+                    );
+                }
             }
         }
     }
@@ -2889,14 +2952,39 @@ pub async fn run_main(
         .add_service(log_svc)
         .add_service(admin_svc)
         .add_service(storage_admin_svc);
+    // 2026-06-01: spawn the TCP-framed fabric listener BEFORE moving
+    // `cluster_chunk_server` into the tonic Router. Both listeners
+    // share the same handler via Arc — a fragment arriving on either
+    // transport hits the same `local` ops. The TCP-framed listener
+    // is on by default (ADR-042 §2.2); the gRPC listener stays for
+    // peer back-compat during rolling upgrades.
+    {
+        let fabric_tcp_port = data_port.saturating_add(fabric_tcp_port_offset);
+        let fabric_tcp_addr: std::net::SocketAddr = format!("0.0.0.0:{fabric_tcp_port}")
+            .parse()
+            .expect("valid fabric TCP-framed addr");
+        let handler = std::sync::Arc::new(cluster_chunk_server.clone_for_tcp_framed_handler());
+        let listener = kiseki_chunk_cluster::TcpFramedFabricListener::new(fabric_tcp_addr, handler);
+        tokio::spawn(async move {
+            if let Err(e) = listener.run().await {
+                tracing::error!(error = %e, addr = %fabric_tcp_addr, "fabric TCP-framed listener exited");
+            }
+        });
+        tracing::info!(
+            addr = %fabric_tcp_addr,
+            "fabric TCP-framed listener spawned (ADR-042 §2.2 default for inter-node hop)",
+        );
+    }
     if cluster_chunk_svc_intercepted {
         router = router.add_service(cluster_chunk_server.into_tonic_server_with_san_check());
-        tracing::info!("ClusterChunkService: SAN-role interceptor active (mTLS)");
+        tracing::info!(
+            "ClusterChunkService gRPC: SAN-role interceptor active (mTLS) — kept for back-compat"
+        );
     } else {
         router = router.add_service(cluster_chunk_server.into_tonic_server());
         tracing::warn!(
-            "ClusterChunkService: NO SAN interceptor (plaintext development mode — \
-             cross-node fabric is not protected against tenant certs)",
+            "ClusterChunkService gRPC: NO SAN interceptor (plaintext development mode — \
+             cross-node fabric is not protected against tenant certs); TCP-framed is the perf path",
         );
     }
     // ADR-042 Phase 4: register the native GatewayDataService alongside

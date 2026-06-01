@@ -32,6 +32,7 @@ kiseki-proto = { workspace = true }
 # (ADR-047 escalation). Heavy deps inside kiseki-tracing are
 # feature-gated; OFF expansion is `()`.
 kiseki-tracing = { workspace = true }
+dashmap = "6"
 parking_lot = { workspace = true }
 postcard = { workspace = true }
 prometheus = { workspace = true }

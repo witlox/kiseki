@@ -88,7 +88,9 @@ pub use ec::{
     FragmentRoute,
 };
 pub use metrics::FabricMetrics;
-pub use peer::{FabricPeer, FabricPeerError, GrpcFabricPeer};
+pub use peer::{
+    FabricPeer, FabricPeerError, GrpcFabricPeer, TcpFramedFabricListener, TcpFramedFabricPeer,
+};
 pub use placement::pick_placement;
 pub use scrub::{
     ChunkPlacement, ChunkScrubInfo, ClusterChunkOracle, FragmentAvailabilityOracle, LogChunkOracle,
