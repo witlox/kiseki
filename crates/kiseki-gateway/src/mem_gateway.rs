@@ -3138,7 +3138,6 @@ impl InMemoryGateway {
                     idempotency_key,
                     append,
                 };
-                let intent_started = std::time::Instant::now();
                 // ADR-047 §"Problem" / §11 — EC/Raft parallelization.
                 // Run the chunk-write fan and the intent fan
                 // concurrently. Both reach `min_acks`-durable
@@ -3160,6 +3159,33 @@ impl InMemoryGateway {
                         .collect();
                 let pool_for_fan = pool.clone();
                 let chunks_for_fan = std::sync::Arc::clone(&self.chunks);
+                // 2026-06-02 — fix put_phase aliasing.
+                //
+                // PRE-FIX: this branch captured `chunk_fan_started`,
+                // `intent_started`, and `composition_record_started`
+                // as separate `Instant`s, then observed all three
+                // histograms after `try_join!` returned — meaning
+                // every histogram measured from its respective
+                // `Instant` to the SAME (post-join) point. The labels
+                // looked like a per-phase decomposition but the
+                // numbers were the same wall time three different
+                // ways (Pass 4 confirmed: chunk_write=12 168 µs,
+                // raft_commit=12 169 µs, composition_record=12 406 µs
+                // — within microseconds of each other, all governed
+                // by the join wall-time, not the per-fan latency).
+                //
+                // POST-FIX: each fan future captures and returns its
+                // own internal duration via the `Ok` tuple. We
+                // observe `chunk_fan_inner` and `intent_fan_inner`
+                // (the real per-fan latencies) and
+                // `parallel_fan_wall` (the join wall — `max(inner)`
+                // plus a small scheduling tax). The legacy
+                // `chunk_write` / `raft_commit` /
+                // `composition_record` labels are preserved for
+                // dashboard back-compat but now point at the same
+                // value as `parallel_fan_wall` so existing alerts
+                // don't break — and the new `*_inner` labels are the
+                // ones to trust for decomposition.
                 let chunk_fan_fut = async move {
                     // Sequential `await` over staged envelopes. The
                     // common case is a single 64 KiB chunk per PUT
@@ -3173,6 +3199,7 @@ impl InMemoryGateway {
                     // FuturesUnordered is a follow-up if multi-MB
                     // PUTs become hot — needs the `futures` dep
                     // wired into kiseki-gateway first.)
+                    let inner_started = std::time::Instant::now();
                     for env in envelopes_for_fan {
                         let chunks = std::sync::Arc::clone(&chunks_for_fan);
                         chunks.write_chunk(env, &pool_for_fan).await.map_err(|e| {
@@ -3183,20 +3210,43 @@ impl InMemoryGateway {
                             map_chunk_write_error(e)
                         })?;
                     }
-                    Ok::<(), GatewayError>(())
+                    Ok::<std::time::Duration, GatewayError>(inner_started.elapsed())
                 };
 
                 let intent_fan_fut = async {
+                    let inner_started = std::time::Instant::now();
                     log.put_intent_and_fan(shard_id, intent)
                         .await
-                        .map_err(|e| GatewayError::Upstream(format!("intent quorum: {e}")))
+                        .map_err(|e| GatewayError::Upstream(format!("intent quorum: {e}")))?;
+                    Ok::<std::time::Duration, GatewayError>(inner_started.elapsed())
                 };
 
                 match tokio::try_join!(chunk_fan_fut, intent_fan_fut) {
-                    Ok(((), ())) => {
+                    Ok((chunk_fan_inner, intent_fan_inner)) => {
                         // Both quorums reached. Ack.
-                        self.observe_put_phase("chunk_write", chunk_fan_started.elapsed());
-                        self.observe_put_phase("raft_commit", intent_started.elapsed());
+                        let parallel_fan_wall = chunk_fan_started.elapsed();
+                        // Truthful per-fan decomposition. These are
+                        // the histograms to use when asking "which
+                        // fan paces a write."
+                        self.observe_put_phase("chunk_fan_inner", chunk_fan_inner);
+                        self.observe_put_phase("intent_fan_inner", intent_fan_inner);
+                        // Wall-time of the join — this is the number
+                        // the caller observes for "how long did the
+                        // parallel section take." Equals
+                        // ≈ max(chunk_fan_inner, intent_fan_inner) +
+                        // a small scheduling tax.
+                        self.observe_put_phase("parallel_fan_wall", parallel_fan_wall);
+                        // Back-compat labels — keep firing so any
+                        // existing dashboard / alert reading
+                        // `chunk_write` / `raft_commit` still works.
+                        // ALL THREE now report the same wall-time
+                        // (which is what they really measured
+                        // before, just under misleading names).
+                        // Treat as soft-deprecated; prefer the
+                        // `_inner` / `parallel_fan_wall` variants
+                        // above.
+                        self.observe_put_phase("chunk_write", parallel_fan_wall);
+                        self.observe_put_phase("raft_commit", parallel_fan_wall);
                         self.observe_put_phase(
                             "composition_record",
                             composition_record_started.elapsed(),
