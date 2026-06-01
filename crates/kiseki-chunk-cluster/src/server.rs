@@ -408,6 +408,51 @@ impl ClusterChunkServer {
             .max_decoding_message_size(crate::peer::FABRIC_MAX_MESSAGE_BYTES)
     }
 
+    /// Produce a handle suitable for the TCP-framed fabric listener
+    /// to share with the gRPC adapter. All internal references are
+    /// already `Arc<>` / `Clone` types, so this is a cheap clone of
+    /// handles — the same `local` ops, the same envelope registry,
+    /// the same metrics. A fragment arriving on either transport
+    /// hits the same backend state.
+    ///
+    /// Used at runtime startup to wire one handler into both the
+    /// tonic gRPC service and the TCP-framed listener simultaneously
+    /// (rolling-upgrade posture; ADR-042 §2.2).
+    #[must_use]
+    pub fn clone_for_tcp_framed_handler(&self) -> Self {
+        Self {
+            local: Arc::clone(&self.local),
+            default_pool: self.default_pool.clone(),
+            maintenance: self.maintenance.clone(),
+            chunk_envelope_meta: self.chunk_envelope_meta.clone(),
+            metrics: self.metrics.clone(),
+        }
+    }
+
+    /// Accessors used by the TCP-framed sibling server. Plain
+    /// `pub(crate)` getters rather than exposing fields, so the
+    /// gRPC vs TCP-framed paths share state through a documented
+    /// surface (see `peer/tcp_framed/server.rs`).
+    pub(crate) fn local_for_tcp_framed(&self) -> &Arc<dyn AsyncChunkOps> {
+        &self.local
+    }
+    pub(crate) fn default_pool_for_tcp_framed(&self) -> &str {
+        &self.default_pool
+    }
+    pub(crate) fn chunk_envelope_meta_for_tcp_framed(&self) -> &ChunkEnvelopeRegistry {
+        &self.chunk_envelope_meta
+    }
+    pub(crate) fn metrics_for_tcp_framed(&self) -> Option<&Arc<crate::FabricMetrics>> {
+        self.metrics.as_ref()
+    }
+    pub(crate) fn envelope_from_bytes_for_tcp_framed(
+        &self,
+        chunk_id: RustChunkId,
+        bytes: Vec<u8>,
+    ) -> kiseki_crypto::envelope::Envelope {
+        self.envelope_from_bytes(chunk_id, bytes)
+    }
+
     /// Deposit chunk-level crypto fields for a chunk this node is
     /// going to (or just did) write a local fragment for. The leader
     /// of an EC write fans out `PutFragment` RPCs to peers — those

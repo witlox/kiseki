@@ -228,6 +228,10 @@ Environment=KISEKI_CHUNK_FLUSH_INTERVAL_MS=100
 # only seeing the user-visible Io error.
 Environment=RUST_LOG=info,kiseki_chunk_cluster=debug
 
+# pprof CPU flamegraph dump on graceful shutdown (pprof feature). Harmless
+# when the binary was built without the feature — the env var is unread.
+Environment=KISEKI_PPROF_OUT=/var/log/kiseki-pprof.svg
+
 [Install]
 WantedBy=multi-user.target
 EOF
