@@ -224,54 +224,80 @@ PR #149 — `log_append_err` demotes routine `ForwardToLeader` /
 profiling signal but only ~0.05 % per-write CPU back (not a perf lever
 on its own — the headline win is signal clarity).
 
-### W6 — Log fsync coalescing (group-commit at the openraft log layer) · NEW 2026-06-01
-**This is the multi-protocol unblock the 2026-06-01 GCP run pointed at.**
+### W6 — Log fsync coalescing · #151 / PR #152 LANDED, **measured + REJECTED at production parameters** (Pass 4, 2026-06-01)
+**Implementation correct, hypothesis wrong, code stays in gated off.**
 
-Pass 1's off-CPU profile of node-1 under sustained PUT load:
-**12.2 % of sched-switch events were `kiseki-committer` in D state**
-(uninterruptible kernel wait on local NVMe fsync completion).
-Bench A vs Bench B in Pass 3 confirmed the per-write floor is
-~8 ms server-side under aggregate load, with the fsync contributing
-~3-4 ms of that. Pass 3 also confirmed openraft batching is doing
-its job (mean 12.3 ms → 8.1 ms when load tripled); the remaining
-fsync cost is **intra-shard** — even with batched AppendEntries
-rounds, each round still does ONE physical `Database::persist(SyncAll)`
-on its per-shard fjall instance.
+#### Predicted lift (2026-06-01 framing) vs measured (Pass 4, same day)
 
-**The fix:** add an `FsyncCoalescer` on `FjallLogStore`. Concurrent
-`flush()` callers join a small window (e.g. 500 µs / 32 entries,
-whichever fires first); one physical `db.persist(SyncAll)` covers
-all waiters. The openraft `IOFlushed::io_completed(Ok(()))` callback
-fires for every waiter when the merged fsync returns.
+| metric | predicted | measured | verdict |
+|---|---:|---:|---|
+| per-write fsync (1 client) | 3 ms → 0.3 ms | 12.4 ms → 12.4 ms | ❌ no change on critical path |
+| server-side floor (3 clients) | 8 ms → 3 ms | 8.1 ms → 8.2 ms | ❌ no change |
+| p50 (1 client) | 4 ms → 2 ms | 3.95 ms → 3.89 ms | ❌ noise |
+| p99 (1 client) | 75 ms → 10-15 ms | 108 ms → 93 ms | ⚠️ tail-only −14 % |
+| sched-switches | −50 % | 1.7 M → 1.0 M (−41 %) | ✅ as predicted |
 
-This is **opt-in via `with_fsync_coalescing(window_us, max_batch)`**
-on `FjallLogStore`. Off by default until benchmarked.
+Snapshot: [`specs/performance/2026-06-01-gcp-w6-rejected.md`](../../specs/performance/2026-06-01-gcp-w6-rejected.md).
 
-**Where it lands:**
-- `crates/kiseki-raft/src/fjall_log_store.rs` — coalescer + opt-in
-  constructor
-- `crates/kiseki-raft/src/fjall_raft_log_store.rs` — pass through
-  the coalescer options
-- `crates/kiseki-log/src/raft/openraft_store.rs` — read window /
-  batch size from env vars (`KISEKI_RAFT_FSYNC_WINDOW_US`,
-  `KISEKI_RAFT_FSYNC_BATCH`) for tunability without rebuild
+#### Why the hypothesis was wrong
 
-**Expected lift:**
-- Per-write fsync cost: ~3 ms → ~0.1-0.5 ms (one fsync covers N writes)
-- Server-side floor: 8 ms → ~3-4 ms (replication RTT dominates)
-- p50: 4 ms → ~2 ms
-- p99: 75 ms → ~10-15 ms (fewer tail-of-fsync-queue waits)
+The Pass 1 off-CPU profile **correctly identified** that 12.2 % of
+sched-switch events were `kiseki-committer` in D state on local NVMe
+fsync. W6 reduced those events as predicted (−41 % at 1-client load
+on the same node).
 
-**Crucially, benefits every protocol equally** — NFS, S3, pNFS,
-native, FUSE all funnel through the same
-`emit_chunk_and_delta` → openraft `client_write` →
-`FjallRaftLogStore::append` path. Unlike client-side route-to-leader
-(which only helps native + FUSE), W6 is the multi-protocol win.
+But **the fsync wait sits in parallel with `chunks.write_chunk` and
+the AppendEntries replication RTT inside the `tokio::try_join!` fan
+in `mem_gateway::write_impl`**. Removing one parallel branch by 3 ms
+does nothing when another parallel branch is the same length. Pass 4
+confirmed the `chunk_write` / `raft_commit` / `composition_record`
+put-phase histograms ALL show the same mean — they all stop at the
+moment both fans complete.
 
-**Risk:** introduces a small latency floor under low load (the
-window timer waits for stragglers). Mitigated by setting the
-window to 500 µs (≤ 1 % of an 8 ms write at the worst case).
-Off by default, env-var-gated for tuning.
+The Pass 1 "off-CPU wait identified" was real but **off the critical
+path**. We needed an on-CPU + per-fan timing breakdown to see this,
+not just sched_switch.
+
+#### Code disposition
+
+PR #152 stays merged. The coalescer is correct (7 unit tests pass,
+including a timing assertion proving callers actually park inside
+the window). Two reasons:
+
+1. **Useful for the rare workload where Raft-log fsync IS critical
+   path** — high-write single-shard, small object, no EC fan, no
+   replication. Niche, but real.
+2. **Removing it is more risk than leaving it gated off.** The
+   `fsync_barrier()` tri-state preserves the existing inline-SyncAll
+   shape when env vars are unset (the default).
+
+#### Where it lives
+
+- `crates/kiseki-raft/src/fsync_coalescer.rs` — the coordinator
+- `crates/kiseki-raft/src/fjall_log_store.rs` —
+  `with_fsync_coalescing(window_us, max_batch)` opt-in builder
+- `crates/kiseki-raft/src/fjall_raft_log_store.rs` —
+  `open_with_fsync_coalescing(...)` openraft wrapper
+- `crates/kiseki-log/src/raft/openraft_store.rs` — env-var gate
+  (`KISEKI_RAFT_FSYNC_WINDOW_US`, `KISEKI_RAFT_FSYNC_BATCH`); logs
+  `info!` when enabled
+
+#### What the real lever is (next diagnostic, ~$3)
+
+> **Pass 5 — hot_path span decomposition.** Same binary, same env,
+> single client, snapshot the `kiseki_gateway_hot_path_*` histograms
+> before/after. Separates `chunk_write` (chunk-store fan) from
+> `raft_commit` (intent fan). Whichever has the higher mean is the
+> real target.
+
+Three plausible outcomes:
+- **chunk_write dominates** → fix is in `kiseki-chunk` (per-chunk
+  fsync, EC fan latency); skip EC for inline-tier sizes; analogue of
+  W6 on the chunk store
+- **intent fan dominates** → openraft replication RTT is the floor;
+  network tuning, h2 flow-control, or per-shard transport batching
+- **Balanced (within ~1 ms)** → both need work; W6 deserves re-test
+  after one of them moves
 
 ### W7 — Forward-path decomposition · **profile pass, not landed**
 Pass 3's data says the forward hop adds ~30 % under aggregate load
