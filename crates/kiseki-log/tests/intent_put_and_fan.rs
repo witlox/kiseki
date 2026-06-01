@@ -151,7 +151,16 @@ fn spawn_durable_node(
 /// On a real 3-node durable shard, `put_intent_and_fan` reaches `min_acks` (the
 /// default 2 = local + >= 1 peer) and the intent is present on the LOCAL store
 /// plus at least one peer's store.
+///
+/// Slow: 4-second sleep for Raft leader election then an intent fan-out. Runs
+/// in ~4 s on a dev box but starves to 240 s+ under CI's 4-vCPU workspace-
+/// parallel load (the 4 s sleep is not enough for election under contention).
+/// Picked up by Tier 2 (`make test-slow`) and the BDD smoke gate, where the
+/// same invariant (intent fan reaches quorum on a real 3-node shard) is
+/// exercised end-to-end against spawned `kiseki-server` children with their
+/// own runtimes — no test-thread oversubscription.
 #[test]
+#[ignore = "slow: 3-node Raft election + intent fan-out; flakes under CI workspace-parallel load"]
 fn put_intent_and_fan_reaches_quorum_on_three_nodes() {
     let _env = MIN_ACKS_ENV_LOCK
         .lock()
@@ -279,7 +288,13 @@ fn put_intent_and_fan_refuses_non_durable_store() {
 /// (`put_intent_and_fan`'s quorum semantics — incl. fan-includes-leader — are
 /// pinned by the dedicated tests above; this one isolates the supervisor's
 /// become-leader → recover → drain wiring.)
+///
+/// Slow: same shape as `put_intent_and_fan_reaches_quorum_on_three_nodes` —
+/// 3-node durable Raft + a 4 s election sleep + a 6 s polling loop for the
+/// committer to incorporate. Fast (~5 s) on a dev box, but the 4 s election
+/// floor isn't enough under CI's workspace-parallel oversubscription.
 #[test]
+#[ignore = "slow: 3-node Raft election + committer-supervisor incorporate loop; flakes under CI workspace-parallel load"]
 fn committer_spawn_incorporates_intent_into_the_log() {
     let _env = MIN_ACKS_ENV_LOCK
         .lock()
