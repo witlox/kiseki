@@ -19,9 +19,10 @@ use kiseki_proto::native_contract::wire_tcp_framed::{
     build_response_header, decode_request_frame, RequestFrameView, WireDecodeError, WireStatus,
     NATIVE_TCP_FRAMED_MAX_BODY,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_rustls::TlsAcceptor;
 
 use crate::peer::tcp_framed::wire::{
     DeleteFragmentMeta, DeleteFragmentResponse, EnvelopeMeta, GetFragmentMeta,
@@ -33,19 +34,51 @@ use crate::server::ClusterChunkServer;
 
 /// Listener for the TCP-framed fabric. Cheap to clone via `Arc`; the
 /// runtime wires one per node.
+///
+/// Transport posture:
+///   - `tls_acceptor: Some(_)` → mTLS at handshake; plaintext sockets
+///     are rejected by the rustls handshake.
+///   - `tls_acceptor: None`    → plaintext (dev mode). The runtime
+///     emits the standard `PLAINTEXT — development only` warning at
+///     wire time, the same posture the gateway TCP-framed listener
+///     and the gRPC fabric service take when `cfg.tls` is unset.
 pub struct TcpFramedFabricListener {
     /// Bind address — `0.0.0.0:port` or similar.
     addr: std::net::SocketAddr,
     /// Shared handler — the same struct the gRPC adapter wraps.
     handler: Arc<ClusterChunkServer>,
+    /// rustls acceptor — `None` for plaintext dev mode. mTLS uses the
+    /// same cluster CA the gRPC fabric service trusts.
+    tls_acceptor: Option<TlsAcceptor>,
 }
 
 impl TcpFramedFabricListener {
-    /// Build a listener that will spawn one task per accepted
-    /// connection and dispatch through `handler`.
+    /// Build a plaintext listener — dev only. Production callers use
+    /// [`Self::with_tls`] to enforce the cluster mTLS posture.
     #[must_use]
     pub fn new(addr: std::net::SocketAddr, handler: Arc<ClusterChunkServer>) -> Self {
-        Self { addr, handler }
+        Self {
+            addr,
+            handler,
+            tls_acceptor: None,
+        }
+    }
+
+    /// Build an mTLS-enforcing listener. Per-connection rustls
+    /// handshake runs before the first frame is read; a peer
+    /// presenting no client cert is rejected by the rustls policy
+    /// (same posture as the gRPC fabric service).
+    #[must_use]
+    pub fn with_tls(
+        addr: std::net::SocketAddr,
+        handler: Arc<ClusterChunkServer>,
+        server_config: Arc<rustls::ServerConfig>,
+    ) -> Self {
+        Self {
+            addr,
+            handler,
+            tls_acceptor: Some(TlsAcceptor::from(server_config)),
+        }
     }
 
     /// Bind + run the accept loop. Returns only on `listener.accept()`
@@ -55,11 +88,19 @@ impl TcpFramedFabricListener {
     /// `io::Error` from `bind` or `accept`.
     pub async fn run(self) -> io::Result<()> {
         let listener = TcpListener::bind(self.addr).await?;
-        tracing::warn!(
-            target: "kiseki::fabric::tcp_framed",
-            addr = %self.addr,
-            "fabric TCP-framed listener up (plaintext — dev mode; TLS variant TBD)",
-        );
+        if self.tls_acceptor.is_some() {
+            tracing::info!(
+                target: "kiseki::fabric::tcp_framed",
+                addr = %self.addr,
+                "fabric TCP-framed listener up (mTLS)",
+            );
+        } else {
+            tracing::warn!(
+                target: "kiseki::fabric::tcp_framed",
+                addr = %self.addr,
+                "fabric TCP-framed listener up (PLAINTEXT — development only)",
+            );
+        }
         loop {
             let (stream, peer) = listener.accept().await?;
             // TCP_NODELAY — same Nagle 40ms trap as the gateway and the
@@ -68,8 +109,19 @@ impl TcpFramedFabricListener {
                 tracing::warn!(error = %e, %peer, "fabric TCP-framed: TCP_NODELAY failed");
             }
             let handler = Arc::clone(&self.handler);
+            let acceptor = self.tls_acceptor.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_connection(stream, handler).await {
+                let res = match acceptor {
+                    Some(acc) => match acc.accept(stream).await {
+                        Ok(tls) => serve_connection(tls, handler).await,
+                        Err(e) => {
+                            tracing::debug!(%peer, error = %e, "fabric TCP-framed: TLS handshake failed");
+                            Ok(())
+                        }
+                    },
+                    None => serve_connection(stream, handler).await,
+                };
+                if let Err(e) = res {
                     tracing::debug!(%peer, error = %e, "fabric TCP-framed: connection ended");
                 }
             });
@@ -78,9 +130,14 @@ impl TcpFramedFabricListener {
 }
 
 /// Per-connection read/dispatch/write loop. Errors here close the
-/// connection; the client reconnects.
-async fn serve_connection(stream: TcpStream, handler: Arc<ClusterChunkServer>) -> io::Result<()> {
-    let (mut read_half, write_half) = stream.into_split();
+/// connection; the client reconnects. Generic over `AsyncRead +
+/// AsyncWrite` so the same loop drives plaintext `TcpStream` and
+/// the rustls-wrapped variant.
+async fn serve_connection<S>(stream: S, handler: Arc<ClusterChunkServer>) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut read_half, write_half) = tokio::io::split(stream);
     let write_half = Arc::new(AsyncMutex::new(write_half));
     loop {
         // Read frame length.
@@ -181,64 +238,30 @@ fn err_from_chunk(e: &ChunkError) -> (WireStatus, Vec<u8>, Vec<u8>) {
 }
 
 // -- put_fragment ----------------------------------------------------
+// All four verb handlers now delegate to shared `handle_*` methods on
+// `ClusterChunkServer`. The adapter's job here is purely
+// codec + status mapping: postcard-decode the typed meta + bulk,
+// call the shared handler, postcard-encode the response.
 
 async fn handle_put_fragment(
     handler: &ClusterChunkServer,
     view: RequestFrameView<'_>,
 ) -> (WireStatus, Vec<u8>, Vec<u8>) {
-    let decode_started = std::time::Instant::now();
     let meta: PutFragmentMeta = match postcard::from_bytes(view.meta) {
         Ok(m) => m,
         Err(e) => return err_outcome(WireStatus::InvalidArgument, &format!("bad meta: {e}")),
     };
     let envelope = meta.envelope.with_ciphertext(view.bulk.to_vec());
-
-    // Mirror the gRPC method: record envelope crypto, observe decode
-    // phase, route by fragment_index.
-    let chunk_id = envelope.chunk_id;
-    handler.chunk_envelope_meta_for_tcp_framed().record(
-        chunk_id,
-        envelope.auth_tag,
-        envelope.nonce,
-        envelope.system_epoch,
-        envelope.tenant_epoch,
-        envelope.tenant_wrapped_material.clone(),
-    );
-    if let Some(m) = handler.metrics_for_tcp_framed() {
-        m.observe_put_recv("decode", decode_started.elapsed());
-    }
-
     let pool = if meta.pool_id.is_empty() {
         handler.default_pool_for_tcp_framed().to_owned()
     } else {
         meta.pool_id
     };
-
-    let write_started = std::time::Instant::now();
-    let stored_result = if meta.fragment_index == 0 {
-        handler
-            .local_for_tcp_framed()
-            .write_chunk(envelope, &pool)
-            .await
-    } else {
-        match handler
-            .local_for_tcp_framed()
-            .write_fragment_in_pool(&chunk_id, meta.fragment_index, envelope.ciphertext, &pool)
-            .await
-        {
-            Ok(()) => Ok(true), // EC fragment writes report stored=true
-            Err(e) => Err(e),
-        }
-    };
-    if let Some(m) = handler.metrics_for_tcp_framed() {
-        m.observe_put_recv("write_chunk", write_started.elapsed());
-    }
-    match stored_result {
-        Ok(stored) => {
-            let resp = PutFragmentResponse { stored };
-            let meta_bytes = postcard::to_allocvec(&resp).unwrap_or_default();
-            (WireStatus::Ok, meta_bytes, Vec::new())
-        }
+    match handler
+        .handle_put_fragment(meta.fragment_index, pool, envelope)
+        .await
+    {
+        Ok(stored) => ok_with(&PutFragmentResponse { stored }),
         Err(e) => err_from_chunk(&e),
     }
 }
@@ -253,48 +276,18 @@ async fn handle_get_fragment(
         Ok(m) => m,
         Err(e) => return err_outcome(WireStatus::InvalidArgument, &format!("bad meta: {e}")),
     };
-
-    if meta.fragment_index == 0 {
-        // Same dual path as gRPC: try fragment then whole-envelope.
-        if let Ok(bytes) = handler
-            .local_for_tcp_framed()
-            .read_fragment(&meta.chunk_id, 0)
-            .await
-        {
-            let env = handler.envelope_from_bytes_for_tcp_framed(meta.chunk_id, bytes);
+    match handler
+        .handle_get_fragment(meta.chunk_id, meta.fragment_index)
+        .await
+    {
+        Ok(env) => {
+            // Split envelope onto meta + bulk lanes — the V3 perf trick.
             let (em, ct) = EnvelopeMeta::split_from(env);
             let resp = GetFragmentResponseMeta { envelope: em };
             let meta_bytes = postcard::to_allocvec(&resp).unwrap_or_default();
-            return (WireStatus::Ok, meta_bytes, ct);
+            (WireStatus::Ok, meta_bytes, ct)
         }
-        match handler
-            .local_for_tcp_framed()
-            .read_chunk(&meta.chunk_id, None)
-            .await
-        {
-            Ok(env) => {
-                let (em, ct) = EnvelopeMeta::split_from(env);
-                let resp = GetFragmentResponseMeta { envelope: em };
-                let meta_bytes = postcard::to_allocvec(&resp).unwrap_or_default();
-                (WireStatus::Ok, meta_bytes, ct)
-            }
-            Err(e) => err_from_chunk(&e),
-        }
-    } else {
-        match handler
-            .local_for_tcp_framed()
-            .read_fragment(&meta.chunk_id, meta.fragment_index)
-            .await
-        {
-            Ok(bytes) => {
-                let env = handler.envelope_from_bytes_for_tcp_framed(meta.chunk_id, bytes);
-                let (em, ct) = EnvelopeMeta::split_from(env);
-                let resp = GetFragmentResponseMeta { envelope: em };
-                let meta_bytes = postcard::to_allocvec(&resp).unwrap_or_default();
-                (WireStatus::Ok, meta_bytes, ct)
-            }
-            Err(e) => err_from_chunk(&e),
-        }
+        Err(e) => err_from_chunk(&e),
     }
 }
 
@@ -308,28 +301,12 @@ async fn handle_delete_fragment(
         Ok(m) => m,
         Err(e) => return err_outcome(WireStatus::InvalidArgument, &format!("bad meta: {e}")),
     };
-    if meta.fragment_index == 0 {
-        match handler
-            .local_for_tcp_framed()
-            .decrement_refcount(&meta.chunk_id)
-            .await
-        {
-            Ok(0) => ok_with(&DeleteFragmentResponse { deleted: true }),
-            Ok(_) => ok_with(&DeleteFragmentResponse { deleted: false }),
-            Err(ChunkError::NotFound(_)) => ok_with(&DeleteFragmentResponse { deleted: false }),
-            Err(e) => err_from_chunk(&e),
-        }
-    } else {
-        match handler
-            .local_for_tcp_framed()
-            .delete_fragment(&meta.chunk_id, meta.fragment_index)
-            .await
-        {
-            Ok(was_present) => ok_with(&DeleteFragmentResponse {
-                deleted: was_present,
-            }),
-            Err(e) => err_from_chunk(&e),
-        }
+    match handler
+        .handle_delete_fragment(meta.chunk_id, meta.fragment_index)
+        .await
+    {
+        Ok(deleted) => ok_with(&DeleteFragmentResponse { deleted }),
+        Err(e) => err_from_chunk(&e),
     }
 }
 
@@ -343,24 +320,13 @@ async fn handle_has_fragment(
         Ok(m) => m,
         Err(e) => return err_outcome(WireStatus::InvalidArgument, &format!("bad meta: {e}")),
     };
-    let present = if meta.fragment_index == 0 {
-        match handler
-            .local_for_tcp_framed()
-            .refcount(&meta.chunk_id)
-            .await
-        {
-            Ok(rc) => rc > 0,
-            Err(ChunkError::NotFound(_)) => false,
-            Err(e) => return err_from_chunk(&e),
-        }
-    } else {
-        handler
-            .local_for_tcp_framed()
-            .list_fragments(&meta.chunk_id)
-            .await
-            .contains(&meta.fragment_index)
-    };
-    ok_with(&HasFragmentResponse { present })
+    match handler
+        .handle_has_fragment(meta.chunk_id, meta.fragment_index)
+        .await
+    {
+        Ok(present) => ok_with(&HasFragmentResponse { present }),
+        Err(e) => err_from_chunk(&e),
+    }
 }
 
 fn ok_with<T: serde::Serialize>(resp: &T) -> (WireStatus, Vec<u8>, Vec<u8>) {
