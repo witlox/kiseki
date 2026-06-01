@@ -214,9 +214,46 @@ impl OpenRaftLogStore {
                 LogError::StoreConstruction(format!("create_dir_all({}): {e}", raft_dir.display()))
             })?;
             let log_path = raft_dir.join(format!("shard-{}", shard_id.0));
-            let log_store = FjallRaftLogStore::<C>::open(&log_path).map_err(|e| {
-                LogError::StoreConstruction(format!("fjall open at {}: {e}", log_path.display()))
-            })?;
+            // #151 (W6) — opt-in fsync coalescing. Off by default;
+            // operators enable per-deployment by setting both
+            // env vars. The window is a duration in microseconds
+            // that a fsync request waits for stragglers; the batch
+            // is the max waiters per merged fsync. See the
+            // `kiseki_raft::fsync_coalescer` module docs for the
+            // tuning trade-off (low values approximate the legacy
+            // per-AE-round fsync; high values amortise the fsync
+            // tax across more entries at the cost of a small
+            // floor under low load).
+            let fsync_window_us: Option<u64> = std::env::var("KISEKI_RAFT_FSYNC_WINDOW_US")
+                .ok()
+                .and_then(|s| s.parse().ok());
+            let fsync_max_batch: Option<usize> = std::env::var("KISEKI_RAFT_FSYNC_BATCH")
+                .ok()
+                .and_then(|s| s.parse().ok());
+            let log_store = match (fsync_window_us, fsync_max_batch) {
+                (Some(w), Some(b)) if w > 0 && b > 0 => {
+                    tracing::info!(
+                        shard_id = %shard_id.0,
+                        window_us = w,
+                        max_batch = b,
+                        "FjallRaftLogStore: fsync coalescing ON (#151 / W6)",
+                    );
+                    FjallRaftLogStore::<C>::open_with_fsync_coalescing(&log_path, w, b).map_err(
+                        |e| {
+                            LogError::StoreConstruction(format!(
+                                "fjall open (coalesced) at {}: {e}",
+                                log_path.display()
+                            ))
+                        },
+                    )?
+                }
+                _ => FjallRaftLogStore::<C>::open(&log_path).map_err(|e| {
+                    LogError::StoreConstruction(format!(
+                        "fjall open at {}: {e}",
+                        log_path.display()
+                    ))
+                })?,
+            };
             if peers.len() > 1 {
                 let network = TcpNetworkFactory::<C>::new(shard_id);
                 Raft::new(node_id, config, network, log_store, state_machine)

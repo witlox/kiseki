@@ -46,6 +46,21 @@ impl<C: RaftTypeConfig> FjallRaftLogStore<C> {
         })
     }
 
+    /// #151 (W6) — Open with group-commit fsync coalescing on. See
+    /// [`FjallLogStore::with_fsync_coalescing`] for the contract and
+    /// tuning. `window_us == 0` is mapped to 1 µs internally.
+    pub fn open_with_fsync_coalescing(
+        path: &Path,
+        window_us: u64,
+        max_batch: usize,
+    ) -> io::Result<Self> {
+        let inner = FjallLogStore::open(path)?.with_fsync_coalescing(window_us, max_batch);
+        Ok(Self {
+            inner: Arc::new(inner),
+            _phantom: std::marker::PhantomData,
+        })
+    }
+
     /// Check whether this store has any persisted state (log entries
     /// or vote). Returns `true` if the store was previously used —
     /// the Raft node should NOT call `initialize()` on restart.
@@ -133,6 +148,17 @@ where
         // (1% of GET on GCP compact 2026-05-17).
         self.inner
             .append_batch(entries.into_iter().map(|e| (e.index(), e)))?;
+        // #151 (W6) — when the coalescer is on, `append_batch` only
+        // appended to the WAL with `PersistMode::Buffer` (no device
+        // sync yet). The durability barrier — and thus the
+        // `IOFlushed::io_completed` signal — waits on the
+        // coalescer's next merged fsync window. When the coalescer
+        // is off, `append_batch` already did the SyncAll inline and
+        // `fsync_barrier()` is a redundant-but-cheap second
+        // persist. We always go through `fsync_barrier()` so the
+        // openraft contract — *the callback fires when entries are
+        // durable* — is uniform across both modes.
+        self.inner.fsync_barrier().await?;
         callback.io_completed(Ok(()));
         Ok(())
     }
