@@ -73,6 +73,40 @@ pub fn derive_convergent_nonce(
     Ok(nonce)
 }
 
+/// #155 Win 1: derive both the per-chunk DEK and the convergent nonce
+/// from a **single** HKDF-Extract.
+///
+/// `derive_system_dek` and `derive_convergent_nonce` each call
+/// `Salt::new(HKDF_SHA256, chunk_id).extract(master)` with identical
+/// inputs — same PRK both times. RFC 5869 §3.2 explicitly contemplates
+/// multiple `expand()` calls from one `extract()`, and that's exactly
+/// what we do here: one Extract, two Expands with distinct info labels.
+///
+/// FIPS posture: identical to the pair of single-purpose functions
+/// above — same primitives (`Salt::extract`, `Prk::expand`), same
+/// FIPS-validated aws-lc-rs path, same domain separation via the
+/// `HKDF_INFO` / `HKDF_NONCE_INFO` labels. The output bytes are
+/// bit-identical to calling the two functions in sequence.
+pub fn derive_system_dek_and_nonce(
+    master: &SystemMasterKey,
+    chunk_id: &ChunkId,
+) -> Result<(Zeroizing<[u8; 32]>, [u8; 12]), CryptoError> {
+    let salt = Salt::new(HKDF_SHA256, &chunk_id.0);
+    let prk = salt.extract(master.material());
+
+    let mut dek = Zeroizing::new([0u8; 32]);
+    prk.expand(&[HKDF_INFO], HkdfLen)
+        .and_then(|okm| okm.fill(&mut *dek))
+        .map_err(|_| CryptoError::HkdfFailed)?;
+
+    let mut nonce = [0u8; 12];
+    prk.expand(&[HKDF_NONCE_INFO], NonceLen)
+        .and_then(|okm| okm.fill(&mut nonce))
+        .map_err(|_| CryptoError::HkdfFailed)?;
+
+    Ok((dek, nonce))
+}
+
 /// Derive a tenant's dedup HMAC key from the master key (ADR-044).
 ///
 /// `chunk_id = HMAC-SHA256(tenant_dedup_key, plaintext)` under
@@ -200,6 +234,27 @@ mod tests {
             &dek[..12],
             "nonce must be domain-separated from the DEK"
         );
+    }
+
+    // #155 Win 1: combined derivation.
+
+    #[test]
+    fn combined_dek_and_nonce_matches_pair() {
+        // The combined `derive_system_dek_and_nonce` MUST produce
+        // bit-identical output to the pair of single-purpose calls.
+        // This is the FIPS-equivalence claim: same primitives + same
+        // domain separation = same bytes.
+        let master = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
+        for chunk_byte in [0x00u8, 0xab, 0xff] {
+            let chunk_id = ChunkId([chunk_byte; 32]);
+            let dek_solo = derive_system_dek(&master, &chunk_id).unwrap_or_else(|_| unreachable!());
+            let nonce_solo =
+                derive_convergent_nonce(&master, &chunk_id).unwrap_or_else(|_| unreachable!());
+            let (dek_combo, nonce_combo) =
+                derive_system_dek_and_nonce(&master, &chunk_id).unwrap_or_else(|_| unreachable!());
+            assert_eq!(*dek_solo, *dek_combo, "DEK must match pair output");
+            assert_eq!(nonce_solo, nonce_combo, "nonce must match pair output");
+        }
     }
 
     // ADR-044 tenant dedup HMAC key.
