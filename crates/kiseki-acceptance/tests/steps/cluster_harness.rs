@@ -572,6 +572,16 @@ fn spawn_with_env(
         .env("KISEKI_PEER_DATA_ADDRS", fabric_peers_env)
         .env("KISEKI_DS_PEERS", ds_peers_env)
         .env("KISEKI_BOOTSTRAP", if bootstrap { "true" } else { "false" })
+        // 2026-06-01: the runtime now defaults to TCP-framed fabric
+        // (ADR-042 §2.2 applied to the inter-node hop) and binds the
+        // listener on `data_port + 50`. The BDD harness allocates
+        // ephemeral ports for `grpc_data`, and `+50` from one node's
+        // grpc_data can collide with another node's allocated ports.
+        // Pin the harness to gRPC fabric until the harness learns to
+        // allocate a fabric-tcp port and thread `KISEKI_FABRIC_TCP_*`
+        // env vars through. Production stays on TCP-framed by default
+        // (no env var → default = tcp). Tracked in followup #350.
+        .env("KISEKI_FABRIC_TRANSPORT", "grpc")
         .env("KISEKI_ALLOW_PLAINTEXT_NFS", "true")
         .env("KISEKI_INSECURE_NFS", "true")
         // Enables `/admin/test/...` endpoints (drop fragment, fabric
