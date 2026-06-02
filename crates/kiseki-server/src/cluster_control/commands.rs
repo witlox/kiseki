@@ -9,6 +9,7 @@
 //! per-shard Raft group creation locally on each node.
 
 use kiseki_common::ids::{NodeId, OrgId, ShardId};
+use kiseki_common::{NodeDeviceInventory, PlacementPolicy, WorkloadParams};
 use serde::{Deserialize, Serialize};
 
 /// One mutation to the cluster's namespace shard map.
@@ -84,6 +85,36 @@ pub enum ControlCommand {
         /// The shard to remove. No-op if not present.
         shard_id: ShardId,
     },
+    /// ADR-049 — upsert this node's device inventory into the
+    /// cluster catalog. Submitted at boot AND every
+    /// `KISEKI_INVENTORY_REFRESH_MS` (default 60 s). Apply MUST be
+    /// idempotent on identical inputs (I-DI6): re-publishing an
+    /// unchanged inventory MUST NOT bump `policy_revision` and
+    /// MUST NOT touch `policy_change_ms`. It MAY update
+    /// `inventory_change_ms` for D10 observability.
+    UpsertNodeInventory {
+        /// The node this inventory belongs to.
+        node_id: NodeId,
+        /// Discovered + tagged devices.
+        inventory: NodeDeviceInventory,
+    },
+    /// ADR-049 — replace the cluster placement policy. Apply
+    /// runs the I-DI9 gate (re-resolve against current inventories;
+    /// Strict rejects if any node would violate I-DI8). On commit,
+    /// bumps `policy_revision` and `policy_change_ms` (the
+    /// `await_catalog_ready` quiescence clock; rev-4 N-5 fix).
+    SetPlacementPolicy {
+        /// The new policy to install.
+        policy: PlacementPolicy,
+    },
+    /// ADR-049 — replace the cluster workload parameters
+    /// (capacity-formula inputs). Apply runs the I-DI9 gate.
+    /// On commit, bumps `policy_revision` and `policy_change_ms`
+    /// (same quiescence clock as `SetPlacementPolicy`).
+    SetWorkloadParams {
+        /// The new workload params to install.
+        params: WorkloadParams,
+    },
 }
 
 // I-K8-style courtesy: Display omits payload bytes (key ranges) so
@@ -124,6 +155,20 @@ impl std::fmt::Display for ControlCommand {
                 namespace_id,
                 shard_id,
             } => write!(f, "RetireShard(ns={namespace_id}, shard={:?})", shard_id.0),
+            Self::UpsertNodeInventory { node_id, inventory } => write!(
+                f,
+                "UpsertNodeInventory(node={:?}, devices={})",
+                node_id.0,
+                inventory.devices.len()
+            ),
+            Self::SetPlacementPolicy { policy } => {
+                write!(f, "SetPlacementPolicy(tiers={})", policy.tiers.len())
+            }
+            Self::SetWorkloadParams { params } => write!(
+                f,
+                "SetWorkloadParams(avg_file_bytes={}, R={}, headroom_pct={})",
+                params.avg_file_bytes, params.metadata_replication, params.fast_headroom_pct,
+            ),
         }
     }
 }

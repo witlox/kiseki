@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use futures::TryStreamExt;
 use kiseki_common::ids::{NodeId, OrgId, ShardId};
+use kiseki_common::ClusterDeviceCatalog;
 use kiseki_control::shard_topology::{
     NamespaceCreationState, NamespaceShardMap, NamespaceShardMapStore, ShardRange,
 };
@@ -110,10 +111,20 @@ impl NamespaceShardMapSnapshot {
 /// One snapshot of the entire control-plane state — used both for
 /// openraft's snapshot install/build path and for unit tests that
 /// want to deterministically inspect the post-apply state.
+///
+/// ADR-049 phase 1 added `catalog` with `#[serde(default)]` so a
+/// pre-upgrade snapshot (no `catalog` field) decodes cleanly into
+/// `ClusterDeviceCatalog::default()`. Subsequent
+/// `UpsertNodeInventory` / `SetPlacementPolicy` /
+/// `SetWorkloadParams` applies then populate it. Q36 acceptance.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ControlSnapshot {
     /// All namespaces known to the control plane.
     pub namespaces: HashMap<String, NamespaceShardMapSnapshot>,
+    /// ADR-049 cluster device catalog. `#[serde(default)]` keeps
+    /// pre-upgrade snapshots decodable.
+    #[serde(default)]
+    pub catalog: ClusterDeviceCatalog,
 }
 
 /// Inner state shared between the `RaftStateMachine` impl and
@@ -122,6 +133,11 @@ pub struct ControlSnapshot {
 /// `apply` future.
 pub(crate) struct StateMachineInner {
     pub(crate) namespaces: HashMap<String, NamespaceShardMapSnapshot>,
+    /// ADR-049 cluster device catalog. Mutated by
+    /// `UpsertNodeInventory` / `SetPlacementPolicy` /
+    /// `SetWorkloadParams` applies. Read by every node's
+    /// `await_catalog_ready` + resolver at boot.
+    pub(crate) catalog: ClusterDeviceCatalog,
     pub(crate) last_applied_log: Option<LogIdOf<C>>,
     pub(crate) last_membership: StoredMembershipOf<C>,
 }
@@ -130,6 +146,7 @@ impl StateMachineInner {
     pub(crate) fn new() -> Self {
         Self {
             namespaces: HashMap::new(),
+            catalog: ClusterDeviceCatalog::default(),
             last_applied_log: None,
             last_membership: StoredMembershipOf::<C>::default(),
         }
@@ -260,8 +277,65 @@ impl StateMachineInner {
                 }
                 ControlResponse::Applied
             }
+            ControlCommand::UpsertNodeInventory { node_id, inventory } => {
+                // ADR-049 I-DI6: idempotent on identical inputs. Compare
+                // against current state; skip the mutation if unchanged
+                // so a re-publish during refresh churn does NOT bump
+                // `inventory_change_ms`.
+                let changed = self
+                    .catalog
+                    .inventories
+                    .get(node_id)
+                    .is_none_or(|cur| cur != inventory);
+                if changed {
+                    self.catalog.inventories.insert(*node_id, inventory.clone());
+                    // `inventory_change_ms` is for D10 observability
+                    // only and explicitly NOT the quiescence clock
+                    // (rev-4 N-5 fix). `policy_change_ms` stays put.
+                    self.catalog.inventory_change_ms = now_ms();
+                }
+                ControlResponse::Applied
+            }
+            ControlCommand::SetPlacementPolicy { policy } => {
+                // ADR-049 I-DI9 + I-DI8 (apply-time gate): re-resolve
+                // budgets against current inventories; Strict rejects
+                // policies that would violate I-DI8 on any node.
+                // BestEffort always applies and emits a
+                // `policy_apply_rebudget` event for each node whose
+                // budget shrinks below current actual usage.
+                //
+                // Phase 1 lands the variant + bump; the I-DI9 gate
+                // is wired in phase 4 (admin RPC + resolver land
+                // first so the gate can call `compute_cluster_budgets`).
+                // Until then, apply unconditionally — pre-prod
+                // accepts this; production gating ships before any
+                // public release.
+                if self.catalog.policy != *policy {
+                    self.catalog.policy = policy.clone();
+                    self.catalog.policy_revision = self.catalog.policy_revision.saturating_add(1);
+                    self.catalog.policy_change_ms = now_ms();
+                }
+                ControlResponse::Applied
+            }
+            ControlCommand::SetWorkloadParams { params } => {
+                if self.catalog.workload != *params {
+                    self.catalog.workload = *params;
+                    self.catalog.policy_revision = self.catalog.policy_revision.saturating_add(1);
+                    self.catalog.policy_change_ms = now_ms();
+                }
+                ControlResponse::Applied
+            }
         }
     }
+}
+
+/// Wall-clock helper used by ADR-049 apply paths.
+/// Returns 0 if `SystemTime::now()` is before the epoch (impossible
+/// on a sane host, but the apply path must not panic).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 fn shard_record_to_snapshot(r: &ShardRecord) -> ShardSnapshot {
@@ -413,9 +487,18 @@ impl ControlStateMachine {
             // state-machine snapshot. Follow-up: thread split/merge
             // updates through too (tracked alongside the split/merge
             // BDD scenarios).
+            //
+            // ADR-049 catalog mutations (`UpsertNodeInventory` /
+            // `SetPlacementPolicy` / `SetWorkloadParams`) also don't
+            // touch the namespace shard map; they live in
+            // `ClusterDeviceCatalog` and are read directly by the
+            // resolver + admin RPC.
             ControlCommand::RecordSplit { .. }
             | ControlCommand::RecordMerge { .. }
-            | ControlCommand::RetireShard { .. } => {}
+            | ControlCommand::RetireShard { .. }
+            | ControlCommand::UpsertNodeInventory { .. }
+            | ControlCommand::SetPlacementPolicy { .. }
+            | ControlCommand::SetWorkloadParams { .. } => {}
         }
     }
 
@@ -425,7 +508,17 @@ impl ControlStateMachine {
         let inner = self.inner.lock().await;
         ControlSnapshot {
             namespaces: inner.namespaces.clone(),
+            catalog: inner.catalog.clone(),
         }
+    }
+
+    /// Read-only catalog snapshot — used by the ADR-049 resolver,
+    /// admin RPCs, and observability gauges; avoids cloning the
+    /// whole `ControlSnapshot` when only the catalog is needed.
+    #[allow(dead_code)]
+    pub async fn catalog(&self) -> ClusterDeviceCatalog {
+        let inner = self.inner.lock().await;
+        inner.catalog.clone()
     }
 
     /// Get a single namespace's shard map. `None` if the namespace
@@ -448,6 +541,7 @@ impl RaftSnapshotBuilder<C> for ControlStateMachine {
         let inner = self.inner.lock().await;
         let snap = ControlSnapshot {
             namespaces: inner.namespaces.clone(),
+            catalog: inner.catalog.clone(),
         };
         let data = serde_json::to_vec(&snap).map_err(io::Error::other)?;
         let snapshot_id = format!(
@@ -604,6 +698,7 @@ impl RaftStateMachine<C> for ControlStateMachine {
         }
         let mut inner = self.inner.lock().await;
         inner.namespaces = snap.namespaces;
+        inner.catalog = snap.catalog;
         inner.last_applied_log = meta.last_log_id;
         inner.last_membership = meta.last_membership.clone();
         Ok(())
@@ -616,6 +711,7 @@ impl RaftStateMachine<C> for ControlStateMachine {
         };
         let snap = ControlSnapshot {
             namespaces: inner.namespaces.clone(),
+            catalog: inner.catalog.clone(),
         };
         let data = serde_json::to_vec(&snap).map_err(io::Error::other)?;
         let meta = SnapshotMetaOf::<C> {
@@ -836,11 +932,172 @@ mod tests {
         });
         let snap = ControlSnapshot {
             namespaces: sm.namespaces.clone(),
+            catalog: sm.catalog.clone(),
         };
         let bytes = serde_json::to_vec(&snap).expect("serialize");
         let parsed: ControlSnapshot = serde_json::from_slice(&bytes).expect("deserialize");
         assert_eq!(parsed.namespaces.len(), 1);
         assert_eq!(parsed.namespaces[&ns()].shards.len(), 1);
         assert_eq!(parsed.namespaces[&ns()].shards[0].shard_id, shard(1));
+    }
+
+    // ---- ADR-049 phase 1 catalog apply tests ----
+
+    fn inventory(node: u64, fast_gib: u64, slow_gib: u64) -> kiseki_common::NodeDeviceInventory {
+        use kiseki_common::{DeviceEntry, MediaType, NodeDeviceInventory};
+        use std::path::PathBuf;
+        let gib = 1024 * 1024 * 1024;
+        NodeDeviceInventory {
+            node_id: NodeId(node),
+            devices: vec![
+                DeviceEntry {
+                    mount_path: PathBuf::from(format!("/mnt/nvme{node}")),
+                    media_class: MediaType::Nvme,
+                    total_bytes: fast_gib * gib,
+                    free_bytes: fast_gib * gib,
+                    tag: None,
+                    exclusive: true,
+                },
+                DeviceEntry {
+                    mount_path: PathBuf::from(format!("/mnt/sata{node}")),
+                    media_class: MediaType::Ssd,
+                    total_bytes: slow_gib * gib,
+                    free_bytes: slow_gib * gib,
+                    tag: None,
+                    exclusive: true,
+                },
+            ],
+            refreshed_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn upsert_node_inventory_populates_catalog_and_bumps_inventory_clock() {
+        let mut sm = StateMachineInner::new();
+        let before_policy_ms = sm.catalog.policy_change_ms;
+        let resp = sm.apply_command(&ControlCommand::UpsertNodeInventory {
+            node_id: NodeId(7),
+            inventory: inventory(7, 1500, 8000),
+        });
+        assert_eq!(resp, ControlResponse::Applied);
+        assert_eq!(sm.catalog.inventories.len(), 1);
+        assert!(sm.catalog.inventories.contains_key(&NodeId(7)));
+        // policy_change_ms (the quiescence clock — N-5 fix) MUST NOT
+        // be touched by inventory upserts; inventory_change_ms (D10)
+        // MUST be bumped.
+        assert_eq!(
+            sm.catalog.policy_change_ms, before_policy_ms,
+            "UpsertNodeInventory must not touch the quiescence clock"
+        );
+        assert!(sm.catalog.inventory_change_ms > 0);
+    }
+
+    #[test]
+    fn upsert_node_inventory_is_idempotent_on_identical_inputs() {
+        // I-DI6 (refresh idempotency): re-publishing identical
+        // inventory MUST NOT touch inventory_change_ms either.
+        let mut sm = StateMachineInner::new();
+        sm.apply_command(&ControlCommand::UpsertNodeInventory {
+            node_id: NodeId(7),
+            inventory: inventory(7, 1500, 8000),
+        });
+        let after_first = sm.catalog.inventory_change_ms;
+        // Sleep a millisecond so a clock-bump would be visible.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        sm.apply_command(&ControlCommand::UpsertNodeInventory {
+            node_id: NodeId(7),
+            inventory: inventory(7, 1500, 8000),
+        });
+        assert_eq!(
+            sm.catalog.inventory_change_ms, after_first,
+            "identical re-publish must be a no-op (I-DI6)"
+        );
+        assert_eq!(sm.catalog.inventories.len(), 1);
+    }
+
+    #[test]
+    fn set_placement_policy_bumps_revision_and_quiescence_clock() {
+        let mut sm = StateMachineInner::new();
+        let before_rev = sm.catalog.policy_revision;
+        let resp = sm.apply_command(&ControlCommand::SetPlacementPolicy {
+            policy: kiseki_common::PlacementPolicy::built_in_default(),
+        });
+        assert_eq!(resp, ControlResponse::Applied);
+        assert_eq!(sm.catalog.policy_revision, before_rev + 1);
+        assert!(sm.catalog.policy_change_ms > 0);
+    }
+
+    #[test]
+    fn set_workload_params_bumps_revision_and_quiescence_clock() {
+        let mut sm = StateMachineInner::new();
+        let before_rev = sm.catalog.policy_revision;
+        let mut params = kiseki_common::WorkloadParams::default();
+        params.avg_file_bytes = 64 * 1024;
+        let resp = sm.apply_command(&ControlCommand::SetWorkloadParams { params });
+        assert_eq!(resp, ControlResponse::Applied);
+        assert_eq!(sm.catalog.policy_revision, before_rev + 1);
+        assert_eq!(sm.catalog.workload.avg_file_bytes, 64 * 1024);
+        assert!(sm.catalog.policy_change_ms > 0);
+    }
+
+    #[test]
+    fn idempotent_policy_set_does_not_bump_revision() {
+        // Replaying the same policy MUST NOT bump revision (I-DI6
+        // applies broadly — idempotent applies don't churn the
+        // catalog).
+        let mut sm = StateMachineInner::new();
+        sm.apply_command(&ControlCommand::SetPlacementPolicy {
+            policy: kiseki_common::PlacementPolicy::built_in_default(),
+        });
+        let after_first = sm.catalog.policy_revision;
+        sm.apply_command(&ControlCommand::SetPlacementPolicy {
+            policy: kiseki_common::PlacementPolicy::built_in_default(),
+        });
+        assert_eq!(sm.catalog.policy_revision, after_first);
+    }
+
+    #[test]
+    fn catalog_round_trips_through_full_snapshot_install_path() {
+        // ADR-049 phase 1 wire test: snapshot includes catalog,
+        // install repopulates it. Q36 acceptance: future field
+        // additions are forward-compatible via #[serde(default)].
+        let mut sm = StateMachineInner::new();
+        sm.apply_command(&ControlCommand::CreateNamespace {
+            namespace_id: ns(),
+            tenant_id: org(),
+            shards: vec![full_range(shard(1))],
+        });
+        sm.apply_command(&ControlCommand::UpsertNodeInventory {
+            node_id: NodeId(7),
+            inventory: inventory(7, 1500, 8000),
+        });
+        sm.apply_command(&ControlCommand::SetPlacementPolicy {
+            policy: kiseki_common::PlacementPolicy::built_in_default(),
+        });
+        let snap = ControlSnapshot {
+            namespaces: sm.namespaces.clone(),
+            catalog: sm.catalog.clone(),
+        };
+        let bytes = serde_json::to_vec(&snap).expect("serialize");
+        let parsed: ControlSnapshot = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(parsed.namespaces.len(), 1);
+        assert_eq!(parsed.catalog.inventories.len(), 1);
+        assert!(parsed.catalog.inventories.contains_key(&NodeId(7)));
+        assert_eq!(parsed.catalog.policy_revision, 1);
+        assert!(!parsed.catalog.policy.tiers.is_empty());
+    }
+
+    #[test]
+    fn pre_upgrade_snapshot_decodes_with_serde_default_catalog() {
+        // Q36 acceptance: a pre-upgrade snapshot (no `catalog`
+        // field in the JSON) MUST decode cleanly via
+        // #[serde(default)] -> ClusterDeviceCatalog::default().
+        let pre_upgrade_json = r#"{"namespaces": {}}"#;
+        let parsed: ControlSnapshot =
+            serde_json::from_str(pre_upgrade_json).expect("forward-compat decode");
+        assert!(parsed.namespaces.is_empty());
+        assert!(parsed.catalog.inventories.is_empty());
+        assert_eq!(parsed.catalog.policy_revision, 0);
+        assert!(parsed.catalog.policy.tiers.is_empty());
     }
 }
