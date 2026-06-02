@@ -480,6 +480,34 @@ fn take_array16(cur: &mut &[u8]) -> Result<[u8; 16], IntentError> {
         .map_err(|_| IntentError::Codec("truncated value idem key".to_string()))
 }
 
+/// In-memory mirror of the pending intent set + idempotency-key index.
+///
+/// W11 (2026-06-02): the 2026-06-02 GCP profile showed `FjallIntentStore::
+/// remove_seqs` still consuming 70.5 % of every storage-node core AFTER the
+/// W7 batching — the per-element fjall `get` inside the batch loop was
+/// burning CPU on **already-pruned no-op snapshot entries**. This struct
+/// keeps a memory mirror of the durable state so the hot-path operations
+/// (`pending`, `next_pending_seq`, `pending_len`, and the dedup check in
+/// `put`) skip fjall entirely, and `remove_seqs` / `remove_seq` / `prune`
+/// only touch fjall for seqs actually present.
+///
+/// The fjall keyspaces stay the SOURCE OF TRUTH: the index is rebuilt from
+/// a one-time scan at `open()` and kept consistent on every mutation by
+/// updating it AFTER a successful fjall commit (under the existing
+/// `mutations` mutex). A crash before commit leaves both untouched; a
+/// crash after commit but before index update is fine because the next
+/// `open()` rebuilds from fjall.
+#[derive(Default)]
+struct PendingIndex {
+    /// Seq → intent, `BTreeMap` so iteration is ascending (matches
+    /// `pending()`'s contract: ascending perspective-seq) and `range(..=k)`
+    /// drives `prune`'s cutoff walk.
+    by_seq: BTreeMap<PerspectiveSeq, WriteIntent>,
+    /// Idempotency key → its current seq, for ADR-047 §5 / O3 dedup
+    /// without touching the durable `idem` keyspace.
+    by_idem: HashMap<IdempotencyKey, PerspectiveSeq>,
+}
+
 /// Durable, fjall-backed [`IntentStore`] (ADR-047 phase 2).
 ///
 /// Single-node durable store — NO quorum replication (that lands in a
@@ -494,6 +522,12 @@ fn take_array16(cur: &mut &[u8]) -> Result<[u8; 16], IntentError> {
 /// `WriteBatch`, so a crash never leaves a dedup pointer without its
 /// intent (or vice-versa). Durability per commit follows `sync_per_write`
 /// exactly as `kiseki_chunk`'s `FjallMetaStore` does.
+///
+/// W11 (2026-06-02): an in-memory [`PendingIndex`] mirror serves the
+/// hot-path reads (`pending`, `next_pending_seq`, `pending_len`, dedup
+/// in `put`) so the supervisor tick doesn't drive the per-shard LSM
+/// memtable for every snapshot entry. fjall remains the durable
+/// authority; the mirror is rebuilt on `open()`.
 pub struct FjallIntentStore {
     db: Database,
     intents_ks: Keyspace,
@@ -510,6 +544,10 @@ pub struct FjallIntentStore {
     /// in-memory store). Coarse but correct for the single-node store; the
     /// quorum-write phase revisits granularity.
     mutations: Mutex<()>,
+    /// W11 (2026-06-02): in-memory mirror of pending state — see
+    /// [`PendingIndex`]. Updated AFTER successful fjall commits (under
+    /// `mutations`), rebuilt from fjall on `open()`.
+    pending_index: Mutex<PendingIndex>,
 }
 
 impl FjallIntentStore {
@@ -553,12 +591,36 @@ impl FjallIntentStore {
             batch.commit()?;
         }
 
+        // W11 (2026-06-02): rebuild the in-memory mirror from the durable
+        // intents keyspace. ONE LSM scan amortised over the lifetime of
+        // the store; subsequent reads (`pending`, `next_pending_seq`,
+        // `pending_len`, dedup) are pure memory ops.
+        let mut by_seq: BTreeMap<PerspectiveSeq, WriteIntent> = BTreeMap::new();
+        let mut by_idem: HashMap<IdempotencyKey, PerspectiveSeq> = HashMap::new();
+        for entry in intents_ks.iter() {
+            let (k, v) = entry.into_inner()?;
+            let seq = decode_seq_key(k.as_ref())?;
+            let decoded = decode_value(v.as_ref())?;
+            if let Some(idem) = decoded.idempotency_key {
+                by_idem.insert(idem, seq);
+            }
+            by_seq.insert(
+                seq,
+                WriteIntent {
+                    perspective_seq: seq,
+                    idempotency_key: decoded.idempotency_key,
+                    append: decoded.append,
+                },
+            );
+        }
+
         Ok(Self {
             db,
             intents_ks,
             idem_ks,
             sync_per_write: AtomicBool::new(true),
             mutations: Mutex::new(()),
+            pending_index: Mutex::new(PendingIndex { by_seq, by_idem }),
         })
     }
 
@@ -598,17 +660,22 @@ impl IntentStore for FjallIntentStore {
             .mutations
             .lock()
             .lock_or_die("intent_store.fjall.mutations");
-        // Idempotency check first: a duplicate key returns the ORIGINAL
-        // seq and writes nothing (ADR-047 §5 / O3). The dedup pointer is
-        // persisted, so this holds across reopen.
+        // W11: dedup via the in-memory mirror. The mirror reflects fjall
+        // (rebuilt on open + maintained under `mutations`), so this check
+        // is consistent with the durable state.
         if let Some(key) = intent.idempotency_key {
-            if let Some(existing) = self.idem_ks.get(key)? {
-                let seq = decode_seq_key(existing.as_ref())?;
-                return Ok(PutOutcome::Duplicate(seq));
+            let idx = self
+                .pending_index
+                .lock()
+                .lock_or_die("intent_store.fjall.pending_index");
+            if let Some(&existing) = idx.by_idem.get(&key) {
+                return Ok(PutOutcome::Duplicate(existing));
             }
         }
 
-        let seq_key = encode_seq_key(intent.perspective_seq);
+        let seq = intent.perspective_seq;
+        let idem = intent.idempotency_key;
+        let seq_key = encode_seq_key(seq);
         let value = encode_value(&intent);
 
         // One batch: the intent row and (if keyed) its dedup pointer
@@ -616,36 +683,40 @@ impl IntentStore for FjallIntentStore {
         // nothing, so a dedup pointer never outlives its intent.
         let mut batch = self.batch_for_write();
         batch.insert(&self.intents_ks, seq_key.to_vec(), value);
-        if let Some(key) = intent.idempotency_key {
+        if let Some(key) = idem {
             batch.insert(&self.idem_ks, key.to_vec(), seq_key.to_vec());
         }
         batch.commit()?;
+
+        // W11: durable commit succeeded — update the mirror to match.
+        let mut idx = self
+            .pending_index
+            .lock()
+            .lock_or_die("intent_store.fjall.pending_index");
+        if let Some(key) = idem {
+            idx.by_idem.insert(key, seq);
+        }
+        idx.by_seq.insert(seq, intent);
         Ok(PutOutcome::Recorded)
     }
 
     fn pending(&self) -> Result<Vec<WriteIntent>, IntentError> {
-        let mut out = Vec::new();
-        for entry in self.intents_ks.iter() {
-            let (k, v) = entry.into_inner()?;
-            let seq = decode_seq_key(k.as_ref())?;
-            let decoded = decode_value(v.as_ref())?;
-            out.push(WriteIntent {
-                perspective_seq: seq,
-                idempotency_key: decoded.idempotency_key,
-                append: decoded.append,
-            });
-        }
-        Ok(out)
+        // W11: pure memory read. BTreeMap iterates ascending by seq, which
+        // matches the IntentStore::pending contract.
+        let idx = self
+            .pending_index
+            .lock()
+            .lock_or_die("intent_store.fjall.pending_index");
+        Ok(idx.by_seq.values().cloned().collect())
     }
 
     fn next_pending_seq(&self) -> Result<Option<PerspectiveSeq>, IntentError> {
-        match self.intents_ks.iter().next() {
-            Some(entry) => {
-                let (k, _v) = entry.into_inner()?;
-                Ok(Some(decode_seq_key(k.as_ref())?))
-            }
-            None => Ok(None),
-        }
+        // W11: pure memory read — BTreeMap::keys().next() is the lowest.
+        let idx = self
+            .pending_index
+            .lock()
+            .lock_or_die("intent_store.fjall.pending_index");
+        Ok(idx.by_seq.keys().next().copied())
     }
 
     fn prune(&self, up_to: PerspectiveSeq) -> Result<(), IntentError> {
@@ -655,27 +726,45 @@ impl IntentStore for FjallIntentStore {
             .mutations
             .lock()
             .lock_or_die("intent_store.fjall.mutations");
-        let cutoff = encode_seq_key(up_to);
+        // W11: walk the in-memory mirror's `..=up_to` range to identify
+        // the intents to drop + their idem keys. Avoids the fjall LSM
+        // scan over the durable keyspace.
+        let work: Vec<(PerspectiveSeq, Option<IdempotencyKey>)> = {
+            let idx = self
+                .pending_index
+                .lock()
+                .lock_or_die("intent_store.fjall.pending_index");
+            idx.by_seq
+                .range(..=up_to)
+                .map(|(s, intent)| (*s, intent.idempotency_key))
+                .collect()
+        };
+        if work.is_empty() {
+            return Ok(());
+        }
+        // Drop the intent rows and dedup pointers in one batch so a crash
+        // mid-prune never leaves a pointer without its intent.
         let mut batch = self.batch_for_write();
-        // Iterate intents with seq-key ≤ cutoff (inclusive). Keys are
-        // order-preserving, so a byte-wise `<=` is exactly seq `<= up_to`.
-        for entry in self.intents_ks.iter() {
-            let (k, v) = entry.into_inner()?;
-            if k.as_ref() > cutoff.as_slice() {
-                // Ascending order — the first strictly-greater key means
-                // nothing past it can be ≤ cutoff. Stop scanning.
-                break;
-            }
-            // Drop the intent row and, if it carried one, its dedup
-            // pointer — both in the same batch so the pair stays
-            // consistent across a crash mid-prune.
-            batch.remove(&self.intents_ks, k.as_ref().to_vec());
-            let decoded = decode_value(v.as_ref())?;
-            if let Some(idem) = decoded.idempotency_key {
-                batch.remove(&self.idem_ks, idem.to_vec());
+        for (seq, idem) in &work {
+            let seq_key = encode_seq_key(*seq);
+            batch.remove(&self.intents_ks, seq_key.to_vec());
+            if let Some(k) = idem {
+                batch.remove(&self.idem_ks, k.to_vec());
             }
         }
         batch.commit()?;
+
+        // Durable commit succeeded — bring the mirror into line.
+        let mut idx = self
+            .pending_index
+            .lock()
+            .lock_or_die("intent_store.fjall.pending_index");
+        for (seq, idem) in &work {
+            idx.by_seq.remove(seq);
+            if let Some(k) = idem {
+                idx.by_idem.remove(k);
+            }
+        }
         Ok(())
     }
 
@@ -686,41 +775,54 @@ impl IntentStore for FjallIntentStore {
             .mutations
             .lock()
             .lock_or_die("intent_store.fjall.mutations");
-        let seq_key = encode_seq_key(seq);
-        let Some(v) = self.intents_ks.get(seq_key)? else {
-            // Idempotent — no-op when the seq is already gone.
-            return Ok(());
+        // W11: look up via the in-memory mirror. Absent → no-op without
+        // touching fjall (was the bulk of the 70 % CPU hit pre-W11).
+        let idem = {
+            let idx = self
+                .pending_index
+                .lock()
+                .lock_or_die("intent_store.fjall.pending_index");
+            match idx.by_seq.get(&seq) {
+                Some(intent) => intent.idempotency_key,
+                None => return Ok(()),
+            }
         };
-        let decoded = decode_value(v.as_ref())?;
+        let seq_key = encode_seq_key(seq);
         let mut batch = self.batch_for_write();
         batch.remove(&self.intents_ks, seq_key.to_vec());
-        if let Some(idem) = decoded.idempotency_key {
-            // Match the in-mem impl: only drop the dedup pointer if it still
-            // points at THIS seq (a later put may have replaced it).
-            if let Some(pointer) = self.idem_ks.get(idem)? {
+        if let Some(k) = idem {
+            // Only drop the dedup pointer if it still points at THIS seq.
+            // The mirror's invariant (an idem-pointed seq is always live)
+            // means in the common case the pointer matches; we still
+            // re-check fjall so the durable state stays consistent if a
+            // future change relaxes the mirror's coupling.
+            if let Some(pointer) = self.idem_ks.get(k)? {
                 if pointer.as_ref() == seq_key.as_slice() {
-                    batch.remove(&self.idem_ks, idem.to_vec());
+                    batch.remove(&self.idem_ks, k.to_vec());
                 }
             }
         }
         batch.commit()?;
+
+        let mut idx = self
+            .pending_index
+            .lock()
+            .lock_or_die("intent_store.fjall.pending_index");
+        idx.by_seq.remove(&seq);
+        if let Some(k) = idem {
+            if idx.by_idem.get(&k).copied() == Some(seq) {
+                idx.by_idem.remove(&k);
+            }
+        }
         Ok(())
     }
 
     fn remove_seqs(&self, seqs: &[PerspectiveSeq]) -> Result<(), IntentError> {
-        // W7 (2026-06-02): batched per-seq prune. Same per-seq atomicity
-        // contract as `remove_seq` — intent row + dedup pointer go together
-        // — but the whole snapshot lands in ONE batch and ONE commit. The
-        // 2026-06-02 GCP profile showed `remove_seq` called per-element from
-        // `run_supervisor_loop` consuming 71.75% of every storage-node core;
-        // every call paid one fjall `get` + one batch commit (≈ one WAL
-        // sync). Batching collapses that to one mutex acquisition + one
-        // commit per supervisor tick.
-        //
-        // Most snapshot entries are no-ops (the SM's recent-incorporated set
-        // races ahead of the local prune state by a few ticks; entries the
-        // local store has already dropped are skipped here at zero cost
-        // beyond the `get`).
+        // W7 (2026-06-02): batched per-seq prune — one mutex + one batch
+        // commit per supervisor tick. W11 (2026-06-02): consults the
+        // in-memory mirror first so absent seqs (the common case — the
+        // SM's `recent_incorporated_seqs` snapshot tail) are no-ops
+        // WITHOUT a fjall `get` per element.
         if seqs.is_empty() {
             return Ok(());
         }
@@ -728,34 +830,62 @@ impl IntentStore for FjallIntentStore {
             .mutations
             .lock()
             .lock_or_die("intent_store.fjall.mutations");
+
+        // W11: filter against the mirror — present seqs go to the batch,
+        // absent seqs are skipped at zero LSM cost.
+        let work: Vec<(PerspectiveSeq, Option<IdempotencyKey>)> = {
+            let idx = self
+                .pending_index
+                .lock()
+                .lock_or_die("intent_store.fjall.pending_index");
+            seqs.iter()
+                .filter_map(|&seq| {
+                    idx.by_seq
+                        .get(&seq)
+                        .map(|intent| (seq, intent.idempotency_key))
+                })
+                .collect()
+        };
+        if work.is_empty() {
+            return Ok(());
+        }
+
         let mut batch = self.batch_for_write();
-        let mut any = false;
-        for &seq in seqs {
-            let seq_key = encode_seq_key(seq);
-            let Some(v) = self.intents_ks.get(seq_key)? else {
-                continue;
-            };
-            let decoded = decode_value(v.as_ref())?;
+        for (seq, idem) in &work {
+            let seq_key = encode_seq_key(*seq);
             batch.remove(&self.intents_ks, seq_key.to_vec());
-            if let Some(idem) = decoded.idempotency_key {
-                if let Some(pointer) = self.idem_ks.get(idem)? {
+            if let Some(k) = idem {
+                if let Some(pointer) = self.idem_ks.get(*k)? {
                     if pointer.as_ref() == seq_key.as_slice() {
-                        batch.remove(&self.idem_ks, idem.to_vec());
+                        batch.remove(&self.idem_ks, k.to_vec());
                     }
                 }
             }
-            any = true;
         }
-        if any {
-            batch.commit()?;
+        batch.commit()?;
+
+        let mut idx = self
+            .pending_index
+            .lock()
+            .lock_or_die("intent_store.fjall.pending_index");
+        for (seq, idem) in &work {
+            idx.by_seq.remove(seq);
+            if let Some(k) = idem {
+                if idx.by_idem.get(k).copied() == Some(*seq) {
+                    idx.by_idem.remove(k);
+                }
+            }
         }
         Ok(())
     }
 
     fn pending_len(&self) -> Result<usize, IntentError> {
-        // Not a hot path (observability / backpressure); a full count is
-        // acceptable per the trait contract.
-        Ok(self.intents_ks.iter().count())
+        // W11: pure memory read.
+        let idx = self
+            .pending_index
+            .lock()
+            .lock_or_die("intent_store.fjall.pending_index");
+        Ok(idx.by_seq.len())
     }
 }
 
@@ -1165,6 +1295,58 @@ mod tests {
             // Empty batch is a no-op.
             store.remove_seqs(&[]).unwrap();
         }
+    }
+
+    /// W11 (2026-06-02): the in-memory mirror MUST be rebuilt from the
+    /// durable keyspace on reopen, including the idem dedup pointer.
+    #[test]
+    fn fjall_pending_index_rebuilds_from_disk_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intents");
+
+        // First open: insert a keyed + an unkeyed intent, remove the
+        // unkeyed one, prune nothing — durable state has 1 keyed intent.
+        {
+            let store = FjallIntentStore::open(&path).unwrap();
+            let s1 = seq(1, 0, 1);
+            let s2 = seq(1, 1, 1);
+            let key = [7u8; 16];
+            store.put(intent(s1, Some(key))).unwrap();
+            store.put(intent(s2, None)).unwrap();
+            store.remove_seq(s2).unwrap();
+            assert_eq!(store.pending_len().unwrap(), 1);
+            // Duplicate put dedups via the in-memory idem index.
+            assert!(matches!(
+                store.put(intent(seq(2, 0, 1), Some(key))).unwrap(),
+                PutOutcome::Duplicate(s) if s == s1
+            ));
+        }
+
+        // Reopen: index rebuild scans fjall; pending(), pending_len(),
+        // next_pending_seq(), and the idem dedup all reflect the durable
+        // state.
+        let store = FjallIntentStore::open(&path).unwrap();
+        let s1 = seq(1, 0, 1);
+        let key = [7u8; 16];
+        assert_eq!(store.pending_len().unwrap(), 1, "reopen rebuilds the count");
+        let p = store.pending().unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].perspective_seq, s1);
+        assert_eq!(store.next_pending_seq().unwrap(), Some(s1));
+        // Dedup pointer survived the reopen via the durable idem keyspace
+        // (which the index rebuilt from).
+        assert!(matches!(
+            store.put(intent(seq(3, 0, 1), Some(key))).unwrap(),
+            PutOutcome::Duplicate(s) if s == s1
+        ));
+        // Removing the surviving intent clears the idem index too.
+        store.remove_seq(s1).unwrap();
+        assert_eq!(store.pending_len().unwrap(), 0);
+        // Same idem key is now reusable.
+        assert!(matches!(
+            store.put(intent(seq(4, 0, 1), Some(key))).unwrap(),
+            PutOutcome::Recorded
+        ));
     }
 
     #[test]
