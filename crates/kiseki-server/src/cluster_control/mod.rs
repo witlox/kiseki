@@ -41,6 +41,11 @@ pub mod device_discovery;
 // ADR-049 phase 3: placement + capacity resolver (§D4.5 formula).
 pub mod resolver;
 
+// ADR-049 phase 5a (pure): kiseki-tier-paths.json pointer file +
+// I-CP-Move enforcement. Wired into the runtime.rs boot path
+// alongside the boot reorder (phase 5a continued).
+pub mod tier_paths;
+
 pub use commands::ControlCommand;
 pub use metrics::ClusterControlMetrics;
 // Re-exports kept for the follow-up subtask that switches admin
