@@ -38,6 +38,9 @@ pub mod types;
 // ADR-049 phase 2: per-node device discovery + InventoryReporter.
 pub mod device_discovery;
 
+// ADR-049 phase 3: placement + capacity resolver (§D4.5 formula).
+pub mod resolver;
+
 pub use commands::ControlCommand;
 pub use metrics::ClusterControlMetrics;
 // Re-exports kept for the follow-up subtask that switches admin
