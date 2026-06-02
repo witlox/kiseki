@@ -52,6 +52,13 @@ pub mod locks;
 // kiseki-chunk.
 pub mod storage_location;
 
+// ADR-049 device inventory + placement policy + capacity formula
+// inputs + the PER_FILE_METADATA_FOOTPRINT_BYTES constant (moved
+// here from kiseki-server::system_disk so every fjall consumer +
+// the control-plane state machine + admin RPC can import without
+// crate cycles).
+pub mod metadata;
+
 // Re-export the flat public surface for convenience. Match
 // ubiquitous-language.md names exactly.
 pub use error::{KisekiError, PermanentError, RetriableError, SecurityError};
@@ -70,3 +77,11 @@ pub use advisory::{
 };
 
 pub use storage_location::{ChunkRefLocation, SlabId};
+
+// ADR-049: device inventory + placement-policy types + the
+// PER_FILE_METADATA_FOOTPRINT_BYTES constant.
+pub use metadata::{
+    ClusterDeviceCatalog, DeviceEntry, DeviceMatcher, FjallStoreTier, MediaType,
+    NodeDeviceInventory, PlacementPolicy, PolicyMode, TierCapacity, TierPolicy, WorkloadParams,
+    PER_FILE_METADATA_FOOTPRINT_BYTES,
+};

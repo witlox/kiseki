@@ -584,20 +584,28 @@ pub async fn run_main(
 
     // Small object store for inline files (ADR-030).
     // Created before the log store so Raft state machines can use it.
-    let small_store: Option<std::sync::Arc<kiseki_chunk::SmallObjectStore>> = if let Some(ref dir) =
-        cfg.data_dir
-    {
-        std::fs::create_dir_all(dir.join("small")).ok();
-        let store = kiseki_chunk::SmallObjectStore::open(&dir.join("small").join("objects.redb"))
-            .map_err(|e| format!("small object store: {e}"))?;
-        tracing::info!(
-            path = %dir.display(),
-            "small object store: persistent (redb)",
-        );
-        Some(std::sync::Arc::new(store))
-    } else {
-        None
-    };
+    let small_store: Option<std::sync::Arc<kiseki_chunk::SmallObjectStore>> =
+        if let Some(ref dir) = cfg.data_dir {
+            // ADR-022 rev-5 (#129 unblock): SmallObjectStore moved from
+            // redb to fjall. Path becomes a directory under
+            // `small/objects/` instead of the legacy `small/objects.redb`
+            // file. Phase 5b: this hardcoded path is the LAST stop before
+            // the ADR-049 resolver replaces it with
+            // `<resolved SmallObject mount>/kiseki/small-object/` — that
+            // wiring lands as part of the runtime.rs boot reorder
+            // (phase 5a continued); until then, the data_dir-relative
+            // path keeps single-host development clusters working.
+            std::fs::create_dir_all(dir.join("small")).ok();
+            let store = kiseki_chunk::SmallObjectStore::open(&dir.join("small").join("objects"))
+                .map_err(|e| format!("small object store: {e}"))?;
+            tracing::info!(
+                path = %dir.display(),
+                "small object store: persistent (fjall, ADR-022 rev-5)",
+            );
+            Some(std::sync::Arc::new(store))
+        } else {
+            None
+        };
 
     // Metrics: built early so per-shard `RaftRpcListener` metrics
     // (ADR-041 §"Observability") are wired into the listener BEFORE
@@ -830,6 +838,73 @@ pub async fn run_main(
         // (admin API + dedicated `--bench-namespace`) rather than
         // targeting `default`. See `infra/gcp/benchmarks/setup-shards.sh`
         // for the operator script.
+
+        // ADR-049 phase 5a: now that the control-plane Raft is up,
+        // run the boot helper. This: (1) discovers local devices via
+        // `/proc/mounts`, (2) submits `UpsertNodeInventory` to the
+        // catalog, (3) reads policy, (4) computes resolved tier
+        // paths, (5) checks I-CP-Move against the prior pointer
+        // file, (6) saves the pointer file with the resolved paths.
+        // In phase 5a the resolved paths are advisory — actual
+        // fjall stores (already opened above at `data_dir`-relative
+        // paths) get reconciled by the phase-6 `storage migrate`
+        // CLI command. The pointer file IS the I-CP-Move guard
+        // for the NEXT boot.
+        if let Some(ref data_dir) = cfg.data_dir {
+            use crate::cluster_control::{device_discovery, phase5_boot};
+            let tags_env = std::env::var("KISEKI_DEVICE_TAGS").unwrap_or_default();
+            let tags = device_discovery::DeviceTagMap::parse(&tags_env);
+            let catalog_for_phase5 = Arc::new(ctrl_store.state());
+            let ctrl_for_submit = Arc::clone(&ctrl_store);
+            let submit: phase5_boot::SubmitInventoryFn = Box::new(move |cmd| {
+                Box::pin(async move {
+                    ctrl_for_submit
+                        .submit(cmd)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| format!("UpsertNodeInventory submit: {e}"))
+                })
+            });
+            let boot_inputs = phase5_boot::Phase5BootInputs {
+                node_id: kiseki_common::ids::NodeId(cfg.node_id),
+                data_dir: data_dir.as_path(),
+                tags: &tags,
+                catalog: catalog_for_phase5,
+                submit_inventory: submit,
+            };
+            match phase5_boot::run(boot_inputs).await {
+                Ok(resolved) => {
+                    tracing::info!(
+                        node_id = cfg.node_id,
+                        devices = resolved.inventory.devices.len(),
+                        "ADR-049 phase 5a boot: catalog populated, pointer file saved",
+                    );
+                }
+                Err(phase5_boot::Phase5BootError::PathVersionMismatch {
+                    tier_label,
+                    prior,
+                    resolved,
+                    ..
+                }) => {
+                    return Err(format!(
+                        "ADR-049 I-CP-Move tripped on tier {tier_label}: prior={} resolved={}. \
+                         Run `kiseki-admin storage migrate --tier={tier_label} --node={}` before retrying.",
+                        prior.display(),
+                        resolved.display(),
+                        cfg.node_id,
+                    )
+                    .into());
+                }
+                Err(e) => {
+                    // Non-fatal at phase 5a: log + continue so the
+                    // cluster doesn't refuse to boot under partial
+                    // ADR-049 wiring. The pointer file gets written
+                    // on the next successful boot once the issue is
+                    // resolved (catalog reachable, policy set, etc.).
+                    tracing::warn!(error = %e, "ADR-049 phase 5a boot non-fatal error (continuing)");
+                }
+            }
+        }
 
         cluster_control_store = Some(ctrl_store);
         raft_shard_store_for_admin = Some(Arc::clone(&store_arc));

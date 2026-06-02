@@ -151,6 +151,18 @@ Environment=KISEKI_METRICS_ADDR=0.0.0.0:9090
 
 # Metadata on boot disk (fast SSD), data on raw devices
 Environment=KISEKI_DATA_DIR=${meta_dir}
+# ADR-049 phase 5a: device-inventory tags so the catalog policy
+# can target `Tag("nvme-fast")` etc. The boot SSD hosts
+# `KISEKI_DATA_DIR` (metadata + raft log fjall). Raw-block-device
+# entries go via `KISEKI_RAW_DEVICES` above (orthogonal axis per
+# §D11.1). Operator can extend this list when additional mount
+# points are configured.
+Environment=KISEKI_DEVICE_TAGS=${meta_dir}=data-dir-default
+# ADR-049 §D2.5: Raft log path is bootstrap-only — never resolver-
+# routed. Defaults to `${meta_dir}/raft` when unset; we set it
+# explicitly so an operator changing `KISEKI_DATA_DIR` later
+# doesn't accidentally orphan the Raft log.
+Environment=KISEKI_RAFT_LOG_DIR=${meta_dir}/raft
 # Only node 1 bootstraps (seeds the Raft cluster).
 # Other nodes join as followers via Raft RPCs from the leader.
 %{ if node_id == 1 ~}
