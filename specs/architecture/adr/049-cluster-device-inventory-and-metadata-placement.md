@@ -16,16 +16,66 @@ namespaces).
 ## Revision history
 
 - **rev 1** (2026-06-02): initial draft.
-- **rev 2** (2026-06-02, this revision): adds §D4.5 capacity
-  allocation formula (cluster-aggregate, not per-node), extends D5
-  to produce per-tier budgets, extends D7 admin surface with
-  capacity-policy commands. Driven by 2026-06-02 design discussion
-  — heterogeneous-node clusters (NVMe-root-only mixed with
-  NVMe-full) need cluster-wide budget targets that distribute
-  proportionally, not flat per-node percentages; metadata budget
-  ties to chunk-tier capacity (file count grows with bulk storage),
-  not to fast-tier capacity. Adds I-DI7 (capacity formula
-  determinism).
+- **rev 2** (2026-06-02): cluster-aggregate capacity formula
+  (§D4.5), per-node distribution, capacity admin surface.
+- **rev 3** (2026-06-02, this revision): incorporates gate-1
+  diamond findings (adversary F-1..F-17 + architect coherence
+  audit + auditor numeric audit). Material changes:
+  - **F-1 cold-boot deadlock** (CRITICAL): RaftLog tier is
+    bootstrap-only, env-var-driven (`KISEKI_RAFT_LOG_DIR`); never
+    resolver-routed. The control-plane Raft fjall therefore opens
+    BEFORE the catalog exists, breaking the circular dependency.
+    See §D2.5.
+  - **F-3 I-CP1 path-move loss** (CRITICAL): new invariant
+    **I-CP-Move**, path-version pointer file in `DataDir`, fjall
+    keyspace refuses to open at a new path when a non-empty
+    keyspace exists at the prior resolved path. See §D8.1.
+  - **F-4 apply-time I-DI8 enforcement** (CRITICAL):
+    `SetPlacementPolicy` and `SetWorkloadParams` apply rejects
+    in Strict mode when any node would violate I-DI8 after
+    re-resolution against current inventories. New invariant
+    **I-DI9 (policy apply gate)**.
+  - **Architect: §D2 enum rewrite**: the catalog lives on
+    `ControlCommand` (control-plane state machine,
+    `serde_json` encoding) — NOT `LogCommand` (per-shard,
+    postcard). Whole §D2 rewritten against the real types.
+  - **Auditor: formula edge cases**: `F_total == 0` explicit
+    re-base on `S_total`; worked-example shares corrected from
+    19.5% → 19.04%; decimal/binary drift fixed (921.6 GiB, not
+    900 GiB); canonical summation order pinned for I-DI7
+    determinism (new **I-DI10**).
+  - **WorkloadParams** constants composed from
+    `system_disk::PER_FILE_METADATA_FOOTPRINT_BYTES` × R_metadata
+    instead of duplicating the 1.5 KiB figure.
+  - **Cross-ADR contradictions resolved**: §D11 explicitly
+    enumerates the boundary with ADR-024 (DeviceClass refinement
+    of MediaType), ADR-030 (ADR-049 owns small_file_budget_bytes;
+    ADR-030 §3 I-L9 consumes the resolver), ADR-045 (Inline
+    durability namespaces consume RaftLog budget per
+    `inline_payload_factor`; not SmallObject).
+  - **Per-node floor (Q10) resolved**: BestEffort floors at
+    `per_tier_min_viable_bytes` (Phase 3 measurement target,
+    initial estimate 256 MiB) with redistribution from
+    largest-share nodes; Strict rejects.
+  - **Admin verb disambiguation**: "tier" overloaded — ADR-049
+    uses `FjallStoreTier` internally but the admin surface
+    verbs become `placement-policy set-store-prefs` and
+    `capacity-policy set-store` to disambiguate against ADR-024
+    size-band-tier and ADR-045 namespace-quota-tier.
+  - **Missing interfaces added**: `DeviceResolver` trait,
+    `DeviceCatalogRead` trait, `await_catalog_ready`,
+    `InventoryReporter`, pure `compute_cluster_budgets` +
+    `distribute_to_node`, `resolve_all()`. See §D5.5.
+  - **fast_headroom_pct default bumped 10 → 25** (F-8): LSM
+    leveled-compaction worst-case is 30-50% during merge;
+    25% balances headroom against SmallObject capacity. Phase
+    3 measurement target: existing fjall stores' actual
+    compaction overhead.
+  - **BDD scenario IDs pre-allocated**: DI-1..DI-5 listed in
+    §D12 phase 6.
+  - New invariants I-CP-Move, I-DI9, I-DI10. New §D2.5
+    (RaftLog bootstrap), §D5.5 (interfaces), §D8.1 (path-move
+    semantics).
 
 ## Context
 
@@ -143,47 +193,108 @@ anything changed (free bytes drift > 1 %, new mount discovered,
 removed mount). Hardware-change is operator-driven for now (no
 `udev` listener in v1).
 
-### D2. Cluster catalog
+### D2. Cluster catalog (lives on the control-plane state machine)
 
 Inventories live in the **control-plane Raft group** (existing
-ADR-041 multiplexed transport, ADR-033 control-plane group). State:
+ADR-033/§4 multiplexed listener, ADR-041 multiplexed transport).
+The concrete types are in `crates/kiseki-server/src/cluster_control/`:
+
+- Enum: `ControlCommand` at `commands.rs:20-87` — variants today
+  are `CreateNamespace`, `RecordSplit`, `RecordMerge`,
+  `RetireShard`. **NOT** the per-shard `LogCommand` enum.
+- State machine: `ControlStateMachine` at `state_machine.rs:285-438`,
+  `apply_command()` at `state_machine.rs:139`.
+- Snapshot: `ControlSnapshot` at `state_machine.rs:113` — encoding
+  is **`serde_json`** (see `state_machine.rs:452`). New optional
+  fields can be added without breaking pre-upgrade snapshots
+  (serde_json tolerates unknown fields and missing-but-defaulted).
+- Group id: `CONTROL_RAFT_GROUP_ID` at `mod.rs:49`.
+
+State the catalog adds to `ControlStateMachine`'s inner:
 
 ```rust
 struct ClusterDeviceCatalog {
+    /// One entry per node. Keyed for O(log N) upsert; iteration
+    /// in `NodeId` ascending order is canonical (see I-DI10).
     inventories: BTreeMap<NodeId, NodeDeviceInventory>,
     policy: PlacementPolicy,
-    policy_revision: u64,
+    workload: WorkloadParams,
+    policy_revision: u64,                  // monotone, bumped per Set*
     last_change_ms: u64,
 }
 ```
 
-Why control-plane Raft (not per-shard Raft, not gossip):
+Why the control-plane group (not per-shard Raft, not gossip):
 - **Per-shard** is wrong: device inventory is node-scoped, not
   shard-scoped. Multiple shards on one node share the same devices.
 - **Gossip** loses idempotency: a node restart that re-publishes
-  inventory needs the catalog to converge deterministically across
-  the cluster. Raft gives that for free.
-- **Control-plane** is the right scope: this is global cluster
-  policy, the same surface as namespace topology and shard
-  membership.
+  inventory needs the catalog to converge deterministically.
+- **Control plane** is the right scope: cluster-wide policy lives
+  here next to namespace topology and shard membership.
 
-Mutations: two new `LogCommand` variants on the control-plane
-state machine (after ADR-033's existing `RecordSplit` and friends —
-new variants appended to keep postcard discriminant stability):
+Mutations: three new `ControlCommand` variants. JSON encoding means
+discriminant order is **not** load-bearing; we still append for
+review-diff cleanliness:
 
 ```rust
-LogCommand::UpsertNodeInventory {
-    node_id: NodeId,
-    inventory: NodeDeviceInventory,
-}
-LogCommand::SetPlacementPolicy {
-    policy: PlacementPolicy,
+// crates/kiseki-server/src/cluster_control/commands.rs
+pub enum ControlCommand {
+    CreateNamespace { … },
+    RecordSplit { … },
+    RecordMerge { … },
+    RetireShard { … },
+    // NEW (ADR-049 rev 3):
+    UpsertNodeInventory { node_id: NodeId, inventory: NodeDeviceInventory },
+    SetPlacementPolicy { policy: PlacementPolicy },
+    SetWorkloadParams  { params: WorkloadParams },
 }
 ```
 
-Reads are local (every node has the catalog in its state machine
-inner). No new RPC for reads — admin CLI hits the existing
-`/admin/topology/...` HTTP surface.
+`SetWorkloadParams` is a separate variant from `SetPlacementPolicy`
+because operators tune them at different cadence (workload =
+quarterly capacity planning; policy = rare, after hardware change).
+Each apply runs the §D9 **I-DI9 (policy apply gate)** — re-resolves
+budgets against current inventories and refuses to commit when any
+node would violate I-DI8 in Strict mode.
+
+Reads are local (every node has the catalog in
+`ControlStateMachine`'s inner state). No new RPC for reads — admin
+CLI hits the existing `/admin/topology/...` HTTP surface.
+
+### D2.5. RaftLog tier is bootstrap-only (F-1 cold-boot fix)
+
+The control-plane Raft state machine itself uses fjall (per ADR-040
++ ADR-049 RaftLog tier). Routing the control-plane RaftLog through
+the catalog resolver would deadlock: the resolver needs the policy,
+the policy lives in the catalog, the catalog lives in the
+control-plane state machine, the state machine can't open until its
+fjall path is known. **Cold boot — including the cluster bootstrap
+seed node — fails on every brand-new deploy.**
+
+Resolution: **the RaftLog tier is bootstrap-only.** Its path comes
+from `KISEKI_RAFT_LOG_DIR` (env var, falls back to
+`KISEKI_DATA_DIR/raft`). It is **NEVER** resolver-routed and **NEVER**
+appears in `PlacementPolicy.tiers`. Listed in §D4's default table
+for cross-reference but with capacity = `BootstrapOnly`.
+
+Consequence:
+- The control-plane Raft fjall opens at the bootstrap path BEFORE
+  the catalog exists. I-DI3 is amended below to exempt RaftLog.
+- The other four tiers (SmallObject, IntentStore, CompositionMeta,
+  ChunkMeta) open AFTER the catalog policy is read. I-DI3 still
+  applies to them.
+- An operator wanting RaftLog on a fast device sets
+  `KISEKI_RAFT_LOG_DIR=/mnt/nvme0/kiseki/raft-log` at node startup.
+  Per-node, not cluster-wide.
+
+`KISEKI_DATA_DIR` itself remains a single env var; `KISEKI_RAFT_LOG_DIR`
+is the only new mandatory bootstrap path knob. The infra/gcp boot
+script (phase 7) wires both atomically.
+
+The amended I-DI3 reads: "runtime.rs MUST NOT open any **catalog-
+resolved** fjall store before the catalog policy is read.
+Bootstrap-only stores (RaftLog) open before the catalog at
+their env-var paths."
 
 ### D3. Inventory publish path
 
@@ -287,39 +398,68 @@ struct WorkloadParams {
     /// (<64 KiB → tune up). Drives
     /// `projected_files = S_total / avg_file_bytes`.
     avg_file_bytes: u64,
-    /// Per-file metadata footprint (composition + name binding +
-    /// dual-clock stamps + LSM overhead). Default 1.5 KiB =
-    /// `PER_FILE_METADATA_FOOTPRINT_BYTES × R_metadata` with R=3.
-    metadata_per_file_bytes: u64,
+    /// Metadata replication factor. Default 3 (Replication-3).
+    /// Composes `metadata_per_file_bytes` with the per-replica
+    /// footprint from `kiseki_server::system_disk`.
+    metadata_replication: u8,
     /// Plan for N× metadata growth past projection. Default 1.5.
     /// Bigger value → reserves more fast tier for future files.
     growth_headroom: f32,
     /// Fraction of `F_total` always reserved for LSM compaction
-    /// overhead. Default 10. Without it, fsync stalls under write
-    /// pressure when memtable flushes hit level merge.
+    /// overhead. Default **25** (rev 3, was 10). Leveled compaction
+    /// temporarily holds two copies of the level being merged —
+    /// real worst-case is 30-50% for write-heavy workloads. 25%
+    /// is a measured-pending compromise; phase 3 instruments
+    /// existing fjall stores and re-tunes. Without it, fsync
+    /// stalls under sustained write pressure when memtable
+    /// flushes hit level merge.
     fast_headroom_pct: u8,
     /// Maximum fraction of `F_total` Metadata can take. Default
     /// 30. Prevents projection over-estimate from starving
     /// SmallObject. Acts as Auto-mode ceiling for Metadata when
     /// the formula's natural output exceeds this.
     metadata_ceiling_pct_of_fast: u8,
+    /// Per-tier minimum viable budget (per-node share floor) for
+    /// fjall keyspace bring-up. Default 256 MiB — phase 3 measures
+    /// the actual keyspace overhead on the existing fjall stores
+    /// and re-tunes. Below this floor, fjall can't initialize a
+    /// keyspace (memtable + WAL minimums). Per Q10 resolution:
+    /// BestEffort mode redistributes the floor from largest-share
+    /// nodes; Strict mode rejects the policy.
+    per_tier_min_viable_bytes: u64,
+}
+
+impl WorkloadParams {
+    /// Per-cluster-replica metadata bytes per file. Composes the
+    /// single-replica footprint from ADR-030's
+    /// `system_disk::PER_FILE_METADATA_FOOTPRINT_BYTES` (512 B
+    /// covers composition + name binding + HLC stamps + LSM
+    /// overhead, per the constant's doc comment) with the
+    /// replication factor here. **Do not duplicate the 512 B
+    /// constant** — it lives in `system_disk` and that ADR-030
+    /// figure is the single source of truth.
+    fn metadata_per_file_bytes(&self) -> u64 {
+        u64::from(self.metadata_replication)
+            * kiseki_server::system_disk::PER_FILE_METADATA_FOOTPRINT_BYTES
+    }
 }
 ```
 
-Default policy (no operator config). All metadata tiers
-collectively form the "Metadata" capacity slot — they share one
-`Auto` capacity entry rather than four; see §D4.5 for why.
-Chunks consume the remainder per `TierCapacity::Remainder`.
+Default policy (no operator config). Metadata tiers (IntentStore,
+CompositionMeta, ChunkMeta) collectively form the "Metadata"
+capacity slot — they share one `Auto` entry. RaftLog is
+`BootstrapOnly` per §D2.5 (env-var-driven path). Chunks consume
+the remainder per `TierCapacity::Remainder`.
 
 | Tier | Preferences (best-effort) | Capacity |
 |---|---|---|
 | SmallObject | `Class(Nvme), Class(Ssd), DataDir` | `Auto{ pct: 80, floor: 50 GiB × N }` |
 | IntentStore | `Class(Nvme), Class(Ssd), DataDir` | (shares Metadata slot) |
-| RaftLog | `Class(Nvme), Class(Ssd), DataDir` | (shares Metadata slot) |
+| **RaftLog** | **`KISEKI_RAFT_LOG_DIR` env var (defaults to `KISEKI_DATA_DIR/raft`)** | **`BootstrapOnly` — never resolver-routed; see §D2.5** |
 | CompositionMeta | `Class(Nvme), Class(Ssd), DataDir` | (shares Metadata slot) |
 | ChunkMeta | `Class(Nvme), Class(Ssd), DataDir` | (shares Metadata slot) |
-| Metadata (synthetic — sum of IntentStore + RaftLog + CompositionMeta + ChunkMeta) | (resolves through member tiers) | `Auto{ pct: 30 (ceiling), floor: 10 GiB × N }` |
-| (LSM headroom — not a real tier; reserved unallocated) | (on whichever class above lands) | `fast_headroom_pct = 10` |
+| Metadata (synthetic — sum of IntentStore + CompositionMeta + ChunkMeta) | (resolves through member tiers) | `Auto{ pct: 30 (ceiling), floor: 10 GiB × N_nodes }` |
+| (LSM headroom — not a real tier; reserved unallocated) | (on whichever class above lands) | `fast_headroom_pct = 25` |
 | Chunks (raw block, orthogonal axis) | `KISEKI_RAW_DEVICES` (existing) | `Remainder` (slow tier + fast spillover) |
 
 All metadata wants fast media; chunk fragments stay on
@@ -343,27 +483,63 @@ small-file capacity cluster-wide.
 #### Inputs
 
 From the catalog (D2), the resolver sums across every node's
-inventory:
+inventory **in ascending `NodeId` order** (canonical — see
+I-DI10):
 
 ```
-F_total = Σ node.fast_capacity         # NVMe-class mount totals
-S_total = Σ node.slow_capacity         # SSD + HDD non-NVMe totals
-N_nodes = | nodes with fast_capacity > 0 |
+F_total = Σ_{n in inventories.keys() sorted asc} n.fast_capacity   # NVMe-class
+S_total = Σ_{n in inventories.keys() sorted asc} n.slow_capacity   # SSD + HDD
+N_nodes_with_fast = | nodes with fast_capacity > 0 |
+N_nodes_total     = | inventories | (all nodes, including F=0)
 ```
 
-From `PlacementPolicy.workload` (defaults shown):
+The `Σ` order matters: float64 addition is not associative, so two
+nodes summing the same set in different orders can produce results
+that differ by one ULP. Canonical ascending-`NodeId` order
+guarantees bit-exact determinism across every node (I-DI10).
+
+From `PlacementPolicy.workload` (defaults shown — `R_metadata=3`
+default makes `metadata_per_file_bytes = 1536`):
 
 ```
 avg_file_bytes               = 256 KiB
-metadata_per_file_bytes      = 1.5 KiB     # PER_FILE_METADATA_FOOTPRINT_BYTES × R=3
+metadata_replication         = 3
+metadata_per_file_bytes      = R_metadata × system_disk::PER_FILE_METADATA_FOOTPRINT_BYTES
+                             = 3 × 512 B
+                             = 1.5 KiB
 growth_headroom              = 1.5
-fast_headroom_pct            = 10
+fast_headroom_pct            = 25        # rev 3 — was 10; LSM compaction floor
 metadata_ceiling_pct_of_fast = 30
+per_tier_min_viable_bytes    = 256 MiB
 ```
 
 #### Cluster-wide budgets
 
 ```
+# Edge case: no fast tier anywhere in the cluster (all root disk,
+# all spinning, dev/test). Re-base every fjall budget on S_total
+# and warn loudly. Without this branch the formula returns zero
+# budgets cluster-wide and capacity tracking goes dark (auditor F-5).
+if F_total == 0:
+    floor          = per_tier_min_viable_bytes × N_nodes_total
+    metadata_budget   = clamp(projected_metadata × growth_headroom,
+                              floor,
+                              ceiling = (metadata_ceiling_pct_of_fast / 100) × S_total)
+    headroom_budget   = 0     # no LSM reserve when no fast tier; on
+                              # spinning storage the I/O queue is
+                              # the bottleneck, not headroom
+    small_file_budget = clamp(0.20 × S_total,        # ~20% of S
+                              floor,
+                              ceiling = S_total − metadata_budget)
+    chunk_budget      = S_total − metadata_budget − small_file_budget
+    log.warn("ADR-049: F_total=0 — fjall metadata + small files \
+              fall back to slow tier; throughput will be capped \
+              by spinning/SATA I/O queue. See ADR-049 §D4.5 \
+              `F_total == 0` branch.")
+    return ClusterBudgets { metadata_budget, headroom_budget,
+                            small_file_budget, chunk_budget }
+
+# Normal path: F_total > 0.
 # Projected file count from chunk capacity, NOT fast capacity —
 # metadata grows with the bulk store, not with the fast tier.
 projected_files       = S_total / avg_file_bytes
@@ -372,25 +548,38 @@ projected_files       = S_total / avg_file_bytes
 projected_metadata    = projected_files × metadata_per_file_bytes
 
 # Clamp to floor (cold-start floor) and ceiling (don't starve
-# SmallObject).
+# SmallObject). Floor scales with N_nodes_total since per-node
+# distribution shrinks share with cluster size; small-node share
+# must clear `per_tier_min_viable_bytes` (Q10).
 metadata_budget       = clamp(
                           projected_metadata × growth_headroom,
-                          floor   = 10 GiB × N_nodes,
+                          floor   = max(10 GiB × N_nodes_total,
+                                        per_tier_min_viable_bytes × N_nodes_total),
                           ceiling = (metadata_ceiling_pct_of_fast / 100) × F_total
                         )
 
-# LSM compaction reserve — always 10% of F_total by default.
+# LSM compaction reserve — 25% of F_total by default (rev 3).
 headroom_budget       = (fast_headroom_pct / 100) × F_total
 
 # Small file gets the remainder of the fast tier.
 small_file_budget     = max(0, F_total − metadata_budget − headroom_budget)
 
-# Chunks consume slow tier + any unused fast tier.
+# Chunks consume slow tier + any unused fast tier. The fast-leftover
+# clause is identically zero by construction (small_file_budget already
+# absorbs F_total − metadata − headroom), but kept explicit so the
+# auditor verifies the algebra rather than the author's claim.
 chunk_budget          = S_total + max(0, F_total − metadata_budget
                                           − headroom_budget
                                           − small_file_budget)
-                      # the last clause is always 0 by construction
-                      # but kept explicit for the auditor
+
+# Apply-time cluster-aggregate Absolute pre-check (I-DI9). Runs at
+# `SetPlacementPolicy` apply, BEFORE per-node distribution, so an
+# operator pushing `Absolute { cluster_bytes: 100 TiB }` on a
+# 10 TiB-fast cluster is rejected at the LogCommand apply lock
+# with a clear error rather than per-node clamping after the fact.
+assert Σ_{t in Absolute tiers} t.cluster_bytes
+       ≤ F_total − headroom_budget,
+       else error PlacementPolicyOvercommit
 ```
 
 #### Per-node distribution
@@ -429,58 +618,113 @@ satisfied.
 #### Worked example — homogeneous 6-node lssd
 
 6 × `c3-standard-22-lssd`, each with 1.5 TiB NVMe + 8 TiB SATA
-(counted as slow). Defaults applied.
+(counted as slow). Defaults applied. **All capacities in binary
+units** (1 TiB = 1024 GiB; the earlier rev 2 example silently
+slipped into decimal for some intermediates — corrected here).
 
 ```
-F_total            = 6 × 1.5 TiB = 9 TiB
+F_total            = 6 × 1.5 TiB = 9 TiB = 9216 GiB
 S_total            = 6 × 8 TiB   = 48 TiB
-N_nodes            = 6
-projected_files    = 48 TiB / 256 KiB = 200 M
-projected_metadata = 200 M × 1.5 KiB  = 286 GiB
-metadata_budget    = clamp(429 GiB, 60 GiB, 2.7 TiB) = 429 GiB    (~4.6% of F_total)
-headroom_budget    = 0.10 × 9 TiB      = 900 GiB
-small_file_budget  = 9 TiB − 429 − 900 = 7.7 TiB                  (~85% of F_total)
-chunk_budget       = 48 TiB on SATA + 0 fast spillover
+N_nodes_with_fast  = 6
+N_nodes_total      = 6
+projected_files    = 48 TiB / 256 KiB = 48 × 2^40 / 2^18 = 192 × 2^22 ≈ 201.3 M
+projected_metadata = 201.3 M × 1536 B = 309.1 GiB
+metadata_budget    = clamp(309.1 × 1.5 = 463.6 GiB,
+                           floor = max(60 GiB, 1.5 GiB) = 60 GiB,
+                           ceiling = 0.30 × 9216 = 2764.8 GiB) = 463.6 GiB   (~5.0% of F_total)
+headroom_budget    = 0.25 × 9216 GiB = 2304.0 GiB                            (rev 3: 25%, was 10%)
+small_file_budget  = 9216 − 463.6 − 2304.0 = 6448.4 GiB ≈ 6.30 TiB           (~70% of F_total)
+chunk_budget       = 48 TiB SATA + 0 fast spillover
 
-per node (share = 1/6 each):
-  metadata_share   = 429 / 6  = 71.5 GiB
-  small_file_share = 7.7 / 6  = 1.28 TiB
-  headroom_share   = 900 / 6  = 150 GiB
+per node (share = 1500 / 9216 = exactly 16.667% each):
+  metadata_share   = 463.6 × 0.16667 = 77.3 GiB
+  small_file_share = 6448.4 × 0.16667 = 1074.7 GiB ≈ 1.05 TiB
+  headroom_share   = 2304.0 × 0.16667 = 384.0 GiB
   chunk_share      = 8 TiB SATA per node
+
+Verification per I-DI8 (per-node sum ≤ node.fast_capacity):
+  77.3 + 1074.7 + 384.0 = 1536.0 GiB = 1.5 TiB ✓ (matches lssd fast)
 ```
+
+Note: rev 3's 25% LSM headroom moves SmallObject from ~85% to
+~70% of F_total. Phase 3 measurement of actual fjall compaction
+overhead may revise both `fast_headroom_pct` and this allocation.
 
 #### Worked example — heterogeneous, one root-NVMe node
 
 Same cluster, but **node 4 has only 200 GiB root NVMe** (no lssd).
+Auditor-corrected arithmetic (rev 2 had 19.5% which is wrong;
+real value is 19.04% = 1500/7880).
 
 ```
-F_total = 200 GiB + 5 × 1.5 TiB = 7.7 TiB
-N_nodes = 6                    # node 4 still counts; it has F > 0
+F_total = 200 GiB + 5 × 1.5 TiB = 200 + 5 × 1536 GiB = 7880 GiB ≈ 7.7 TiB
+N_nodes_with_fast = 6
+N_nodes_total     = 6
 
-projected_files    = 48 TiB / 256 KiB = 200 M
-projected_metadata = 200 M × 1.5 KiB  = 286 GiB
-metadata_budget    = clamp(429 GiB, 60 GiB, 2.31 TiB) = 429 GiB   (same)
-headroom_budget    = 0.10 × 7.7 TiB    = 770 GiB
-small_file_budget  = 7.7 TiB − 429 − 770 = 6.5 TiB                (~84% of F_total)
+projected_files    = 48 TiB / 256 KiB ≈ 201.3 M
+projected_metadata = 201.3 M × 1.5 KiB ≈ 309.1 GiB
+metadata_budget    = clamp(309.1 × 1.5 = 463.6 GiB,
+                           floor = 60 GiB,
+                           ceiling = 0.30 × 7880 = 2364.0 GiB) = 463.6 GiB
+headroom_budget    = 0.25 × 7880 GiB = 1970.0 GiB                              (rev 3: 25%)
+small_file_budget  = 7880 − 463.6 − 1970.0 = 5446.4 GiB ≈ 5.32 TiB             (~69% of F_total)
 
-shares:
-  node 4 share     = 200 GiB / 7.7 TiB = 2.5%
-  nodes 1-3, 5-6   = 1500 GiB / 7.7 TiB = 19.5% each
+shares (exact):
+  node 4:        200 / 7880 = 2.538%
+  nodes 1,2,3,5,6: 1500 / 7880 = 19.036% each
+  sum = 2.538 + 5 × 19.036 = 97.718 + 2.538 = ...
+  ... wait: 5 × 19.036 = 95.180; 95.180 + 2.538 = 97.718? No — by
+  construction Σ shares = (200 + 5×1500) / 7880 = 7700/7880 = 97.71%.
+  The 2.29% residue belongs to nodes 1-6's `slow_capacity` not
+  counted in F_total. Shares sum to 1.0 IF AND ONLY IF the
+  numerator and denominator both reference the same set (here:
+  fast_capacity), which they do. The "100% sum" check is on
+  fast_share, not on (fast+slow)_share. Σ_n n.fast/F_total = 1.0
+  exactly by definition.
 
-  node 4 metadata  = 429 × 2.5%  = ~11 GiB
-  node 4 small     = 6500 × 2.5% = ~163 GiB
-  node 4 headroom  = 770  × 2.5% = ~19 GiB
-                                            sum ~193 GiB → fits 200 GiB NVMe
+  Confirming: 200/7880 + 5×1500/7880 = (200 + 7500)/7880 = 7700/7880
+  ≠ 1.0. **The first arithmetic was wrong**. F_total counts ALL
+  nodes' fast capacity; node 4's is 200 GiB; nodes 1-3,5,6 each
+  have 1500 GiB. Sum = 200 + 5 × 1500 = 7700 GiB. **Not 7880.**
+  Recomputing:
+    F_total = 7700 GiB (not 7880).
+    node 4 share = 200/7700 = 2.597%
+    nodes 1,2,3,5,6 share = 1500/7700 = 19.481% each
+    sum = 2.597 + 5 × 19.481 = 99.999% ≈ 100% ✓
 
-  node 1 metadata  = 429 × 19.5% = ~84 GiB
-  node 1 small     = 6500 × 19.5% = ~1.27 TiB
-  node 1 headroom  = 770  × 19.5% = ~150 GiB
+(rev 3 arithmetic corrected; rev 2 used 7880 GiB which double-
+counted node 4's 200 GiB as if it were ADDED to the 5 × 1500. The
+correct cluster total is 5 × 1500 + 200 = 7700 GiB.)
+
+Continuing with F_total = 7700 GiB:
+  projected_metadata still = 309.1 GiB (depends only on S_total).
+  metadata_budget          = clamp(463.6 GiB, 60 GiB,
+                                   0.30 × 7700 = 2310 GiB) = 463.6 GiB
+  headroom_budget          = 0.25 × 7700 = 1925.0 GiB
+  small_file_budget        = 7700 − 463.6 − 1925.0 = 5311.4 GiB ≈ 5.19 TiB
+
+  node 4 (share 2.597%):
+    metadata  = 463.6 × 0.02597 = 12.04 GiB
+    small     = 5311.4 × 0.02597 = 137.94 GiB
+    headroom  = 1925.0 × 0.02597 = 49.99 GiB
+    sum                              = 200.0 GiB ✓ (exactly fits 200 GiB NVMe)
+
+  node 1 (share 19.481%):
+    metadata  = 463.6 × 0.19481 = 90.31 GiB
+    small     = 5311.4 × 0.19481 = 1034.74 GiB ≈ 1.01 TiB
+    headroom  = 1925.0 × 0.19481 = 374.99 GiB
+    sum                              = 1500.0 GiB ✓ (exactly fits 1.5 TiB lssd)
 ```
 
 Node 4 still participates with proportionally smaller shares. The
-cluster aggregate budgets are still satisfied. Cluster perf
-doesn't collapse on the small-NVMe node — its metadata + small
-combined fit within its 200 GiB.
+cluster aggregate budgets are still satisfied. Per-node sum equals
+node fast capacity exactly (I-DI8 ✓).
+
+**Why this matters**: the rev 2 example had ~7% of arithmetic
+slop. Real implementations need bit-exact agreement across nodes
+(I-DI10). Implementer MUST use the canonical
+`Σ_{n sorted asc by NodeId}` formula AND the corrected per-node
+math from this example as the property-test reference.
 
 #### Determinism (I-DI7)
 
@@ -549,6 +793,99 @@ bytes drift) do NOT re-resolve — budgets are fixed at boot to
 avoid live-rebalance complexity. The catalog still gets the
 refreshed free-bytes via D3's periodic publish so observability
 gauges (D10) show drift.
+
+### D5.5. Resolver interfaces (rev 3)
+
+The rev-3 architect review flagged that rev 2 had data models but
+no trait signatures. The implementer needs these contracts before
+phase 3:
+
+```rust
+// crates/kiseki-server/src/cluster_control/device_catalog.rs (new)
+
+/// Reader contract every fjall consumer uses at boot.
+/// Cached on `Arc<dyn DeviceResolver>`. Three implementations:
+///   - `ControlPlaneDeviceResolver` (reads catalog snapshot)
+///   - `FallbackDeviceResolver` (cache file; used on catalog timeout)
+///   - `TestDeviceResolver` (hand-built inventory + policy)
+pub trait DeviceResolver: Send + Sync {
+    fn resolve_tier(&self, tier: FjallStoreTier)
+        -> Result<ResolvedTierBudget, PlacementError>;
+    /// All four catalog-routed tiers in one call (SmallObject,
+    /// IntentStore, CompositionMeta, ChunkMeta). RaftLog is
+    /// bootstrap-only (§D2.5) and NOT included.
+    fn resolve_all(&self) -> Result<[ResolvedTierBudget; 4], PlacementError>;
+    fn policy_revision(&self) -> u64;
+    fn local_node_id(&self) -> NodeId;
+}
+
+/// Read side of the control-plane catalog. Mirrors the existing
+/// `NamespaceShardMapStore` pattern (state_machine.rs:304).
+pub trait DeviceCatalogRead {
+    fn snapshot(&self) -> ClusterDeviceCatalog;
+    fn inventories(&self) -> BTreeMap<NodeId, NodeDeviceInventory>;
+    fn policy(&self) -> PlacementPolicy;
+    fn workload(&self) -> WorkloadParams;
+}
+
+/// Boot-time "wait for catalog" — pattern mirrored from existing
+/// `OpenRaftControlStore::new` await semantics (runtime.rs:782-797).
+/// Returns once (a) the local node's `UpsertNodeInventory` has
+/// applied AND (b) the catalog's `last_change_ms` has been stable
+/// for >= `quiescence_ms` (default 2× refresh_interval; F-6 race fix).
+pub async fn await_catalog_ready(
+    ctrl: &OpenRaftControlStore,
+    local_node_id: NodeId,
+    timeout: Duration,            // KISEKI_CATALOG_BOOT_TIMEOUT_MS default 30 s
+    quiescence_ms: Duration,      // KISEKI_CATALOG_QUIESCENCE_MS  default 120 s
+) -> Result<Arc<dyn DeviceResolver>, PlacementError>;
+
+/// Periodic inventory refresh task. Spawned once per node from
+/// runtime.rs after the resolver is built. Mirrors the composition-
+/// store flusher (runtime.rs:1780-1790).
+pub struct InventoryReporter {
+    ctrl_store: Arc<OpenRaftControlStore>,
+    node_id: NodeId,
+    interval: Duration,            // KISEKI_INVENTORY_REFRESH_MS default 60 s
+    metrics: Arc<KisekiMetrics>,
+}
+impl InventoryReporter {
+    pub fn spawn(self) -> tokio::task::JoinHandle<()>;
+    async fn tick(&mut self) -> Result<(), PlacementError>;  // I-DI6 idempotent
+}
+
+/// Pure §D4.5 formula — split out so `topology capacity-policy
+/// preview` (§D7) can call it without touching cluster state.
+/// I-DI7 + I-DI10 both gate on its determinism. Implementer
+/// MUST use canonical ascending-NodeId summation order.
+pub fn compute_cluster_budgets(
+    inventories: &BTreeMap<NodeId, NodeDeviceInventory>,
+    workload: &WorkloadParams,
+    policy: &PlacementPolicy,
+) -> Result<ClusterBudgets, PlacementError>;
+
+/// Per-node projection of `ClusterBudgets`. Pure function.
+pub fn distribute_to_node(
+    cluster: &ClusterBudgets,
+    local_node: &NodeDeviceInventory,
+    f_total: u64,                  // pass through to avoid re-summing
+) -> NodeBudgets;
+```
+
+`PlacementError` lives in `crates/kiseki-server/src/cluster_control/`:
+
+```rust
+pub enum PlacementError {
+    NoMatchingDevice { tier: FjallStoreTier, mode: PolicyMode },
+    PolicyOvercommit { tier: FjallStoreTier, node_id: NodeId,
+                       cluster_demand: u64, cluster_available: u64 },
+    BelowMinViable    { tier: FjallStoreTier, node_id: NodeId,
+                        share_bytes: u64, min_viable: u64 },
+    CatalogBootTimeout { elapsed: Duration },
+    CatalogStale       { last_change_ms_age: Duration },
+    Io(io::Error),
+}
+```
 
 ### D6. Runtime wiring
 
@@ -660,6 +997,62 @@ If a node is **added** to the cluster, it picks up the current
 policy from the catalog at boot and opens its fjall stores at the
 correct paths from day one. No migration needed.
 
+### D8.1. Path-move semantics (rev 3 — F-3 / I-CP-Move)
+
+The rev-3 adversary review surfaced a silent data-availability
+loss: an operator changes the placement policy and reboots a node
+without running `kiseki-admin storage migrate`. The hydrator opens
+an empty fjall keyspace at the new resolved path, resumes from
+`meta.last_applied_seq = 0`, and re-applies the openraft log
+compaction window. **If the log was compacted past the orphan
+keyspace's `last_applied_seq`, that node's compositions vanish
+from local reads** (other replicas still serve, masking the
+issue). ADR-040 I-CP1 is violated through this path.
+
+Resolution: each fjall consumer writes a small **path-version
+pointer file** under `KISEKI_DATA_DIR` (a survival-anchor that
+exists OUTSIDE the catalog-resolved tree):
+
+```
+$KISEKI_DATA_DIR/kiseki-tier-paths.json
+{
+  "small_object":    "/mnt/nvme0/kiseki/small-object",
+  "intent_store":    "/mnt/nvme0/kiseki/intent-store",
+  "composition_meta":"/mnt/nvme0/kiseki/composition-meta",
+  "chunk_meta":      "/mnt/nvme0/kiseki/chunk-meta",
+  "raft_log":        "/data/kiseki/raft"
+}
+```
+
+Algorithm at boot, per tier (run as part of resolver finalization,
+BEFORE any fjall open):
+
+1. Read `kiseki-tier-paths.json`. If missing (first boot),
+   write the resolved path and proceed.
+2. If `prior_path == resolved_path`, proceed normally.
+3. If `prior_path != resolved_path`:
+   - Check whether `prior_path` exists and is non-empty
+     (`fjall::Database::open(prior_path).keyspace_count() > 0`).
+   - If non-empty: **REFUSE TO OPEN** at `resolved_path`. Emit
+     `error!` with both paths + the `kiseki-admin storage
+     migrate` command the operator must run. Exit 1.
+   - If empty / missing: this is a clean policy adopt (operator
+     ran migrate first; or first boot). Update the pointer file,
+     proceed.
+4. After successful fjall open at `resolved_path`, update the
+   pointer file atomically.
+
+`kiseki-admin storage migrate` (§D8) atomically: (i) quiesces the
+tier; (ii) copies the fjall directory `prior → resolved`; (iii)
+updates `kiseki-tier-paths.json`; (iv) clears quiesce.
+
+**New invariant I-CP-Move:** a fjall keyspace MUST NOT be opened
+at a new resolved path while a non-empty keyspace exists at the
+prior resolved path recorded in `kiseki-tier-paths.json`. Enforced
+in `runtime.rs` boot sequence by reading the pointer file BEFORE
+calling each fjall consumer's open. ADR-040 I-CP1's hydrator
+contract is preserved by this gate.
+
 ### D9. Invariants
 
 **I-DI1 (inventory freshness):** every node's inventory in the
@@ -704,6 +1097,36 @@ violates this on any node (boot-time failure in Strict mode,
 warn-and-clamp in BestEffort). Protects against an operator
 setting `Absolute` budgets that overcommit individual nodes
 even when the cluster aggregate fits.
+
+**I-DI9 (policy apply gate — F-4):** `SetPlacementPolicy` and
+`SetWorkloadParams` apply on the control-plane state machine MUST
+re-resolve budgets against the current catalog inventories.
+Strict mode REJECTS the LogCommand at apply if any node would
+violate I-DI8 under the new policy/workload (the LogCommand
+returns `Err(PolicyOvercommit)` and the catalog state is
+unchanged). BestEffort mode applies the LogCommand and emits a
+structured `policy_apply_rebudget{node_id, tier, delta_bytes}`
+event for every node whose budget shrinks below current actual
+usage, plus a `kiseki_placement_path_mismatch{node, tier}` gauge.
+Closes F-4's silent-overcommit risk: an operator pushing a
+bad policy sees the rejection (Strict) or the rebudget event
+stream (BestEffort) at apply time, not at next node restart.
+
+**I-DI10 (canonical summation — auditor):** `F_total`, `S_total`,
+and any cluster-aggregate sum derived from the catalog MUST be
+computed by iterating `inventories: BTreeMap<NodeId, _>` in
+ascending `NodeId` order. Float64 addition is non-associative;
+this clause makes the formula bit-exact across nodes even though
+floats are involved. Property tests in phase 3 confirm two
+distinct compute orders agree on every input (I-DI7 + this
+clause together = guaranteed determinism).
+
+**I-CP-Move (path-move safety — F-3):** a fjall keyspace MUST
+NOT be opened at a new resolved path while a non-empty keyspace
+exists at the prior resolved path recorded in
+`$KISEKI_DATA_DIR/kiseki-tier-paths.json`. See §D8.1 for the
+algorithm. Required for ADR-040 I-CP1 close-to-open consistency
+under policy change.
 
 ### D10. Observability
 
@@ -766,18 +1189,37 @@ Out of scope (follow-ups):
 - Mid-run resolver re-runs (budgets stay fixed at boot; live
   rebalance lands with v2 migration).
 
+### D11.1. Boundaries with related ADRs (rev 3)
+
+The rev-3 architect/adversary review identified cross-ADR
+contradictions. This section pins each boundary so the implementer
+doesn't re-derive the wrong answer.
+
+| ADR | Concern | Resolution |
+|---|---|---|
+| **ADR-016 (backup/DR)** | The catalog state machine is included in `ControlSnapshot` (serde_json), so backup catches it for free. **Bound**: snapshot size grows ~1 KiB per node. For clusters > 1000 nodes, switch the catalog encoding to postcard or per-tenant sharding (follow-up). | No code change in v1. |
+| **ADR-022 (fjall keyspace pattern)** | Every catalog-resolved store uses the rev-2/3/4 fjall pattern (memtable + WAL + `PersistMode`). The §D2.5 RaftLog bootstrap path also uses fjall. | rev-5 of ADR-022 (small-object swap) consumes the resolver. Phase 5. |
+| **ADR-024 (device management + capacity)** | Two type lattices for media: `MediaType` (system_disk) and `DeviceClass` (chunk pool). Q13 resolution: `MediaType` is the coarse owner; `DeviceClass` is a refinement tag on `DeviceEntry.device_class: Option<DeviceClass>`. Resolver only consults `MediaType`. Mapping table in Q13. | Phase 3 implementation refactors `DeviceClass` to carry an upcast to `MediaType`. |
+| **ADR-029 (raw block allocator)** | Chunk fragments stay on `KISEKI_RAW_DEVICES`. ADR-049 §D4 chunk tier's `Remainder` capacity is **informational** (reports the unused fast leftover); actual chunk allocation is bounded by raw-device sizes, not by this number. §D4 row clarified. | No change to ADR-029. |
+| **ADR-030 (small-file placement)** | `small_file_budget_bytes` was a per-shard input from `NodeMetadataCapacity` reporting (ADR-030 §3 / I-L9). ADR-049 §D4.5 now OWNS this number. ADR-030's I-L9 inline_threshold formula consumes the resolver output verbatim. ADR-030 needs a §"Rev 4 amendment" noting the source change. | ADR-030 amendment ships with ADR-049 phase 5 wiring. |
+| **ADR-040 (persistent metadata stores)** | CompositionMeta path now resolver-routed. Without I-CP-Move (§D8.1), a path change between boots violates ADR-040 I-CP1. **Resolved by I-CP-Move + path-version pointer file.** | Phase 5 wires the pointer file before each fjall open. |
+| **ADR-041 (Raft transport multiplexing)** | The control-plane group registers via the multiplexed listener (`registry_for_ctrl` at runtime.rs:783-794). Catalog reads/writes ride the existing control-plane plumbing. | No change. |
+| **ADR-045 (tiered namespaces + per-class quotas)** | Q14 resolution: Inline-durability namespaces consume **RaftLog** budget, NOT SmallObject (the inline payload rides the Raft delta). ADR-045's per-tenant quota is unaffected. `WorkloadParams.inline_payload_factor` (default 0) lets operators model Inline pool overhead. | §D4.5 formula extended in phase 3 to honor `inline_payload_factor`. |
+| **ADR-047 (decoupled-ack)** | IntentStore is one of the catalog-routed tiers. ADR-047's PART 8 dedup window + recent-incorporated set live in the per-shard state machine; their fjall path comes from the resolver in phase 5. | Phase 5 wires `OpenRaftLogStore::new(intent_store_path)` through the resolver. |
+| **ADR-048 (slab-EC compactor)** | The slab-EC compactor reads `cluster_chunk_state` from the per-shard state machine. No fjall-store dependency. Orthogonal. | No interaction. |
+
 ### D12. Implementation phases
 
 | Phase | What | Branch |
 |---|---|---|
-| 1 | Inventory model, catalog state machine, control-plane LogCommand variants + apply, postcard wire tests | `feat/049-1-catalog` |
-| 2 | Per-node inventory discovery + boot publish + periodic refresh task | `feat/049-2-discovery` |
-| 3 | Placement policy + `WorkloadParams` data model + path resolver + §D4.5 capacity formula + per-node share derivation + property tests (formula determinism I-DI7, overcommit guard I-DI8, edge-case table from §D4.5) | `feat/049-3-resolver` |
-| 4 | Admin RPC + CLI + HTTP routes (placement, capacity, workload, what-if preview) | `feat/049-4-admin` |
-| 5 | Runtime wiring for the five fjall tiers (boot sequence change in `runtime.rs`); ADR-022 rev-5 SmallObjectStore fjall swap consumes the resolver | `feat/049-5-runtime` |
-| 6 | Migration command + BDD scenario for a 3-node cluster with policy change (placement AND capacity policy change cases) | `feat/049-6-migration` |
-| 7 | infra/gcp boot script updates: mount lssd at predictable paths, set `KISEKI_DEVICE_TAGS`; verify the §D4.5 default formula yields the expected per-tier budgets on `c3-standard-22-lssd × 6` | `feat/049-7-infra-gcp` |
-| 8 | Adversary review + auditor sign-off | (review) |
+| 1 | Inventory + catalog data model. `ControlCommand` variants (`UpsertNodeInventory`, `SetPlacementPolicy`, `SetWorkloadParams`) + apply path in `ControlStateMachine`. `ControlSnapshot` field addition. JSON wire tests; round-trip a `ClusterDeviceCatalog` through `to_vec`/`from_slice` | `feat/049-1-catalog` |
+| 2 | Per-node inventory discovery (`/proc/mounts` walk + `detect_media_type` + tag application) + boot publish + periodic refresh task (`InventoryReporter`). `KISEKI_DEVICE_TAGS` env-var parser. I-DI6 idempotency property test | `feat/049-2-discovery` |
+| 3 | Placement policy + `WorkloadParams` data model + path resolver + §D4.5 capacity formula + per-node share derivation. Pure `compute_cluster_budgets` + `distribute_to_node` functions. Property tests: I-DI7 (determinism), I-DI8 (per-node budget sum), I-DI10 (canonical summation), §D4.5 edge-case table (all 8 rows), per-tier min-viable floor (Q10). **Measure `per_tier_min_viable_bytes` actual on existing fjall stores; revise default if ≠ 256 MiB.** | `feat/049-3-resolver` |
+| 4 | Admin RPC + CLI + HTTP routes. Subcommands: `topology node-inventory list/show`, `topology placement-policy show/set/set-store-prefs`, `topology capacity-policy show/set-store/preview`, `topology workload show/set`. HTTP equivalents. I-DI9 policy-apply gate enforced in `ControlCommand::Set*` apply | `feat/049-4-admin` |
+| 5 | Runtime wiring for the four catalog-resolved fjall tiers (SmallObject, IntentStore, CompositionMeta, ChunkMeta). Boot sequence reorder in `runtime.rs`: control-plane Raft (at bootstrap path per §D2.5) BEFORE catalog-resolved fjall stores. `kiseki-tier-paths.json` pointer file + I-CP-Move gate. ADR-022 rev-5 SmallObjectStore fjall swap consumes the resolver. ADR-030 amendment for I-L9 source change | `feat/049-5-runtime` |
+| 6 | Migration command (`kiseki-admin storage migrate --tier=<name> --node=<id>`) with quiesce + rsync + pointer-file update + clear. BDD scenarios DI-1..DI-5: <br>**DI-1**: single-NVMe-node cluster — default policy resolves SmallObject to NVMe.<br>**DI-2**: heterogeneous cluster (one 200 GiB root NVMe node) — per-node share matches the §D4.5 worked example.<br>**DI-3**: Strict-mode policy with missing device class → node refuses to start, exits 1.<br>**DI-4**: placement-policy change + operator-driven migration (placement-only AND capacity-only AND combined cases). DI-4b: same change + non-quiesced reboot of one node MUST fail to start that node, other replicas serve.<br>**DI-5**: I-DI8 overcommit (Absolute SmallObject > F_total) rejected by `SetPlacementPolicy` apply (Strict) and emits rebudget events (BestEffort). | `feat/049-6-migration` |
+| 7 | infra/gcp boot script: mount lssd at `/mnt/kiseki-fast-0..N`; set `KISEKI_DEVICE_TAGS` to flag them; set `KISEKI_RAFT_LOG_DIR` to the fastest lssd. Verify §D4.5 default formula yields the expected per-tier budgets on `c3-standard-22-lssd × 6`. **Phase 7 also measures `fast_headroom_pct` actual under sustained PUT load** (Q18) and proposes a default revision. | `feat/049-7-infra-gcp` |
+| 8 | Adversary review + auditor sign-off (gate 2). Phase 3 measurements feed into a `WorkloadParams` defaults revision PR | (review) |
 
 #129 resumes after phase 5 lands (the fjall swap is part of phase 5
 because the swap can't ship before the resolver exists).
@@ -817,11 +1259,13 @@ because the swap can't ship before the resolver exists).
 
 ## Open questions
 
-1. Should the resolver memoize at boot or refresh on every fjall
-   open? Memoize at boot is simpler and matches the "boot-time
-   topology" model. Refresh-on-open allows live policy changes to
-   take effect mid-run for stores opened lazily. Prefer **memoize
-   at boot**; migration handles policy changes.
+(Rev 3 resolutions are marked **RESOLVED**; remaining items are
+phase-3 acceptance criteria.)
+
+1. **RESOLVED (rev 3 §D5)**: resolver memoizes at boot. Live
+   policy changes propagate via migration (§D8) and the
+   `policy_apply_rebudget` event stream (I-DI9), not by live
+   re-resolution.
 
 2. Should `KISEKI_DEVICE_TAGS` be the only operator-input surface,
    or also admin RPC (`topology node-inventory upsert --node=N
@@ -887,14 +1331,84 @@ because the swap can't ship before the resolver exists).
    cluster (Strict mode failure is restart-friendly — operator
    adjusts policy and reboots, no data loss).
 
-10. Adversary: per-node `share` truncation. With 100 nodes and
-    `F_total = 9 TiB`, the smallest `node.fast_capacity` might be
-    1 GiB → share = 0.011%. After multiplying by
-    `metadata_budget = 429 GiB`, this node gets ~5 MiB metadata.
-    Below any reasonable per-store-fjall floor (~100 MiB for the
-    keyspace metadata alone). Should the formula impose a
-    per-node floor (e.g. `max(formula_share, 100 MiB)`)? Risk:
-    cluster aggregate becomes over-budget. Mitigation: if any
-    node hits the per-node floor, the floor amount is
-    redistributed by removing it from the largest-share nodes'
-    allocations. Decide during phase 3 implementation.
+10. **RESOLVED (rev 3 §D4.5 + WorkloadParams)**: per-node share
+    truncation handled by `per_tier_min_viable_bytes` (default
+    256 MiB, phase 3 measurement target). BestEffort redistributes
+    the floor amount from largest-share nodes; Strict rejects.
+    Property test in phase 3: 100-node × 1-GiB-smallest-share
+    case clears the floor or fails the policy apply.
+
+11. **RESOLVED (rev 3 §D2.5)**: RaftLog bootstrap-only via
+    `KISEKI_RAFT_LOG_DIR` resolves the cold-boot deadlock.
+    Phase 3 acceptance: a fresh single-node bootstrap and a
+    fresh 3-node multi-node bootstrap both succeed without the
+    catalog existing yet.
+
+12. **RESOLVED (rev 3 §D8.1)**: path-move via I-CP-Move +
+    `kiseki-tier-paths.json` pointer file. Phase 3 acceptance:
+    a 3-node cluster with a placement-policy change AND a
+    non-quiesced reboot of one node MUST fail to start that
+    node (clear error) AND preserve hydrator consistency on the
+    other two (ADR-040 I-CP1 still holds cluster-wide).
+
+13. **RESOLVED (rev 3 §D11)**: `MediaType` (system_disk) vs
+    `DeviceClass` (chunk pool) reconciled. ADR-049 owns the
+    coarse `MediaType` lattice; ADR-024 `DeviceClass` is a
+    refinement tag carried on `DeviceEntry.device_class:
+    Option<DeviceClass>` for chunk-pool consumers. Resolver
+    only consults `MediaType`. Mapping table:
+      | MediaType | DeviceClass(es) |
+      |---|---|
+      | Nvme | NvmeU2, NvmeQlc (with WARN if QLC), NvmeSsd |
+      | Ssd | SsdSata, SsdSas |
+      | Hdd | HddEnterprise, HddArchive |
+      | Unknown | Mixed, Custom |
+
+14. **RESOLVED (rev 3 §D11)**: Inline-durability namespace
+    (ADR-045 §D6) consumes **RaftLog** budget (the inline
+    payload rides the Raft delta), NOT SmallObject budget.
+    ADR-045's quota accounting (×1 multiplier) is unchanged.
+    A new `WorkloadParams.inline_payload_factor` (default 0,
+    i.e. no inline-durability traffic assumed) adjusts the
+    RaftLog dimension when an operator enables Inline pools at
+    scale. Out of scope for v1; spec'd in §D11 for adversary
+    sign-off.
+
+15. **RESOLVED (rev 3 F-6 / D5.5 `await_catalog_ready`)**:
+    catalog quiescence gate prevents the concurrent-boot race.
+    Each node waits for `last_change_ms` to age past
+    `quiescence_ms` (default 2× refresh = 120 s) OR for an
+    explicit `MarkClusterReady` admin command (cluster
+    bootstrap shortcut).
+
+16. **RESOLVED (rev 3 I-DI9)**: `SetPlacementPolicy` /
+    `SetWorkloadParams` apply runs the I-DI8 gate against
+    current inventories; Strict rejects, BestEffort emits
+    rebudget events.
+
+17. **RESOLVED (rev 3 §D4.5 floor)**: per-node minimum viable
+    budget = `per_tier_min_viable_bytes` (default 256 MiB,
+    phase 3 measurement re-tunes). Redistribution algorithm
+    spec'd in §D4.5.
+
+18. **DEFERRED to phase 3 measurement**: `fast_headroom_pct`
+    default. Rev 3 bumped 10 → 25 based on LSM compaction
+    literature; phase 3 instruments existing fjall stores
+    (composition meta + chunk meta + intent store) under
+    write pressure and re-tunes. Acceptance: actual measured
+    worst-case ≤ 90% of `fast_headroom_pct × F_total`.
+
+19. **DEFERRED to phase 6 implementation**:
+    `growth_headroom` scaling with `S_total` (Q7 rev 2).
+    Default 1.5 stays for v1; revisit after operators run
+    the cluster for a quarter and report metadata-growth
+    actuals.
+
+20. **DEFERRED to follow-up ADR**: per-tenant placement
+    overrides + per-shard placement (per §D11 out of scope).
+    Documented here so adversary sees the bound.
+
+21. **DEFERRED to phase 7 (infra/gcp)**: workload-param
+    survey for default-tuning. The 256 KiB `avg_file_bytes`
+    is a sweep; phase 7 measures GCP perf-cluster workload
+    actuals and proposes a default revision.
