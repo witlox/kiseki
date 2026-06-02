@@ -279,21 +279,26 @@ pub fn discover_with_proc_mounts(
             dir_str.starts_with(entry_str.as_ref())
         });
         if !already_present {
+            // ADR-049 D1 step 3 says "always include" — sandboxed CI
+            // runners (tmpfs / non-statvfs-friendly mounts) report
+            // `total_bytes=0`. Drop the entry only if statvfs errors
+            // entirely; a zero-byte report still gets the entry so
+            // `DeviceMatcher::DataDir` policies retain a target. The
+            // resolver's BestEffort fallback can pick this up even
+            // when capacity is unknown.
             let (total_bytes, free_bytes) = fs_stats(dir);
-            if total_bytes > 0 {
-                let media_class = detect_media_type(dir);
-                let tag = tags
-                    .tag_for(dir)
-                    .or_else(|| Some("data-dir-default".to_owned()));
-                devices.push(DeviceEntry {
-                    mount_path: dir.to_path_buf(),
-                    media_class,
-                    total_bytes,
-                    free_bytes,
-                    tag,
-                    exclusive: false,
-                });
-            }
+            let media_class = detect_media_type(dir);
+            let tag = tags
+                .tag_for(dir)
+                .or_else(|| Some("data-dir-default".to_owned()));
+            devices.push(DeviceEntry {
+                mount_path: dir.to_path_buf(),
+                media_class,
+                total_bytes,
+                free_bytes,
+                tag,
+                exclusive: false,
+            });
         }
     }
 
