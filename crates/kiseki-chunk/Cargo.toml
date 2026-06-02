@@ -54,9 +54,10 @@ fjall = "3.1"
 postcard = { workspace = true }
 kiseki-keymanager = { workspace = true }
 prometheus = { workspace = true }
-# `redb` retained for `SmallObjectStore` (low-frequency ADR-030
-# inline-data path; not on the chunk hot path).
-redb = "4"
+# `redb` was retained for `SmallObjectStore` pre-rev-5; ADR-022
+# rev-5 (#129 unblock) moved the inline path to fjall — see
+# `small_object_store.rs`. fjall is already a workspace dep
+# above so no new line is needed.
 reed-solomon-erasure = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

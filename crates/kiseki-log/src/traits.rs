@@ -47,6 +47,18 @@ pub struct AppendChunkAndDeltaRequest {
     /// `cluster_chunk_state[(tenant, chunk_id)]` row with refcount=1
     /// and the leader-side placement list.
     pub new_chunks: Vec<NewChunkMeta>,
+    /// #129 — inline small-file payloads to write to each
+    /// replica's `InlineStore` (ADR-022 rev-5 fjall-backed
+    /// `SmallObjectStore`) at apply time. `(chunk_id, env_bytes)`
+    /// per entry; the gateway read path resolves `chunk_refs[i]`
+    /// via `small_store.get(&chunk_id.0)` first before falling
+    /// back to the chunk store. Empty for non-inline writes;
+    /// every pre-#129 emitter passes `Vec::new()` and pre-prod
+    /// wipe-and-redeploy clears persisted history of the legacy
+    /// `has_inline_data` offload path. Keyed by `chunk_id` per
+    /// ADR-030 §2 (replaces the pre-#129
+    /// `derive_inline_key(hashed_key, seq)` shape).
+    pub inline_payloads: Vec<(ChunkId, Vec<u8>)>,
 }
 
 /// Forwards an already-built `ChunkAndDelta` append to the shard's

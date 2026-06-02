@@ -81,7 +81,25 @@ pub const WIRE_FRAME_OVERHEAD_RESERVED: usize = 1024;
 /// single-port multiplexing (ADR-041 gate-1 F-M5). Override with
 /// `KISEKI_RAFT_PER_PEER_MAX` for cluster sizes/shard counts that
 /// legitimately exceed the default.
-pub const RAFT_TRANSPORT_PER_PEER_MAX_DEFAULT: u32 = 16;
+/// Default per-peer inbound + outbound connection cap.
+///
+/// **2026-06-01 — raised from 16 to 256.** The previous default
+/// silently capped clusters where `shards × min_acks ≥ 16` (which
+/// is most production-sized deployments). GCP n=6 / 18-shard run
+/// at 32-conc PUT load saw `raft_transport_rpc{op=append_entries}`
+/// mean = 129 ms (vs ~150 µs same-zone RTT floor = 800× overshoot)
+/// because the leader's outbound pool and the follower's inbound
+/// cap both clamped at 16, causing inbound rejections
+/// (`per-peer cap exceeded peer=… active=17`) and 33 / 44 340 PUT
+/// quorum-shortfall errors. See
+/// `specs/performance/2026-06-01-gcp-instrumented-single-client.md`.
+///
+/// TCP connections + per-conn buffers are cheap (a few KiB each);
+/// the cap exists to bound per-process FD growth in pathological
+/// cases, not to throttle steady-state load. 256 fits 18-shard ×
+/// 2-follower fanout with concurrency headroom; tune up via
+/// `KISEKI_RAFT_PER_PEER_MAX` for larger.
+pub const RAFT_TRANSPORT_PER_PEER_MAX_DEFAULT: u32 = 256;
 
 /// Resolve the runtime per-peer cap from `KISEKI_RAFT_PER_PEER_MAX`,
 /// falling back to [`RAFT_TRANSPORT_PER_PEER_MAX_DEFAULT`]. Read once
@@ -1331,11 +1349,20 @@ where
 /// Map a free-form tag string to the bounded label set used by the
 /// metrics. Unknown tags collapse to `op::UNKNOWN` so cardinality
 /// stays bounded.
+///
+/// The 2026-06-02 GCP profile run found `op=unknown` holding ~1M samples
+/// at 244 ms mean — the ADR-047 aux tags (`intent_put`,
+/// `intent_gather_pending`) were ingressing the listener and falling
+/// through to `_ => UNKNOWN`. They now have their own labels so the
+/// `intent_put` hot path is visible separately from genuinely-unknown
+/// tags (a real protocol bug, not just a missing match arm).
 fn normalize_op(tag: &str) -> &'static str {
     match tag {
         "append_entries" => crate::transport_metrics::op::APPEND_ENTRIES,
         "vote" => crate::transport_metrics::op::VOTE,
         "full_snapshot" => crate::transport_metrics::op::FULL_SNAPSHOT,
+        "intent_put" => crate::transport_metrics::op::INTENT_PUT,
+        "intent_gather_pending" => crate::transport_metrics::op::INTENT_GATHER_PENDING,
         _ => crate::transport_metrics::op::UNKNOWN,
     }
 }

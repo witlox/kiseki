@@ -11,7 +11,13 @@ use serde::{Deserialize, Serialize};
 
 /// Opaque node identifier within the cluster. Raw `u64` so HLC can use
 /// it as a final tiebreaker (see `time::HybridLogicalClock`).
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+///
+/// `Default` yields `NodeId(0)` for "uninitialized" — used as the
+/// pre-bootstrap value for the ADR-049 catalog's `NodeDeviceInventory`
+/// default and for HLC tiebreaker baselines.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize,
+)]
 pub struct NodeId(pub u64);
 
 /// Tenant organization identifier — the isolation domain for keys,

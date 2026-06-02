@@ -52,12 +52,18 @@ use crate::shard_committer::PeerIntentGatherer;
 /// Aux tag: "your full pending intent set for this shard" — for election
 /// intent-recovery (gate-1 O2). MUST NOT collide with the Raft tags
 /// (`append_entries` / `vote` / `full_snapshot`).
+///
+/// Wire-compat coupling: `kiseki_raft::transport_metrics::op::INTENT_GATHER_PENDING`
+/// MUST equal this string verbatim (the asserts in the tests below catch drift).
 pub const INTENT_GATHER_PENDING_TAG: &str = "intent_gather_pending";
 
 /// Aux tag: "durably record this fanned intent on your local store" — the
 /// quorum intent-write the producer fans to a shard's voter peers BEFORE the
 /// gateway fast-acks (ADR-047 phase 5c, the no-loss floor I-L2/I-CS1). MUST
 /// NOT collide with the Raft tags or the other intent tags.
+///
+/// Wire-compat coupling: `kiseki_raft::transport_metrics::op::INTENT_PUT`
+/// MUST equal this string verbatim (the asserts in the tests below catch drift).
 pub const INTENT_PUT_TAG: &str = "intent_put";
 
 /// Wire form of a [`WriteIntent`] — used both for the `gather_pending`
@@ -160,27 +166,31 @@ pub fn build_intent_dispatcher(store: Arc<dyn IntentStore>) -> ShardDispatch {
                         }
                     },
                     INTENT_PUT_TAG => {
+                        // W12 (2026-06-02): the wire is now a BATCH —
+                        // `Vec<WireIntent>` in, `Vec<bool>` out (one bool per
+                        // input intent, true = durable on this replica). The
+                        // producer-side coalescer fans up to
+                        // KISEKI_INTENT_FAN_BATCH_MAX intents per RPC; the
+                        // receiver decodes the whole batch and does ONE
+                        // `store.put_batch` so the fjall WAL sync amortises
+                        // across the batch.
+                        //
                         // ADR-047 hot-path timer (aux.handle_intent_put_total)
-                        // — total server-side processing budget for one fanned
-                        // intent, from the moment this handler task starts
-                        // running to the moment the response is encoded.
-                        // Paired with the leader-side `pif.leader_first_hop` /
-                        // `pif.parallel_topup` totals so we can split the round
-                        // trip into (wire + scheduler queue) vs (server proc).
-                        // The follower's contribution to the leader's measured
-                        // RPC time is bounded by this number; the remainder is
-                        // network and listener-queue time.
+                        // — total server-side processing budget for ONE FAN
+                        // (carrying N intents post-W12). Paired with the
+                        // leader-side `pif.leader_first_hop` /
+                        // `pif.parallel_topup` totals so we can split the
+                        // round trip into (wire + scheduler queue) vs
+                        // (server proc). Note: under W12 a higher mean means
+                        // bigger batches, NOT slower receivers — pair with
+                        // `kiseki_intent_put_batch_size` to interpret.
                         kiseki_tracing::hot_timer_guard!(
                             _ht_aux_total = "aux.handle_intent_put_total"
                         );
-                        // Decode the fanned WireIntent → reconstruct the
-                        // WriteIntent → durably record it. A decode fault or a
-                        // store error degrades to ParseError, which the producer
-                        // counts as a NON-ack (no durable copy credited).
                         // ADR-047 hot-path timer (aux.decode) — the
-                        // postcard decode + proto re-decode for the
-                        // append. Per-peer cost on every fanned intent.
-                        let wire: WireIntent = {
+                        // postcard decode of the Vec<WireIntent> + per-intent
+                        // proto re-decode for the appends.
+                        let wires: Vec<WireIntent> = {
                             kiseki_tracing::hot_timer_guard!(_ht_dec = "aux.decode");
                             match postcard::from_bytes(&payload) {
                                 Ok(w) => w,
@@ -190,32 +200,50 @@ pub fn build_intent_dispatcher(store: Arc<dyn IntentStore>) -> ShardDispatch {
                                 }
                             }
                         };
-                        let intent = match wire.into_intent() {
-                            Ok(i) => i,
-                            Err(e) => {
-                                tracing::warn!(error = %e, tag = %tag, "IntentSync intent_put append decode failed");
-                                return DispatchOutcome::ParseError;
+                        // Record the batch size metric so the per-RPC
+                        // histogram remains interpretable post-coalescing.
+                        crate::intent_metrics::observe_intent_put_batch_size(wires.len());
+                        // Decode every intent up front. A decode fault on ANY
+                        // one drops the whole batch — the producer treats
+                        // that as a non-ack for every PUT in the batch and
+                        // retries. (Pre-W12 the same fault dropped one PUT;
+                        // the failure-mode aggregation is acceptable since
+                        // any decode fault here points at a wire bug, not a
+                        // legitimate per-PUT condition.)
+                        let mut intents = Vec::with_capacity(wires.len());
+                        for w in wires {
+                            match w.into_intent() {
+                                Ok(i) => intents.push(i),
+                                Err(e) => {
+                                    tracing::warn!(error = %e, tag = %tag, "IntentSync intent_put append decode failed");
+                                    return DispatchOutcome::ParseError;
+                                }
                             }
-                        };
-                        // ADR-047 hot-path timer (aux.store_put) —
-                        // local fjall IntentStore write on the peer.
-                        // Mirrors `pif.local_put` on the producer side
-                        // so we can compare in-process vs across-the-
-                        // wire local-store cost.
-                        let put_res =
-                            kiseki_tracing::hot_span!("aux.store_put", { store.put(intent) });
+                        }
+                        let n = intents.len();
+                        // ADR-047 hot-path timer (aux.store_put) — local fjall
+                        // IntentStore write on the peer. Now wraps the whole
+                        // batch commit, mirroring `put_batch`'s one-WAL-sync
+                        // shape on the producer side.
+                        let put_res = kiseki_tracing::hot_span!("aux.store_put", {
+                            store.put_batch(intents)
+                        });
                         match put_res {
-                            // Recorded OR Duplicate both mean the intent is now
-                            // durable on this replica — credit the ack either
-                            // way (idempotent re-fan must still count, ADR-047
-                            // §5 / O3). The reply body is an empty `()`.
-                            Ok(_) => {
-                                // ADR-047 hot-path timer (aux.encode_response)
-                                // — postcard-encode of the empty `()` ack.
-                                // Trivial but split so any future ack-body
-                                // bloat shows up here, not buried in the
-                                // total round-trip cost.
-                                kiseki_tracing::hot_span!("aux.encode_response", { encode_ok(&()) })
+                            // Recorded OR Duplicate both mean the intent is
+                            // durable on this replica — credit the ack
+                            // either way (idempotent re-fan must still
+                            // count, ADR-047 §5 / O3). The reply is one bool
+                            // per input intent in input order.
+                            Ok(outcomes) => {
+                                let acks: Vec<bool> = outcomes.iter().map(|_| true).collect();
+                                debug_assert_eq!(
+                                    acks.len(),
+                                    n,
+                                    "put_batch must return one outcome per input"
+                                );
+                                kiseki_tracing::hot_span!("aux.encode_response", {
+                                    encode_ok(&acks)
+                                })
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, tag = %tag, "IntentSync intent_put store write failed");
@@ -415,6 +443,24 @@ mod tests {
         })
     }
 
+    /// W9 (2026-06-02): the metric label strings in `kiseki-raft` are
+    /// hard-coded literals because `kiseki-raft` can't depend on
+    /// `kiseki-log` (the dep edge points the other way). This catches drift
+    /// if either side renames its tag.
+    #[test]
+    fn metric_label_strings_match_aux_tag_strings() {
+        assert_eq!(
+            INTENT_PUT_TAG,
+            kiseki_raft::transport_metrics::op::INTENT_PUT,
+            "intent_put tag drift — metric label out of sync"
+        );
+        assert_eq!(
+            INTENT_GATHER_PENDING_TAG,
+            kiseki_raft::transport_metrics::op::INTENT_GATHER_PENDING,
+            "intent_gather_pending tag drift — metric label out of sync"
+        );
+    }
+
     /// A non-trivial append: real `chunk_refs`, payload, operation, and a
     /// new chunk — so the proto round-trip is exercised on every field.
     fn rich_intent(s: PerspectiveSeq, key: Option<IdempotencyKey>) -> WriteIntent {
@@ -444,6 +490,7 @@ mod tests {
                     placement: vec![7, 9],
                     original_len: 4096,
                 }],
+                inline_payloads: vec![(ChunkId([0x33u8; 32]), vec![0xc0, 0xff, 0xee, 0x00])],
             },
         }
     }
@@ -464,6 +511,15 @@ mod tests {
             assert_eq!(x.chunk_id, y.chunk_id, "new_chunk.chunk_id");
             assert_eq!(x.placement, y.placement, "new_chunk.placement");
             assert_eq!(x.original_len, y.original_len, "new_chunk.original_len");
+        }
+        assert_eq!(
+            a.inline_payloads.len(),
+            b.inline_payloads.len(),
+            "inline_payloads len",
+        );
+        for ((ac, ab), (bc, bb)) in a.inline_payloads.iter().zip(&b.inline_payloads) {
+            assert_eq!(ac, bc, "inline_payload.chunk_id");
+            assert_eq!(ab, bb, "inline_payload.bytes");
         }
     }
 
@@ -517,29 +573,41 @@ mod tests {
         assert_append_eq(&decoded[1].append, &i2.append);
     }
 
-    /// The `intent_put` arm decodes a fanned `WireIntent` and durably records
-    /// it in the peer's store — the server side of the producer's quorum
-    /// intent-write (ADR-047 phase 5c). The Ok reply is an empty `()`.
+    /// The `intent_put` arm decodes a fanned `Vec<WireIntent>` and durably
+    /// records every intent in the peer's store — the server side of the
+    /// producer's quorum intent-write (ADR-047 phase 5c, W12 batched).
+    /// The Ok reply is a `Vec<bool>` (one true per durable intent).
     #[tokio::test]
     async fn dispatcher_intent_put_stores_fanned_intent() {
         let store: Arc<dyn IntentStore> = Arc::new(InMemIntentStore::new());
         let dispatch = build_intent_dispatcher(Arc::clone(&store));
 
-        let original = rich_intent(seq(7, 3, 2), Some([0xa1u8; 16]));
-        let payload = postcard::to_stdvec(&WireIntent::from(&original)).unwrap();
+        let one = rich_intent(seq(7, 3, 2), Some([0xa1u8; 16]));
+        let two = rich_intent(seq(7, 4, 2), Some([0xa2u8; 16]));
+        let three = rich_intent(seq(7, 5, 2), None);
+        let wires: Vec<WireIntent> = [&one, &two, &three]
+            .iter()
+            .map(|i| WireIntent::from(*i))
+            .collect();
+        let payload = postcard::to_stdvec(&wires).unwrap();
         let outcome = dispatch(INTENT_PUT_TAG, &payload).await;
         let DispatchOutcome::Ok(bytes) = outcome else {
             panic!("expected Ok ack");
         };
-        // Reply body is `()`.
-        let (): () = postcard::from_bytes(&bytes).unwrap();
+        // Reply body is `Vec<bool>` — one ack per input intent.
+        let acks: Vec<bool> = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(acks.len(), 3, "one ack per input");
+        assert!(acks.iter().all(|b| *b), "all three durably stored");
 
-        // The intent now round-trips out of the peer's store, append intact.
+        // The intents now round-trip out of the peer's store, appends intact.
         let pending = store.pending().unwrap();
-        assert_eq!(pending.len(), 1, "fanned intent stored");
-        assert_eq!(pending[0].perspective_seq, original.perspective_seq);
-        assert_eq!(pending[0].idempotency_key, original.idempotency_key);
-        assert_append_eq(&pending[0].append, &original.append);
+        assert_eq!(pending.len(), 3, "all three fanned intents stored");
+        assert_eq!(pending[0].perspective_seq, one.perspective_seq);
+        assert_append_eq(&pending[0].append, &one.append);
+        assert_eq!(pending[1].perspective_seq, two.perspective_seq);
+        assert_append_eq(&pending[1].append, &two.append);
+        assert_eq!(pending[2].perspective_seq, three.perspective_seq);
+        assert_append_eq(&pending[2].append, &three.append);
     }
 
     /// A malformed `intent_put` payload degrades to `ParseError` (a non-ack)

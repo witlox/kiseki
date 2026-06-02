@@ -102,6 +102,15 @@ pub fn append_chunk_and_delta_request_to_proto(
                 original_len: n.original_len,
             })
             .collect(),
+        // #129 — inline small-file ciphertexts (ADR-030 §2 chunk_id key).
+        inline_payloads: req
+            .inline_payloads
+            .iter()
+            .map(|(cid, bytes)| kiseki_proto::v1::InlinePayload {
+                chunk_id: cid.0.to_vec(),
+                bytes: bytes.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -162,6 +171,18 @@ pub fn proto_to_append_chunk_and_delta(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    // #129 — inline small-file ciphertexts.
+    let inline_payloads: Vec<(ChunkId, Vec<u8>)> = req
+        .inline_payloads
+        .into_iter()
+        .map(|p| {
+            let chunk_id: [u8; 32] = p
+                .chunk_id
+                .try_into()
+                .map_err(|_| "inline_payloads.chunk_id must be 32 bytes".to_string())?;
+            Ok((ChunkId(chunk_id), p.bytes))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     Ok(crate::traits::AppendChunkAndDeltaRequest {
         delta: crate::traits::AppendDeltaRequest {
             shard_id,
@@ -174,6 +195,7 @@ pub fn proto_to_append_chunk_and_delta(
             has_inline_data: req.has_inline_data,
         },
         new_chunks,
+        inline_payloads,
     })
 }
 

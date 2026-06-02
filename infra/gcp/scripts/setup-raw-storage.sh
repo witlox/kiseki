@@ -151,6 +151,18 @@ Environment=KISEKI_METRICS_ADDR=0.0.0.0:9090
 
 # Metadata on boot disk (fast SSD), data on raw devices
 Environment=KISEKI_DATA_DIR=${meta_dir}
+# ADR-049 phase 5a: device-inventory tags so the catalog policy
+# can target `Tag("nvme-fast")` etc. The boot SSD hosts
+# `KISEKI_DATA_DIR` (metadata + raft log fjall). Raw-block-device
+# entries go via `KISEKI_RAW_DEVICES` above (orthogonal axis per
+# §D11.1). Operator can extend this list when additional mount
+# points are configured.
+Environment=KISEKI_DEVICE_TAGS=${meta_dir}=data-dir-default
+# ADR-049 §D2.5: Raft log path is bootstrap-only — never resolver-
+# routed. Defaults to `${meta_dir}/raft` when unset; we set it
+# explicitly so an operator changing `KISEKI_DATA_DIR` later
+# doesn't accidentally orphan the Raft log.
+Environment=KISEKI_RAFT_LOG_DIR=${meta_dir}/raft
 # Only node 1 bootstraps (seeds the Raft cluster).
 # Other nodes join as followers via Raft RPCs from the leader.
 %{ if node_id == 1 ~}
@@ -220,6 +232,27 @@ Environment=KISEKI_ADMIN_AUTH_DISABLED=true
 Environment=KISEKI_RAFT_FLUSH_INTERVAL_MS=100
 Environment=KISEKI_COMPOSITION_FLUSH_INTERVAL_MS=100
 Environment=KISEKI_CHUNK_FLUSH_INTERVAL_MS=100
+
+# 2026-06-01 — Raft TCP transport per-peer connection cap. The in-code
+# default was raised to 256 in the same commit that added these lines;
+# they are written here explicitly so future operators see the choice
+# in the systemd unit and can tune without rebuilding.
+#
+# Why this matters: on the 2026-06-01 instrumented run (default cap = 16
+# at the time), `raft_transport_rpc{op=append_entries}` mean ballooned
+# to 129 ms (vs ~150 µs same-zone GCP RTT floor). Journals showed
+# `rejecting Raft RPC connection — per-peer cap exceeded peer=… active=17`.
+# 18 shards × min_acks=2 fan = up to 36 inflight per follower; the
+# 16-slot cap rejected, leader retried, AppendEntries RTT exploded.
+# See specs/performance/2026-06-01-gcp-instrumented-single-client.md.
+#
+#   * KISEKI_RAFT_PER_PEER_MAX — server-side inbound cap.
+#   * KISEKI_RAFT_CONN_POOL_PER_PEER — client-side outbound pool size.
+#
+# 128 is double the typical 18-shard fan × 2 followers = 36 with
+# headroom for retransmits + the leaderless quorum-write producer.
+Environment=KISEKI_RAFT_PER_PEER_MAX=128
+Environment=KISEKI_RAFT_CONN_POOL_PER_PEER=128
 
 # 2026-05-09: bump kiseki_chunk_cluster to debug so wrapper-layer
 # warnings (peer GetFragment timeouts → surfaced as ChunkError::Io

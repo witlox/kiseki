@@ -123,6 +123,7 @@ fn rich_intent(s: PerspectiveSeq, key: Option<IdempotencyKey>) -> WriteIntent {
                 placement: vec![2, 3],
                 original_len: 4096,
             }],
+            inline_payloads: vec![],
         },
     }
 }

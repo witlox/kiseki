@@ -13,31 +13,13 @@
 
 use std::path::Path;
 
-/// Storage media type.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MediaType {
-    /// `NVMe` SSD (non-rotational, nvme device).
-    Nvme,
-    /// SATA/SAS SSD (non-rotational).
-    Ssd,
-    /// Spinning disk (rotational).
-    Hdd,
-    /// Unknown (non-Linux or detection failed).
-    Unknown,
-}
-
-impl MediaType {
-    /// Label string for the prom info gauge. Stable for dashboards.
-    #[must_use]
-    pub const fn as_label(self) -> &'static str {
-        match self {
-            Self::Nvme => "nvme",
-            Self::Ssd => "ssd",
-            Self::Hdd => "hdd",
-            Self::Unknown => "unknown",
-        }
-    }
-}
+// ADR-049 phase 1: MediaType + PER_FILE_METADATA_FOOTPRINT_BYTES
+// relocated to kiseki-common so every dependent crate (the control-
+// plane state machine, admin RPC, resolver, fjall consumers) can
+// import them. Re-exported here for back-compat with existing
+// in-server callers (`runtime.rs:529`, `web/admin_extra.rs:1635`,
+// the storage_admin_cli pool view, BDD test fixtures).
+pub use kiseki_common::{MediaType, PER_FILE_METADATA_FOOTPRINT_BYTES};
 
 /// Metadata capacity budget for the system disk.
 #[derive(Clone, Debug)]
@@ -212,13 +194,7 @@ pub fn emit_capacity_metrics(metrics: &crate::metrics::KisekiMetrics, cap: &Node
     }
 }
 
-/// Conservative metadata footprint per file. Used by the cluster
-/// aggregator to derive `cluster_max_files` from the
-/// `Σ soft_limit_bytes` aggregated across nodes.
-///
-/// 512 bytes covers: composition record (~280B), namespace hash key
-/// reservation (32B), name binding (~80B avg), HLC stamps (~16B per
-/// dual-clock entry), and ~104B reserved for fjall LSM overhead and
-/// future fields. Aligns with the planning figure in
-/// `docs/performance/capacity-planning.md`.
-pub const PER_FILE_METADATA_FOOTPRINT_BYTES: u64 = 512;
+// (PER_FILE_METADATA_FOOTPRINT_BYTES moved to kiseki-common::metadata
+// per ADR-049 phase 1. Re-exported at the top of this file via the
+// `pub use kiseki_common::*` line so existing callers continue to
+// compile against `crate::system_disk::PER_FILE_METADATA_FOOTPRINT_BYTES`.)

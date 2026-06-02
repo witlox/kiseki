@@ -3,7 +3,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
   System disk auto-detection, per-shard inline thresholds, metadata
   capacity management, workload-driven shard placement, and SSD
   read accelerators. The inline threshold determines whether a file's
-  encrypted content is stored in small/objects.redb (metadata tier) or
+  encrypted content is stored in small/objects (fjall, ADR-022 rev-5) (metadata tier) or
   as a chunk extent on a raw block device (data tier).
 
   Background:
@@ -31,7 +31,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
     Then the gateway encrypts the file with envelope encryption
     And the encrypted payload is included in the Raft log entry as delta payload
     And the log entry is replicated to all voters
-    And on apply the state machine offloads the payload to small/objects.redb
+    And on apply the state machine offloads the payload to small/objects (fjall, ADR-022 rev-5)
     And the in-memory state machine retains only the delta header
 
   @library
@@ -48,21 +48,21 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
   Scenario: Read path is transparent — checks redb first, then block
     Given shard "shard-1" has both inline and chunked files
     When a client reads an inline file (chunk_id = "abc123")
-    Then ChunkOps::get() finds it in small/objects.redb
+    Then ChunkOps::get() finds it in small/objects (fjall, ADR-022 rev-5)
     And returns the encrypted content
     When a client reads a chunked file (chunk_id = "def456")
-    Then ChunkOps::get() misses in small/objects.redb
+    Then ChunkOps::get() misses in small/objects (fjall, ADR-022 rev-5)
     And reads from the block device extent
     And returns the encrypted content
 
   @library
   Scenario: Snapshot includes inline content (I-SF5)
-    Given shard "shard-1" has 1000 inline files in small/objects.redb
+    Given shard "shard-1" has 1000 inline files in small/objects (fjall, ADR-022 rev-5)
     When the state machine builds a snapshot
     Then the snapshot includes all 1000 inline file contents read from redb
     When a new learner receives this snapshot
     And installs it via install_snapshot
-    Then the learner's small/objects.redb contains all 1000 files
+    Then the learner's small/objects (fjall, ADR-022 rev-5) contains all 1000 files
     And reads for those files succeed on the learner
 
   # === Metadata capacity management (I-SF2) ===
@@ -76,24 +76,38 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
     And commits threshold reduction using votes from node-1 and node-3
     And node-2 receives the committed change via Raft replication
 
-  # === GC for small/objects.redb (I-SF6) ===
+  # === GC for small/objects (fjall, ADR-022 rev-5) (I-SF6) ===
 
   @library
-  Scenario: Inline file deletion cleans small/objects.redb
-    Given an inline file with chunk_id "abc123" exists in small/objects.redb
+  Scenario: Inline file deletion cleans small/objects (fjall, ADR-022 rev-5)
+    Given an inline file with chunk_id "abc123" exists in small/objects (fjall, ADR-022 rev-5)
     When the file is deleted (tombstone delta committed via Raft)
     And all consumer watermarks advance past the tombstone
     And truncate_log or compact_shard runs
-    Then the entry for "abc123" is removed from small/objects.redb
+    Then the entry for "abc123" is removed from small/objects (fjall, ADR-022 rev-5)
     And no orphan entry remains
 
   @library
-  Scenario: Orphan detection in small/objects.redb
-    Given small/objects.redb has 10,000 entries
+  Scenario: Orphan detection in small/objects (fjall, ADR-022 rev-5)
+    Given small/objects (fjall, ADR-022 rev-5) has 10,000 entries
     And the delta log references only 9,990 of them
     When a scrub or consistency check runs
     Then 10 orphan entries are detected
     And an alert is emitted for investigation
+
+  # === #129 — multi-node inline correctness ===
+
+  @integration
+  Scenario: Inline small file PUT on node 1 is GET-able on node 3
+    Given a 3-node Kiseki cluster
+    And every node has its SmallObjectStore mounted
+    When a 1 KB inline-eligible object is PUT through the gateway on node 1
+    Then the AppendChunkAndDeltaRequest carries the ciphertext in inline_payloads
+    And the Raft state-machine apply on every replica writes the ciphertext to its local SmallObjectStore keyed by chunk_id
+    When the same object is GET through the gateway on node 3
+    Then the gateway resolves the bytes from node 3's local SmallObjectStore
+    And the returned bytes are identical to the PUT bytes
+    And no chunk-fabric round-trip is made for the read
 
   # === Workload-driven shard placement ===
 
@@ -149,7 +163,7 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
     And shard "shard-1" has high read IOPS for small files
     When an SSD learner is added to shard "shard-1"
     Then the learner receives the full Raft log
-    And its small/objects.redb is populated via log replay
+    And its small/objects (fjall, ADR-022 rev-5) is populated via log replay
     And read requests can be served from the SSD learner
     And the learner does NOT participate in elections
     And the learner does NOT count toward commit quorum

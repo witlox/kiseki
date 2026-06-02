@@ -2116,7 +2116,6 @@ dependencies = [
  "postcard",
  "prometheus",
  "proptest",
- "redb",
  "reed-solomon-erasure",
  "serde",
  "serde_json",
@@ -2201,6 +2200,7 @@ version = "2026.43.0"
 dependencies = [
  "proptest",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tracing",
  "uuid",

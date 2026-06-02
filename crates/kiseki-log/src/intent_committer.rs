@@ -357,6 +357,7 @@ mod tests {
                     has_inline_data: false,
                 },
                 new_chunks: vec![],
+                inline_payloads: vec![],
             },
         }
     }

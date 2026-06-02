@@ -35,6 +35,22 @@ pub mod store;
 #[allow(missing_docs)]
 pub mod types;
 
+// ADR-049 phase 2: per-node device discovery + InventoryReporter.
+pub mod device_discovery;
+
+// ADR-049 phase 3: placement + capacity resolver (§D4.5 formula).
+pub mod resolver;
+
+// ADR-049 phase 5a (pure): kiseki-tier-paths.json pointer file +
+// I-CP-Move enforcement. Wired into the runtime.rs boot path
+// alongside the boot reorder (phase 5a continued).
+pub mod tier_paths;
+
+// ADR-049 phase 5a continued: boot-time integration helper.
+// Wraps discovery → publish → resolve → I-CP-Move → save-pointer
+// in one call.
+pub mod phase5_boot;
+
 pub use commands::ControlCommand;
 pub use metrics::ClusterControlMetrics;
 // Re-exports kept for the follow-up subtask that switches admin
