@@ -115,6 +115,10 @@ pub struct KisekiWorld {
     pub last_response: Option<Vec<u8>>,
     pub writes_rejected: bool,
     pub reads_working: bool,
+    /// ADR-047 MF-1 / MF-9 — set by the multi-node concurrent
+    /// same-name convergence step; checked by the follow-up
+    /// "converged value is one of" step.
+    pub last_converged_value: Option<String>,
 
     // --- Name → ID mappings (Gherkin readability) ---
     pub shard_names: HashMap<String, ShardId>,
@@ -173,6 +177,7 @@ impl KisekiWorld {
             last_response: None,
             writes_rejected: false,
             reads_working: false,
+            last_converged_value: None,
             shard_names: HashMap::new(),
             tenant_ids: HashMap::new(),
             namespace_ids: HashMap::new(),
@@ -249,6 +254,9 @@ impl KisekiWorld {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         });
         self.namespace_ids.insert(name.to_owned(), ns_id);
         ns_id
@@ -276,6 +284,9 @@ impl KisekiWorld {
                 read_only: false,
                 versioning_enabled: false,
                 compliance_tags: Vec::new(),
+                tier_policy: Vec::new(),
+
+                size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
             })
             .await;
         ns_id
@@ -343,6 +354,9 @@ impl KisekiWorld {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         };
         self.legacy.gateway.add_namespace(ns.clone()).await;
 
@@ -405,6 +419,9 @@ impl KisekiWorld {
                 read_only: false,
                 versioning_enabled: false,
                 compliance_tags: Vec::new(),
+                tier_policy: Vec::new(),
+
+                size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
             })
             .await;
     }
@@ -573,6 +590,10 @@ impl KisekiWorld {
                     read_only: false,
                     versioning_enabled: false,
                     compliance_tags: Vec::new(),
+                    tier_policy: Vec::new(),
+
+                    size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(
+                    ),
                 })
                 .await;
         }
@@ -590,6 +611,10 @@ impl KisekiWorld {
 
                 forwarded_from_node: None,
                 comp_id_override: None,
+                tier: None,
+                surface: kiseki_gateway::ops::WriteSurface::S3,
+                base_composition_id: None,
+                base_bytes: 0,
             })
             .await
             .map_err(|e| e.to_string())

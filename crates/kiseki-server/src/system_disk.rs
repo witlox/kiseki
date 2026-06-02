@@ -3,26 +3,26 @@
 //! Detects media type (`NVMe`, SSD, HDD) of the system partition via
 //! sysfs on Linux. Falls back to `Unknown` on other platforms.
 //! Computes metadata budget from total capacity and configured limits.
+//!
+//! ADR-030 2026-05-31 amendment §"admin-driven metadata device role":
+//! the result is pushed into the
+//! `kiseki_node_metadata_capacity_bytes{kind=...}` gauge so the cluster
+//! aggregator can derive `cluster_max_files` from
+//! `Σ soft_limit / per-file metadata footprint`. See
+//! `docs/performance/capacity-planning.md`.
 
 use std::path::Path;
 
-/// Storage media type.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
-pub enum MediaType {
-    /// `NVMe` SSD (non-rotational, nvme device).
-    Nvme,
-    /// SATA/SAS SSD (non-rotational).
-    Ssd,
-    /// Spinning disk (rotational).
-    Hdd,
-    /// Unknown (non-Linux or detection failed).
-    Unknown,
-}
+// ADR-049 phase 1: MediaType + PER_FILE_METADATA_FOOTPRINT_BYTES
+// relocated to kiseki-common so every dependent crate (the control-
+// plane state machine, admin RPC, resolver, fjall consumers) can
+// import them. Re-exported here for back-compat with existing
+// in-server callers (`runtime.rs:529`, `web/admin_extra.rs:1635`,
+// the storage_admin_cli pool view, BDD test fixtures).
+pub use kiseki_common::{MediaType, PER_FILE_METADATA_FOOTPRINT_BYTES};
 
 /// Metadata capacity budget for the system disk.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct NodeMetadataCapacity {
     /// Total capacity of the system partition (bytes).
     pub total_bytes: u64,
@@ -157,3 +157,44 @@ pub fn warn_if_rotational(media_type: MediaType) {
         );
     }
 }
+
+/// ADR-030 2026-05-31 amendment — push the
+/// `NodeMetadataCapacity` snapshot into the Prometheus gauges so the
+/// cluster aggregator can derive `cluster_max_files` and surface
+/// per-node media class. Idempotent and cheap; safe to call on a
+/// periodic tick.
+pub fn emit_capacity_metrics(metrics: &crate::metrics::KisekiMetrics, cap: &NodeMetadataCapacity) {
+    // Per-kind capacity gauges. Each label resets cleanly on
+    // re-application, so periodic refresh is correct.
+    let kinds: [(&str, u64); 5] = [
+        ("total", cap.total_bytes),
+        ("used", cap.used_bytes),
+        ("soft_limit", cap.soft_limit_bytes),
+        ("hard_limit", cap.hard_limit_bytes),
+        ("small_file_budget", cap.small_file_budget_bytes),
+    ];
+    for (kind, value) in kinds {
+        // Cast saturates at i64::MAX — exabyte+ scale clamps but never panics.
+        let v = i64::try_from(value).unwrap_or(i64::MAX);
+        metrics
+            .node_metadata_capacity_bytes
+            .with_label_values(&[kind])
+            .set(v);
+    }
+
+    // Media-type info gauge: one-hot. Zero out the others on every
+    // refresh in case the active media class flipped (e.g. operator
+    // remounted onto a different device).
+    for &kind in &["nvme", "ssd", "hdd", "unknown"] {
+        let v = i64::from(cap.media_type.as_label() == kind);
+        metrics
+            .node_metadata_media_type
+            .with_label_values(&[kind])
+            .set(v);
+    }
+}
+
+// (PER_FILE_METADATA_FOOTPRINT_BYTES moved to kiseki-common::metadata
+// per ADR-049 phase 1. Re-exported at the top of this file via the
+// `pub use kiseki_common::*` line so existing callers continue to
+// compile against `crate::system_disk::PER_FILE_METADATA_FOOTPRINT_BYTES`.)

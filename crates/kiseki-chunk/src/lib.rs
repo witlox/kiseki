@@ -29,15 +29,17 @@ pub mod placement;
 pub mod pool;
 pub mod rebalance;
 pub mod scrub_engine;
+pub mod slab;
 pub mod small_object_store;
 pub mod store;
 pub mod striping;
 
 pub use async_ops::{arc_async, AsyncChunkOps, SyncBridge};
+pub use ec::EcEncoded;
 pub use error::ChunkError;
 #[cfg(any(feature = "gpu-cuda", feature = "gpu-rocm", test))]
 pub use gpu_direct::{GpuBackend, GpuDmaAllocator, GpuDmaBuffer, MockDmaAllocator};
 pub use persistent_store::PersistentChunkStore;
 pub use pool::{select_pool_for_write, AffinityPool, DeviceClass, DurabilityStrategy};
 pub use small_object_store::SmallObjectStore;
-pub use store::{ChunkOps, ChunkStore};
+pub use store::{ChunkOps, ChunkStore, StorageStats};

@@ -35,6 +35,17 @@ pub enum OperationType {
     /// Tenant + shard + composition-store flags travel in the
     /// payload (see `kiseki-composition::namespace_create_payload`).
     NamespaceCreate,
+    /// ADR-048 §"Read path"/§"Hot-tier eviction" — flip a
+    /// composition's per-chunk `ChunkRefLocation` entries from `Hot`
+    /// to `Cold` atomically via Raft consensus. Emitted by the
+    /// slab-EC compactor task after a slab is durable on `min_acks`
+    /// placement nodes. Payload encodes `(comp_id, Vec<(chunk_idx,
+    /// ChunkRefLocation::Cold {…})>)` (`kiseki-composition::
+    /// migrate_locations_payload`). Hydrator-side application
+    /// mutates `Composition.chunk_locations` and decrements the
+    /// local chunk-store refcount on the migrated chunks (I-SE1,
+    /// I-SE4).
+    MigrateChunkLocations,
 }
 
 /// System-visible delta header — cleartext metadata.

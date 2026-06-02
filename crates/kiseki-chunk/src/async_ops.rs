@@ -63,6 +63,26 @@ pub trait AsyncChunkOps: Send + Sync {
     /// `refcount` + `increment_refcount` path.
     async fn try_increment_if_exists(&self, chunk_id: &ChunkId) -> Result<Option<u64>, ChunkError>;
 
+    /// Register a `chunk_id` in the dedup index without device I/O.
+    /// Called by the cluster wrapper after a successful EC fragment
+    /// fan; without it the dedup index stays empty in EC mode and the
+    /// gateway re-encrypts + re-fans the same content on every PUT.
+    /// Defaults to the trait error so non-cluster backends don't
+    /// have to implement it.
+    ///
+    /// # Errors
+    /// Backends may return `ChunkError::Io` on refcount overflow or
+    /// meta-store persistence failure.
+    async fn register_ec_chunk(
+        &self,
+        _envelope: &kiseki_crypto::envelope::Envelope,
+        _pool: &str,
+    ) -> Result<bool, ChunkError> {
+        Err(ChunkError::Io(
+            "register_ec_chunk not supported on this AsyncChunkOps".into(),
+        ))
+    }
+
     /// Decrement refcount. Returns the new refcount.
     async fn decrement_refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError>;
 
@@ -86,6 +106,12 @@ pub trait AsyncChunkOps: Send + Sync {
 
     /// Get the refcount for a chunk.
     async fn refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError>;
+
+    /// Storage capacity + dedup statistics. Default returns zeroes;
+    /// persistent backends report real device capacity + dedup.
+    async fn storage_stats(&self) -> crate::store::StorageStats {
+        crate::store::StorageStats::default()
+    }
 
     /// Phase 16c step 1: fan a `DeleteFragment` out to every cluster
     /// peer that holds a copy of `chunk_id`. Default no-op so the
@@ -116,6 +142,19 @@ pub trait AsyncChunkOps: Send + Sync {
         _bytes: Vec<u8>,
     ) -> Result<(), ChunkError> {
         Err(ChunkError::Io("write_fragment not implemented".into()))
+    }
+
+    /// Write one EC fragment with a placement-tier hint from `pool`
+    /// (ADR-045 §D4). Default ignores `pool` and delegates to
+    /// [`write_fragment`](Self::write_fragment).
+    async fn write_fragment_in_pool(
+        &self,
+        chunk_id: &ChunkId,
+        fragment_index: u32,
+        bytes: Vec<u8>,
+        _pool: &str,
+    ) -> Result<(), ChunkError> {
+        self.write_fragment(chunk_id, fragment_index, bytes).await
     }
 
     /// Phase 16c step 6: read one EC fragment.
@@ -230,8 +269,18 @@ pub trait AsyncChunkOps: Send + Sync {
 /// [`AsyncChunkOps`]'s `&self` signature. Reads (`read_chunk`,
 /// `refcount`, `list_chunk_ids`, `list_fragments`, `read_fragment`,
 /// `snapshot_pools`) take a read lock so parallel readers proceed
-/// concurrently. Writes take a write lock and serialize with both
-/// readers and other writers. (B7 in the optimization backlog.)
+/// concurrently.
+///
+/// GH #137: the data-path writes (`write_chunk`, `increment_refcount`,
+/// `decrement_refcount`, `write_fragment`, `write_fragment_in_pool`)
+/// now take `&self` on the inner store, so they take a **read** lock
+/// here too — concurrent writers share the read lock and parallelize,
+/// relying on the inner store's fine-grained interior locks for
+/// correctness (the persistent store releases its chunk-index mutex
+/// across device I/O). The outer write lock is reserved for the rare
+/// admin mutations (`add_pool`, `add_device`, `remove_device`,
+/// `set_pool_durability`, `delete_chunk_force`, `delete_fragment`,
+/// `gc`) that still take `&mut self` on the inner store.
 pub struct SyncBridge<T: ChunkOps + Send + Sync + 'static> {
     inner: Arc<parking_lot::RwLock<T>>,
 }
@@ -261,7 +310,9 @@ pub fn arc_async<T: ChunkOps + Send + Sync + 'static>(inner: T) -> Arc<dyn Async
 #[async_trait]
 impl<T: ChunkOps + Send + Sync + 'static> AsyncChunkOps for SyncBridge<T> {
     async fn write_chunk(&self, envelope: Envelope, pool: &str) -> Result<bool, ChunkError> {
-        self.inner.write().write_chunk(envelope, pool)
+        // GH #137: `&self` on the inner store → read lock here so
+        // concurrent writers parallelize on the inner interior locks.
+        self.inner.read().write_chunk(envelope, pool)
     }
 
     async fn read_chunk(
@@ -275,15 +326,32 @@ impl<T: ChunkOps + Send + Sync + 'static> AsyncChunkOps for SyncBridge<T> {
     }
 
     async fn increment_refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
-        self.inner.write().increment_refcount(chunk_id)
+        // GH #137: `&self` on the inner store → read lock here.
+        self.inner.read().increment_refcount(chunk_id)
     }
 
     async fn try_increment_if_exists(&self, chunk_id: &ChunkId) -> Result<Option<u64>, ChunkError> {
-        self.inner.write().try_increment_if_exists(chunk_id)
+        // GH #137: the atomic check-and-increment is now `&self` on the
+        // inner store (one chunk-index critical section, no I/O) → read
+        // lock here, so the gateway's per-write dedup preflight no longer
+        // serializes every writer through the exclusive lock.
+        self.inner.read().try_increment_if_exists(chunk_id)
+    }
+
+    async fn register_ec_chunk(
+        &self,
+        envelope: &kiseki_crypto::envelope::Envelope,
+        pool: &str,
+    ) -> Result<bool, ChunkError> {
+        // Mirrors the `try_increment_if_exists` lock shape: the
+        // inner-store method is `&self` (chunk-index critical section
+        // only), so a read lock here is enough.
+        self.inner.read().register_ec_chunk(envelope, pool)
     }
 
     async fn decrement_refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
-        self.inner.write().decrement_refcount(chunk_id)
+        // GH #137: `&self` on the inner store → read lock here.
+        self.inner.read().decrement_refcount(chunk_id)
     }
 
     async fn set_retention_hold(
@@ -312,6 +380,10 @@ impl<T: ChunkOps + Send + Sync + 'static> AsyncChunkOps for SyncBridge<T> {
         self.inner.read().refcount(chunk_id)
     }
 
+    async fn storage_stats(&self) -> crate::store::StorageStats {
+        self.inner.read().storage_stats()
+    }
+
     async fn list_chunk_ids(&self) -> Vec<ChunkId> {
         self.inner.read().list_chunk_ids()
     }
@@ -322,9 +394,23 @@ impl<T: ChunkOps + Send + Sync + 'static> AsyncChunkOps for SyncBridge<T> {
         fragment_index: u32,
         bytes: Vec<u8>,
     ) -> Result<(), ChunkError> {
+        // GH #137: `&self` on the inner store → read lock here.
         self.inner
-            .write()
+            .read()
             .write_fragment(chunk_id, fragment_index, bytes)
+    }
+
+    async fn write_fragment_in_pool(
+        &self,
+        chunk_id: &ChunkId,
+        fragment_index: u32,
+        bytes: Vec<u8>,
+        pool: &str,
+    ) -> Result<(), ChunkError> {
+        // GH #137: `&self` on the inner store → read lock here.
+        self.inner
+            .read()
+            .write_fragment_in_pool(chunk_id, fragment_index, bytes, pool)
     }
 
     async fn read_fragment(
@@ -403,7 +489,7 @@ mod tests {
     }
 
     fn store_with_pool(name: &str) -> ChunkStore {
-        let mut store = ChunkStore::new();
+        let store = ChunkStore::new();
         store.add_pool(AffinityPool {
             name: name.to_owned(),
             device_class: DeviceClass::NvmeSsd,
@@ -411,6 +497,8 @@ mod tests {
             devices: vec![],
             capacity_bytes: 1 << 30,
             used_bytes: 0,
+            requires_migration: false,
+            ..Default::default()
         });
         store
     }

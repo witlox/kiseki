@@ -35,6 +35,9 @@ fn setup_fuse() -> KisekiFuse<InMemoryGateway> {
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
+
+        size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
     });
 
     let chunks = ChunkStore::new();

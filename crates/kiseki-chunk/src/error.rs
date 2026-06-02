@@ -10,6 +10,14 @@ pub enum ChunkError {
     #[error("chunk not found: {0}")]
     NotFound(ChunkId),
 
+    /// ADR-048 slab not found. Distinct from `NotFound(ChunkId)` because
+    /// a slab's identity is a UUID rather than a content-addressed
+    /// chunk id; the read path uses this variant when an EC-reconstruct
+    /// of a slab fails to locate any fragment for the requested
+    /// `slab_id`.
+    #[error("slab not found: {0}")]
+    SlabNotFound(uuid::Uuid),
+
     /// Chunk data corrupted (AEAD auth tag failed).
     #[error("chunk corrupted: {0}")]
     Corrupted(ChunkId),
@@ -67,6 +75,9 @@ impl From<ChunkError> for KisekiError {
     fn from(e: ChunkError) -> Self {
         match e {
             ChunkError::NotFound(id) => KisekiError::Permanent(PermanentError::ChunkLost(id)),
+            ChunkError::SlabNotFound(slab_uuid) => KisekiError::Permanent(
+                PermanentError::InvariantViolation(format!("slab not found: {slab_uuid}")),
+            ),
             ChunkError::Corrupted(id) | ChunkError::RefcountUnderflow(id) => {
                 KisekiError::Permanent(PermanentError::InvariantViolation(format!(
                     "chunk error: {id}"

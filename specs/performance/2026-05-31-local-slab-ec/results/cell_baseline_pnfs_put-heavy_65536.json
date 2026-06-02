@@ -1,0 +1,16 @@
+{
+  "label": "baseline_pnfs_put-heavy_65536",
+  "pool_type": "baseline",
+  "protocol": "pnfs",
+  "shape": "put-heavy",
+  "object_size": 65536,
+  "ok": true,
+  "rc": 0,
+  "wall_s": 31.878443145018537,
+  "ops": 46177,
+  "ops_per_s": 4617.7,
+  "mib_per_s": 288.61,
+  "p50_us": 2480,
+  "p95_us": 5478,
+  "p99_us": 34657
+}

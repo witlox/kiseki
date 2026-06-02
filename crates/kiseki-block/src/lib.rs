@@ -28,7 +28,9 @@ pub mod extent;
 pub mod file;
 pub mod journal;
 pub mod metrics;
+pub mod pool;
 pub mod probe;
+pub mod raw;
 pub mod superblock;
 pub mod trim;
 
@@ -38,12 +40,14 @@ pub mod uring_file;
 pub use metrics::BlockMetrics;
 
 pub use allocator::{BitmapAllocator, MAX_EXTENT_BYTES};
-pub use backend::DeviceBackend;
+pub use backend::{DeviceBackend, DeviceUsage};
 pub use error::{AllocError, BlockError};
 pub use extent::Extent;
 pub use file::{FileBackedDevice, MAX_EXTENT_PAYLOAD_BYTES};
 pub use journal::Journal;
-pub use probe::{DetectedMedium, DeviceCharacteristics, IoStrategy};
+pub use pool::DevicePool;
+pub use probe::{DetectedMedium, DeviceCharacteristics, IoStrategy, StorageTier};
+pub use raw::RawBlockDevice;
 pub use superblock::Superblock;
 pub use trim::{TrimConfig, TrimQueue};
 

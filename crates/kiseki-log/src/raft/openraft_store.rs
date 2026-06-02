@@ -156,7 +156,16 @@ fn op_to_u8(op: crate::delta::OperationType) -> u8 {
         crate::delta::OperationType::SetAttribute => 4,
         crate::delta::OperationType::Finalize => 5,
         crate::delta::OperationType::NamespaceCreate => 6,
+        crate::delta::OperationType::MigrateChunkLocations => 7,
     }
+}
+
+/// Re-export of the operation-code mapper so sibling modules
+/// ([`crate::raft_intent_sink`]) can build `IncorporateItem`s without
+/// duplicating the table.
+#[must_use]
+pub fn op_to_u8_pub(op: crate::delta::OperationType) -> u8 {
+    op_to_u8(op)
 }
 
 impl OpenRaftLogStore {
@@ -194,22 +203,71 @@ impl OpenRaftLogStore {
         let state_machine = ShardStateMachine::new(Arc::clone(&state_inner));
 
         // Select log store backend: persistent (fjall) or in-memory.
+        // Errors are surfaced as `LogError::StoreConstruction(<source>)`
+        // so operators see the underlying fjall / openraft failure
+        // instead of the prior opaque `Unavailable`. Each call site
+        // tags its phase so the message reads e.g.
+        // "fjall open at /data/raft/shard-…: <fjall::Error>".
         let raft = if let Some(dir) = data_dir {
             let raft_dir = dir.join("raft");
-            std::fs::create_dir_all(&raft_dir).ok();
+            std::fs::create_dir_all(&raft_dir).map_err(|e| {
+                LogError::StoreConstruction(format!("create_dir_all({}): {e}", raft_dir.display()))
+            })?;
             let log_path = raft_dir.join(format!("shard-{}", shard_id.0));
-            let log_store =
-                FjallRaftLogStore::<C>::open(&log_path).map_err(|_| LogError::Unavailable)?;
+            // #151 (W6) — opt-in fsync coalescing. Off by default;
+            // operators enable per-deployment by setting both
+            // env vars. The window is a duration in microseconds
+            // that a fsync request waits for stragglers; the batch
+            // is the max waiters per merged fsync. See the
+            // `kiseki_raft::fsync_coalescer` module docs for the
+            // tuning trade-off (low values approximate the legacy
+            // per-AE-round fsync; high values amortise the fsync
+            // tax across more entries at the cost of a small
+            // floor under low load).
+            let fsync_window_us: Option<u64> = std::env::var("KISEKI_RAFT_FSYNC_WINDOW_US")
+                .ok()
+                .and_then(|s| s.parse().ok());
+            let fsync_max_batch: Option<usize> = std::env::var("KISEKI_RAFT_FSYNC_BATCH")
+                .ok()
+                .and_then(|s| s.parse().ok());
+            let log_store = match (fsync_window_us, fsync_max_batch) {
+                (Some(w), Some(b)) if w > 0 && b > 0 => {
+                    tracing::info!(
+                        shard_id = %shard_id.0,
+                        window_us = w,
+                        max_batch = b,
+                        "FjallRaftLogStore: fsync coalescing ON (#151 / W6)",
+                    );
+                    FjallRaftLogStore::<C>::open_with_fsync_coalescing(&log_path, w, b).map_err(
+                        |e| {
+                            LogError::StoreConstruction(format!(
+                                "fjall open (coalesced) at {}: {e}",
+                                log_path.display()
+                            ))
+                        },
+                    )?
+                }
+                _ => FjallRaftLogStore::<C>::open(&log_path).map_err(|e| {
+                    LogError::StoreConstruction(format!(
+                        "fjall open at {}: {e}",
+                        log_path.display()
+                    ))
+                })?,
+            };
             if peers.len() > 1 {
                 let network = TcpNetworkFactory::<C>::new(shard_id);
                 Raft::new(node_id, config, network, log_store, state_machine)
                     .await
-                    .map_err(|_e| LogError::Unavailable)?
+                    .map_err(|e| {
+                        LogError::StoreConstruction(format!("Raft::new multi-node: {e}"))
+                    })?
             } else {
                 let network = StubNetworkFactory::<C>::new();
                 Raft::new(node_id, config, network, log_store, state_machine)
                     .await
-                    .map_err(|_e| LogError::Unavailable)?
+                    .map_err(|e| {
+                        LogError::StoreConstruction(format!("Raft::new single-node: {e}"))
+                    })?
             }
         } else {
             let log_store = MemLogStore::<C>::new();
@@ -217,12 +275,20 @@ impl OpenRaftLogStore {
                 let network = TcpNetworkFactory::<C>::new(shard_id);
                 Raft::new(node_id, config, network, log_store, state_machine)
                     .await
-                    .map_err(|_e| LogError::Unavailable)?
+                    .map_err(|e| {
+                        LogError::StoreConstruction(format!(
+                            "Raft::new multi-node (mem-store): {e}"
+                        ))
+                    })?
             } else {
                 let network = StubNetworkFactory::<C>::new();
                 Raft::new(node_id, config, network, log_store, state_machine)
                     .await
-                    .map_err(|_e| LogError::Unavailable)?
+                    .map_err(|e| {
+                        LogError::StoreConstruction(format!(
+                            "Raft::new single-node (mem-store): {e}"
+                        ))
+                    })?
             }
         };
 
@@ -310,6 +376,43 @@ impl OpenRaftLogStore {
     #[must_use]
     pub fn raft_handle(&self) -> Arc<openraft::Raft<C, ShardStateMachine>> {
         Arc::new(self.raft.clone())
+    }
+
+    /// This shard's current Raft **voter** node ids, read from the live
+    /// membership metrics (ADR-047 phase 5b). Learners are excluded — only
+    /// voters carry the durability quorum the recovery gather counts against.
+    /// The set includes this node when it is itself a voter; the caller (the
+    /// [`TransportIntentGatherer`](crate::intent_sync)) drops the local id
+    /// before fanning out. Empty before membership is initialized.
+    #[must_use]
+    pub fn voter_ids(&self) -> Vec<u64> {
+        self.raft
+            .metrics()
+            .borrow_watched()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect()
+    }
+
+    /// Is this node the **established leader** of this shard's Raft group right
+    /// now (ADR-047 `LeaderSink` leadership detection)? Reads
+    /// `ServerState::Leader` from the live metrics watch — a cheap, lock-free
+    /// borrow, safe to poll on the committer supervisor's tick. A deposed
+    /// leader flips to `Candidate`/`Follower` here as soon as openraft sees a
+    /// higher term, which is the supervisor's signal to stop draining.
+    #[must_use]
+    pub fn is_leader(&self) -> bool {
+        self.raft.is_leader()
+    }
+
+    /// The node id this shard's Raft group currently regards as leader, if any
+    /// (ADR-047 `LeaderSink` — the `put_intent_and_fan` fan-includes-leader
+    /// target). `None` during an election (no committed leader). Read from the
+    /// live metrics watch.
+    #[must_use]
+    pub fn current_leader_id(&self) -> Option<u64> {
+        self.raft.metrics().borrow_watched().current_leader
     }
 
     /// Append a delta through Raft consensus.
@@ -473,6 +576,7 @@ impl OpenRaftLogStore {
         &self,
         req: AppendDeltaRequest,
         new_chunks: Vec<crate::raft_store::NewChunkMeta>,
+        inline_payloads: Vec<([u8; 32], Vec<u8>)>,
     ) -> Result<SequenceNumber, LogError> {
         {
             let inner = self.state.lock().await;
@@ -489,8 +593,58 @@ impl OpenRaftLogStore {
             payload: req.payload,
             has_inline_data: req.has_inline_data,
             new_chunks,
+            inline_payloads,
         };
 
+        let resp = self.raft.client_write(cmd).await.map_err(|e| {
+            if matches!(
+                e,
+                openraft::errors::RaftError::APIError(
+                    openraft::error::ClientWriteError::ForwardToLeader(_)
+                )
+            ) {
+                LogError::LeaderUnavailable(self.shard_id)
+            } else {
+                LogError::Unavailable
+            }
+        })?;
+
+        match resp.response() {
+            LogResponse::Appended(seq) => Ok(SequenceNumber(*seq)),
+            LogResponse::Ok | LogResponse::DecrementOutcome(_) => Err(LogError::Unavailable),
+        }
+    }
+
+    /// ADR-047 PART 8 — incorporate a BATCH of async-committed intents into
+    /// the Raft log as a single [`LogCommand::IncorporateIntents`] command.
+    ///
+    /// Replaces the per-intent `append_intent` (Finding U). Each item runs
+    /// through the per-item SM gate (recent set + ancient cutoff); items
+    /// already in the recent set are no-ops, items below the cutoff are
+    /// refused-with-alarm. Atomicity is preserved across the batch — the
+    /// whole apply runs under one SM-lock-held block.
+    ///
+    /// # Errors
+    /// [`LogError::MaintenanceMode`] if the shard is draining;
+    /// [`LogError::LeaderUnavailable`] if this node is not the leader;
+    /// [`LogError::Unavailable`] on any other Raft client-write failure.
+    pub async fn append_intents(
+        &self,
+        items: Vec<crate::raft_store::IncorporateItem>,
+    ) -> Result<SequenceNumber, LogError> {
+        {
+            let inner = self.state.lock().await;
+            if inner.maintenance {
+                return Err(LogError::MaintenanceMode(self.shard_id));
+            }
+        }
+        if items.is_empty() {
+            // Nothing to do — return the current tip so callers can rely on
+            // a SequenceNumber result.
+            return Ok(self.current_tip().await);
+        }
+
+        let cmd = LogCommand::IncorporateIntents { items };
         let resp = self.raft.client_write(cmd).await.map_err(|e| {
             if matches!(
                 e,
@@ -518,6 +672,7 @@ impl OpenRaftLogStore {
         &self,
         req: AppendDeltaRequest,
         new_chunks: Vec<crate::raft_store::NewChunkMeta>,
+        inline_payloads: Vec<([u8; 32], Vec<u8>)>,
     ) -> Result<SequenceNumber, LogError> {
         {
             let inner = self.state.lock().await;
@@ -534,6 +689,7 @@ impl OpenRaftLogStore {
             payload: req.payload,
             has_inline_data: req.has_inline_data,
             new_chunks,
+            inline_payloads,
         };
 
         let resp = self
@@ -632,10 +788,20 @@ impl OpenRaftLogStore {
         }
 
         let inner = self.state.lock().await;
-        let deltas: Vec<Delta> = inner
+        // `deltas` is appended in strictly increasing sequence order
+        // (tip += 1, then push) and the snapshot-install path preserves
+        // that order, so it is sorted ascending by `header.sequence`.
+        // Binary-search to the range start and stop at `to` instead of
+        // scanning the whole vec — O(log N + range), not O(total log).
+        // The old O(total) scan ran on every hydrator poll, so hydration
+        // degraded as the log grew (the root of #133's ~50 deltas/s) and
+        // held the shared SM mutex for the whole scan.
+        let start = inner
             .deltas
+            .partition_point(|d| d.header.sequence < req.from);
+        let deltas: Vec<Delta> = inner.deltas[start..]
             .iter()
-            .filter(|d| d.header.sequence >= req.from && d.header.sequence <= req.to)
+            .take_while(|d| d.header.sequence <= req.to)
             .map(|d| {
                 // Reconstruct inline payload from store if needed.
                 // Key = hashed_key with sequence mixed into last 8 bytes
@@ -781,6 +947,51 @@ impl OpenRaftLogStore {
     pub async fn current_tip(&self) -> SequenceNumber {
         let inner = self.state.lock().await;
         SequenceNumber(inner.tip)
+    }
+
+    /// ADR-047 PART 8 §T — snapshot the perspective-seqs currently in the SM's
+    /// recent-incorporated set. The supervisor calls this each tick and
+    /// per-intent-prunes the local store so only intents *known to be applied
+    /// on this replica* are removed.
+    pub async fn recent_incorporated_snapshot(
+        &self,
+    ) -> std::collections::HashSet<kiseki_common::time::HybridLogicalClock> {
+        let inner = self.state.lock().await;
+        inner.recent_incorporated_snapshot()
+    }
+
+    /// ADR-047 PART 8 — the SM's ancient cutoff log-index. Recovery uses this
+    /// to filter out re-gathered intents whose intent-store residency is
+    /// suspiciously old (Finding Q).
+    pub async fn ancient_cutoff_log_index(&self) -> u64 {
+        let inner = self.state.lock().await;
+        inner.ancient_cutoff_log_index
+    }
+
+    /// PART 8 §W — the SM's last-applied Raft log index. Used by the
+    /// supervisor's post-promotion wait-for-current: drain does NOT start
+    /// until `applied_log_index >= committed_log_index`, so the recent set is
+    /// guaranteed to cover the just-promoted leader's incoming log.
+    #[must_use]
+    pub fn applied_log_index(&self) -> u64 {
+        self.raft
+            .metrics()
+            .borrow_watched()
+            .last_applied
+            .as_ref()
+            .map_or(0, openraft::LogId::index)
+    }
+
+    /// PART 8 §W — the SM's last-committed Raft log index. Used as the bar the
+    /// applied index must catch up to before draining resumes after promotion.
+    #[must_use]
+    pub fn committed_log_index(&self) -> u64 {
+        self.raft
+            .metrics()
+            .borrow_watched()
+            .committed
+            .as_ref()
+            .map_or(0, openraft::LogId::index)
     }
 
     /// Check whether the shard is in maintenance mode.

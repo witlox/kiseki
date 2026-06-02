@@ -22,6 +22,8 @@ use std::io;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -74,10 +76,41 @@ pub const RESERVED_VERSION_BYTES: [u8; 3] = [0x5b, 0x7b, 0x22];
 /// at the cap fits the framed wire (ADR-041 gate-1 F-M3).
 pub const WIRE_FRAME_OVERHEAD_RESERVED: usize = 1024;
 
-/// Maximum concurrent inbound TCP connections per peer cert
+/// Default maximum concurrent inbound TCP connections per peer cert
 /// fingerprint. Mitigates connection-flood DoS amplified by the
-/// single-port multiplexing (ADR-041 gate-1 F-M5).
-pub const RAFT_TRANSPORT_PER_PEER_MAX: u32 = 16;
+/// single-port multiplexing (ADR-041 gate-1 F-M5). Override with
+/// `KISEKI_RAFT_PER_PEER_MAX` for cluster sizes/shard counts that
+/// legitimately exceed the default.
+/// Default per-peer inbound + outbound connection cap.
+///
+/// **2026-06-01 — raised from 16 to 256.** The previous default
+/// silently capped clusters where `shards × min_acks ≥ 16` (which
+/// is most production-sized deployments). GCP n=6 / 18-shard run
+/// at 32-conc PUT load saw `raft_transport_rpc{op=append_entries}`
+/// mean = 129 ms (vs ~150 µs same-zone RTT floor = 800× overshoot)
+/// because the leader's outbound pool and the follower's inbound
+/// cap both clamped at 16, causing inbound rejections
+/// (`per-peer cap exceeded peer=… active=17`) and 33 / 44 340 PUT
+/// quorum-shortfall errors. See
+/// `specs/performance/2026-06-01-gcp-instrumented-single-client.md`.
+///
+/// TCP connections + per-conn buffers are cheap (a few KiB each);
+/// the cap exists to bound per-process FD growth in pathological
+/// cases, not to throttle steady-state load. 256 fits 18-shard ×
+/// 2-follower fanout with concurrency headroom; tune up via
+/// `KISEKI_RAFT_PER_PEER_MAX` for larger.
+pub const RAFT_TRANSPORT_PER_PEER_MAX_DEFAULT: u32 = 256;
+
+/// Resolve the runtime per-peer cap from `KISEKI_RAFT_PER_PEER_MAX`,
+/// falling back to [`RAFT_TRANSPORT_PER_PEER_MAX_DEFAULT`]. Read once
+/// per accept so an operator can tune without a restart.
+fn per_peer_cap() -> u32 {
+    std::env::var("KISEKI_RAFT_PER_PEER_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(RAFT_TRANSPORT_PER_PEER_MAX_DEFAULT)
+}
 
 // ---------------------------------------------------------------------------
 // Response status — ADR-041 §"Response frame"
@@ -198,6 +231,15 @@ impl<C: RaftTypeConfig> TcpNetworkFactory<C> {
     }
 }
 
+/// A reusable connection to a Raft peer (the connection-pooling fix).
+/// Held across RPCs by `TcpNetwork` so each AppendEntries no longer pays
+/// a full TCP (re)dial — the dominant per-write commit cost on the
+/// multi-node write path.
+enum RaftConn {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
 /// A TCP connection to a single Raft peer for ONE shard's group. The
 /// `shard_id` is sent in every frame so the peer's listener routes
 /// correctly (ADR-041).
@@ -206,6 +248,10 @@ pub struct TcpNetwork {
     shard_id: ShardId,
     /// TLS client config for mTLS-secured connections (ADV-S2).
     tls_config: Option<Arc<rustls::ClientConfig>>,
+    /// Persistent connection reused across `append_entries` RPCs. Lazily
+    /// established; dropped + reconnected on any I/O error (the peer may
+    /// close a half-open connection). `None` until the first RPC.
+    conn: Option<RaftConn>,
 }
 
 impl<C: RaftTypeConfig<Node = KisekiNode, SnapshotData = Cursor<Vec<u8>>>> RaftNetworkFactory<C>
@@ -218,6 +264,7 @@ impl<C: RaftTypeConfig<Node = KisekiNode, SnapshotData = Cursor<Vec<u8>>>> RaftN
             addr: node.addr.clone(),
             shard_id: self.shard_id,
             tls_config: self.tls_config.clone(),
+            conn: None,
         }
     }
 }
@@ -349,6 +396,49 @@ where
     }
 }
 
+/// `KISEKI_RAFT_FAKE_RTT_US` — simulated outbound RTT (microseconds)
+/// added BEFORE every request write on the client side. Read once at
+/// module init via a `OnceLock`. Empty / unset / `0` / unparseable →
+/// the sleep is skipped (~1 cmp + branch per call, no syscall).
+///
+/// Purpose: harness-driven scenario discrimination per
+/// `specs/escalations/2026-05-30-decoupled-ack-perf-10x-analysis.md`
+/// A-1 finding. Localhost loopback RTT is ~30 µs; the ~22 ms p50 on
+/// GCP implies several ms / hop. Setting `KISEKI_RAFT_FAKE_RTT_US=2000`
+/// on a localhost cluster injects a 2 ms-per-RTT shape so we can
+/// validate whether the "extra RTT per write" hypothesis is the
+/// dominant factor on real cluster numbers without owning a real
+/// cluster.
+///
+/// Always-on (NOT gated by `hot-path-trace`): the cost when unset is
+/// one `OnceLock::get()` + one `if x > 0` compare per RPC.
+fn fake_rtt_us() -> u64 {
+    static CACHE: OnceLock<u64> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("KISEKI_RAFT_FAKE_RTT_US")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Inject the configured fake RTT before issuing the request — pure
+/// `tokio::time::sleep`, runs on the current task. Zero-µs when the
+/// env var is unset / 0 (the function short-circuits without ever
+/// touching the timer wheel).
+async fn maybe_inject_fake_rtt() {
+    let us = fake_rtt_us();
+    if us == 0 {
+        return;
+    }
+    tokio::time::sleep(Duration::from_micros(us)).await;
+}
+
+/// `rpc_call_plain`: open a fresh plain-TCP connection to `addr` and
+/// run one `rpc_exchange`. For harness-driven scenario discrimination
+/// per `specs/escalations/2026-05-30-decoupled-ack-perf-10x-analysis.md`
+/// A-1 finding we inject the optional `KISEKI_RAFT_FAKE_RTT_US`
+/// outbound-latency sleep BEFORE writing the request.
 async fn rpc_call_plain<Req: Serialize, Resp: DeserializeOwned>(
     addr: &str,
     shard_id: ShardId,
@@ -356,9 +446,17 @@ async fn rpc_call_plain<Req: Serialize, Resp: DeserializeOwned>(
     req: &Req,
 ) -> io::Result<Resp> {
     let mut stream = TcpStream::connect(addr).await?;
+    maybe_inject_fake_rtt().await;
     rpc_exchange(&mut stream, shard_id, tag, req).await
 }
 
+/// `rpc_call_tls`: open a fresh mTLS connection to `addr` and run one
+/// `rpc_exchange`. For harness-driven scenario discrimination per
+/// `specs/escalations/2026-05-30-decoupled-ack-perf-10x-analysis.md`
+/// A-1 finding we inject the optional `KISEKI_RAFT_FAKE_RTT_US`
+/// outbound-latency sleep BEFORE writing the request (post-handshake
+/// — TLS connect is itself >1 RTT and the goal is to model app-level
+/// RTT on top of an already-warm connection).
 async fn rpc_call_tls<Req: Serialize, Resp: DeserializeOwned>(
     addr: &str,
     shard_id: ShardId,
@@ -380,24 +478,256 @@ async fn rpc_call_tls<Req: Serialize, Resp: DeserializeOwned>(
         .connect(server_name, tcp)
         .await
         .map_err(|e| network_error(NetworkErrorKind::Transport, e))?;
+    maybe_inject_fake_rtt().await;
     rpc_exchange(&mut tls_stream, shard_id, tag, req).await
 }
 
-async fn rpc_call<Req: Serialize, Resp: DeserializeOwned>(
+/// Send one request/response RPC to `addr` for `shard_id` under `tag`
+/// over a **pooled, long-lived peer connection** (per
+/// `specs/escalations/2026-05-30-decoupled-ack-perf-10x-analysis.md`
+/// finding: 93 % of localhost `pif.leader_first_hop` round-trip was
+/// fresh-`TcpStream::connect` overhead, not actual server work).
+/// Plaintext when `tls_config` is `None`, otherwise mTLS — the inner
+/// `rpc_call_plain` / `rpc_call_tls` helpers remain available for
+/// callers that genuinely want a fresh connection per call.
+///
+/// The pool holds [`raft_pool_size_per_peer()`] slots per
+/// `(addr, tls?)` key; slots reconnect lazily on first use or after
+/// any I/O error. The server side already supports keep-alive (see
+/// [`handle_one_connection`] looping [`serve_one_request`]) — no
+/// wire-format change.
+///
+/// This is the call seam ADR-047's `TransportIntentGatherer` uses to
+/// reach a peer's auxiliary (non-Raft) `IntentSync` dispatcher — the
+/// same wire path the Raft `vote` / `full_snapshot` calls take.
+///
+/// # Errors
+/// Returns an `io::Error` on connect/transport failure or when the peer
+/// answers with a non-`Ok` status (`UnknownShard` / `ParseError` /
+/// `DispatcherPanic`); classify it with [`classify_network_error`]. On
+/// any error the slot's connection is dropped and the next call to that
+/// slot reconnects.
+pub async fn rpc_call<Req: Serialize, Resp: DeserializeOwned>(
     addr: &str,
     shard_id: ShardId,
     tag: &str,
     tls_config: Option<&Arc<rustls::ClientConfig>>,
     req: &Req,
 ) -> io::Result<Resp> {
-    match tls_config {
-        Some(tls) => rpc_call_tls(addr, shard_id, tag, tls, req).await,
-        None => rpc_call_plain(addr, shard_id, tag, req).await,
+    let pool = get_or_create_peer_pool(addr, tls_config);
+    pool.rpc(shard_id, tag, req).await
+}
+
+// ---------------------------------------------------------------------------
+// Peer connection pool — fix for the localhost `pif.leader_first_hop`
+// 93 %-queue-time finding on the n=6 trace (see escalation 2026-05-30).
+// ---------------------------------------------------------------------------
+
+/// One persistent connection in a [`PeerConnPool`] slot. Enum'd so the
+/// pool doesn't need to box a trait object: monomorphised dispatch into
+/// [`rpc_exchange`] keeps the hot path inline.
+enum PooledStream {
+    Plain(TcpStream),
+    // `TlsStream<TcpStream>` is ~1 KiB on the stack (rustls connection
+    // state + buffers); boxing it keeps the enum a normal 8-byte tag +
+    // pointer for the plaintext-localhost hot path. `clippy::large_enum_variant`.
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+/// Per-peer pool of N long-lived TCP/TLS connections. Picked
+/// round-robin by [`Self::rpc`]; each slot serialises its own RPCs
+/// behind a [`tokio::sync::Mutex`] so we stay wire-compatible with the
+/// existing one-frame-at-a-time listener loop without needing
+/// request-id demultiplexing.
+struct PeerConnPool {
+    addr: String,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
+    slots: Vec<tokio::sync::Mutex<Option<PooledStream>>>,
+    next: AtomicU32,
+}
+
+impl PeerConnPool {
+    fn new(addr: String, tls_config: Option<Arc<rustls::ClientConfig>>, slot_count: usize) -> Self {
+        let slots = (0..slot_count)
+            .map(|_| tokio::sync::Mutex::new(None))
+            .collect();
+        Self {
+            addr,
+            tls_config,
+            slots,
+            next: AtomicU32::new(0),
+        }
     }
+
+    async fn dial(&self) -> io::Result<PooledStream> {
+        let tcp = TcpStream::connect(&self.addr).await?;
+        let _ = tcp.set_nodelay(true);
+        match &self.tls_config {
+            None => Ok(PooledStream::Plain(tcp)),
+            Some(cfg) => {
+                let connector = tokio_rustls::TlsConnector::from(Arc::clone(cfg));
+                let ip: std::net::IpAddr = self
+                    .addr
+                    .split(':')
+                    .next()
+                    .and_then(|h| h.parse().ok())
+                    .ok_or_else(|| {
+                        network_error(NetworkErrorKind::Transport, "invalid Raft peer address")
+                    })?;
+                let server_name = ServerName::IpAddress(ip.into());
+                let tls = connector
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(|e| network_error(NetworkErrorKind::Transport, e))?;
+                Ok(PooledStream::Tls(Box::new(tls)))
+            }
+        }
+    }
+
+    async fn rpc<Req: Serialize, Resp: DeserializeOwned>(
+        &self,
+        shard_id: ShardId,
+        tag: &str,
+        req: &Req,
+    ) -> io::Result<Resp> {
+        // Round-robin slot pick. `fetch_add(_, Relaxed)` is enough — we
+        // tolerate hot-collisions on a slot; the per-slot mutex serialises.
+        let idx = (self.next.fetch_add(1, Ordering::Relaxed) as usize) % self.slots.len();
+        let mut guard = self.slots[idx].lock().await;
+
+        // Cancel-safe pattern: TAKE the stream out of the slot for the
+        // RPC; only PUT it back on success. If the caller's outer future
+        // is cancelled mid-`rpc_exchange`, the local `stream` is dropped
+        // (closing the TCP), the slot stays `None`, and the next caller
+        // reconnects — never a desync'd reuse.
+        let mut stream = match guard.take() {
+            Some(s) => s,
+            None => self.dial().await?,
+        };
+
+        maybe_inject_fake_rtt().await;
+        let result = match &mut stream {
+            PooledStream::Plain(s) => rpc_exchange(s, shard_id, tag, req).await,
+            PooledStream::Tls(s) => rpc_exchange(s, shard_id, tag, req).await,
+        };
+        if result.is_ok() {
+            *guard = Some(stream);
+        }
+        // On error: `stream` is dropped here, closing the TCP. Slot stays
+        // `None` → next caller reconnects.
+        result
+    }
+}
+
+/// Slot count per peer for the Raft transport connection pool. Read once
+/// per process via `OnceLock`. Default `16` matches the per-peer inbound
+/// cap [`RAFT_TRANSPORT_PER_PEER_MAX_DEFAULT`] — the client's outbound
+/// pool size doesn't need to exceed what the server side accepts. Tune
+/// up with `KISEKI_RAFT_CONN_POOL_PER_PEER` for very high concurrency
+/// (the fan-out in a leaderless quorum producer scales with bench
+/// `--concurrency` × shard count); tune down with `1` to force serial
+/// per-peer RPCs for diagnostics.
+fn raft_pool_size_per_peer() -> usize {
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("KISEKI_RAFT_CONN_POOL_PER_PEER")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(RAFT_TRANSPORT_PER_PEER_MAX_DEFAULT as usize)
+    })
+}
+
+/// Process-wide registry of [`PeerConnPool`]s, keyed by
+/// `(addr, tls_present)` so a peer reachable via both plaintext and TLS
+/// in the same process (test-only today, but cheap to be safe) gets one
+/// pool per scheme.
+static PEER_POOLS: OnceLock<DashMap<(String, bool), Arc<PeerConnPool>>> = OnceLock::new();
+
+fn get_or_create_peer_pool(
+    addr: &str,
+    tls_config: Option<&Arc<rustls::ClientConfig>>,
+) -> Arc<PeerConnPool> {
+    let pools = PEER_POOLS.get_or_init(DashMap::new);
+    let key = (addr.to_string(), tls_config.is_some());
+    if let Some(p) = pools.get(&key) {
+        return Arc::clone(&p);
+    }
+    let pool = Arc::new(PeerConnPool::new(
+        addr.to_string(),
+        tls_config.cloned(),
+        raft_pool_size_per_peer(),
+    ));
+    pools
+        .entry(key)
+        .or_insert_with(|| Arc::clone(&pool))
+        .value()
+        .clone()
 }
 
 fn to_rpc_error<C: RaftTypeConfig>(e: io::Error) -> RPCError<C> {
     RPCError::Unreachable(Unreachable::new(&e))
+}
+
+impl TcpNetwork {
+    /// Open a fresh connection (plain TCP, or TLS when configured), with
+    /// `TCP_NODELAY` so small Raft frames aren't delayed by Nagle.
+    async fn connect(&self) -> io::Result<RaftConn> {
+        let tcp = TcpStream::connect(&self.addr).await?;
+        let _ = tcp.set_nodelay(true);
+        match &self.tls_config {
+            None => Ok(RaftConn::Plain(tcp)),
+            Some(tls_config) => {
+                let connector = tokio_rustls::TlsConnector::from(Arc::clone(tls_config));
+                let ip: std::net::IpAddr = self
+                    .addr
+                    .split(':')
+                    .next()
+                    .and_then(|h| h.parse().ok())
+                    .ok_or_else(|| {
+                        network_error(NetworkErrorKind::Transport, "invalid Raft peer address")
+                    })?;
+                let server_name = ServerName::IpAddress(ip.into());
+                let tls_stream = connector
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(|e| network_error(NetworkErrorKind::Transport, e))?;
+                Ok(RaftConn::Tls(Box::new(tls_stream)))
+            }
+        }
+    }
+
+    /// Send an RPC over the persistent connection, reconnecting ONCE if
+    /// the held connection is stale/half-open. On a second failure the
+    /// error propagates — openraft treats it as `Unreachable` and retries
+    /// replication later, so no entry is silently dropped.
+    async fn rpc_pooled<Req: Serialize, Resp: DeserializeOwned>(
+        &mut self,
+        tag: &str,
+        req: &Req,
+    ) -> io::Result<Resp> {
+        let shard_id = self.shard_id;
+        let mut last_err: Option<io::Error> = None;
+        for _ in 0..2 {
+            if self.conn.is_none() {
+                self.conn = Some(self.connect().await?);
+            }
+            let res = match self.conn.as_mut().expect("conn set above") {
+                RaftConn::Plain(s) => rpc_exchange(s, shard_id, tag, req).await,
+                RaftConn::Tls(s) => rpc_exchange(&mut **s, shard_id, tag, req).await,
+            };
+            match res {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    // Drop the (possibly half-open) connection and retry once.
+                    self.conn = None;
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| network_error(NetworkErrorKind::Transport, "rpc_pooled failed")))
+    }
 }
 
 impl<C: RaftTypeConfig<SnapshotData = Cursor<Vec<u8>>>> RaftNetworkV2<C> for TcpNetwork
@@ -410,15 +740,9 @@ where
         rpc: openraft::raft::AppendEntriesRequest<C>,
         _option: openraft::network::RPCOption,
     ) -> Result<openraft::raft::AppendEntriesResponse<C>, RPCError<C>> {
-        rpc_call(
-            &self.addr,
-            self.shard_id,
-            "append_entries",
-            self.tls_config.as_ref(),
-            &rpc,
-        )
-        .await
-        .map_err(to_rpc_error::<C>)
+        self.rpc_pooled("append_entries", &rpc)
+            .await
+            .map_err(to_rpc_error::<C>)
     }
 
     async fn full_snapshot(
@@ -481,7 +805,9 @@ where
 
 /// Type-erased per-shard dispatcher. Each `register_shard<C, SM>`
 /// call builds a closure capturing the typed `Raft<C, SM>` handle.
-type ShardDispatch = Arc<
+/// Exported so a higher crate (ADR-047 kiseki-log) can construct an
+/// auxiliary dispatcher of this exact type for `register_aux`.
+pub type ShardDispatch = Arc<
     dyn for<'a> Fn(&'a str, &'a [u8]) -> futures::future::BoxFuture<'a, DispatchOutcome>
         + Send
         + Sync,
@@ -496,6 +822,10 @@ pub enum DispatchOutcome {
     Ok(Vec<u8>),
     ParseError,
     Panicked,
+    /// The dispatcher does not recognize this tag — the listener may
+    /// fall through to an auxiliary dispatcher; if none handles it,
+    /// the wire status is `ParseError`.
+    UnknownTag,
 }
 
 /// Clonable handle to the per-node shard registry. Each shard's
@@ -505,6 +835,11 @@ pub enum DispatchOutcome {
 #[derive(Clone)]
 pub struct RegistryHandle {
     inner: Arc<DashMap<ShardId, ShardDispatch>>,
+    /// Auxiliary (non-Raft) per-shard dispatchers (ADR-047). The
+    /// listener consults this map only after the shard's Raft
+    /// dispatcher returns `UnknownTag`, so the consensus-critical
+    /// Raft path never touches it.
+    aux: Arc<DashMap<ShardId, ShardDispatch>>,
     /// Optional metrics handle — when set, register/unregister
     /// updates `kiseki_raft_transport_registry_size`.
     metrics: Option<Arc<crate::transport_metrics::RaftTransportMetrics>>,
@@ -583,7 +918,11 @@ impl RegistryHandle {
                                 Err(_) => DispatchOutcome::Panicked,
                             }
                         }
-                        _ => DispatchOutcome::ParseError,
+                        // Not a Raft tag. Signal the listener to fall
+                        // through to the auxiliary dispatcher (if any);
+                        // a genuinely unknown tag still maps to the
+                        // `ParseError` wire status.
+                        _ => DispatchOutcome::UnknownTag,
                     }
                 })
             },
@@ -605,6 +944,21 @@ impl RegistryHandle {
             #[allow(clippy::cast_possible_wrap)]
             m.registry_size.set(self.inner.len() as i64);
         }
+    }
+
+    /// Register an auxiliary (non-Raft) per-shard tag dispatcher. The listener
+    /// routes a tag to this dispatcher only after the shard's Raft dispatcher
+    /// returns `UnknownTag`, so aux tags MUST NOT collide with the Raft tags
+    /// ("append_entries"/"vote"/"full_snapshot"). Idempotent — replaces the
+    /// previous aux dispatcher. (ADR-047 phase 5b-rpc registers the IntentSync
+    /// handler here.)
+    pub fn register_aux(&self, shard_id: ShardId, dispatch: ShardDispatch) {
+        self.aux.insert(shard_id, dispatch);
+    }
+
+    /// Remove a shard's auxiliary dispatcher.
+    pub fn unregister_aux(&self, shard_id: ShardId) {
+        self.aux.remove(&shard_id);
     }
 
     /// Number of shards currently registered. Exposed for the
@@ -641,6 +995,7 @@ impl RaftRpcListener {
             tls_acceptor: ArcSwap::from_pointee(acceptor),
             registry: RegistryHandle {
                 inner: Arc::new(DashMap::new()),
+                aux: Arc::new(DashMap::new()),
                 metrics: None,
             },
             active_per_peer: Arc::new(DashMap::new()),
@@ -700,19 +1055,31 @@ impl RaftRpcListener {
 
         loop {
             let (tcp_stream, peer_addr) = listener.accept().await?;
+            // TCP_NODELAY on the accepted socket: with persistent
+            // connection reuse, small Raft response frames would
+            // otherwise sit in the kernel under Nagle (~40ms delayed-ACK
+            // stall) instead of going out immediately. Connect-per-call
+            // hid this because the socket close forced a flush.
+            let _ = tcp_stream.set_nodelay(true);
             let registry = self.registry.clone();
             let acceptor = self.tls_acceptor.load_full();
             let per_peer = Arc::clone(&self.active_per_peer);
             let peer_key = peer_addr.ip().to_string();
             let metrics = self.metrics.clone();
 
-            // Per-peer cap (gate-1 F-M5).
+            // Per-peer cap (gate-1 F-M5). Skipped for loopback: the cap
+            // protects against external connection-flood DoS, but on
+            // loopback the meter key (peer IP) collapses every local
+            // process's connections into one bucket, so dev/test
+            // multi-node-on-127.0.0.1 trips the cap before the cluster
+            // can do useful work. Real peers (≠ loopback) still meter.
             let counter = per_peer
                 .entry(peer_key.clone())
                 .or_insert_with(|| AtomicU32::new(0));
             let active = counter.fetch_add(1, Ordering::Relaxed) + 1;
             drop(counter);
-            if active > RAFT_TRANSPORT_PER_PEER_MAX {
+            let cap_applies = !peer_addr.ip().is_loopback();
+            if cap_applies && active > per_peer_cap() {
                 if let Some(c) = per_peer.get(&peer_key) {
                     c.fetch_sub(1, Ordering::Relaxed);
                 }
@@ -813,10 +1180,49 @@ async fn handle_one_connection(
             .await
             .map_err(|e| network_error(NetworkErrorKind::Transport, e))?;
         let mut s = tls;
-        serve_one_request(&mut s, registry, metrics).await
+        // Connection reuse: serve requests on this stream until the peer
+        // closes it (Ok(false)) or an I/O error occurs. The client side
+        // keeps one persistent connection per (peer, shard) and pipelines
+        // sequential RPCs over it instead of re-dialing per call.
+        while serve_one_request(&mut s, registry, metrics).await? {}
+        Ok(())
     } else {
         let mut s = tcp_stream;
-        serve_one_request(&mut s, registry, metrics).await
+        while serve_one_request(&mut s, registry, metrics).await? {}
+        Ok(())
+    }
+}
+
+/// ADR-047 auxiliary tag-dispatch (UnknownTag fallthrough).
+///
+/// When the shard's Raft dispatcher returns `UnknownTag` (its `_` arm —
+/// any tag that is not "append_entries"/"vote"/"full_snapshot"), route
+/// the request to the shard's auxiliary (non-Raft) dispatcher if one is
+/// registered, using ITS outcome. If no aux dispatcher exists (or the
+/// aux also returns `UnknownTag`), the outcome stays `UnknownTag`, which
+/// the listener maps to the same `ParseError` wire status as before this
+/// hook existed — so a truly-unknown tag is indistinguishable on the
+/// wire. Any other Raft outcome (`Ok`/`ParseError`/`Panicked`) is
+/// returned unchanged: the consensus-critical path never reaches the
+/// aux map. An aux panic is caught and mapped to `Panicked`, matching
+/// the Raft dispatcher's panic semantics.
+async fn aux_fallthrough(
+    registry: &RegistryHandle,
+    shard_id: ShardId,
+    tag: &str,
+    payload: &[u8],
+    outcome: DispatchOutcome,
+) -> DispatchOutcome {
+    if !matches!(outcome, DispatchOutcome::UnknownTag) {
+        return outcome;
+    }
+    let Some(aux) = registry.aux.get(&shard_id).map(|e| Arc::clone(&*e)) else {
+        return DispatchOutcome::UnknownTag;
+    };
+    let fut = std::panic::AssertUnwindSafe(aux(tag, payload));
+    match futures::FutureExt::catch_unwind(fut).await {
+        Ok(o) => o,
+        Err(_) => DispatchOutcome::Panicked,
     }
 }
 
@@ -824,14 +1230,18 @@ async fn serve_one_request<S>(
     stream: &mut S,
     registry: &RegistryHandle,
     metrics: Option<&crate::transport_metrics::RaftTransportMetrics>,
-) -> io::Result<()>
+) -> io::Result<bool>
 where
     S: AsyncReadExt + AsyncWriteExt + Unpin,
 {
+    // Returns Ok(true) when a request was served and the connection is
+    // still frame-synced (the caller may keep it alive for the next
+    // request — connection reuse, the pooling fix); Ok(false) when the
+    // peer closed or the stream desynced and the connection must close.
     let started = std::time::Instant::now();
     let mut len_buf = [0u8; 4];
     if stream.read_exact(&mut len_buf).await.is_err() {
-        return Ok(()); // peer closed
+        return Ok(false); // peer closed
     }
     let req_len = u32::from_be_bytes(len_buf) as usize;
     if req_len > MAX_RAFT_RPC_SIZE {
@@ -845,11 +1255,13 @@ where
                 started.elapsed(),
             );
         }
-        return Ok(());
+        // We did NOT drain the oversized body — the stream is desynced;
+        // close rather than keep-alive.
+        return Ok(false);
     }
     let mut req_buf = vec![0u8; req_len];
     if stream.read_exact(&mut req_buf).await.is_err() {
-        return Ok(());
+        return Ok(false); // peer closed mid-frame
     }
 
     let Some((shard_id, tag, payload_value)) = decode_request_body(&req_buf) else {
@@ -862,7 +1274,7 @@ where
                 started.elapsed(),
             );
         }
-        return Ok(());
+        return Ok(true); // frame fully consumed — connection stays synced
     };
 
     let Some(dispatch) = registry.inner.get(&shard_id).map(|e| Arc::clone(&*e)) else {
@@ -881,7 +1293,7 @@ where
             tag = %tag,
             "Raft RPC: unknown_shard (peer cache stale or shard retired)",
         );
-        return Ok(());
+        return Ok(true); // frame fully consumed — connection stays synced
     };
 
     // The dispatcher closure takes a `&[u8]` payload (the typed
@@ -890,9 +1302,19 @@ where
     // to the dispatcher, which postcard-decodes against the typed
     // handler.
     let outcome = dispatch(&tag, &payload_value).await;
+    // ADR-047 auxiliary tag-dispatch: the Raft dispatcher signals
+    // `UnknownTag` for any non-Raft tag. Fall through to the shard's
+    // auxiliary (non-Raft) dispatcher if one is registered. The Raft
+    // tags never reach the fallthrough, so the consensus-critical path
+    // is untouched.
+    let outcome = aux_fallthrough(registry, shard_id, &tag, &payload_value, outcome).await;
     let (status, body, outcome_label) = match outcome {
         DispatchOutcome::Ok(b) => (DispatchStatus::Ok, b, crate::transport_metrics::outcome::OK),
-        DispatchOutcome::ParseError => (
+        // A genuinely unknown tag (no aux dispatcher, or aux also
+        // returned `UnknownTag`) is reported identically to a
+        // `ParseError` on the wire — same status, empty body, same
+        // metrics label — so callers cannot tell the hook exists.
+        DispatchOutcome::ParseError | DispatchOutcome::UnknownTag => (
             DispatchStatus::ParseError,
             Vec::new(),
             crate::transport_metrics::outcome::PARSE_ERROR,
@@ -920,17 +1342,27 @@ where
             );
         }
     }
-    write_response(stream, status, body).await
+    write_response(stream, status, body).await?;
+    Ok(true)
 }
 
 /// Map a free-form tag string to the bounded label set used by the
 /// metrics. Unknown tags collapse to `op::UNKNOWN` so cardinality
 /// stays bounded.
+///
+/// The 2026-06-02 GCP profile run found `op=unknown` holding ~1M samples
+/// at 244 ms mean — the ADR-047 aux tags (`intent_put`,
+/// `intent_gather_pending`) were ingressing the listener and falling
+/// through to `_ => UNKNOWN`. They now have their own labels so the
+/// `intent_put` hot path is visible separately from genuinely-unknown
+/// tags (a real protocol bug, not just a missing match arm).
 fn normalize_op(tag: &str) -> &'static str {
     match tag {
         "append_entries" => crate::transport_metrics::op::APPEND_ENTRIES,
         "vote" => crate::transport_metrics::op::VOTE,
         "full_snapshot" => crate::transport_metrics::op::FULL_SNAPSHOT,
+        "intent_put" => crate::transport_metrics::op::INTENT_PUT,
+        "intent_gather_pending" => crate::transport_metrics::op::INTENT_GATHER_PENDING,
         _ => crate::transport_metrics::op::UNKNOWN,
     }
 }
@@ -1049,5 +1481,202 @@ mod tests {
         // io::Error from outside this module returns None.
         let foreign = io::Error::other("from somewhere else");
         assert_eq!(classify_network_error(&foreign), None);
+    }
+
+    // -----------------------------------------------------------------
+    // ADR-047 auxiliary tag-dispatch (UnknownTag fallthrough)
+    // -----------------------------------------------------------------
+    //
+    // Standing up a full `openraft::Raft` inside this crate's tests is
+    // heavy (it needs a state machine + log store + network factory,
+    // none of which `kiseki-raft` exposes for tests). The listener
+    // fallthrough under test treats every `ShardDispatch` identically —
+    // it cannot tell a real Raft dispatcher from any other closure — so
+    // these tests insert a STUB main dispatcher that replicates the Raft
+    // dispatcher's tag-matching contract byte-for-byte: it returns
+    // `Ok` for a Raft-shaped tag and `UnknownTag` for everything else
+    // (exactly what `register_shard`'s closure does at its `_` arm).
+    // The end-to-end wire path (`RaftRpcListener` + `rpc_call_plain`)
+    // is the real production code.
+
+    /// Build a stub main dispatcher mirroring the Raft dispatcher's tag
+    /// contract: a recognized Raft tag → `Ok`, anything else →
+    /// `UnknownTag` (the `_` arm of `register_shard`'s closure).
+    fn stub_raft_dispatch() -> ShardDispatch {
+        Arc::new(
+            move |tag: &str, _payload: &[u8]| -> futures::future::BoxFuture<'_, DispatchOutcome> {
+                let tag = tag.to_owned();
+                Box::pin(async move {
+                    match tag.as_str() {
+                        "append_entries" | "vote" | "full_snapshot" => {
+                            // Echo a marker so the "Raft path still wins"
+                            // test can assert the aux was NOT consulted.
+                            let resp: Vec<u8> = b"raft".to_vec();
+                            DispatchOutcome::Ok(postcard::to_stdvec(&resp).unwrap())
+                        }
+                        _ => DispatchOutcome::UnknownTag,
+                    }
+                })
+            },
+        )
+    }
+
+    /// Spawn a plaintext listener on an ephemeral port, returning its
+    /// address and a registry handle obtained before `run()` consumed
+    /// the listener.
+    async fn spawn_listener() -> (String, RegistryHandle) {
+        // Bind first to learn the OS-assigned port, then hand the bound
+        // address to the listener.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+        let listener = RaftRpcListener::new(addr.clone(), None);
+        let registry = listener.registry();
+        tokio::spawn(async move {
+            let _ = listener.run().await;
+        });
+        // Give the accept loop a moment to bind.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (addr, registry)
+    }
+
+    /// An aux tag (one the Raft dispatcher does not recognize) is routed
+    /// to the registered auxiliary dispatcher, and the exact bytes it
+    /// returned cross the wire unchanged (status Ok + body == b"pong").
+    #[tokio::test]
+    async fn aux_tag_routes_to_aux_dispatcher() {
+        let (addr, registry) = spawn_listener().await;
+        let shard = ShardId(uuid::Uuid::from_u128(0x0A_0002));
+
+        registry.inner.insert(shard, stub_raft_dispatch());
+        let aux: ShardDispatch = Arc::new(
+            move |tag: &str, _payload: &[u8]| -> futures::future::BoxFuture<'_, DispatchOutcome> {
+                let tag = tag.to_owned();
+                Box::pin(async move {
+                    if tag == "intent_test" {
+                        DispatchOutcome::Ok(b"pong".to_vec())
+                    } else {
+                        DispatchOutcome::UnknownTag
+                    }
+                })
+            },
+        );
+        registry.register_aux(shard, aux);
+
+        let (status, body) = raw_rpc(&addr, shard, "intent_test", &[]).await;
+        assert_eq!(status, DispatchStatus::Ok as u8);
+        assert_eq!(body, b"pong", "aux dispatcher bytes must cross the wire");
+    }
+
+    /// A Raft tag still reaches the (stub) Raft dispatcher even when an
+    /// aux dispatcher is registered — the aux is NEVER consulted for a
+    /// recognized Raft tag.
+    #[tokio::test]
+    async fn raft_tag_still_routes_to_raft_with_aux_present() {
+        let (addr, registry) = spawn_listener().await;
+        let shard = ShardId(uuid::Uuid::from_u128(0x0A_0003));
+
+        registry.inner.insert(shard, stub_raft_dispatch());
+        // An aux that would HIJACK any tag if (incorrectly) consulted.
+        let aux: ShardDispatch = Arc::new(
+            move |_tag: &str, _payload: &[u8]| -> futures::future::BoxFuture<'_, DispatchOutcome> {
+                Box::pin(async move { DispatchOutcome::Ok(b"AUX_HIJACK".to_vec()) })
+            },
+        );
+        registry.register_aux(shard, aux);
+
+        let (status, body) = raw_rpc(&addr, shard, "append_entries", &[]).await;
+        assert_eq!(status, DispatchStatus::Ok as u8);
+        // The stub Raft dispatcher returns a postcard-encoded b"raft";
+        // crucially it is NOT the aux's "AUX_HIJACK" — proving the aux
+        // was not consulted for a Raft tag.
+        let decoded: Vec<u8> = postcard::from_bytes(&body).expect("decode raft marker");
+        assert_eq!(decoded, b"raft");
+        assert_ne!(body.as_slice(), b"AUX_HIJACK");
+    }
+
+    /// A bogus tag on a shard with NO aux dispatcher returns the
+    /// `ParseError` wire status — identical to the pre-ADR-047 behavior.
+    #[tokio::test]
+    async fn unknown_tag_without_aux_is_parse_error() {
+        let (addr, registry) = spawn_listener().await;
+        let shard = ShardId(uuid::Uuid::from_u128(0x0A_0004));
+
+        registry.inner.insert(shard, stub_raft_dispatch());
+        // No register_aux for this shard.
+
+        let (status, body) = raw_rpc(&addr, shard, "definitely_not_a_tag", &[]).await;
+        assert_eq!(
+            status,
+            DispatchStatus::ParseError as u8,
+            "unknown tag with no aux must map to ParseError (unchanged wire behavior)"
+        );
+        assert!(body.is_empty(), "ParseError carries no body");
+    }
+
+    /// An aux dispatcher that also returns `UnknownTag` for the tag
+    /// collapses to the same `ParseError` wire status — the fallthrough
+    /// is exhausted, so the response is indistinguishable from "no aux".
+    #[tokio::test]
+    async fn aux_returning_unknown_tag_is_parse_error() {
+        let (addr, registry) = spawn_listener().await;
+        let shard = ShardId(uuid::Uuid::from_u128(0x0A_0005));
+
+        registry.inner.insert(shard, stub_raft_dispatch());
+        let aux: ShardDispatch = Arc::new(
+            move |_tag: &str, _payload: &[u8]| -> futures::future::BoxFuture<'_, DispatchOutcome> {
+                Box::pin(async move { DispatchOutcome::UnknownTag })
+            },
+        );
+        registry.register_aux(shard, aux);
+
+        let (status, body) = raw_rpc(&addr, shard, "something_unknown", &[]).await;
+        assert_eq!(status, DispatchStatus::ParseError as u8);
+        assert!(body.is_empty());
+    }
+
+    /// `unregister_aux` removes the aux dispatcher — a previously-routed
+    /// aux tag goes back to `ParseError`.
+    #[tokio::test]
+    async fn unregister_aux_restores_parse_error() {
+        let (addr, registry) = spawn_listener().await;
+        let shard = ShardId(uuid::Uuid::from_u128(0x0A_0006));
+
+        registry.inner.insert(shard, stub_raft_dispatch());
+        let aux: ShardDispatch = Arc::new(
+            move |_tag: &str, _payload: &[u8]| -> futures::future::BoxFuture<'_, DispatchOutcome> {
+                Box::pin(async move { DispatchOutcome::Ok(b"pong".to_vec()) })
+            },
+        );
+        registry.register_aux(shard, aux);
+        let (status, _) = raw_rpc(&addr, shard, "intent_test", &[]).await;
+        assert_eq!(status, DispatchStatus::Ok as u8);
+
+        registry.unregister_aux(shard);
+        let (status, body) = raw_rpc(&addr, shard, "intent_test", &[]).await;
+        assert_eq!(status, DispatchStatus::ParseError as u8);
+        assert!(body.is_empty());
+    }
+
+    // -- test helpers ------------------------------------------------
+
+    /// Drive a single plaintext RPC and return the raw (status_byte,
+    /// body) without the typed postcard decode `rpc_exchange` does — so
+    /// tests can assert on the exact wire bytes / status the listener
+    /// produced.
+    async fn raw_rpc(addr: &str, shard: ShardId, tag: &str, payload: &[u8]) -> (u8, Vec<u8>) {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let body = encode_request_body(shard, tag, &payload.to_vec()).unwrap();
+        let len = u32::try_from(body.len()).unwrap();
+        stream.write_all(&len.to_be_bytes()).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await.unwrap();
+        let resp_len = u32::from_be_bytes(len_buf) as usize;
+        let mut resp = vec![0u8; resp_len];
+        stream.read_exact(&mut resp).await.unwrap();
+        (resp[0], resp[1..].to_vec())
     }
 }

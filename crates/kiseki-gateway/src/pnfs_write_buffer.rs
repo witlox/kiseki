@@ -61,13 +61,33 @@ pub enum BufferWriteResult {
     /// Bytes were appended successfully.
     Accepted,
     /// Adding `data.len()` would exceed the per-composition cap.
+    /// #146 — `op_write_ds` returns NFS4ERR_NOSPC to the kernel; the
+    /// kernel pNFS client recovers by issuing COMMIT (which now
+    /// drains via the chain — see `drain_post_commit`) and then
+    /// retries the WRITE against the freshly-drained buffer.
     Nospc {
-        /// Current buffer size.
+        /// Current buffer size (bytes in `data`, not including base).
         current: u64,
-        /// Configured cap.
+        /// Configured cap (applies to `data` only — base lives in the
+        /// chain composition, not in memory).
         cap: u64,
         /// How many additional bytes were requested.
         requested: u64,
+    },
+    /// #146 — write is at an offset BELOW the buffer's `base_bytes`
+    /// (the file region already drained to a prior composition).
+    /// Overwriting committed regions would require reading the prior
+    /// composition, patching it in memory, and re-uploading — a
+    /// "patch composition" primitive that doesn't exist yet. For
+    /// sequential workloads (fio --rw=write, append-only NFS) this
+    /// case never fires; flagged for follow-up if a workload starts
+    /// hitting it. Mapped to NFS4ERR_NOSPC so the kernel surfaces
+    /// an error rather than silently dropping the write.
+    BackwardWriteUnsupported {
+        /// Where the WRITE landed (file offset).
+        offset: u64,
+        /// Current drain boundary (file offset).
+        base_bytes: u64,
     },
 }
 
@@ -81,7 +101,24 @@ pub struct BufferEntry {
     pub tenant_id: OrgId,
     /// Namespace the original composition belongs to.
     pub namespace_id: NamespaceId,
+    /// #146 — chain root: the most recent composition produced by a
+    /// COMMIT-driven drain. `None` until the first cap-hit COMMIT
+    /// drains the buffer; `Some(id)` thereafter. The next
+    /// `gateway.write` is constructed as `id`'s chunks + chunks
+    /// derived from `data`, so the resulting composition still
+    /// contains every byte ever written through this fh — the
+    /// #74 correctness property is preserved.
+    pub base_composition_id: Option<CompositionId>,
+    /// #146 — cumulative bytes in `base_composition_id`. Zero when
+    /// no drain has happened yet. Used as the file-offset origin of
+    /// `data[0]`: a buffered byte at `data[i]` represents file
+    /// offset `base_bytes + i`. WRITEs at offsets `< base_bytes`
+    /// are not yet supported (data-overwrite case — flagged for
+    /// follow-up; logged as warn and rejected with NOSPC so the
+    /// kernel surfaces an error rather than silently corrupting).
+    pub base_bytes: u64,
     /// Accumulated plaintext, zero-padded across holes between writes.
+    /// `data[i]` represents file offset `base_bytes + i`.
     pub data: Vec<u8>,
 }
 
@@ -147,17 +184,35 @@ impl DsWriteBuffers {
         let entry = g.buffers.entry(composition_id).or_insert(BufferEntry {
             tenant_id,
             namespace_id,
+            base_composition_id: None,
+            base_bytes: 0,
             data: Vec::new(),
         });
 
-        let off = usize::try_from(offset).unwrap_or(usize::MAX);
+        // #146 — translate file offset → buffer-relative offset by
+        // subtracting the drain boundary (`base_bytes`). For the
+        // first-COMMIT case (`base_bytes == 0`) this is a no-op; for
+        // post-drain WRITEs the kernel's "retry at the same file
+        // offset" pattern aligns with `data[0]` on the freshly-drained
+        // buffer.
+        if offset < entry.base_bytes {
+            return BufferWriteResult::BackwardWriteUnsupported {
+                offset,
+                base_bytes: entry.base_bytes,
+            };
+        }
+        let rel_offset = offset - entry.base_bytes;
+        let off = usize::try_from(rel_offset).unwrap_or(usize::MAX);
         let end = off.saturating_add(data.len());
         let new_len_u64 = u64::try_from(end).unwrap_or(u64::MAX);
         let cur_len_u64 = u64::try_from(entry.data.len()).unwrap_or(u64::MAX);
         let growth = new_len_u64.saturating_sub(cur_len_u64);
 
-        // Cap check on the post-write size (only the growth contributes
-        // to total_bytes — overlapping writes don't grow the buffer).
+        // Cap check on the post-write size of `data` only. The base
+        // composition's bytes live in the chunk store (refcounted),
+        // not in memory — so the in-memory cap bounds at most
+        // `cap_bytes` worth of dirty bytes per composition,
+        // regardless of file size.
         if cur_len_u64.saturating_add(growth) > self.cap_bytes {
             ds_write_bytes_total()
                 .with_label_values(&["rejected_nospc"])
@@ -190,6 +245,42 @@ impl DsWriteBuffers {
         g.total_bytes = g.total_bytes.saturating_sub(bytes);
         ds_buffer_bytes_gauge().set(i64::try_from(g.total_bytes).unwrap_or(i64::MAX));
         Some(entry)
+    }
+
+    /// #146 — drain the in-memory buffer after a successful
+    /// COMMIT-driven `gateway.write` and update the chain anchor.
+    /// Called by `op_commit_ds` once the gateway has confirmed the
+    /// new composition is durable + the redirect is recorded. The
+    /// just-flushed bytes now live in `new_base_composition_id`'s
+    /// chunks; the next WRITE will append into a freshly-empty
+    /// `data` Vec at file offset `new_base_bytes`, and the next
+    /// COMMIT will issue a `WriteRequest` with
+    /// `base_composition_id = Some(new_base_composition_id)` so the
+    /// new composition again contains every byte ever written
+    /// through this fh.
+    ///
+    /// No-op if `composition_id` has no buffer entry (already
+    /// dropped on session teardown) — drain semantics are
+    /// idempotent in that case.
+    pub fn drain_post_commit(
+        &self,
+        composition_id: CompositionId,
+        new_base_composition_id: CompositionId,
+        new_base_bytes: u64,
+    ) {
+        let mut g = self
+            .inner
+            .lock()
+            .lock_or_die("pnfs_write_buffer.drain_post_commit");
+        if let Some(entry) = g.buffers.get_mut(&composition_id) {
+            let drained = u64::try_from(entry.data.len()).unwrap_or(0);
+            entry.data.clear();
+            entry.data.shrink_to_fit();
+            entry.base_composition_id = Some(new_base_composition_id);
+            entry.base_bytes = new_base_bytes;
+            g.total_bytes = g.total_bytes.saturating_sub(drained);
+            ds_buffer_bytes_gauge().set(i64::try_from(g.total_bytes).unwrap_or(i64::MAX));
+        }
     }
 
     /// Snapshot the accumulated bytes for `composition_id` without
@@ -268,7 +359,15 @@ impl DsWriteBuffers {
         let Some(entry) = g.buffers.get(&composition_id) else {
             return (Vec::new(), false);
         };
-        let off = usize::try_from(offset).unwrap_or(usize::MAX);
+        // #146 — `data[i]` represents file offset `base_bytes + i`.
+        // Reads below the drain boundary fall through to the gateway
+        // (which serves them via the chain composition); reads at or
+        // above it index into the in-memory buffer.
+        if offset < entry.base_bytes {
+            return (Vec::new(), false);
+        }
+        let rel_offset = offset - entry.base_bytes;
+        let off = usize::try_from(rel_offset).unwrap_or(usize::MAX);
         let cnt = usize::try_from(count).unwrap_or(usize::MAX);
         if off >= entry.data.len() {
             return (Vec::new(), false);
@@ -318,7 +417,7 @@ impl Default for DsWriteBuffers {
 // Telemetry — shared across all DS instances in a process via OnceLock.
 // =============================================================================
 
-fn ds_write_bytes_total() -> &'static IntCounterVec {
+pub(crate) fn ds_write_bytes_total() -> &'static IntCounterVec {
     static C: OnceLock<IntCounterVec> = OnceLock::new();
     C.get_or_init(|| {
         register_int_counter_vec!(
@@ -326,7 +425,7 @@ fn ds_write_bytes_total() -> &'static IntCounterVec {
                 "kiseki_pnfs_ds_write_bytes_total",
                 "Bytes accepted into / rejected from per-composition DS \
                  write buffers (ADR-038 rev 3 §D5.1). `state` ∈ \
-                 {accepted, rejected_nospc}."
+                 {accepted, rejected_nospc, rejected_backward}."
             ),
             &["state"],
         )
@@ -482,6 +581,142 @@ mod tests {
     fn snapshot_for_commit_returns_none_for_missing_buffer() {
         let buf = DsWriteBuffers::with_cap(1024);
         assert!(buf.snapshot_for_commit(cid(42)).is_none());
+    }
+
+    /// #146 — `drain_post_commit` empties the in-memory buffer AND
+    /// installs a chain anchor (`base_composition_id`, `base_bytes`).
+    /// The next WRITE at file offset `base_bytes` lands at `data[0]`;
+    /// the next snapshot's `base_composition_id` is the just-drained
+    /// composition so `op_commit_ds` can pass it as `WriteRequest::
+    /// base_composition_id` to the gateway (which prepends the prior
+    /// chunks). This is the F-1 wedge fix.
+    #[test]
+    fn drain_post_commit_empties_buffer_and_installs_chain_anchor() {
+        let buf = DsWriteBuffers::with_cap(8);
+        let (t, n) = tn();
+
+        // Fill the buffer to the cap.
+        buf.buffer_write(cid(1), t, n, 0, b"AAAAAAAA");
+        assert_eq!(buf.total_bytes(), 8);
+
+        // Drain — simulates op_commit_ds finishing a successful
+        // gateway.write that produced comp_v1 with size 8.
+        buf.drain_post_commit(cid(1), cid(100), 8);
+
+        // Buffer empty.
+        assert_eq!(buf.total_bytes(), 0);
+
+        // Snapshot now carries the chain anchor — `base_composition_id`
+        // is Some(comp_v1), `base_bytes` is 8, `data` is empty.
+        let snap = buf
+            .snapshot_for_commit(cid(1))
+            .expect("entry survives drain");
+        assert_eq!(snap.base_composition_id, Some(cid(100)));
+        assert_eq!(snap.base_bytes, 8);
+        assert!(snap.data.is_empty());
+    }
+
+    /// #146 — after a drain, the next WRITE at the file offset
+    /// `base_bytes` is `Accepted` and lands at `data[0]`. This is what
+    /// breaks the kernel's NOSPC ↔ COMMIT-retry loop: WRITE at offset
+    /// 256 MiB (after a 256 MiB drain) succeeds against a freshly-
+    /// empty buffer.
+    #[test]
+    fn write_after_drain_accepts_at_post_drain_offset() {
+        let buf = DsWriteBuffers::with_cap(8);
+        let (t, n) = tn();
+
+        buf.buffer_write(cid(1), t, n, 0, b"AAAAAAAA"); // fills cap
+        buf.drain_post_commit(cid(1), cid(100), 8);
+
+        // WRITE at file offset 8 = base_bytes — relative offset 0,
+        // 4 bytes. Should be Accepted (buffer is empty, cap allows 8).
+        let r = buf.buffer_write(cid(1), t, n, 8, b"BCDE");
+        assert_eq!(r, BufferWriteResult::Accepted);
+
+        // The buffer now has 4 bytes at relative offset 0; reading
+        // from file offset 8 returns them.
+        let (bytes, full) = buf.read(cid(1), 8, 4);
+        assert_eq!(bytes, b"BCDE");
+        assert!(full);
+
+        // Reading from file offset 0 (below the drain boundary) misses
+        // the buffer — caller falls through to the gateway via redirect.
+        let (bytes, full) = buf.read(cid(1), 0, 4);
+        assert!(bytes.is_empty());
+        assert!(!full);
+    }
+
+    /// #146 — WRITE at a file offset BELOW the drain boundary returns
+    /// `BackwardWriteUnsupported`. Sequential workloads (fio, NFS
+    /// append-only) never hit this case; flagged so any workload
+    /// that DOES gets a clean error instead of silent data
+    /// corruption.
+    #[test]
+    fn write_below_drain_boundary_rejects_backward() {
+        let buf = DsWriteBuffers::with_cap(16);
+        let (t, n) = tn();
+
+        buf.buffer_write(cid(1), t, n, 0, b"AAAAAAAA");
+        buf.drain_post_commit(cid(1), cid(100), 8);
+
+        // WRITE at file offset 4 < base_bytes=8.
+        let r = buf.buffer_write(cid(1), t, n, 4, b"BB");
+        assert!(matches!(
+            r,
+            BufferWriteResult::BackwardWriteUnsupported {
+                offset: 4,
+                base_bytes: 8,
+            }
+        ));
+    }
+
+    /// #146 — sustained-write simulation: WRITE 8 + DRAIN, repeated
+    /// three times. Buffer never exceeds the 8-byte cap; the chain
+    /// anchor walks forward each cycle so the synthesized
+    /// `snapshot_for_commit` always reflects the right base
+    /// composition / `base_bytes` for the next gateway.write call.
+    /// This is the in-buffer slice of the per-COMMIT chain test in
+    /// `pnfs_ds_server`.
+    #[test]
+    fn sustained_write_drain_cycle_keeps_under_cap() {
+        let buf = DsWriteBuffers::with_cap(8);
+        let (t, n) = tn();
+
+        for cycle in 0u64..3 {
+            let off = cycle * 8;
+            let r = buf.buffer_write(cid(1), t, n, off, b"AAAAAAAA");
+            assert_eq!(r, BufferWriteResult::Accepted, "cycle {cycle} write");
+
+            // Snapshot at this point — base anchor advances each cycle.
+            let snap = buf.snapshot_for_commit(cid(1)).expect("entry alive");
+            assert_eq!(snap.base_bytes, off);
+            assert_eq!(snap.data.len(), 8);
+
+            // Drain. Synthesize a "new comp_id" per cycle to verify
+            // the anchor is the LATEST one each time.
+            let new_cid = cid(100 + u128::from(cycle));
+            buf.drain_post_commit(cid(1), new_cid, off + 8);
+            assert_eq!(buf.total_bytes(), 0);
+        }
+
+        // After 3 cycles, the entry's anchor is the 3rd drain's comp,
+        // base_bytes = 24, data empty.
+        let snap = buf.snapshot_for_commit(cid(1)).expect("entry alive");
+        assert_eq!(snap.base_composition_id, Some(cid(102)));
+        assert_eq!(snap.base_bytes, 24);
+        assert!(snap.data.is_empty());
+    }
+
+    /// #146 — `drain_post_commit` is idempotent on a missing buffer
+    /// entry (e.g. cleared by `clear_all` between snapshot and drain).
+    /// Important so a COMMIT-during-session-teardown race surfaces
+    /// as a no-op, not a panic.
+    #[test]
+    fn drain_post_commit_is_noop_for_missing_entry() {
+        let buf = DsWriteBuffers::with_cap(8);
+        buf.drain_post_commit(cid(42), cid(100), 1024);
+        assert_eq!(buf.total_bytes(), 0);
     }
 
     #[test]

@@ -30,6 +30,11 @@
 #![deny(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+// Fine-grained per-step write-path timers (`hot_timer!` / `hot_span!`)
+// for the ADR-047 escalation. Gated behind `hot-path-trace`; expands
+// to `()` when off. See module docs.
+pub mod hot_path;
+
 use std::sync::OnceLock;
 
 use opentelemetry::trace::{Span as _, Tracer as _, TracerProvider as _};

@@ -102,7 +102,7 @@ impl LegacyState {
 
         let inline_temp_dir = tempfile::tempdir().expect("tempdir for inline small_object store");
         let inline_store = Arc::new(
-            kiseki_chunk::SmallObjectStore::open(&inline_temp_dir.path().join("objects.redb"))
+            kiseki_chunk::SmallObjectStore::open(&inline_temp_dir.path().join("objects"))
                 .expect("open small_object store"),
         );
         let _ = mem_shard_store.set_inline_store(
@@ -131,6 +131,9 @@ impl LegacyState {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         });
 
         let shard_map_store = Arc::new(NamespaceShardMapStore::new());

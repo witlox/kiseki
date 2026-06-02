@@ -34,6 +34,9 @@ fn setup_nfs_gateway() -> Arc<NfsGateway<InMemoryGateway>> {
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
+
+        size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
     });
 
     let chunks = ChunkStore::new();
@@ -54,6 +57,7 @@ async fn nfs_write_read_roundtrip() {
             namespace_id: test_namespace(),
             data: data.clone(),
             comp_id_override: None,
+            name: None,
         })
         .await
         .unwrap();
@@ -96,6 +100,7 @@ async fn concurrent_nfs_writes_no_deadlock() {
                         namespace_id: test_namespace(),
                         data,
                         comp_id_override: None,
+                        name: None,
                     }))
                     .unwrap();
                 assert!(resp.count > 0, "write returned 0 bytes");
@@ -128,6 +133,7 @@ async fn concurrent_nfs_mixed_read_write() {
                 namespace_id: test_namespace(),
                 data: vec![i; 2048],
                 comp_id_override: None,
+                name: None,
             })
             .await
             .unwrap();
@@ -149,6 +155,7 @@ async fn concurrent_nfs_mixed_read_write() {
                     namespace_id: test_namespace(),
                     data,
                     comp_id_override: None,
+                    name: None,
                 }))
                 .unwrap();
             }

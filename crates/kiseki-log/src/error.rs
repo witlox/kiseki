@@ -78,6 +78,17 @@ pub enum LogError {
     #[error("raft unavailable")]
     Unavailable,
 
+    /// `OpenRaftLogStore::new` failed during construction — fjall open
+    /// error, openraft initialization error, or transport setup
+    /// failure. Carries the underlying cause as a string so operators
+    /// can distinguish "fjall corrupt" from "openraft handshake
+    /// failed" without grepping container logs. The runtime maps this
+    /// to a typed startup failure rather than panicking the worker
+    /// thread (which previously surfaced as SIGSEGV with no
+    /// diagnostic).
+    #[error("raft log store construction failed: {0}")]
+    StoreConstruction(String),
+
     /// Backing I/O failure (inline store, persistent log, etc.).
     #[error("log I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -113,6 +124,9 @@ impl From<LogError> for KisekiError {
             LogError::Unavailable => {
                 KisekiError::Retriable(RetriableError::ShardUnavailable(ShardId(uuid::Uuid::nil())))
             }
+            LogError::StoreConstruction(msg) => KisekiError::Permanent(
+                PermanentError::InvariantViolation(format!("raft store construction: {msg}")),
+            ),
             LogError::Io(e) => KisekiError::Permanent(PermanentError::InvariantViolation(format!(
                 "log I/O error: {e}"
             ))),

@@ -2,7 +2,12 @@
 //!
 //! The gRPC `ClusterChunkService` client lives behind this trait so
 //! [`crate::ClusteredChunkStore`] stays unit-testable with mock peers.
-//! The real gRPC implementation lives in [`grpc`].
+//! Two transport bindings are implemented:
+//! - [`tcp_framed`] — **default**. TCP-framed-postcard wire (ADR-042
+//!   §2.2 applied to the fabric edge). 2026-06-01: closes the
+//!   1.6 ms gRPC-on-loopback gap measured in the 3-node profile.
+//! - [`grpc`] — legacy / fallback. Kept until every operator deploy
+//!   is on a binary with the TCP-framed listener wired in.
 
 use async_trait::async_trait;
 use kiseki_common::ids::{ChunkId, OrgId};
@@ -10,11 +15,13 @@ use kiseki_crypto::envelope::Envelope;
 use thiserror::Error;
 
 pub mod grpc;
+pub mod tcp_framed;
 
 pub use grpc::{
     is_retriable_status, status_to_fabric_err, GrpcFabricPeer, FABRIC_CIPHERTEXT_MAX_BYTES,
     FABRIC_MAX_MESSAGE_BYTES, FABRIC_WRAPPER_HEADROOM_BYTES,
 };
+pub use tcp_framed::{TcpFramedFabricListener, TcpFramedFabricPeer};
 
 /// Errors a fabric peer call can fail with. Maps onto the gRPC
 /// status codes in the real impl: `NOT_FOUND` → `NotFound`,

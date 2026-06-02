@@ -20,11 +20,11 @@ use kiseki_composition::namespace::Namespace;
 use kiseki_crypto::envelope::Envelope;
 use kiseki_crypto::keys::SystemMasterKey;
 use kiseki_gateway::mem_gateway::InMemoryGateway;
-use kiseki_gateway::ops::GatewayOps;
+use kiseki_gateway::ops::{GatewayOps, WriteRequest};
 use kiseki_log::error::LogError;
 use kiseki_log::shard::{ShardConfig, ShardInfo, ShardState};
 use kiseki_log::traits::{
-    AppendChunkAndDeltaRequest, AppendDeltaRequest, LogOps, ReadDeltasRequest,
+    AppendChunkAndDeltaRequest, AppendDeltaRequest, AppendForwarder, LogOps, ReadDeltasRequest,
 };
 
 fn test_tenant() -> OrgId {
@@ -65,6 +65,46 @@ impl LogOps for RecordingLog {
     ) -> Result<SequenceNumber, LogError> {
         self.chunk_and_delta_calls.lock().unwrap().push(req);
         Ok(SequenceNumber(1))
+    }
+
+    // The gateway now routes through the forward-aware emit (#111), which
+    // calls the `_with_forwarding` variants. Production's variants do the
+    // same `client_write` as their plain siblings (only the error mapping
+    // differs), so the mock records them identically.
+    async fn append_delta_with_forwarding(
+        &self,
+        req: AppendDeltaRequest,
+    ) -> Result<SequenceNumber, LogError> {
+        self.plain_calls.lock().unwrap().push(req);
+        Ok(SequenceNumber(1))
+    }
+
+    async fn append_chunk_and_delta_with_forwarding(
+        &self,
+        req: AppendChunkAndDeltaRequest,
+    ) -> Result<SequenceNumber, LogError> {
+        self.chunk_and_delta_calls.lock().unwrap().push(req);
+        Ok(SequenceNumber(1))
+    }
+
+    /// ADR-047: decoupled-ack is THE write path for S3/Native — the
+    /// gateway now calls `put_intent_and_fan` instead of the synchronous
+    /// `append_chunk_and_delta`. Mirror the bridge's empty-new-chunks
+    /// routing rule so dedup-hit writes (empty `new_chunks`) land in
+    /// `plain_calls` and fresh-chunk writes land in `chunk_and_delta_calls`
+    /// — the same accounting the existing assertions rely on.
+    async fn put_intent_and_fan(
+        &self,
+        _shard_id: ShardId,
+        intent: kiseki_log::intent::WriteIntent,
+    ) -> Result<(), LogError> {
+        let req = intent.append;
+        if req.new_chunks.is_empty() {
+            self.plain_calls.lock().unwrap().push(req.delta);
+        } else {
+            self.chunk_and_delta_calls.lock().unwrap().push(req);
+        }
+        Ok(())
     }
 
     async fn increment_chunk_refcount(
@@ -179,6 +219,9 @@ fn setup_with_placement_and_target(
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
+
+        size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
     });
 
     let chunks = ChunkStore::new();
@@ -210,6 +253,10 @@ async fn fresh_chunk_write_emits_chunk_and_delta_proposal() {
 
         forwarded_from_node: None,
         comp_id_override: None,
+        tier: None,
+        surface: kiseki_gateway::WriteSurface::S3,
+        base_composition_id: None,
+        base_bytes: 0,
     })
     .await
     .expect("write");
@@ -267,6 +314,10 @@ async fn dedup_write_does_not_emit_chunk_and_delta() {
 
         forwarded_from_node: None,
         comp_id_override: None,
+        tier: None,
+        surface: kiseki_gateway::WriteSurface::S3,
+        base_composition_id: None,
+        base_bytes: 0,
     })
     .await
     .expect("write 1");
@@ -283,6 +334,10 @@ async fn dedup_write_does_not_emit_chunk_and_delta() {
 
         forwarded_from_node: None,
         comp_id_override: None,
+        tier: None,
+        surface: kiseki_gateway::WriteSurface::S3,
+        base_composition_id: None,
+        base_bytes: 0,
     })
     .await
     .expect("write 2");
@@ -333,6 +388,10 @@ async fn fresh_chunk_write_carries_configured_placement() {
 
         forwarded_from_node: None,
         comp_id_override: None,
+        tier: None,
+        surface: kiseki_gateway::WriteSurface::S3,
+        base_composition_id: None,
+        base_bytes: 0,
     })
     .await
     .expect("write");
@@ -371,6 +430,10 @@ async fn placement_is_capped_at_target_copies_when_cluster_is_larger() {
 
         forwarded_from_node: None,
         comp_id_override: None,
+        tier: None,
+        surface: kiseki_gateway::WriteSurface::S3,
+        base_composition_id: None,
+        base_bytes: 0,
     })
     .await
     .expect("write");
@@ -411,6 +474,10 @@ async fn single_node_gateway_emits_empty_placement() {
 
         forwarded_from_node: None,
         comp_id_override: None,
+        tier: None,
+        surface: kiseki_gateway::WriteSurface::S3,
+        base_composition_id: None,
+        base_bytes: 0,
     })
     .await
     .expect("write");
@@ -448,6 +515,10 @@ async fn composition_delete_emits_decrement_for_each_chunk() {
 
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
+            surface: kiseki_gateway::WriteSurface::S3,
+            base_composition_id: None,
+            base_bytes: 0,
         })
         .await
         .expect("write");
@@ -548,6 +619,9 @@ fn setup_with_chunks(
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
+
+        size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
     });
 
     let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
@@ -581,6 +655,10 @@ async fn tombstone_decrement_triggers_delete_distributed() {
 
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
+            surface: kiseki_gateway::WriteSurface::S3,
+            base_composition_id: None,
+            base_bytes: 0,
         })
         .await
         .expect("write");
@@ -626,6 +704,10 @@ async fn non_tombstone_decrement_does_not_fan_out() {
 
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
+            surface: kiseki_gateway::WriteSurface::S3,
+            base_composition_id: None,
+            base_bytes: 0,
         })
         .await
         .expect("write");
@@ -694,5 +776,198 @@ async fn multipart_complete_records_real_original_len_for_scrub() {
     assert!(
         lens.contains(&5000),
         "part 2's length must be recorded: {lens:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// #111: gateway-internal write forwarding to the shard leader.
+//
+// A log whose forwarding-aware append returns `ForwardToLeader` (this
+// node is a follower for the target shard). With a `WriteForwarder`
+// wired, the gateway must re-issue the write to the leader and return
+// the leader's outcome — instead of surfacing the `ForwardToLeader`
+// error. This is what makes distributed-multi-shard writes work for
+// S3/NFS (which call `write()`), not just the native proxy path.
+// ---------------------------------------------------------------------
+
+/// `LogOps` whose `append_chunk_and_delta_with_forwarding` always reports
+/// the shard's leader is `leader`. Other methods are inert.
+struct ForwardToLeaderLog {
+    shard: ShardId,
+    leader: u64,
+}
+
+#[async_trait::async_trait]
+impl LogOps for ForwardToLeaderLog {
+    async fn put_intent_and_fan(
+        &self,
+        _shard_id: ShardId,
+        _intent: kiseki_log::intent::WriteIntent,
+    ) -> Result<(), LogError> {
+        // This stub focuses on the synchronous forward-to-leader path; the
+        // test driving it uses a POSIX surface so the gateway skips the
+        // decoupled path. If a future test exercises async forwarding it
+        // should return the leader hint here too.
+        Err(LogError::Unavailable)
+    }
+
+    async fn append_delta(&self, _req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
+        Ok(SequenceNumber(1))
+    }
+    async fn append_chunk_and_delta(
+        &self,
+        _req: AppendChunkAndDeltaRequest,
+    ) -> Result<SequenceNumber, LogError> {
+        Ok(SequenceNumber(1))
+    }
+    async fn append_chunk_and_delta_with_forwarding(
+        &self,
+        _req: AppendChunkAndDeltaRequest,
+    ) -> Result<SequenceNumber, LogError> {
+        Err(LogError::ForwardToLeader {
+            shard_id: self.shard,
+            leader_node_id: NodeId(self.leader),
+        })
+    }
+    async fn increment_chunk_refcount(
+        &self,
+        _s: ShardId,
+        _t: OrgId,
+        _c: ChunkId,
+    ) -> Result<(), LogError> {
+        Ok(())
+    }
+    async fn decrement_chunk_refcount(
+        &self,
+        _s: ShardId,
+        _t: OrgId,
+        _c: ChunkId,
+    ) -> Result<bool, LogError> {
+        Ok(false)
+    }
+    async fn read_deltas(
+        &self,
+        _req: ReadDeltasRequest,
+    ) -> Result<Vec<kiseki_log::delta::Delta>, LogError> {
+        Ok(vec![])
+    }
+    async fn shard_health(&self, _s: ShardId) -> Result<ShardInfo, LogError> {
+        Err(LogError::Unavailable)
+    }
+    async fn set_maintenance(&self, _s: ShardId, _e: bool) -> Result<(), LogError> {
+        Ok(())
+    }
+    async fn truncate_log(&self, _s: ShardId) -> Result<SequenceNumber, LogError> {
+        Ok(SequenceNumber(0))
+    }
+    async fn compact_shard(&self, _s: ShardId) -> Result<u64, LogError> {
+        Ok(0)
+    }
+    fn create_shard(&self, _s: ShardId, _t: OrgId, _n: NodeId, _c: ShardConfig) {}
+    fn update_shard_range(&self, _s: ShardId, _a: [u8; 32], _b: [u8; 32]) {}
+    fn set_shard_state(&self, _s: ShardId, _st: ShardState) {}
+    fn set_shard_config(&self, _s: ShardId, _c: ShardConfig) {}
+    async fn register_consumer(
+        &self,
+        _s: ShardId,
+        _c: &str,
+        _p: SequenceNumber,
+    ) -> Result<(), LogError> {
+        Ok(())
+    }
+    async fn advance_watermark(
+        &self,
+        _s: ShardId,
+        _c: &str,
+        _p: SequenceNumber,
+    ) -> Result<(), LogError> {
+        Ok(())
+    }
+}
+
+/// Records every `forward_append` call and returns a canned sequence.
+#[derive(Default)]
+struct MockForwarder {
+    calls: Mutex<Vec<(u64, usize)>>, // (leader_node, new_chunks count)
+}
+
+#[async_trait::async_trait]
+impl AppendForwarder for MockForwarder {
+    async fn forward_append(
+        &self,
+        leader_node: NodeId,
+        req: AppendChunkAndDeltaRequest,
+    ) -> Result<SequenceNumber, LogError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((leader_node.0, req.new_chunks.len()));
+        Ok(SequenceNumber(42))
+    }
+}
+
+/// #111 RED→GREEN: a write that hits a shard this node doesn't lead is
+/// transparently re-issued (the built append) to the leader via the
+/// wired forwarder, and the gateway returns success — NOT a
+/// `ForwardToLeader` error.
+#[tokio::test(flavor = "multi_thread")]
+async fn write_to_remote_led_shard_forwards_to_leader() {
+    let log: Arc<dyn LogOps + Send + Sync> = Arc::new(ForwardToLeaderLog {
+        shard: test_shard(),
+        leader: 2,
+    });
+    let compositions = CompositionStore::new().with_log(Arc::clone(&log));
+    compositions.add_namespace(Namespace {
+        id: test_namespace(),
+        tenant_id: test_tenant(),
+        shard_id: test_shard(),
+        read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
+
+        size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
+    });
+    let chunks = ChunkStore::new();
+    let forwarder = Arc::new(MockForwarder::default());
+    let gw = InMemoryGateway::new(
+        compositions,
+        kiseki_chunk::arc_async(chunks),
+        SystemMasterKey::new([0x42; 32], KeyEpoch(1)),
+    )
+    .with_cluster_placement(vec![1, 2])
+    .with_target_copies(1)
+    .with_append_forwarder(Arc::clone(&forwarder) as Arc<dyn AppendForwarder>);
+
+    let resp = gw
+        .write(WriteRequest {
+            tenant_id: test_tenant(),
+            namespace_id: test_namespace(),
+            data: vec![0xABu8; 4096],
+            name: None,
+            conditional: None,
+            workflow_ref: None,
+            idempotency_key: None,
+            forwarded_from_node: None,
+            comp_id_override: None,
+            tier: None,
+            // Drive the synchronous forward-to-leader path: POSIX surfaces
+            // are NEVER decoupled (ADR-013), so the gateway emits via
+            // `emit_chunk_and_delta_forwarding_to` and exercises the
+            // `AppendForwarder` we wire above.
+            surface: kiseki_gateway::WriteSurface::Nfs,
+            base_composition_id: None,
+            base_bytes: 0,
+        })
+        .await
+        .expect("write must succeed via leader append-forward, not ForwardToLeader error");
+
+    assert_eq!(resp.bytes_written, 4096);
+    let calls = forwarder.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "forwarded exactly once");
+    assert_eq!(calls[0].0, 2, "forwarded to leader node-2");
+    assert_eq!(
+        calls[0].1, 1,
+        "the write's single new chunk rides the forwarded append"
     );
 }

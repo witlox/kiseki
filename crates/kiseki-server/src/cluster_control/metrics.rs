@@ -37,6 +37,12 @@ pub mod op {
     pub const RECORD_MERGE: &str = "record_merge";
     /// `ControlCommand::RetireShard`.
     pub const RETIRE_SHARD: &str = "retire_shard";
+    /// ADR-049 `ControlCommand::UpsertNodeInventory`.
+    pub const UPSERT_NODE_INVENTORY: &str = "upsert_node_inventory";
+    /// ADR-049 `ControlCommand::SetPlacementPolicy`.
+    pub const SET_PLACEMENT_POLICY: &str = "set_placement_policy";
+    /// ADR-049 `ControlCommand::SetWorkloadParams`.
+    pub const SET_WORKLOAD_PARAMS: &str = "set_workload_params";
 }
 
 /// Outcome label values for `kiseki_cluster_control_submit_total`.
@@ -184,6 +190,9 @@ impl ClusterControlMetrics {
             super::ControlCommand::RecordSplit { .. } => op::RECORD_SPLIT,
             super::ControlCommand::RecordMerge { .. } => op::RECORD_MERGE,
             super::ControlCommand::RetireShard { .. } => op::RETIRE_SHARD,
+            super::ControlCommand::UpsertNodeInventory { .. } => op::UPSERT_NODE_INVENTORY,
+            super::ControlCommand::SetPlacementPolicy { .. } => op::SET_PLACEMENT_POLICY,
+            super::ControlCommand::SetWorkloadParams { .. } => op::SET_WORKLOAD_PARAMS,
         }
     }
 }

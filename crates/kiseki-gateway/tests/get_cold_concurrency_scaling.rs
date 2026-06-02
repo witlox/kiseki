@@ -53,6 +53,9 @@ async fn build_gateway_with_cache_disabled() -> (Arc<InMemoryGateway>, Compositi
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
+
+        size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
     });
     let chunks = ChunkStore::new();
     let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
@@ -75,6 +78,10 @@ async fn build_gateway_with_cache_disabled() -> (Arc<InMemoryGateway>, Compositi
 
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
+            surface: kiseki_gateway::WriteSurface::S3,
+            base_composition_id: None,
+            base_bytes: 0,
         })
         .await
         .expect("warm-put");

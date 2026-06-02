@@ -291,7 +291,7 @@ mod tests {
     }
 
     fn local() -> Arc<dyn AsyncChunkOps> {
-        let mut store = ChunkStore::new();
+        let store = ChunkStore::new();
         store.add_pool(AffinityPool {
             name: "p".into(),
             device_class: DeviceClass::NvmeSsd,
@@ -299,6 +299,8 @@ mod tests {
             devices: vec![],
             capacity_bytes: 1 << 30,
             used_bytes: 0,
+            requires_migration: false,
+            ..Default::default()
         });
         Arc::new(SyncBridge::new(store))
     }

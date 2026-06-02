@@ -290,13 +290,28 @@ Feature: pNFS Flexible Files Layout (ADR-038, RFC 8435)
     And ADR-040 composition immutability is preserved (old composition_id is unchanged on disk)
 
   @library @pnfs-15d @ds-write
-  Scenario: WRITE past KISEKI_PNFS_DS_BUFFER_CAP_BYTES returns NFS4ERR_NOSPC
+  Scenario: WRITE past KISEKI_PNFS_DS_BUFFER_CAP_BYTES auto-drains and succeeds (#146)
     Given the per-composition buffer cap is 1 MiB (test override)
     And a client has buffered 1 MiB on stateid S via WRITE
     When the client sends another WRITE of 4 KiB on stateid S
+    Then the DS performs an INLINE auto-drain via GatewayOps::write
+    And the DS returns NFS4_OK for the WRITE
+    And the buffer chain anchor advances to the just-drained composition
+    And the buffer total bytes equal 4 KiB (the post-drain delta)
+    # The Linux pNFS client does NOT issue COMMIT on NFS4ERR_NOSPC — it
+    # returns the error to userspace. So the server must drain on its
+    # own to unblock sustained writes. The chain anchor preserves the
+    # cumulative content for the next COMMIT (the #74 property).
+
+  @library @pnfs-15d @ds-write
+  Scenario: Single WRITE LARGER than the buffer cap still returns NFS4ERR_NOSPC (#146)
+    Given the per-composition buffer cap is 1 MiB (test override)
+    When the client sends a fresh WRITE of 2048 KiB on stateid S
     Then the DS returns NFS4ERR_NOSPC
-    And the buffer total bytes remain capped at 1 MiB (no partial write)
-    And the client recovers by issuing DESTROY_SESSION (which drops the buffer per #74) then re-opening
+    # Even a fresh buffer can't hold a single WRITE larger than the
+    # cap; the inline auto-drain doesn't help here. The kernel
+    # surfaces this to userspace (which is correct — it's a real
+    # client-side error).
 
   @library @pnfs-15d @ds-write
   Scenario: DESTROY_SESSION drops pending buffers without implicit flush

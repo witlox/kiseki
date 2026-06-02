@@ -995,6 +995,9 @@ async fn given_empty_bucket(w: &mut KisekiWorld, bucket: String) {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         })
         .await;
 }
@@ -1222,6 +1225,9 @@ async fn when_get_bucket(w: &mut KisekiWorld, bucket: String) {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         })
         .await;
     w.last_error = None;
@@ -1737,6 +1743,9 @@ async fn given_bucket_no_objects(w: &mut KisekiWorld, bucket: String) {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         })
         .await;
 }

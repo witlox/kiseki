@@ -39,6 +39,15 @@ pub mod op {
     pub const VOTE: &str = "vote";
     /// `InstallFullSnapshot`.
     pub const FULL_SNAPSHOT: &str = "full_snapshot";
+    /// ADR-047 aux tag `intent_put` — the producer's quorum intent-write
+    /// (per-PUT hot path). Tag string defined in
+    /// `kiseki_log::intent_sync::INTENT_PUT_TAG`; kept literal here to keep
+    /// `kiseki-raft` free of an upward dependency on `kiseki-log`.
+    pub const INTENT_PUT: &str = "intent_put";
+    /// ADR-047 aux tag `intent_gather_pending` — leader-recovery O2 gather
+    /// (cold path; one round per election). Tag string defined in
+    /// `kiseki_log::intent_sync::INTENT_GATHER_PENDING_TAG`.
+    pub const INTENT_GATHER_PENDING: &str = "intent_gather_pending";
     /// Unknown / unrecognized tag.
     pub const UNKNOWN: &str = "unknown";
 }

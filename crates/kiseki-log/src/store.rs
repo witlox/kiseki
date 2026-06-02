@@ -303,6 +303,18 @@ impl Default for MemShardStore {
 
 #[async_trait::async_trait]
 impl LogOps for MemShardStore {
+    /// ADR-047: single-node `MemShardStore` has no peers and no per-shard
+    /// `IntentStore` — `min_acks = 1` is satisfied by appending the
+    /// intent's delta locally. Single-node decoupled-ack collapses to a
+    /// synchronous append (there is nothing to decouple against).
+    async fn put_intent_and_fan(
+        &self,
+        _shard_id: ShardId,
+        intent: crate::intent::WriteIntent,
+    ) -> Result<(), LogError> {
+        self.append_chunk_and_delta(intent.append).await.map(|_| ())
+    }
+
     async fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
         let mut shards = self.shards.lock().lock_or_die("store.shards");
         let shard = shards

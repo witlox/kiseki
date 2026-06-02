@@ -27,6 +27,16 @@ METRIC_PATTERNS=(
   "kiseki_transport_connections_active"
   "kiseki_shard_delta_count"
   "kiseki_pool_capacity_used_bytes"
+  # GH #115 capacity + dedup observability.
+  "kiseki_storage_device_used_bytes"
+  "kiseki_storage_device_total_bytes"
+  "kiseki_storage_logical_bytes"
+  "kiseki_storage_physical_bytes"
+  "kiseki_storage_chunk_count"
+  "kiseki_storage_tier_fast_used_bytes"
+  "kiseki_storage_tier_fast_total_bytes"
+  "kiseki_storage_tier_bulk_used_bytes"
+  "kiseki_storage_tier_cold_used_bytes"
 )
 
 summarize() {

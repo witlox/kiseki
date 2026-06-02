@@ -15,6 +15,7 @@
 //! Phase 2 of the ADR-042 implementation plan
 //! (`specs/implementation/adr-042-native-gateway.md`).
 
+pub mod append_forwarder;
 pub mod canonical_san;
 pub mod dek_fetch_ticket;
 pub mod grpc;

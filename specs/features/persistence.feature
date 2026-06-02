@@ -96,18 +96,18 @@ Feature: Persistence and crash recovery (ADR-022)
   @library @slow
   Scenario: Inline small files survive restart
     Given 100 files below the inline threshold were written
-    And their content is in small/objects.redb
+    And their content is in small/objects (fjall, ADR-022 rev-5)
     When the server is restarted
-    Then all 100 files are readable from small/objects.redb
+    Then all 100 files are readable from small/objects (fjall, ADR-022 rev-5)
     And their encrypted content matches the original writes
 
   @library @slow
   Scenario: Inline files included in Raft snapshot
-    Given shard "s1" has 500 inline files in small/objects.redb
+    Given shard "s1" has 500 inline files in small/objects (fjall, ADR-022 rev-5)
     When a Raft snapshot is built for shard "s1"
     Then the snapshot data includes all 500 inline file contents
     When a new node installs this snapshot
-    Then its small/objects.redb contains all 500 entries
+    Then its small/objects (fjall, ADR-022 rev-5) contains all 500 entries
 
   # === Crash recovery edge cases ===
 

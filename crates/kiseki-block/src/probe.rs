@@ -18,6 +18,47 @@ pub enum DetectedMedium {
     Unknown,
 }
 
+/// Cost/performance tier a medium belongs to (ADR-024 tiering).
+///
+/// Placement prefers the fastest tier with free space and spills to
+/// slower tiers as the fast tier fills, so hot data lands on fast media
+/// across a heterogeneous fleet without paying `NVMe` prices for bulk.
+/// `Ord` is fast → cold, so sorting ascending gives the placement
+/// preference order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub enum StorageTier {
+    /// `NVMe` SSD — hot / latency-sensitive.
+    Fast,
+    /// SATA/SAS SSD (and virtual / unknown block) — warm.
+    Bulk,
+    /// Rotational HDD — cold / archival.
+    Cold,
+}
+
+impl StorageTier {
+    /// Map a detected medium to its cost/performance tier.
+    #[must_use]
+    pub fn of(medium: DetectedMedium) -> Self {
+        match medium {
+            DetectedMedium::NvmeSsd => Self::Fast,
+            DetectedMedium::SataSsd | DetectedMedium::Virtual | DetectedMedium::Unknown => {
+                Self::Bulk
+            }
+            DetectedMedium::Hdd => Self::Cold,
+        }
+    }
+
+    /// Stable lowercase label for metrics + CLI (`fast` / `bulk` / `cold`).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Bulk => "bulk",
+            Self::Cold => "cold",
+        }
+    }
+}
+
 /// I/O strategy derived from device characteristics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum IoStrategy {

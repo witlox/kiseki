@@ -177,10 +177,13 @@ fn reply_mnt<G: GatewayOps>(xid: u32, reader: &mut XdrReader<'_>, ctx: &NfsConte
     encode_reply_accepted(&mut w, xid, 0); // SUCCESS
 
     // Kiseki exports a single namespace named "default" (matches the
-    // NFSv4 PUTROOTFH+LOOKUP("default") path). Accept both "/default"
-    // and "default" (Linux NFS client sends "/default").
+    // NFSv4 PUTROOTFH+LOOKUP("default") path). Accept "/default" and
+    // "default", AND root "/" (empty after trimming) as an alias for
+    // the single namespace — `mount host:/` is the export path
+    // operators reach for and the #128 GCP failure was MNT("/") →
+    // MNT3ERR_NOENT. Any other path is genuinely unknown.
     let trimmed = dirpath.trim_start_matches('/');
-    if trimmed != "default" {
+    if !trimmed.is_empty() && trimmed != "default" {
         w.write_u32(mountstat3::MNT3ERR_NOENT);
         return w.into_bytes();
     }
@@ -246,6 +249,9 @@ mod tests {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         });
         let chunks = ChunkStore::new();
         let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
@@ -356,6 +362,40 @@ mod tests {
         assert_eq!(auth_count, 1, "exactly one auth flavor advertised");
         let auth = r.read_u32().unwrap();
         assert_eq!(auth, AUTH_SYS, "AUTH_SYS (1) advertised for Linux compat");
+    }
+
+    /// #128 (2026-05-28 GCP): `mount host:/` (root) MUST succeed for a
+    /// single-namespace server — it's the export path operators reach
+    /// for. The GCP run failed `mount -o vers=3 host:/` with "No such
+    /// file or directory" (MNT3ERR_NOENT) because MNT only accepted
+    /// "default". Root "/" now aliases the single default namespace,
+    /// mirroring the NFSv4 PUTROOTFH→namespace path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mount3_mnt_root_aliases_default_namespace() {
+        let ctx = test_ctx();
+        let mut body = XdrWriter::new();
+        body.write_string("/");
+        let body_bytes = body.into_bytes();
+        let raw = build_call(
+            0x1003,
+            MOUNT3_PROGRAM,
+            MOUNT3_VERSION,
+            proc::MNT,
+            &body_bytes,
+        );
+        let reply = handle_mount3_message(&header(0x1003, proc::MNT), &raw, &ctx);
+        let mut r = XdrReader::new(&reply);
+        for _ in 0..6 {
+            let _ = r.read_u32();
+        }
+        let fhs_status = r.read_u32().unwrap();
+        assert_eq!(
+            fhs_status,
+            mountstat3::MNT3_OK,
+            "#128: `mount host:/` MUST succeed — root aliases the default namespace",
+        );
+        let fh = r.read_opaque().unwrap();
+        assert_eq!(fh.len(), 32, "namespace root fh");
     }
 
     /// RFC 1813 Appendix I — MNT for an unknown export name MUST yield

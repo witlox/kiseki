@@ -47,6 +47,18 @@ pub mod advisory;
 // structured tracing so the upstream panic is observable).
 pub mod locks;
 
+// ADR-048 storage-location tag (Hot / Cold). Lives here so the
+// composition crate can persist it without taking a dep on
+// kiseki-chunk.
+pub mod storage_location;
+
+// ADR-049 device inventory + placement policy + capacity formula
+// inputs + the PER_FILE_METADATA_FOOTPRINT_BYTES constant (moved
+// here from kiseki-server::system_disk so every fjall consumer +
+// the control-plane state machine + admin RPC can import without
+// crate cycles).
+pub mod metadata;
+
 // Re-export the flat public surface for convenience. Match
 // ubiquitous-language.md names exactly.
 pub use error::{KisekiError, PermanentError, RetriableError, SecurityError};
@@ -62,4 +74,14 @@ pub use clock_skew::{ClockSkewDetector, SkewObservation, SkewSeverity};
 pub use advisory::{
     AccessPattern, AffinityPreference, ClientId, DedupIntent, OperationAdvisory, PhaseId,
     PoolDescriptor, PoolHandle, Priority, RetentionIntent, WorkflowRef, WorkloadProfile,
+};
+
+pub use storage_location::{ChunkRefLocation, SlabId};
+
+// ADR-049: device inventory + placement-policy types + the
+// PER_FILE_METADATA_FOOTPRINT_BYTES constant.
+pub use metadata::{
+    ClusterDeviceCatalog, DeviceEntry, DeviceMatcher, FjallStoreTier, MediaType,
+    NodeDeviceInventory, PlacementPolicy, PolicyMode, TierCapacity, TierPolicy, WorkloadParams,
+    PER_FILE_METADATA_FOOTPRINT_BYTES,
 };

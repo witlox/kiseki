@@ -1,0 +1,16 @@
+{
+  "label": "slabec_nfs4_put-heavy_65536",
+  "pool_type": "slabec",
+  "protocol": "nfs4",
+  "shape": "put-heavy",
+  "object_size": 65536,
+  "ok": true,
+  "rc": 0,
+  "wall_s": 30.921681620005984,
+  "ops": 47240,
+  "ops_per_s": 4724.0,
+  "mib_per_s": 295.25,
+  "p50_us": 2409,
+  "p95_us": 5129,
+  "p99_us": 34683
+}

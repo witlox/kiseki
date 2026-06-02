@@ -19,9 +19,40 @@
 use std::collections::HashMap;
 
 use kiseki_common::ids::{CompositionId, NamespaceId, SequenceNumber, ShardId};
+use kiseki_log::intent::PerspectiveSeq;
 
 use super::error::PersistentStoreError;
 use crate::composition::Composition;
+
+/// ADR-047 MF-1 / MF-9 — per-name LWW guard predicate. Returns `true`
+/// iff a bind / unbind with the `incoming` perspective seq should be
+/// applied over the `stored` perspective seq.
+///
+/// Cross-surface rule (see [`CompositionStorage::name_insert_with_seq`]
+/// for the long-form contract):
+///
+/// - `stored = _`, `incoming = None` → accept. Sync surface; Raft
+///   commit order is authoritative; unconditional bind.
+/// - `stored = None`, `incoming = Some(_)` → accept. `None < Some(_)`,
+///   so any async write beats the (implicit) sync floor.
+/// - `stored = Some(s_old)`, `incoming = Some(s_new)` → accept iff
+///   `s_new >= s_old`, per-key LWW by HLC seq.
+///
+/// Equality (`s_new == s_old`) accepts so a retry of the same write
+/// is idempotent. The skip path (`s_new < s_old`) is the load-bearing
+/// case from MF-1: a newer-HLC write incorporated FIRST must not be
+/// overwritten by an older-HLC write incorporated SECOND.
+#[must_use]
+pub fn lww_accepts_bind(stored: Option<PerspectiveSeq>, incoming: Option<PerspectiveSeq>) -> bool {
+    match (stored, incoming) {
+        // Sync (incoming = None) always wins — unconditional bind.
+        // Same accept reasoning covers None stored + Some incoming
+        // (None < Some(_)): the merged arm keeps clippy happy.
+        (_, None) | (None, Some(_)) => true,
+        // Per-key LWW by HLC perspective seq, equality idempotent.
+        (Some(s_old), Some(s_new)) => s_new >= s_old,
+    }
+}
 
 /// Storage backend for the `comp_id` → `Composition` map plus
 /// hydrator meta state.
@@ -85,11 +116,83 @@ pub trait CompositionStorage: Send + Sync {
     /// (S3 PUT-overwrite semantics — the caller is responsible for
     /// having checked conditional headers like `If-None-Match: *`
     /// before calling this).
+    ///
+    /// Cross-surface seq contract (ADR-047 MF-1 / MF-9): plain
+    /// `name_insert` is the sync surface path (POSIX / NFS / FUSE
+    /// plus the gateway's own atomic create-then-name). It binds
+    /// unconditionally and clears any stored perspective seq for the
+    /// name — sync writes are Raft-commit-order authoritative and
+    /// the next async write (with `Some(seq)`) wins the LWW guard
+    /// against `None` (we treat `None` as `-∞`). The asynchronous
+    /// (decoupled-ack) producer uses [`Self::name_insert_with_seq`]
+    /// which applies the seq guard.
     fn name_insert(
         &self,
         ns: NamespaceId,
         name: String,
         id: CompositionId,
+    ) -> Result<(), PersistentStoreError>;
+
+    /// Bind `name` to `id` in `ns` with an ingress-assigned
+    /// [`PerspectiveSeq`] (ADR-047 MF-1 / MF-9 LWW guard).
+    ///
+    /// `incoming = None` is treated as **sync surface** and binds
+    /// unconditionally, identical to plain [`Self::name_insert`].
+    ///
+    /// `incoming = Some(seq)` is treated as **async surface** and
+    /// binds iff `Some(seq) >= stored_seq` per the per-name LWW
+    /// guard (`None < Some(_)` is the cross-surface ordering: a
+    /// stored `None` from a prior sync write **always loses** to an
+    /// incoming async seq — last-writer-wins, where the sync write
+    /// "landed at unspecified time" and the async write has a
+    /// real HLC). If the incoming seq is strictly older than the
+    /// stored one, the bind is a no-op (the durable state is
+    /// already the LWW winner).
+    ///
+    /// Returns `Ok(true)` when the bind happened, `Ok(false)` when
+    /// the seq guard skipped it (the stored seq was strictly newer).
+    ///
+    /// Default implementation: reads the stored seq, applies the
+    /// rule, and calls into [`Self::name_insert`] + records the new
+    /// seq via [`Self::name_seq_record`]. Persistent backends MAY
+    /// override to fold the lookup + write into one batch.
+    fn name_insert_with_seq(
+        &self,
+        ns: NamespaceId,
+        name: String,
+        id: CompositionId,
+        incoming: Option<PerspectiveSeq>,
+    ) -> Result<bool, PersistentStoreError> {
+        let stored = self.name_seq_lookup(ns, &name)?;
+        if !lww_accepts_bind(stored, incoming) {
+            return Ok(false);
+        }
+        self.name_insert(ns, name.clone(), id)?;
+        self.name_seq_record(ns, name, incoming)?;
+        Ok(true)
+    }
+
+    /// Read the perspective seq stored alongside `(ns, name)`.
+    /// Returns `None` when no binding exists OR when the existing
+    /// binding has no recorded seq (sync-bound: a write that landed
+    /// through the synchronous gateway path, or one whose stamp was
+    /// cleared by a sync overwrite). Per the LWW rule a stored `None`
+    /// is treated as `-∞`, so any incoming `Some(_)` wins.
+    fn name_seq_lookup(
+        &self,
+        ns: NamespaceId,
+        name: &str,
+    ) -> Result<Option<PerspectiveSeq>, PersistentStoreError>;
+
+    /// Record (or clear) the perspective seq for `(ns, name)`. Called
+    /// from [`Self::name_insert_with_seq`] after the bind succeeds. A
+    /// `seq = None` argument CLEARS the recorded seq for the name —
+    /// the sync-surface "raft commit order is authoritative" stamp.
+    fn name_seq_record(
+        &self,
+        ns: NamespaceId,
+        name: String,
+        seq: Option<PerspectiveSeq>,
     ) -> Result<(), PersistentStoreError>;
 
     /// Atomic create-then-name. Stores `comp` AND binds `(ns, name)`
@@ -147,7 +250,44 @@ pub trait CompositionStorage: Send + Sync {
     }
 
     /// Unbind `name` in `ns`. Returns `true` if a binding existed.
+    ///
+    /// **Cross-surface seq contract:** plain `name_remove` is the
+    /// **sync surface** (POSIX / NFS / FUSE DELETE) path — unbinds
+    /// unconditionally and clears any stored seq. The asynchronous
+    /// (decoupled-ack) hydrator path uses
+    /// [`Self::name_remove_with_seq`] which applies the LWW guard
+    /// (an older-seq Delete must not unbind a newer-seq Create's
+    /// binding).
     fn name_remove(&self, ns: NamespaceId, name: &str) -> Result<bool, PersistentStoreError>;
+
+    /// Unbind `name` in `ns` with an ingress-assigned
+    /// [`PerspectiveSeq`] guard. Same cross-surface rule as
+    /// [`Self::name_insert_with_seq`]: `incoming = None` is sync
+    /// (unconditional unbind), `incoming = Some(seq)` is async and
+    /// only unbinds iff `Some(seq) >= stored_seq` (treating stored
+    /// `None` as `-∞`).
+    ///
+    /// Returns `Ok(true)` when the unbind happened, `Ok(false)`
+    /// when the seq guard skipped it.
+    ///
+    /// Default implementation: read stored seq, apply rule, call
+    /// [`Self::name_remove`] + clear via [`Self::name_seq_record`].
+    fn name_remove_with_seq(
+        &self,
+        ns: NamespaceId,
+        name: &str,
+        incoming: Option<PerspectiveSeq>,
+    ) -> Result<bool, PersistentStoreError> {
+        let stored = self.name_seq_lookup(ns, name)?;
+        if !lww_accepts_bind(stored, incoming) {
+            return Ok(false);
+        }
+        let removed = self.name_remove(ns, name)?;
+        // Clear the seq row even when the binding row was absent —
+        // keeps the two indexes consistent on a stale unbind replay.
+        self.name_seq_record(ns, name.to_owned(), None)?;
+        Ok(removed)
+    }
 
     /// Enumerate `(name, composition_id)` bindings in a namespace.
     /// `prefix` filters by string prefix when `Some` (S3 LIST with
@@ -238,17 +378,26 @@ pub struct HydrationBatch {
     pub puts: Vec<Composition>,
     /// Composition ids to remove (Delete deltas).
     pub removes: Vec<CompositionId>,
-    /// Name bindings to insert: `(namespace_id, name, composition_id)`.
-    /// Populated from Create deltas that carry a name (S3 PUT path).
-    /// Followers replay these so GET-by-key + LIST work uniformly
-    /// across nodes.
-    pub name_inserts: Vec<(NamespaceId, String, CompositionId)>,
-    /// Name bindings to remove: `(namespace_id, name)`. Populated
-    /// from Delete deltas via reverse-lookup of the composition's
-    /// current name binding. The hydrator resolves the name on the
-    /// leader (or via its own local `name_for` lookup) before
-    /// emitting the batch.
-    pub name_removes: Vec<(NamespaceId, String)>,
+    /// Name bindings to insert: `(namespace_id, name, composition_id,
+    /// perspective_seq)`. Populated from Create deltas that carry a
+    /// name (S3 PUT path). Followers replay these so GET-by-key +
+    /// LIST work uniformly across nodes.
+    ///
+    /// The fourth tuple element carries the optional ingress
+    /// [`PerspectiveSeq`] decoded from the Create payload (ADR-047
+    /// MF-1 / MF-9). `Some(seq)` engages the per-name LWW guard at
+    /// apply time; `None` (sync surfaces) binds unconditionally.
+    pub name_inserts: Vec<(NamespaceId, String, CompositionId, Option<PerspectiveSeq>)>,
+    /// Name bindings to remove: `(namespace_id, name,
+    /// perspective_seq)`. Populated from Delete deltas via
+    /// reverse-lookup of the composition's current name binding.
+    /// The hydrator resolves the name on the leader (or via its own
+    /// local `name_for` lookup) before emitting the batch.
+    ///
+    /// `perspective_seq = Some(seq)` engages the per-name LWW guard
+    /// — an older-seq Delete must not unbind a newer-seq Create's
+    /// binding (MF-1). `None` unbinds unconditionally (sync surface).
+    pub name_removes: Vec<(NamespaceId, String, Option<PerspectiveSeq>)>,
     /// Advance `last_applied_seq` to this value. Always set; the
     /// hydrator never commits a batch without advancing.
     pub new_last_applied_seq: SequenceNumber,
@@ -257,6 +406,12 @@ pub struct HydrationBatch {
     pub stuck_state: Option<Option<(SequenceNumber, u32)>>,
     /// Update the halt flag. `None` leaves it unchanged.
     pub halted: Option<bool>,
+    /// ADR-048 — chunk IDs migrated to a slab in this batch. The
+    /// commit hook (gateway-side eviction sink) decrements the local
+    /// chunk store's refcount on each; when refcount hits zero the
+    /// chunk-GC sweep reclaims the bytes (I-SE4). Empty on every
+    /// pre-ADR-048 batch.
+    pub migrated_chunk_evictions: Vec<kiseki_common::ids::ChunkId>,
 }
 
 impl HydrationBatch {
@@ -274,6 +429,7 @@ impl HydrationBatch {
             new_last_applied_seq,
             stuck_state: Some(None),
             halted: None,
+            migrated_chunk_evictions: Vec::new(),
         }
     }
 
@@ -311,6 +467,14 @@ pub struct MemoryStorage {
     /// by Delete deltas to find what to unbind. A composition without
     /// a name (NFS path, internal use) has no entry here.
     names_reverse: parking_lot::Mutex<HashMap<CompositionId, (NamespaceId, String)>>,
+    /// ADR-047 MF-1: per-name perspective-seq stamp for the LWW
+    /// guard. `Some(_)` = the binding was last touched by an async
+    /// (decoupled-ack) write at that seq; absent = the binding was
+    /// sync-bound (or the stamp was cleared by a sync overwrite).
+    /// Lives in its own map so a sync write that goes through
+    /// `name_insert` keeps the existing fast path (clears the seq
+    /// via `name_seq_record(None)`).
+    name_seqs: parking_lot::Mutex<HashMap<(NamespaceId, String), PerspectiveSeq>>,
     /// Per-shard last-applied sequence. Multi-shard hydrators write
     /// disjoint keys.
     last_applied_seq: parking_lot::Mutex<HashMap<ShardId, SequenceNumber>>,
@@ -338,6 +502,7 @@ impl MemoryStorage {
             compositions: parking_lot::Mutex::new(HashMap::new()),
             names: parking_lot::Mutex::new(HashMap::new()),
             names_reverse: parking_lot::Mutex::new(HashMap::new()),
+            name_seqs: parking_lot::Mutex::new(HashMap::new()),
             last_applied_seq: parking_lot::Mutex::new(HashMap::new()),
             stuck_state: parking_lot::Mutex::new(HashMap::new()),
             halted: parking_lot::Mutex::new(HashMap::new()),
@@ -378,9 +543,11 @@ impl CompositionStorage for MemoryStorage {
     fn remove(&self, id: CompositionId) -> Result<bool, PersistentStoreError> {
         // Drop the name binding when the composition goes away —
         // otherwise a future PUT to the same key would resolve to a
-        // dangling composition_id. The reverse map stays consistent.
+        // dangling composition_id. The reverse map AND the per-name
+        // seq stamp stay consistent.
         if let Some((ns, name)) = self.names_reverse.lock().remove(&id) {
-            self.names.lock().remove(&(ns, name));
+            self.names.lock().remove(&(ns, name.clone()));
+            self.name_seqs.lock().remove(&(ns, name));
         }
         Ok(self.compositions.lock().remove(&id).is_some())
     }
@@ -410,8 +577,15 @@ impl CompositionStorage for MemoryStorage {
         // composition, drop the old reverse entry. If id already has a
         // name, drop its old forward entry. Caller is responsible for
         // pre-flight conditional checks (If-None-Match etc.).
+        //
+        // **Cross-surface seq contract (ADR-047 MF-9):** this is the
+        // sync-surface path — unconditional bind + clear the stored
+        // perspective-seq stamp (so the next async write with
+        // `Some(seq)` wins LWW; `None` is treated as `-∞` against
+        // any incoming async seq).
         let mut names = self.names.lock();
         let mut names_reverse = self.names_reverse.lock();
+        let mut name_seqs = self.name_seqs.lock();
         if let Some(old_id) = names.get(&(ns, name.clone())).copied() {
             if old_id != id {
                 names_reverse.remove(&old_id);
@@ -419,11 +593,41 @@ impl CompositionStorage for MemoryStorage {
         }
         if let Some((old_ns, old_name)) = names_reverse.get(&id).cloned() {
             if old_ns != ns || old_name != name {
-                names.remove(&(old_ns, old_name));
+                names.remove(&(old_ns, old_name.clone()));
+                name_seqs.remove(&(old_ns, old_name));
             }
         }
         names.insert((ns, name.clone()), id);
-        names_reverse.insert(id, (ns, name));
+        names_reverse.insert(id, (ns, name.clone()));
+        // Sync write: clear the seq stamp.
+        name_seqs.remove(&(ns, name));
+        Ok(())
+    }
+
+    fn name_seq_lookup(
+        &self,
+        ns: NamespaceId,
+        name: &str,
+    ) -> Result<Option<PerspectiveSeq>, PersistentStoreError> {
+        Ok(self.name_seqs.lock().get(&(ns, name.to_owned())).copied())
+    }
+
+    fn name_seq_record(
+        &self,
+        ns: NamespaceId,
+        name: String,
+        seq: Option<PerspectiveSeq>,
+    ) -> Result<(), PersistentStoreError> {
+        let mut name_seqs = self.name_seqs.lock();
+        let key = (ns, name);
+        match seq {
+            Some(s) => {
+                name_seqs.insert(key, s);
+            }
+            None => {
+                name_seqs.remove(&key);
+            }
+        }
         Ok(())
     }
 
@@ -431,6 +635,9 @@ impl CompositionStorage for MemoryStorage {
         let key = (ns, name.to_owned());
         let mut names = self.names.lock();
         let mut names_reverse = self.names_reverse.lock();
+        let mut name_seqs = self.name_seqs.lock();
+        // Sync unbind: clear the seq stamp unconditionally.
+        name_seqs.remove(&key);
         if let Some(id) = names.remove(&key) {
             names_reverse.remove(&id);
             Ok(true)
@@ -489,6 +696,7 @@ impl CompositionStorage for MemoryStorage {
         let mut compositions = self.compositions.lock();
         let mut names = self.names.lock();
         let mut names_reverse = self.names_reverse.lock();
+        let mut name_seqs = self.name_seqs.lock();
         for comp in batch.puts {
             compositions.insert(comp.id, comp);
         }
@@ -496,32 +704,70 @@ impl CompositionStorage for MemoryStorage {
             // Drop any name binding for the removed composition first
             // so the forward index can't outlive the data row.
             if let Some((ns, name)) = names_reverse.remove(&id) {
-                names.remove(&(ns, name));
+                names.remove(&(ns, name.clone()));
+                name_seqs.remove(&(ns, name));
             }
             compositions.remove(&id);
         }
-        for (ns, name, id) in batch.name_inserts {
-            // Reuse the same overwrite-replace semantics as
-            // `name_insert` so a redo of the same Create delta on a
-            // restarted hydrator stays idempotent.
-            if let Some(old_id) = names.get(&(ns, name.clone())).copied() {
+        // ADR-047 MF-1 / MF-9 — per-name LWW guard. For each insert,
+        // bind iff `lww_accepts_bind(stored_seq, incoming_seq)`. The
+        // sync-surface case (`incoming = None`) binds unconditionally
+        // AND clears the stored seq (`-∞` stamp); async (`Some(seq)`)
+        // updates the stamp on accept.
+        for (ns, name, id, incoming_seq) in batch.name_inserts {
+            let key = (ns, name.clone());
+            let stored = name_seqs.get(&key).copied();
+            if !lww_accepts_bind(stored, incoming_seq) {
+                tracing::debug!(
+                    ns = %ns.0,
+                    name = %name,
+                    stored = ?stored,
+                    incoming = ?incoming_seq,
+                    "name-bind: skipped (LWW guard: incoming seq < stored)",
+                );
+                continue;
+            }
+            // Overwrite-replace cascade (matches `name_insert`).
+            if let Some(old_id) = names.get(&key).copied() {
                 if old_id != id {
                     names_reverse.remove(&old_id);
                 }
             }
             if let Some((old_ns, old_name)) = names_reverse.get(&id).cloned() {
                 if old_ns != ns || old_name != name {
-                    names.remove(&(old_ns, old_name));
+                    names.remove(&(old_ns, old_name.clone()));
+                    name_seqs.remove(&(old_ns, old_name));
                 }
             }
-            names.insert((ns, name.clone()), id);
+            names.insert(key.clone(), id);
             names_reverse.insert(id, (ns, name));
+            match incoming_seq {
+                Some(s) => {
+                    name_seqs.insert(key, s);
+                }
+                None => {
+                    name_seqs.remove(&key);
+                }
+            }
         }
-        for (ns, name) in batch.name_removes {
-            let key = (ns, name);
+        for (ns, name, incoming_seq) in batch.name_removes {
+            let key = (ns, name.clone());
+            let stored = name_seqs.get(&key).copied();
+            if !lww_accepts_bind(stored, incoming_seq) {
+                tracing::debug!(
+                    ns = %ns.0,
+                    name = %name,
+                    stored = ?stored,
+                    incoming = ?incoming_seq,
+                    "name-unbind: skipped (LWW guard: incoming seq < stored)",
+                );
+                continue;
+            }
             if let Some(id) = names.remove(&key) {
                 names_reverse.remove(&id);
             }
+            // Clear the seq stamp on accept.
+            name_seqs.remove(&key);
         }
         self.last_applied_seq
             .lock()
@@ -533,5 +779,201 @@ impl CompositionStorage for MemoryStorage {
             self.halted.lock().insert(batch.shard_id, halted);
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ADR-047 MF-1 / MF-9 — per-name perspective-seq LWW guard tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod lww_guard_tests {
+    use super::*;
+    use kiseki_common::ids::NodeId;
+    use kiseki_common::time::HybridLogicalClock;
+
+    fn ns() -> NamespaceId {
+        NamespaceId(uuid::Uuid::from_u128(2))
+    }
+    fn id(n: u128) -> CompositionId {
+        CompositionId(uuid::Uuid::from_u128(n))
+    }
+    fn seq(physical_ms: u64, logical: u32, node: u64) -> PerspectiveSeq {
+        PerspectiveSeq(HybridLogicalClock {
+            physical_ms,
+            logical,
+            node_id: NodeId(node),
+        })
+    }
+
+    // --- Pure predicate tests (lww_accepts_bind) --------------------------
+
+    #[test]
+    fn lww_predicate_table() {
+        // sync incoming always wins
+        assert!(lww_accepts_bind(None, None));
+        assert!(lww_accepts_bind(Some(seq(1, 0, 1)), None));
+        // None stored, Some incoming → accept (None < Some(_))
+        assert!(lww_accepts_bind(None, Some(seq(1, 0, 1))));
+        // Equal seqs → idempotent accept
+        assert!(lww_accepts_bind(Some(seq(5, 0, 1)), Some(seq(5, 0, 1))));
+        // Newer incoming → accept
+        assert!(lww_accepts_bind(Some(seq(5, 0, 1)), Some(seq(6, 0, 1))));
+        // Older incoming → reject
+        assert!(!lww_accepts_bind(Some(seq(6, 0, 1)), Some(seq(5, 0, 1))));
+        // Same physical_ms, newer logical → accept
+        assert!(lww_accepts_bind(Some(seq(5, 0, 1)), Some(seq(5, 1, 1))));
+        // Same physical_ms, older logical → reject
+        assert!(!lww_accepts_bind(Some(seq(5, 1, 1)), Some(seq(5, 0, 1))));
+    }
+
+    // --- MemoryStorage bind/unbind paths ----------------------------------
+
+    #[test]
+    fn bind_guard_async_newer_wins() {
+        let store = MemoryStorage::new();
+        let ns = ns();
+        // First: bind name with seq=2
+        assert!(store
+            .name_insert_with_seq(ns, "k".into(), id(1), Some(seq(2, 0, 1)))
+            .unwrap());
+        assert_eq!(store.name_lookup(ns, "k").unwrap(), Some(id(1)));
+        // Then: bind same name with seq=3, different id → wins
+        assert!(store
+            .name_insert_with_seq(ns, "k".into(), id(2), Some(seq(3, 0, 1)))
+            .unwrap());
+        assert_eq!(store.name_lookup(ns, "k").unwrap(), Some(id(2)));
+        assert_eq!(store.name_seq_lookup(ns, "k").unwrap(), Some(seq(3, 0, 1)));
+    }
+
+    #[test]
+    fn bind_guard_async_older_skipped() {
+        let store = MemoryStorage::new();
+        let ns = ns();
+        // First: bind with seq=3
+        assert!(store
+            .name_insert_with_seq(ns, "k".into(), id(1), Some(seq(3, 0, 1)))
+            .unwrap());
+        // Then: try to bind with seq=2 → REJECTED
+        assert!(!store
+            .name_insert_with_seq(ns, "k".into(), id(2), Some(seq(2, 0, 1)))
+            .unwrap());
+        // Lookup still resolves to original id; stored seq unchanged
+        assert_eq!(store.name_lookup(ns, "k").unwrap(), Some(id(1)));
+        assert_eq!(store.name_seq_lookup(ns, "k").unwrap(), Some(seq(3, 0, 1)));
+    }
+
+    #[test]
+    fn bind_guard_equal_seq_idempotent() {
+        let store = MemoryStorage::new();
+        let ns = ns();
+        assert!(store
+            .name_insert_with_seq(ns, "k".into(), id(1), Some(seq(3, 0, 1)))
+            .unwrap());
+        // Same seq, same id → idempotent accept (a retry of the same write).
+        assert!(store
+            .name_insert_with_seq(ns, "k".into(), id(1), Some(seq(3, 0, 1)))
+            .unwrap());
+        assert_eq!(store.name_lookup(ns, "k").unwrap(), Some(id(1)));
+        assert_eq!(store.name_seq_lookup(ns, "k").unwrap(), Some(seq(3, 0, 1)));
+    }
+
+    #[test]
+    fn bind_guard_sync_always_binds() {
+        let store = MemoryStorage::new();
+        let ns = ns();
+        // sync writes through name_insert (the plain sync entry point).
+        store.name_insert(ns, "k".into(), id(1)).unwrap();
+        store.name_insert(ns, "k".into(), id(2)).unwrap();
+        // Second sync write wins — raft commit order is authoritative.
+        assert_eq!(store.name_lookup(ns, "k").unwrap(), Some(id(2)));
+        // Sync clears the seq stamp.
+        assert_eq!(store.name_seq_lookup(ns, "k").unwrap(), None);
+    }
+
+    #[test]
+    fn bind_guard_sync_then_async_async_wins() {
+        let store = MemoryStorage::new();
+        let ns = ns();
+        // Sync first: no seq stamped.
+        store.name_insert(ns, "k".into(), id(1)).unwrap();
+        assert_eq!(store.name_seq_lookup(ns, "k").unwrap(), None);
+        // Async with Some(seq) → None < Some(_), so async wins.
+        assert!(store
+            .name_insert_with_seq(ns, "k".into(), id(2), Some(seq(5, 0, 1)))
+            .unwrap());
+        assert_eq!(store.name_lookup(ns, "k").unwrap(), Some(id(2)));
+        assert_eq!(store.name_seq_lookup(ns, "k").unwrap(), Some(seq(5, 0, 1)));
+    }
+
+    #[test]
+    fn bind_guard_async_then_sync_sync_wins() {
+        let store = MemoryStorage::new();
+        let ns = ns();
+        // Async first: stamp seq=5.
+        assert!(store
+            .name_insert_with_seq(ns, "k".into(), id(1), Some(seq(5, 0, 1)))
+            .unwrap());
+        assert_eq!(store.name_seq_lookup(ns, "k").unwrap(), Some(seq(5, 0, 1)));
+        // Sync (None) → unconditional bind. Sync wins, stamp cleared.
+        store.name_insert(ns, "k".into(), id(2)).unwrap();
+        assert_eq!(store.name_lookup(ns, "k").unwrap(), Some(id(2)));
+        assert_eq!(store.name_seq_lookup(ns, "k").unwrap(), None);
+    }
+
+    #[test]
+    fn stage_delete_guard_skips_older() {
+        // An older-seq async unbind must NOT unbind a newer-seq name.
+        // Hydration apply path: feed in a `name_removes` entry with an
+        // older seq than what's stored — expect the unbind to be
+        // dropped silently.
+        let store = MemoryStorage::new();
+        let ns = ns();
+        // Bind with seq=5
+        assert!(store
+            .name_insert_with_seq(ns, "k".into(), id(1), Some(seq(5, 0, 1)))
+            .unwrap());
+        // Apply a hydration batch with an OLDER-seq unbind → no-op.
+        let batch = HydrationBatch {
+            shard_id: ShardId(uuid::Uuid::from_u128(1)),
+            puts: Vec::new(),
+            removes: Vec::new(),
+            name_inserts: Vec::new(),
+            name_removes: vec![(ns, "k".into(), Some(seq(2, 0, 1)))],
+            new_last_applied_seq: SequenceNumber(0),
+            stuck_state: None,
+            halted: None,
+            migrated_chunk_evictions: Vec::new(),
+        };
+        store.apply_hydration_batch(batch).unwrap();
+        // Binding survives.
+        assert_eq!(store.name_lookup(ns, "k").unwrap(), Some(id(1)));
+        assert_eq!(store.name_seq_lookup(ns, "k").unwrap(), Some(seq(5, 0, 1)));
+    }
+
+    #[test]
+    fn hydration_batch_lww_guard_drops_older_insert() {
+        // The mirror case of stage_delete_guard_skips_older for inserts:
+        // a hydration apply with an older-seq Create must not regress
+        // the newer-seq binding.
+        let store = MemoryStorage::new();
+        let ns = ns();
+        assert!(store
+            .name_insert_with_seq(ns, "k".into(), id(1), Some(seq(5, 0, 1)))
+            .unwrap());
+        let batch = HydrationBatch {
+            shard_id: ShardId(uuid::Uuid::from_u128(1)),
+            puts: Vec::new(),
+            removes: Vec::new(),
+            name_inserts: vec![(ns, "k".into(), id(2), Some(seq(2, 0, 1)))],
+            name_removes: Vec::new(),
+            new_last_applied_seq: SequenceNumber(0),
+            stuck_state: None,
+            halted: None,
+            migrated_chunk_evictions: Vec::new(),
+        };
+        store.apply_hydration_batch(batch).unwrap();
+        assert_eq!(store.name_lookup(ns, "k").unwrap(), Some(id(1)));
+        assert_eq!(store.name_seq_lookup(ns, "k").unwrap(), Some(seq(5, 0, 1)));
     }
 }

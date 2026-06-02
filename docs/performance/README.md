@@ -5,13 +5,67 @@ Time-series record of every matrix run lives in
 [`specs/performance/`](https://github.com/witlox/kiseki/blob/main/specs/performance/INDEX.md) — those
 files are immutable snapshots, this file moves with HEAD.
 
+> **Gap + plan:** [`roadmap.md`](roadmap.md) is the gap-analysis layer —
+> where each protocol sits vs [`targets.md`](targets.md) on the 6-node
+> `default` profile and the prioritised work to close it. TL;DR: writes
+> are commit-bound (~250 op/s, one Raft round per write — #126);
+> batched commit (W1) is the one lever that matters. Reads scale.
+>
+> **Competitive baseline:**
+> [`competitive-targets.md`](competitive-targets.md) — back-of-napkin
+> comparison vs Lustre / Ceph / VAST on the same GCP hardware. Use it
+> when re-measuring on a 6-node cluster: if kiseki is below a
+> competitor's well-hardened number, the gap is still in our
+> implementation; if at-or-above, the next bottleneck is somewhere
+> else.
+>
+> **Post-#116 correction:** the 2026-05-28 snapshot below predates the
+> #116 merge. #127 (FUSE/NFS/pNFS read-by-name) and #130 (NFSv3 write)
+> are now **fixed + verified live**; #128 (NFSv3 mount) fixed. The
+> functional blockers in that table are resolved — see the matrix
+> snapshot RUN 3 and `roadmap.md`.
+
 > Operators tuning a deployment for throughput should also read
 > [`docs/operations/durability.md`](../operations/durability.md) —
 > the group-commit flags described there trade durability for
 > throughput, and the matrix in that doc spells out the loss
 > windows under each failure mode.
 
-## Latest snapshot — 2026-05-15 evening (PARTIAL — phase 4 wedged)
+## Latest snapshot — 2026-05-28 (GCP `default`, full protocol matrix / PR #116)
+
+6 × `c3-standard-22-lssd` (1.5 TB NVMe each) + 3 × `c3-standard-22` clients, `europe-west1-b`, EC-4+2, rocky9 bins from `feat/115-capacity-tiering` (includes the #124 FUSE fix). Full breakdown in [`specs/performance/2026-05-28-gcp-matrix.md`](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-28-gcp-matrix.md).
+
+| Check / protocol | Number | Status |
+|---|---:|---|
+| **#124 FUSE connect-timeout fix** | mount **attaches** | ✓ verified live (was a silent hang) |
+| native get-heavy (parallel × 3, 64 KB) | **22,668 op/s · 1,417 MiB/s** | ✓ 0 err — 2× the 2026-05-27 run |
+| native put / mixed | 261 / 319 op/s | ✓ 0 err, commit-bound (#126) |
+| S3 PUT + cross-node GET (curl -T) | 8/8 byte-verified | ✓ 0 err, 0 mismatch |
+| dedup ratio | **6.03×** (387 MB → 64 MB) | ✓ |
+| **FUSE + NFSv4 + pNFS read-by-name** | **0 bytes** | ✗ **#127** — POSIX name→composition resolution broken on multi-node (data persists, name index doesn't) |
+| **NFSv3 mount** | fails (`showmount` RPC) | ✗ **#128** |
+
+Findings → #127 is the headline: POSIX name-based reads (FUSE/NFS) return empty after cache-drop even same-node, while native (by composition_id) and S3 (by key) work perfectly — the gateway core is healthy, the POSIX filesystem name/directory layer is broken on multi-node. The #124 fix is what let FUSE mount and expose it. NFS throughput not reported (won't quote numbers while the path is functionally broken).
+
+## Earlier snapshot — 2026-05-27 (GCP `default`, capacity-management / PR #116)
+
+6 × `c3-standard-22-lssd` (1.5 TB NVMe each) + 3 × `c3-standard-22` clients, `europe-west1-b`, EC-4+2, Rocky9 bins from `feat/115-capacity-tiering`. Full breakdown in [`specs/performance/2026-05-27-gcp-capacity.md`](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-27-gcp-capacity.md).
+
+| Check / protocol | Number | Status |
+|---|---:|---|
+| **GH #115 — chunk device per node** | **1500 GiB** | ✓ full NVMe wired (was the silent 4 GiB file cap) |
+| capacity + dedup observability | dedup **1.54×**, per-class fast | ✓ once-dead gauges live |
+| multi-shard S3 (6 distributed-leader shards) | 60 PUT / 40 cross-node GET | ✓ 0 err, 0 mismatch |
+| native get-heavy (parallel × 3, 64 KB) | **10,598 op/s · 662 MiB/s** | ✓ reads scale |
+| native put-heavy / mixed | 253 / 305 op/s | **commit-bound** (forward+composition+Raft per write) |
+| S3 PUT / GET (curl, parallel × 3) | 368 / 2,286 op/s | PUT commit-bound; curl per-op overhead |
+| NFSv4.2 write (fio bs=1m, direct=1) | **6.9 MB/s** | commit-bound (per-COMMIT wall) |
+| FUSE mount | **hang** | ✗ `kiseki-client mount` never attaches (client-side) — finding |
+| NFSv4 read / pNFS | not measured | read inconclusive on fast pass; pNFS skipped |
+
+Findings → write throughput is commit-bound (per-write forward-to-leader + composition + Raft; the forward is logged at WARN — 22 k lines, should be DEBUG); FUSE mount hang; tiered placement-on-class needs a mixed-media profile (default is all-NVMe).
+
+## 2026-05-15 evening (PARTIAL — phase 4 wedged)
 
 3 × `c3-standard-44-lssd` storage + 2 × `c3-standard-44` clients in `europe-west1-b`, binaries built from main `defd8c3` (post all 9 PRs in the sweep). Full breakdown in [`specs/performance/2026-05-15-gcp-compact-evening-partial.md`](https://github.com/witlox/kiseki/blob/main/specs/performance/2026-05-15-gcp-compact-evening-partial.md).
 

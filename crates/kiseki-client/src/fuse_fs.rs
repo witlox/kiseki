@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use kiseki_common::ids::{CompositionId, NamespaceId, OrgId};
-use kiseki_gateway::ops::{GatewayOps, ReadRequest, WriteRequest, WriteResponse};
+use kiseki_gateway::ops::{GatewayOps, ReadRequest, WriteRequest, WriteResponse, WriteSurface};
 
 /// Inode number type.
 pub type Ino = u64;
@@ -383,6 +383,15 @@ impl<G: GatewayOps> KisekiFuse<G> {
 
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
+            // ADR-047: FUSE is POSIX close-to-open (ADR-013) — NEVER
+            // decoupled; always synchronous.
+            surface: WriteSurface::Fuse,
+            // #146 — FUSE writes the full dirty buffer in one shot;
+            // no pNFS-style chain (FUSE has its own per-inode dirty
+            // tracking in `self.dirty`).
+            base_composition_id: None,
+            base_bytes: 0,
         })
     }
 
@@ -476,6 +485,15 @@ impl<G: GatewayOps> KisekiFuse<G> {
 
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
+            // ADR-047: FUSE is POSIX close-to-open (ADR-013) — NEVER
+            // decoupled; always synchronous.
+            surface: WriteSurface::Fuse,
+            // #146 — FUSE writes the full dirty buffer in one shot;
+            // no pNFS-style chain (FUSE has its own per-inode dirty
+            // tracking in `self.dirty`).
+            base_composition_id: None,
+            base_bytes: 0,
         })
     }
 
@@ -805,6 +823,9 @@ mod tests {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         });
         let chunks = ChunkStore::new();
         let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
@@ -833,6 +854,47 @@ mod tests {
         // Read back.
         let read_data = fs.read(ino, 0, 1024).unwrap();
         assert_eq!(read_data, data);
+    }
+
+    /// #127 (FUSE half) — the GCP 2026-05-28 run saw a FUSE write then a
+    /// post-`drop_caches` read return 0 bytes. `drop_caches` evicts the
+    /// kernel page cache, forcing a real gateway READ (by `composition_id`)
+    /// rather than a dirty-buffer hit. This drives the same path:
+    /// create(empty) → write → flush (which clears the dirty buffer) →
+    /// getattr + read. `create_and_read_file` above reads from the dirty
+    /// buffer and so never exercised the post-flush gateway read.
+    #[test]
+    fn write_then_flush_then_read_resolves_via_gateway() {
+        let mut fs = setup_fuse();
+        let data = vec![0x5a_u8; 4096];
+
+        // open(O_CREAT) — empty file, then write, then fsync/close.
+        let ino = fs.create("big", Vec::new()).unwrap();
+        let n = fs.write(ino, 0, &data).unwrap();
+        assert_eq!(n as usize, data.len());
+        fs.flush(ino).unwrap();
+
+        // getattr after flush: size must reflect the write.
+        let attr = fs.getattr(ino).unwrap();
+        assert_eq!(
+            attr.size,
+            data.len() as u64,
+            "#127 FUSE: getattr size after flush is {} (expected {})",
+            attr.size,
+            data.len(),
+        );
+
+        // read after flush: the dirty buffer is gone, so this is served
+        // from the gateway by composition_id — the cache-dropped path.
+        let got = fs
+            .read(ino, 0, u32::try_from(data.len()).expect("fits u32"))
+            .unwrap();
+        assert_eq!(
+            got,
+            data,
+            "#127 FUSE: read-after-flush returned {} bytes",
+            got.len(),
+        );
     }
 
     #[test]
@@ -1081,6 +1143,9 @@ mod tests {
             read_only: true,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         });
         let chunks = ChunkStore::new();
         let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));
@@ -1190,6 +1255,9 @@ mod tests {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         });
         let chunks = ChunkStore::new();
         let master_key = SystemMasterKey::new([0x42; 32], KeyEpoch(1));

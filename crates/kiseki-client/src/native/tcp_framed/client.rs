@@ -28,6 +28,33 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
+/// Bound the TCP connect so an unreachable or firewall-dropped peer
+/// fails fast with a clear `TimedOut` error instead of blocking for
+/// the kernel's full SYN-retry window (`tcp_syn_retries=6` ≈ 127 s on
+/// Linux). #124 (2026-05-27 GCP run): a FUSE mount whose native
+/// endpoint port was unreachable printed "Mounting…" and then hung
+/// silently — the connect never returned and `pool` connections would
+/// each have paid the full window serially. Mirrors the connect bound
+/// the NFS (`remote_nfs::transport`), advisory, and `tcp_tls`
+/// transports already use.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `TcpStream::connect` wrapped in a connect deadline. Separated from
+/// the public `connect_*` entry points so the timeout can be unit
+/// tested with a short injected value against a blackhole address.
+async fn connect_stream(
+    addr: impl tokio::net::ToSocketAddrs,
+    timeout: Duration,
+) -> io::Result<tokio::net::TcpStream> {
+    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("TCP connect timed out after {}s", timeout.as_secs()),
+        )),
+    }
+}
+
 /// Configure `SO_LINGER = 0` so a `close(2)` on the socket — including
 /// the implicit close that happens when the kiseki-client process is
 /// SIGKILL'd — sends RST instead of FIN. Trades any in-flight bytes
@@ -132,7 +159,7 @@ impl TcpFramedClient {
     /// # Errors
     /// Returns `io::Error` from the TCP connect step.
     pub async fn connect_plaintext(addr: impl tokio::net::ToSocketAddrs) -> io::Result<Arc<Self>> {
-        let stream = tokio::net::TcpStream::connect(addr).await?;
+        let stream = connect_stream(addr, CONNECT_TIMEOUT).await?;
         // TCP_NODELAY — see listener-side comment. The split-write
         // (header then body) hits a Nagle 40 ms timer without it.
         if let Err(e) = stream.set_nodelay(true) {
@@ -155,7 +182,7 @@ impl TcpFramedClient {
         server_name: rustls::pki_types::ServerName<'static>,
         tls_config: Arc<rustls::ClientConfig>,
     ) -> io::Result<Arc<Self>> {
-        let tcp = tokio::net::TcpStream::connect(addr).await?;
+        let tcp = connect_stream(addr, CONNECT_TIMEOUT).await?;
         configure_close_linger(&tcp);
         if let Err(e) = tcp.set_nodelay(true) {
             tracing::warn!(error = %e, "TCP-framed client (TLS): TCP_NODELAY failed");
@@ -543,6 +570,9 @@ mod tests {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         })
         .await;
         let signing = Arc::new(SigningKeys::new(
@@ -597,5 +627,47 @@ mod tests {
 
         drop(client);
         let _ = server_task.await;
+    }
+
+    /// #124 regression guard: a connect to an unreachable/blackholed
+    /// peer must return an error within the connect deadline, not
+    /// block on the kernel's full SYN-retry window. Without the
+    /// `connect_stream` timeout the FUSE mount hung silently after
+    /// printing "Mounting…" on the 2026-05-27 GCP run.
+    ///
+    /// Uses TEST-NET-3 (`203.0.113.0/24`, RFC 5737) — reserved for
+    /// documentation and routed nowhere. A connect there either
+    /// blackholes (our timeout fires) or returns an instant
+    /// unreachable; both are a bounded `Err`. A regression that drops
+    /// the timeout would hang past the bound in any environment whose
+    /// routing actually blackholes the address.
+    #[tokio::test]
+    async fn connect_stream_times_out_on_unreachable_peer() {
+        let start = std::time::Instant::now();
+        let result = connect_stream("203.0.113.1:9", Duration::from_millis(200)).await;
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_err(),
+            "connect to a blackhole address must error, not succeed",
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "connect must return within the deadline (+slack); took {elapsed:?} — \
+             the TCP-framed connect timeout regressed (#124)",
+        );
+    }
+
+    /// The connect deadline must not interfere with a reachable peer:
+    /// a connect to a live listener succeeds well within the timeout.
+    #[tokio::test]
+    async fn connect_stream_succeeds_against_live_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let result = connect_stream(addr, CONNECT_TIMEOUT).await;
+        assert!(
+            result.is_ok(),
+            "connect to a live listener must succeed: {result:?}",
+        );
+        drop(listener);
     }
 }

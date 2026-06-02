@@ -36,6 +36,10 @@ serde_json = "1"
 # table on platforms without the intrinsic.
 crc32c = "0.6"
 prometheus = { workspace = true }
+# Open flags (O_DIRECT) for the raw block-device backend; constants
+# only, no `unsafe` (all I/O goes through positioned read/write on
+# block-aligned offsets). Linux is the deployment target (ADR-024).
+libc = { workspace = true }
 # Raw io_uring bindings. The `tokio-uring` alternative replaces the
 # whole runtime — `io-uring` keeps the workspace runtime-agnostic and
 # can be driven from a tokio task via its own reactor inside

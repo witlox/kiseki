@@ -402,8 +402,21 @@ fn pool_to_proto_with_overrides(
                 u32::from(data_shards),
                 u32::from(parity_shards),
             ),
+            // ADR-024 amendment: inline pools surface as their own
+            // durability kind. The replicated/EC counts stay 0 — the
+            // bytes live in `small/objects.redb` with the per-shard
+            // Raft topology providing replication.
+            DurabilityStrategy::Inline => ("inline".to_owned(), 0, 0, 0),
         };
     let o = overrides.unwrap_or_default();
+    // ADR-024 amendment: surface the size-band tags so admin tooling
+    // can show which writes route through which pool.
+    let role = match pool.role {
+        kiseki_chunk::pool::PoolRole::Chunk => "chunk",
+        kiseki_chunk::pool::PoolRole::Metadata => "metadata",
+        kiseki_chunk::pool::PoolRole::Inline => "inline",
+    }
+    .to_owned();
     pb::PoolInfo {
         pool_name: pool.name.clone(),
         durability_kind,
@@ -419,6 +432,10 @@ fn pool_to_proto_with_overrides(
         critical_threshold_pct: o.critical_pct.filter(|v| *v != 0).unwrap_or(85),
         readonly_threshold_pct: o.readonly_pct.filter(|v| *v != 0).unwrap_or(95),
         target_fill_pct: o.target_fill_pct.filter(|v| *v != 0).unwrap_or(70),
+        role,
+        inline_threshold_bytes: pool.inline_threshold_bytes,
+        replication_ceiling_bytes: pool.replication_ceiling_bytes,
+        requires_migration: pool.requires_migration,
     }
 }
 
@@ -747,6 +764,19 @@ impl StorageAdminService for StorageAdminGrpc {
                 r.ec_data_shards,
                 r.ec_parity_shards,
             )?;
+            // ADR-024 amendment §"three-tier durability by size band"
+            // optional fields. Empty / zero → server default.
+            let role = parse_pool_role(&r.role)?;
+            let inline_threshold_bytes = if r.inline_threshold_bytes == 0 {
+                kiseki_chunk::pool::DEFAULT_INLINE_THRESHOLD_BYTES
+            } else {
+                r.inline_threshold_bytes
+            };
+            let replication_ceiling_bytes = if r.replication_ceiling_bytes == 0 {
+                kiseki_chunk::pool::DEFAULT_REPLICATION_CEILING_BYTES
+            } else {
+                r.replication_ceiling_bytes
+            };
             let pool = AffinityPool {
                 name: r.pool_name.clone(),
                 durability,
@@ -754,6 +784,10 @@ impl StorageAdminService for StorageAdminGrpc {
                 capacity_bytes: r.initial_capacity_bytes,
                 used_bytes: 0,
                 devices: Vec::new(),
+                role,
+                inline_threshold_bytes,
+                replication_ceiling_bytes,
+                requires_migration: r.requires_migration,
             };
             store.add_pool(pool).await.map_err(|e| {
                 if e.contains("already exists") {
@@ -1810,8 +1844,27 @@ fn parse_durability(
                 parity_shards: u8::try_from(ec_parity_shards).expect("validated"),
             })
         }
+        // ADR-024 amendment §"three-tier durability by size band":
+        // `Inline` carries no replication/EC count — the per-shard
+        // Raft topology provides the replication.
+        "inline" => Ok(DurabilityStrategy::Inline),
         other => Err(Status::invalid_argument(format!(
-            "durability_kind {other} not recognized; expected `replication` or `erasure_coding`",
+            "durability_kind {other} not recognized; expected `replication`, `erasure_coding`, or `inline`",
+        ))),
+    }
+}
+
+/// Parse the (optional) `role` string from a `CreatePoolRequest` into
+/// a [`kiseki_chunk::pool::PoolRole`]. Empty input → default
+/// (`Chunk`), preserving back-compat with pre-amendment clients.
+fn parse_pool_role(s: &str) -> Result<kiseki_chunk::pool::PoolRole, Status> {
+    use kiseki_chunk::pool::PoolRole;
+    match s.to_ascii_lowercase().as_str() {
+        "" | "chunk" => Ok(PoolRole::Chunk),
+        "metadata" => Ok(PoolRole::Metadata),
+        "inline" => Ok(PoolRole::Inline),
+        other => Err(Status::invalid_argument(format!(
+            "role {other} not recognized; expected one of chunk / metadata / inline",
         ))),
     }
 }
@@ -1874,7 +1927,7 @@ mod tests {
     /// Build a `StorageAdminGrpc` with a populated chunk store and
     /// 3-node cluster membership. Used by the W2 read-only tests.
     fn fixture_with_pools() -> (StorageAdminGrpc, Arc<RepairTracker>) {
-        let mut store = ChunkStore::new();
+        let store = ChunkStore::new();
         store.add_pool(AffinityPool {
             name: "fast-nvme".into(),
             durability: DurabilityStrategy::ErasureCoding {
@@ -1898,6 +1951,8 @@ mod tests {
                     online: false,
                 },
             ],
+            requires_migration: false,
+            ..Default::default()
         });
         store.add_pool(AffinityPool {
             name: "bulk-hdd".into(),
@@ -1909,6 +1964,8 @@ mod tests {
                 id: "hdd-x".into(),
                 online: true,
             }],
+            requires_migration: false,
+            ..Default::default()
         });
         let async_store: Arc<dyn kiseki_chunk::AsyncChunkOps> = Arc::new(SyncBridge::new(store));
         let tracker = Arc::new(RepairTracker::new());
@@ -2591,7 +2648,7 @@ mod tests {
         Arc<dyn kiseki_chunk::AsyncChunkOps>,
         Arc<EvacuationRegistry>,
     ) {
-        let mut store = ChunkStore::new();
+        let store = ChunkStore::new();
         store.add_pool(AffinityPool {
             name: "primary".into(),
             durability: DurabilityStrategy::Replication { copies: 3 },
@@ -2602,6 +2659,8 @@ mod tests {
                 id: "dev-1".into(),
                 online: true,
             }],
+            requires_migration: false,
+            ..Default::default()
         });
         let chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> = Arc::new(SyncBridge::new(store));
         let evacuations = Arc::new(EvacuationRegistry::new());
@@ -2727,6 +2786,10 @@ mod tests {
             ec_data_shards: 0,
             ec_parity_shards: 0,
             initial_capacity_bytes: 1_000_000,
+            role: String::new(),
+            inline_threshold_bytes: 0,
+            replication_ceiling_bytes: 0,
+            requires_migration: false,
         }))
         .await
         .expect("ok");
@@ -2753,6 +2816,10 @@ mod tests {
                 ec_data_shards: 0,
                 ec_parity_shards: 0,
                 initial_capacity_bytes: 0,
+                role: String::new(),
+                inline_threshold_bytes: 0,
+                replication_ceiling_bytes: 0,
+                requires_migration: false,
             }))
             .await;
         assert_eq!(r.expect_err("err").code(), Code::AlreadyExists);
@@ -2770,9 +2837,135 @@ mod tests {
                 ec_data_shards: 0,
                 ec_parity_shards: 0,
                 initial_capacity_bytes: 0,
+                role: String::new(),
+                inline_threshold_bytes: 0,
+                replication_ceiling_bytes: 0,
+                requires_migration: false,
             }))
             .await;
         assert_eq!(r.expect_err("err").code(), Code::InvalidArgument);
+    }
+
+    // ADR-024 2026-05-31 amendment §"three-tier durability by size band"
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_pool_inline_durability_round_trips() {
+        let (grpc, _, _) = fixture_for_w5();
+        grpc.create_pool(Request::new(pb::CreatePoolRequest {
+            pool_name: "inline-meta".into(),
+            device_class: "nvme".into(),
+            durability_kind: "inline".into(),
+            replication_copies: 0,
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
+            initial_capacity_bytes: 1_000_000_000,
+            role: "inline".into(),
+            inline_threshold_bytes: 16 * 1024,
+            replication_ceiling_bytes: 0,
+            requires_migration: false,
+        }))
+        .await
+        .expect("ok");
+        let r = grpc
+            .get_pool(Request::new(pb::GetPoolRequest {
+                pool_name: "inline-meta".into(),
+            }))
+            .await
+            .expect("ok")
+            .into_inner();
+        assert_eq!(r.durability_kind, "inline");
+        assert_eq!(r.role, "inline");
+        assert_eq!(r.inline_threshold_bytes, 16 * 1024);
+    }
+
+    #[tokio::test]
+    async fn create_pool_replication_ceiling_round_trips() {
+        let (grpc, _, _) = fixture_for_w5();
+        grpc.create_pool(Request::new(pb::CreatePoolRequest {
+            pool_name: "fast-r3".into(),
+            device_class: "nvme".into(),
+            durability_kind: "replication".into(),
+            replication_copies: 3,
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
+            initial_capacity_bytes: 10_000_000_000,
+            role: "chunk".into(),
+            inline_threshold_bytes: 0,
+            replication_ceiling_bytes: 4 * 1024 * 1024,
+            requires_migration: false,
+        }))
+        .await
+        .expect("ok");
+        let r = grpc
+            .get_pool(Request::new(pb::GetPoolRequest {
+                pool_name: "fast-r3".into(),
+            }))
+            .await
+            .expect("ok")
+            .into_inner();
+        assert_eq!(r.durability_kind, "replication");
+        assert_eq!(r.role, "chunk");
+        assert_eq!(r.replication_copies, 3);
+        assert_eq!(r.replication_ceiling_bytes, 4 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn create_pool_unknown_role_returns_invalid_argument() {
+        let (grpc, _, _) = fixture_for_w5();
+        let r = grpc
+            .create_pool(Request::new(pb::CreatePoolRequest {
+                pool_name: "bad-role".into(),
+                device_class: "nvme".into(),
+                durability_kind: "replication".into(),
+                replication_copies: 3,
+                ec_data_shards: 0,
+                ec_parity_shards: 0,
+                initial_capacity_bytes: 0,
+                role: "frobnicator".into(),
+                inline_threshold_bytes: 0,
+                replication_ceiling_bytes: 0,
+                requires_migration: false,
+            }))
+            .await;
+        assert_eq!(r.expect_err("err").code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn create_pool_default_role_is_chunk_with_default_thresholds() {
+        let (grpc, _, _) = fixture_for_w5();
+        grpc.create_pool(Request::new(pb::CreatePoolRequest {
+            pool_name: "defaults".into(),
+            device_class: "nvme".into(),
+            durability_kind: "replication".into(),
+            replication_copies: 3,
+            ec_data_shards: 0,
+            ec_parity_shards: 0,
+            initial_capacity_bytes: 0,
+            role: String::new(),
+            inline_threshold_bytes: 0,
+            replication_ceiling_bytes: 0,
+            requires_migration: false,
+        }))
+        .await
+        .expect("ok");
+        let r = grpc
+            .get_pool(Request::new(pb::GetPoolRequest {
+                pool_name: "defaults".into(),
+            }))
+            .await
+            .expect("ok")
+            .into_inner();
+        assert_eq!(r.role, "chunk");
+        // Server applied cluster defaults (16 KiB inline / 4 MiB rep ceiling).
+        assert_eq!(
+            r.inline_threshold_bytes,
+            kiseki_chunk::pool::DEFAULT_INLINE_THRESHOLD_BYTES
+        );
+        assert_eq!(
+            r.replication_ceiling_bytes,
+            kiseki_chunk::pool::DEFAULT_REPLICATION_CEILING_BYTES
+        );
     }
 
     #[tokio::test]

@@ -150,6 +150,36 @@ struct RunArgs {
     /// comparison, or `--binding auto` to honor `KISEKI_NATIVE_TRANSPORT`.
     #[arg(long, value_enum, default_value_t = NativeBinding::Tcp)]
     binding: NativeBinding,
+
+    /// Number of `kiseki-server` nodes to spawn. Default 1 (uses the
+    /// historic single-node [`ProfileServer`] code path; no behavioral
+    /// change vs. pre-`--nodes` invocations). When `>1`, spawns an
+    /// N-node local Raft cluster via [`Cluster`], provisions the
+    /// `kiseki-bench` namespace + a multi-shard topology (ADR-033 §1
+    /// formula: `max(min(3*N, 64), 3)`), and drives the bench
+    /// workload against the leader's endpoints. The
+    /// `InProcess`/`InProcessPersistent` protocols ignore this flag —
+    /// they don't spawn a server at all.
+    #[arg(long, default_value_t = 1)]
+    nodes: usize,
+
+    /// Path to the kiseki-admin binary (used by `--nodes >1` to
+    /// provision the bench namespace + shards). Defaults to
+    /// `kiseki-admin` next to `--server-bin`. Ignored for
+    /// single-node runs.
+    #[arg(long)]
+    admin_bin: Option<std::path::PathBuf>,
+
+    /// ADR-048 §"Decision" — when set, create a Replication pool
+    /// with `requires_migration = true` named
+    /// `slab-ec-bench` BEFORE provisioning the bench namespace,
+    /// and wire `namespace.size_band_pools.replicated` at that
+    /// pool. The runtime's per-pool slab-EC compactor task picks
+    /// it up at boot and migrates chunks to cold-tier slabs
+    /// while the workload runs. Ignored on single-node clusters
+    /// (`--nodes 1`).
+    #[arg(long, default_value_t = false)]
+    slab_ec: bool,
 }
 
 fn main() {
@@ -207,27 +237,94 @@ fn main() {
     }
 }
 
-async fn run(args: RunArgs) -> Result<(), String> {
-    // The in-process driver doesn't need a spawned server — it
-    // instantiates the gateway directly. Skip the harness for it.
-    let server = if matches!(
+/// Either a single-node `ProfileServer` or an N-node `Cluster`.
+/// Holding the harness here keeps the server(s) alive until `run`
+/// returns; Drop sends SIGTERM and (for `--features pprof` builds)
+/// renders each node's flamegraph. Fields are write-only — the
+/// variants exist to keep Drop deferred until the end of `run()`.
+#[allow(dead_code)]
+enum Harness {
+    Single(harness::ProfileServer),
+    Cluster(harness::Cluster),
+}
+
+/// Spawn the harness for `args.protocol` / `args.nodes` and return
+/// the `(Harness, Endpoints)` pair (or `(None, None)` when the
+/// protocol drives an in-process gateway and doesn't need a server).
+async fn build_harness(
+    args: &RunArgs,
+) -> Result<(Option<Harness>, Option<protocols::Endpoints>), String> {
+    let needs_server = !matches!(
         args.protocol,
         Protocol::InProcess | Protocol::InProcessPersistent
-    ) {
-        None
+    );
+    if !needs_server {
+        return Ok((None, None));
+    }
+    if args.nodes == 1 {
+        // Single-node path — unchanged from pre-`--nodes` behavior.
+        let s = harness::ProfileServer::start(args.server_bin.as_deref()).await?;
+        eprintln!(
+            "[harness] single-node up; s3={} nfs={} ds={} metrics={}",
+            s.s3_base,
+            s.nfs_addr,
+            s.ds_addr,
+            s.metrics_url(),
+        );
+        let ep = protocols::Endpoints::from_profile_server(&s);
+        return Ok((Some(Harness::Single(s)), Some(ep)));
+    }
+    // Multi-node path. Each node gets a deterministic per-node
+    // pprof output filename when KISEKI_PPROF_OUT is set on the
+    // profile process: e.g. `OUT.node1.svg`, `OUT.node2.svg`.
+    let pprof_base = std::env::var("KISEKI_PPROF_OUT")
+        .ok()
+        .map(std::path::PathBuf::from);
+    let c = harness::Cluster::start(
+        args.nodes,
+        args.server_bin.as_deref(),
+        pprof_base.as_deref(),
+    )
+    .await?;
+    let shard_count = harness::Cluster::shard_count_for(args.nodes);
+    eprintln!(
+        "[harness] cluster up; nodes={} leader_node_id={} leader_s3={} leader_tcp_framed={} metrics={}",
+        c.node_count(),
+        c.leader_node_id(),
+        c.leader_s3_base(),
+        c.leader_tcp_framed(),
+        c.leader_metrics_url(),
+    );
+    // Per-node metrics URLs — needed by the perf harness to scrape
+    // `aux.*` follower histograms (every shard leader currently sits
+    // on node 1 per the GH #99 fix, so a leader-only scrape sees no
+    // follower work).
+    for (nid, url) in c.all_node_metrics_urls() {
+        eprintln!("[harness] node {nid} metrics={url}");
+    }
+    eprintln!(
+        "[harness] provisioning bench namespace + {shard_count} shards (ADR-033 §1: max(min(3*N, 64), 3))"
+    );
+    let slab_pool: Option<&str> = if args.slab_ec {
+        Some("slab-ec-bench")
     } else {
-        {
-            let s = harness::ProfileServer::start(args.server_bin.as_deref()).await?;
-            eprintln!(
-                "[harness] server up; s3={} nfs={} ds={} metrics={}",
-                s.s3_base,
-                s.nfs_addr,
-                s.ds_addr,
-                s.metrics_url(),
-            );
-            Some(s)
-        }
+        None
     };
+    c.provision_bench_topology_with_pool(args.admin_bin.as_deref(), shard_count, slab_pool)
+        .await?;
+    let ep = protocols::Endpoints::from_cluster_bench(&c);
+    Ok((Some(Harness::Cluster(c)), Some(ep)))
+}
+
+async fn run(args: RunArgs) -> Result<(), String> {
+    if args.nodes == 0 {
+        return Err("--nodes must be at least 1".into());
+    }
+    // _harness_opt: declared so the spawned server(s) live until the
+    // function returns. The Drop impl on ProfileServer / Cluster sends
+    // SIGTERM and (for `--features pprof` builds) renders the
+    // flamegraph SVG, so it MUST survive past the stats output.
+    let (_harness_opt, endpoints) = build_harness(&args).await?;
 
     // Size the NFS connection pool to match concurrency: each
     // worker gets its own session, no FIFO queueing on a shared
@@ -235,7 +332,7 @@ async fn run(args: RunArgs) -> Result<(), String> {
     // session memory if someone runs at extreme concurrency.
     let pool_size = args.concurrency.clamp(1, 32);
     let driver: Arc<dyn protocols::Driver> =
-        protocols::build(args.protocol, args.binding, server.as_ref(), pool_size).await?;
+        protocols::build(args.protocol, args.binding, endpoints.as_ref(), pool_size).await?;
 
     let warmup_keys = if matches!(args.shape, Shape::PutHeavy) {
         Arc::new(Vec::new())
@@ -325,6 +422,23 @@ async fn worker(
 ) {
     use std::cell::Cell;
     let counter: Cell<u64> = Cell::new(worker_id as u64);
+    // Per-worker mutable PUT buffer. Pre-prod the harness used a
+    // single shared `Arc<[u8]>` of `0xa5` bytes for every worker on
+    // every PUT — same content, same `chunk_id = SHA-256(plaintext)`,
+    // and the chunk-store's dedup short-circuit then fires on
+    // 99.99 % of writes (replication mode) or skips silently
+    // (EC mode pre-`register_ec_chunk` fix). Either way the bench
+    // wasn't measuring real writes. We stamp a 16-byte
+    // `(worker_id, op_counter, salt)` prefix into a fresh per-worker
+    // buffer to make every PUT's content distinct.
+    let mut put_buf: Vec<u8> = (*payload).to_vec();
+    let salt_nanos: u64 = match std::time::UNIX_EPOCH.elapsed() {
+        Ok(d) => u64::try_from(d.as_nanos()).unwrap_or(u64::MAX),
+        Err(_) => 0,
+    };
+    let salt: u64 =
+        salt_nanos.wrapping_mul((worker_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let mut put_n: u64 = 0;
     while Instant::now() < deadline {
         let pick_get = match shape {
             Shape::PutHeavy => false,
@@ -347,7 +461,17 @@ async fn worker(
             let key = &warmup_keys[usize::try_from(n).unwrap_or(0) % warmup_keys.len()];
             driver.get(key).await.map(|_| ())
         } else {
-            driver.put(&payload).await.map(|_| ())
+            // Stamp a unique (worker, op, salt) prefix so each PUT's
+            // chunk_id is unique. 16 bytes is sufficient for SHA-256
+            // to produce a different output even on a 64 KiB buffer
+            // whose remaining bytes are identical.
+            if put_buf.len() >= 16 {
+                put_buf[0..8]
+                    .copy_from_slice(&((worker_id as u64).wrapping_shl(40) ^ put_n).to_le_bytes());
+                put_buf[8..16].copy_from_slice(&salt.to_le_bytes());
+            }
+            put_n = put_n.wrapping_add(1);
+            driver.put(&put_buf).await.map(|_| ())
         };
         let dt = start.elapsed();
         match result {

@@ -11,6 +11,18 @@ publish = false  # internal crate; only kiseki-client publishes (release.yml)
 [lints]
 workspace = true
 
+[features]
+default = []
+# ADR-047 §observability — fine-grained per-step write-path timers.
+# OFF: macros expand to `()`, no histograms registered, zero runtime
+# overhead. ON: each instrumented site records elapsed time into a
+# Prometheus histogram exposed on `/metrics` as
+# `kiseki_hotpath_step_duration_seconds{step="..."}`.
+hot-path-trace = ["dep:prometheus"]
+
 [dependencies]
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
+# Only pulled in when `hot-path-trace` is on so the OFF build pays
+# nothing for it (kiseki-tracing is a leaf dep so this is significant).
+prometheus = { workspace = true, optional = true }

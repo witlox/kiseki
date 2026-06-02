@@ -1189,6 +1189,46 @@ async fn then_put_fails_quorum_lost(w: &mut KisekiWorld, mb: usize, target: u64)
     );
 }
 
+/// D-5: PUT *directly to the Raft leader* so it takes the leader's own
+/// fabric write path (PutFragment to its peers, gated on min_acks). A PUT
+/// to a non-leader instead forwards the ChunkAndDelta to the leader over
+/// the #114 Raft path, which replicates via the Raft log (durable) but
+/// does NOT exercise the fabric quorum this scenario asserts — so it would
+/// succeed (200) with both peers denied. Targeting the leader makes the
+/// fabric quorum loss deterministic regardless of who won the election.
+#[then(regex = r"^a (\d+)MB S3 PUT to the leader fails with quorum lost$")]
+async fn then_put_to_leader_fails_quorum_lost(w: &mut KisekiWorld, mb: usize) {
+    let body = vec![0u8; mb * ONE_MEBIBYTE];
+    let bucket = w
+        .cluster
+        .bucket
+        .clone()
+        .unwrap_or_else(|| "default".to_owned());
+    let key = format!("bdd-quorum-lost-{}", uuid::Uuid::new_v4().simple());
+    let guard = cluster(w);
+    let any = guard.nodes().next().expect("at least one node");
+    let lid = leader_id_via(any)
+        .await
+        .expect("leader_id from /admin/cluster/info");
+    let leader = guard.node(lid);
+    let url = format!("{}/{bucket}/{key}", leader.s3_base);
+    let resp = leader
+        .http
+        .put(&url)
+        .body(body)
+        .send()
+        .await
+        .expect("HTTP PUT to leader failed at transport layer");
+    let status = resp.status();
+    let body_txt = resp.text().await.unwrap_or_default();
+    assert!(
+        !status.is_success() && body_txt.contains("quorum lost"),
+        "direct S3 PUT to the leader (node-{lid}) returned {status} body={body_txt:?}; \
+         wanted 5xx with `quorum lost` — the leader's fabric write quorum (min_acks=2) \
+         must fail when both its peers' incoming fabric is denied",
+    );
+}
+
 #[then(regex = r"^the leader's fabric_quorum_lost_total ticked at least (\d+)$")]
 async fn then_quorum_lost_ticked(w: &mut KisekiWorld, expected_ticks: u64) {
     // Sum the metric across EVERY alive node, not just the Raft
@@ -1535,6 +1575,47 @@ async fn given_node_fabric_deny(w: &mut KisekiWorld, node_id: u64) {
 #[then(regex = r"^node-(\d+)'s incoming fabric is allowed$")]
 async fn then_node_fabric_allow(w: &mut KisekiWorld, node_id: u64) {
     set_node_fabric_deny(w, node_id, false).await;
+}
+
+/// D-5: deny the incoming fabric of the TWO non-leader nodes, discovered
+/// at run time from the actual Raft leader. Denying a fixed node-2+node-3
+/// pair flaked: when the election put the leader on node-2/3, that leader
+/// self-acked + node-1 acked = 2 = a real 2-of-3 quorum and the write
+/// correctly succeeded. Isolating the actual leader leaves it with only
+/// its own ack (1 < min_acks=2) → genuine quorum loss every run.
+#[given("the two non-leader nodes have their incoming fabric denied")]
+async fn given_non_leader_fabric_denied(w: &mut KisekiWorld) {
+    let followers: Vec<u64> = {
+        let guard = cluster(w);
+        let any = guard.nodes().next().expect("at least one node");
+        let leader = leader_id_via(any)
+            .await
+            .expect("leader_id from /admin/cluster/info");
+        guard
+            .nodes()
+            .map(|n| n.node_id)
+            .filter(|id| *id != leader)
+            .collect()
+    };
+    for id in &followers {
+        set_node_fabric_deny(w, *id, true).await;
+    }
+    // Snapshot quorum-lost baseline so `ticked at least N` measures only
+    // this scenario's PUTs (mirrors given_node_fabric_deny).
+    snapshot_quorum_lost_baseline(w).await;
+}
+
+/// D-5 cleanup: re-allow every node's incoming fabric. Idempotent, so it
+/// doesn't need to know which nodes the leader-relative deny targeted.
+#[then("all nodes' incoming fabric is allowed")]
+async fn then_all_fabric_allowed(w: &mut KisekiWorld) {
+    let ids: Vec<u64> = {
+        let guard = cluster(w);
+        guard.nodes().map(|n| n.node_id).collect()
+    };
+    for id in ids {
+        set_node_fabric_deny(w, id, false).await;
+    }
 }
 
 /// Drops every local fragment of the most-recently-written chunk
@@ -2040,5 +2121,83 @@ async fn then_s3_get_from_any_follower_fresh_bucket(w: &mut KisekiWorld) {
     assert!(
         verified >= 1,
         "no followers to verify against — leader was the only node?"
+    );
+}
+
+// ============================================================================
+// ADR-047 MF-1 / MF-9 — per-name perspective-seq LWW guard convergence step.
+//
+// Concurrent same-name S3 PUTs landing on different ingress nodes must
+// converge to the SAME value across the cluster — no split-brain.
+// The winner is whichever HLC perspective-seq is greater; the test does
+// not specify which (depends on the per-node HLC ticks at runtime).
+// Without the per-name seq guard (MF-1), a newer-HLC write applied
+// first could be silently overwritten by an older-HLC one — the GETs
+// from each node would diverge.
+// ============================================================================
+
+#[then(
+    regex = r#"^within (\d+) seconds, S3 GETs for key "([^"]*)" on node-(\d+) and node-(\d+) converge to the same value$"#
+)]
+async fn then_s3_gets_converge_on_two_nodes(
+    w: &mut KisekiWorld,
+    seconds: u64,
+    key: String,
+    node_a: u64,
+    node_b: u64,
+) {
+    let guard = cluster(w);
+    let na = guard.node(node_a);
+    let nb = guard.node(node_b);
+    let url_a = s3_node_url(na, &key);
+    let url_b = s3_node_url(nb, &key);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    loop {
+        let (resp_a, resp_b) = tokio::try_join!(
+            async {
+                let r = na.http.get(&url_a).send().await?;
+                let s = r.status();
+                let body = r.text().await.unwrap_or_default();
+                Ok::<_, reqwest::Error>((s, body))
+            },
+            async {
+                let r = nb.http.get(&url_b).send().await?;
+                let s = r.status();
+                let body = r.text().await.unwrap_or_default();
+                Ok::<_, reqwest::Error>((s, body))
+            },
+        )
+        .expect("HTTP GETs");
+        if resp_a.0.is_success() && resp_b.0.is_success() && resp_a.1 == resp_b.1 {
+            // Stash for the next step's "value is one of" assertion.
+            w.last_converged_value = Some(resp_a.1);
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            let last_a = format!("{} / {}", resp_a.0, resp_a.1);
+            let last_b = format!("{} / {}", resp_b.0, resp_b.1);
+            panic!(
+                "GETs did not converge within {seconds}s for key {key:?}: \
+                 node-{node_a}={last_a:?}, node-{node_b}={last_b:?} — \
+                 per-name LWW guard is not engaging across nodes",
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+}
+
+#[then(regex = r#"^the converged value is one of "([^"]*)" or "([^"]*)"$"#)]
+async fn then_converged_value_is_one_of(
+    w: &mut KisekiWorld,
+    candidate_a: String,
+    candidate_b: String,
+) {
+    let observed = w
+        .last_converged_value
+        .clone()
+        .expect("a preceding converge step must run and stash the value");
+    assert!(
+        observed == candidate_a || observed == candidate_b,
+        "converged value {observed:?} must be one of {candidate_a:?} or {candidate_b:?}"
     );
 }

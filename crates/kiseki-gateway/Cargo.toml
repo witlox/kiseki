@@ -26,6 +26,15 @@ native = [
     "dep:tokio-stream",
     "dep:x509-parser",
 ]
+# ADR-047 escalation — fine-grained per-step write-path timers on the
+# gateway write_impl decoupled-ack branch. Propagates through
+# kiseki-log + kiseki-composition + kiseki-tracing. OFF by default
+# (macros expand to `()`; zero runtime cost).
+hot-path-trace = [
+    "kiseki-tracing/hot-path-trace",
+    "kiseki-log/hot-path-trace",
+    "kiseki-composition/hot-path-trace",
+]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -37,6 +46,10 @@ kiseki-chunk-cluster = { workspace = true }
 kiseki-composition = { workspace = true }
 kiseki-control = { workspace = true }
 kiseki-crypto = { workspace = true }
+# `hot_timer!` / `hot_span!` macros on the gateway write_impl hot
+# path (ADR-047 escalation). Heavy deps inside kiseki-tracing are
+# feature-gated; OFF expansion is `()`.
+kiseki-tracing = { workspace = true }
 kiseki-proto = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }

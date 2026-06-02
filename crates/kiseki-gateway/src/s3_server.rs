@@ -510,6 +510,14 @@ async fn put_or_upload_part<G: GatewayOps + Send + Sync + 'static>(
         Err(crate::error::GatewayError::ReadOnlyNamespace) => {
             (StatusCode::FORBIDDEN, "namespace is read-only").into_response()
         }
+        Err(crate::error::GatewayError::InsufficientStorage(msg)) => {
+            tracing::warn!(error = %msg, "S3 PUT: storage pool full → 507");
+            s3_error_response(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "InsufficientStorage",
+                "The storage pool is full; no space to write the object.",
+            )
+        }
         Err(crate::error::GatewayError::NotFound(msg)) => {
             (StatusCode::NOT_FOUND, msg).into_response()
         }
@@ -2045,6 +2053,7 @@ mod tests {
                 new_last_applied_seq: kiseki_common::ids::SequenceNumber(0),
                 stuck_state: Some(None),
                 halted: Some(true),
+                migrated_chunk_evictions: Vec::new(),
             })
             .unwrap();
         let comp_store = CompositionStore::with_storage(Box::new(storage));
