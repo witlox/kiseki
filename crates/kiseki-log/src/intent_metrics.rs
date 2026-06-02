@@ -24,33 +24,16 @@ use std::time::Duration;
 
 use prometheus::{Histogram, HistogramOpts, Registry};
 
-/// `kiseki_intent_put_batch_size` — producer-side, exposed on `/metrics`.
+/// `kiseki_intent_put_batch_size` — exposed on `/metrics`.
 pub const BATCH_SIZE_METRIC_NAME: &str = "kiseki_intent_put_batch_size";
 
-/// `kiseki_intent_coalesce_wait_seconds` — producer-side, exposed on `/metrics`.
+/// `kiseki_intent_coalesce_wait_seconds` — exposed on `/metrics`.
 pub const COALESCE_WAIT_METRIC_NAME: &str = "kiseki_intent_coalesce_wait_seconds";
-
-/// `kiseki_intent_recv_batch_size` — receiver-side total intents per
-/// coalesced fjall `put_batch` flush. Pairs with the producer-side
-/// `BATCH_SIZE_METRIC_NAME` so the per-RPC vs per-receiver-flush split
-/// is visible separately.
-pub const RECV_BATCH_SIZE_METRIC_NAME: &str = "kiseki_intent_recv_batch_size";
-
-/// `kiseki_intent_recv_coalesce_wait_seconds` — receiver-side per-RPC
-/// wait inside the coalescer, from receipt to flush.
-pub const RECV_COALESCE_WAIT_METRIC_NAME: &str = "kiseki_intent_recv_coalesce_wait_seconds";
 
 /// Batch-size buckets — powers-of-two from 1 → 128. `KISEKI_INTENT_FAN_BATCH_MAX`
 /// defaults to 16, so the 1, 2, 4, 8, 16 buckets capture the steady-state
 /// distribution; higher buckets are for capacity/headroom analysis.
 const BATCH_SIZE_BUCKETS: &[f64] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
-
-/// Receiver-side batch-size buckets — wider range than producer because the
-/// receiver aggregates across producers. With 6 nodes × 18 shards ×
-/// ~5 in-flight each, a receiver could see 50+ intents per flush at
-/// steady state.
-const RECV_BATCH_SIZE_BUCKETS: &[f64] =
-    &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0];
 
 /// Coalesce-wait buckets (seconds) — 1 µs → 10 ms. The
 /// `KISEKI_INTENT_FAN_BATCH_TIMEOUT_US` default is 500 µs, so the wait
@@ -62,8 +45,6 @@ const COALESCE_WAIT_BUCKETS: &[f64] = &[
 
 static BATCH_SIZE: OnceLock<Histogram> = OnceLock::new();
 static COALESCE_WAIT: OnceLock<Histogram> = OnceLock::new();
-static RECV_BATCH_SIZE: OnceLock<Histogram> = OnceLock::new();
-static RECV_COALESCE_WAIT: OnceLock<Histogram> = OnceLock::new();
 
 /// Register the W12 intent-coalescing histograms into the given
 /// Prometheus [`Registry`]. Idempotent: a second call after the
@@ -101,33 +82,6 @@ pub fn register(registry: &Registry) -> Result<(), prometheus::Error> {
         registry.register(Box::new(h.clone()))?;
         let _ = COALESCE_WAIT.set(h);
     }
-    if RECV_BATCH_SIZE.get().is_none() {
-        let h = Histogram::with_opts(
-            HistogramOpts::new(
-                RECV_BATCH_SIZE_METRIC_NAME,
-                "Receiver-side intent_put coalescer (Lever 1). Total intents per \
-                 coalesced fjall put_batch flush — aggregates RPCs from multiple \
-                 producers. Should run 4-16× the producer-side batch_size at steady \
-                 state because the receiver is the cluster-wide aggregation point.",
-            )
-            .buckets(RECV_BATCH_SIZE_BUCKETS.to_vec()),
-        )?;
-        registry.register(Box::new(h.clone()))?;
-        let _ = RECV_BATCH_SIZE.set(h);
-    }
-    if RECV_COALESCE_WAIT.get().is_none() {
-        let h = Histogram::with_opts(
-            HistogramOpts::new(
-                RECV_COALESCE_WAIT_METRIC_NAME,
-                "Receiver-side per-RPC wait inside the coalescer, from receipt to \
-                 flush (Lever 1). KISEKI_INTENT_RECV_BATCH_TIMEOUT_US is the upper \
-                 bound.",
-            )
-            .buckets(COALESCE_WAIT_BUCKETS.to_vec()),
-        )?;
-        registry.register(Box::new(h.clone()))?;
-        let _ = RECV_COALESCE_WAIT.set(h);
-    }
     Ok(())
 }
 
@@ -152,24 +106,6 @@ pub fn observe_intent_put_batch_size(n: usize) {
 /// coalescer when each PUT is included in a flushed batch.
 pub fn observe_coalesce_wait(d: Duration) {
     if let Some(h) = COALESCE_WAIT.get() {
-        h.observe(d.as_secs_f64());
-    }
-}
-
-/// Observe one receiver-side coalesced flush size — TOTAL intents
-/// landing in one fjall `put_batch`, aggregated across N incoming RPCs.
-pub fn observe_intent_recv_batch_size(n: usize) {
-    if let Some(h) = RECV_BATCH_SIZE.get() {
-        let clamped = u64::try_from(n).unwrap_or(u64::MAX).min(1u64 << 52);
-        #[allow(clippy::cast_precision_loss)]
-        let v = clamped as f64;
-        h.observe(v);
-    }
-}
-
-/// Observe one per-RPC wait inside the receiver-side coalescer.
-pub fn observe_intent_recv_coalesce_wait(d: Duration) {
-    if let Some(h) = RECV_COALESCE_WAIT.get() {
         h.observe(d.as_secs_f64());
     }
 }
