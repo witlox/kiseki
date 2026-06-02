@@ -1349,11 +1349,20 @@ where
 /// Map a free-form tag string to the bounded label set used by the
 /// metrics. Unknown tags collapse to `op::UNKNOWN` so cardinality
 /// stays bounded.
+///
+/// The 2026-06-02 GCP profile run found `op=unknown` holding ~1M samples
+/// at 244 ms mean — the ADR-047 aux tags (`intent_put`,
+/// `intent_gather_pending`) were ingressing the listener and falling
+/// through to `_ => UNKNOWN`. They now have their own labels so the
+/// `intent_put` hot path is visible separately from genuinely-unknown
+/// tags (a real protocol bug, not just a missing match arm).
 fn normalize_op(tag: &str) -> &'static str {
     match tag {
         "append_entries" => crate::transport_metrics::op::APPEND_ENTRIES,
         "vote" => crate::transport_metrics::op::VOTE,
         "full_snapshot" => crate::transport_metrics::op::FULL_SNAPSHOT,
+        "intent_put" => crate::transport_metrics::op::INTENT_PUT,
+        "intent_gather_pending" => crate::transport_metrics::op::INTENT_GATHER_PENDING,
         _ => crate::transport_metrics::op::UNKNOWN,
     }
 }

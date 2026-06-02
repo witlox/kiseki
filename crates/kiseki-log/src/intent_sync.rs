@@ -52,12 +52,18 @@ use crate::shard_committer::PeerIntentGatherer;
 /// Aux tag: "your full pending intent set for this shard" — for election
 /// intent-recovery (gate-1 O2). MUST NOT collide with the Raft tags
 /// (`append_entries` / `vote` / `full_snapshot`).
+///
+/// Wire-compat coupling: `kiseki_raft::transport_metrics::op::INTENT_GATHER_PENDING`
+/// MUST equal this string verbatim (the asserts in the tests below catch drift).
 pub const INTENT_GATHER_PENDING_TAG: &str = "intent_gather_pending";
 
 /// Aux tag: "durably record this fanned intent on your local store" — the
 /// quorum intent-write the producer fans to a shard's voter peers BEFORE the
 /// gateway fast-acks (ADR-047 phase 5c, the no-loss floor I-L2/I-CS1). MUST
 /// NOT collide with the Raft tags or the other intent tags.
+///
+/// Wire-compat coupling: `kiseki_raft::transport_metrics::op::INTENT_PUT`
+/// MUST equal this string verbatim (the asserts in the tests below catch drift).
 pub const INTENT_PUT_TAG: &str = "intent_put";
 
 /// Wire form of a [`WriteIntent`] — used both for the `gather_pending`
@@ -413,6 +419,24 @@ mod tests {
             logical,
             node_id: NodeId(node),
         })
+    }
+
+    /// W9 (2026-06-02): the metric label strings in `kiseki-raft` are
+    /// hard-coded literals because `kiseki-raft` can't depend on
+    /// `kiseki-log` (the dep edge points the other way). This catches drift
+    /// if either side renames its tag.
+    #[test]
+    fn metric_label_strings_match_aux_tag_strings() {
+        assert_eq!(
+            INTENT_PUT_TAG,
+            kiseki_raft::transport_metrics::op::INTENT_PUT,
+            "intent_put tag drift — metric label out of sync"
+        );
+        assert_eq!(
+            INTENT_GATHER_PENDING_TAG,
+            kiseki_raft::transport_metrics::op::INTENT_GATHER_PENDING,
+            "intent_gather_pending tag drift — metric label out of sync"
+        );
     }
 
     /// A non-trivial append: real `chunk_refs`, payload, operation, and a

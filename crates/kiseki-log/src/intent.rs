@@ -161,6 +161,30 @@ pub trait IntentStore: Send + Sync {
     /// Backing-store I/O or codec failure (durable impls only).
     fn remove_seq(&self, seq: PerspectiveSeq) -> Result<(), IntentError>;
 
+    /// Batched variant of [`remove_seq`] — the supervisor's self-prune calls
+    /// this once per tick with the SM's `recent_incorporated_seqs` snapshot.
+    /// Each seq is treated independently and idempotently (a missing seq is a
+    /// no-op, identical to calling `remove_seq` per element). Durable impls
+    /// MUST commit the whole batch atomically (one WAL write); the default
+    /// fallback walks `remove_seq` for foundational/test impls that do not
+    /// need batching.
+    ///
+    /// The 2026-06-02 GCP profile run showed `remove_seq` consuming 71.75 %
+    /// of every storage-node core when called per-element — every call paid
+    /// one mutex acquisition + one fjall `get` + one batch commit. Batching
+    /// collapses that to one mutex + one commit per supervisor tick.
+    ///
+    /// # Errors
+    /// Backing-store I/O or codec failure (durable impls only). On error the
+    /// store MAY have partially applied earlier seqs; the supervisor logs
+    /// + retries next tick (`remove_seq` semantics are idempotent).
+    fn remove_seqs(&self, seqs: &[PerspectiveSeq]) -> Result<(), IntentError> {
+        for &seq in seqs {
+            self.remove_seq(seq)?;
+        }
+        Ok(())
+    }
+
     /// Pending count — observability + backpressure (ADR-047 §F-6).
     ///
     /// # Errors
@@ -245,6 +269,23 @@ impl IntentStore for InMemIntentStore {
                 // already replaced it and must not lose its pointer.
                 if g.by_key.get(&key).copied() == Some(seq) {
                     g.by_key.remove(&key);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_seqs(&self, seqs: &[PerspectiveSeq]) -> Result<(), IntentError> {
+        if seqs.is_empty() {
+            return Ok(());
+        }
+        let mut g = self.inner.lock().lock_or_die("intent_store.inner");
+        for &seq in seqs {
+            if let Some(intent) = g.by_seq.remove(&seq) {
+                if let Some(key) = intent.idempotency_key {
+                    if g.by_key.get(&key).copied() == Some(seq) {
+                        g.by_key.remove(&key);
+                    }
                 }
             }
         }
@@ -666,6 +707,51 @@ impl IntentStore for FjallIntentStore {
         Ok(())
     }
 
+    fn remove_seqs(&self, seqs: &[PerspectiveSeq]) -> Result<(), IntentError> {
+        // W7 (2026-06-02): batched per-seq prune. Same per-seq atomicity
+        // contract as `remove_seq` — intent row + dedup pointer go together
+        // — but the whole snapshot lands in ONE batch and ONE commit. The
+        // 2026-06-02 GCP profile showed `remove_seq` called per-element from
+        // `run_supervisor_loop` consuming 71.75% of every storage-node core;
+        // every call paid one fjall `get` + one batch commit (≈ one WAL
+        // sync). Batching collapses that to one mutex acquisition + one
+        // commit per supervisor tick.
+        //
+        // Most snapshot entries are no-ops (the SM's recent-incorporated set
+        // races ahead of the local prune state by a few ticks; entries the
+        // local store has already dropped are skipped here at zero cost
+        // beyond the `get`).
+        if seqs.is_empty() {
+            return Ok(());
+        }
+        let _guard = self
+            .mutations
+            .lock()
+            .lock_or_die("intent_store.fjall.mutations");
+        let mut batch = self.batch_for_write();
+        let mut any = false;
+        for &seq in seqs {
+            let seq_key = encode_seq_key(seq);
+            let Some(v) = self.intents_ks.get(seq_key)? else {
+                continue;
+            };
+            let decoded = decode_value(v.as_ref())?;
+            batch.remove(&self.intents_ks, seq_key.to_vec());
+            if let Some(idem) = decoded.idempotency_key {
+                if let Some(pointer) = self.idem_ks.get(idem)? {
+                    if pointer.as_ref() == seq_key.as_slice() {
+                        batch.remove(&self.idem_ks, idem.to_vec());
+                    }
+                }
+            }
+            any = true;
+        }
+        if any {
+            batch.commit()?;
+        }
+        Ok(())
+    }
+
     fn pending_len(&self) -> Result<usize, IntentError> {
         // Not a hot path (observability / backpressure); a full count is
         // acceptable per the trait contract.
@@ -1023,6 +1109,61 @@ mod tests {
             Err(IntentError::Codec(_)) => {}
             Err(other) => panic!("expected Codec, got {other:?}"),
             Ok(_) => panic!("expected open to reject bogus format_version"),
+        }
+    }
+
+    /// W7 (2026-06-02): `remove_seqs` must match per-call `remove_seq` on
+    /// both stores — identical pending-set, identical dedup-pointer state,
+    /// missing seqs are idempotent.
+    #[test]
+    fn remove_seqs_matches_per_call_remove_seq() {
+        for store_kind in &["inmem", "fjall"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store: std::sync::Arc<dyn IntentStore> = match *store_kind {
+                "inmem" => std::sync::Arc::new(InMemIntentStore::new()),
+                "fjall" => std::sync::Arc::new(
+                    FjallIntentStore::open(&dir.path().join("intents")).unwrap(),
+                ),
+                _ => unreachable!(),
+            };
+            // 8 intents, half keyed, half not.
+            let s1 = seq(1, 0, 1);
+            let s2 = seq(1, 1, 1);
+            let s3 = seq(1, 2, 1);
+            let s4 = seq(1, 3, 1);
+            let s5 = seq(1, 4, 1);
+            let s6 = seq(1, 5, 1);
+            let s7 = seq(1, 6, 1);
+            let s8 = seq(1, 7, 1);
+            store.put(intent(s1, Some([1; 16]))).unwrap();
+            store.put(intent(s2, None)).unwrap();
+            store.put(intent(s3, Some([3; 16]))).unwrap();
+            store.put(intent(s4, None)).unwrap();
+            store.put(intent(s5, Some([5; 16]))).unwrap();
+            store.put(intent(s6, None)).unwrap();
+            store.put(intent(s7, Some([7; 16]))).unwrap();
+            store.put(intent(s8, None)).unwrap();
+            assert_eq!(store.pending_len().unwrap(), 8, "store={store_kind}");
+            // Batch-remove 4 of them, including one missing seq (s8 IS
+            // present, but include a definitely-absent seq too).
+            let missing = seq(99, 0, 1);
+            store
+                .remove_seqs(&[s1, s3, s4, missing, s8])
+                .expect("batch remove succeeds");
+            assert_eq!(
+                store.pending_len().unwrap(),
+                4,
+                "store={store_kind}: 4 of 8 removed (missing seq idempotent)"
+            );
+            // Re-adding a keyed seq that was removed must NOT duplicate
+            // (its dedup pointer was dropped).
+            let outcome = store.put(intent(seq(2, 0, 1), Some([1; 16]))).unwrap();
+            assert!(
+                matches!(outcome, PutOutcome::Recorded),
+                "store={store_kind}: dropped dedup pointer must allow re-put"
+            );
+            // Empty batch is a no-op.
+            store.remove_seqs(&[]).unwrap();
         }
     }
 

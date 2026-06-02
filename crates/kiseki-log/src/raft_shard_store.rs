@@ -1107,9 +1107,20 @@ async fn run_supervisor_loop<S, G>(
         // Snapshot the SM's recent_incorporated set and remove exactly those
         // local intents. Only intents already replicated AND applied on this
         // node disappear; everything else stays for recovery to re-derive.
+        //
+        // W7 (2026-06-02): batched. The 2026-06-02 GCP profile showed the
+        // per-element `remove_seq` loop saturating every storage-node core
+        // (71.75% CPU in `FjallIntentStore::remove_seq`). Each call paid one
+        // fjall `get` + one batch commit; most snapshot entries were no-ops
+        // because the local prune had already caught up. `remove_seqs`
+        // collapses the whole snapshot to one mutex + one batch commit.
         let snapshot = leadership_store.recent_incorporated_snapshot().await;
-        for seq in &snapshot {
-            if let Err(e) = prune_store.remove_seq(crate::intent::PerspectiveSeq(*seq)) {
+        if !snapshot.is_empty() {
+            let seqs: Vec<crate::intent::PerspectiveSeq> = snapshot
+                .iter()
+                .map(|s| crate::intent::PerspectiveSeq(*s))
+                .collect();
+            if let Err(e) = prune_store.remove_seqs(&seqs) {
                 tracing::debug!(shard_id = %shard_id.0, error = %e, "per-intent self-prune failed; retry next tick");
             }
         }
