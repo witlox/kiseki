@@ -1,72 +1,104 @@
 #!/bin/bash
 # Setup script for Kiseki storage nodes with RAW block devices.
 # Most disks are NOT mounted — Kiseki DeviceBackend manages them
-# directly via the raw-block fast-path. Two devices are peeled off,
-# formatted ext4, and mounted to host the two ADR-049 fjall fast
-# tiers:
+# directly via the raw-block fast-path. Per ADR-049 §D8.2, two LVM
+# volume groups are provisioned for the catalog-resolved fjall fast
+# tiers, each backed by a striped LV across N physical NVMe:
 #
-#   /mnt/kiseki-small  ← tag "fast-small"  → SmallObjectStore
-#   /mnt/kiseki-meta   ← tag "fast-meta"   → IntentStore + CompositionMeta + ChunkMeta
+#   VG kiseki_small (N=${fast_small_disks}) → LV data
+#     → ext4 → /mnt/fast-small  (tag "fast-small")  → SmallObjectStore
+#   VG kiseki_meta  (N=${fast_meta_disks})  → LV data
+#     → ext4 → /mnt/fast-meta   (tag "fast-meta")   → IntentStore + CompositionMeta + ChunkMeta
 #
-# Splitting small files off the metadata mount removes contention on
-# the hot IntentStore latency path (otherwise SmallObject's LSM
-# compaction storms collide with intent_put fsync on the same NVMe
-# device queue).
+# The remaining NVMe (raw_devices minus the trailing
+# fast_small_disks + fast_meta_disks entries) go to KISEKI_RAW_DEVICES
+# and are managed raw by the chunk store DeviceBackend (no FS).
 #
-# Variables: node_id, node_ip, all_peers, raft_port, raw_devices, device_class, meta_dir
+# Why LVM (per ADR-049 §D8.2): capacity expansion is operator-driven
+# OS work — `pvcreate + vgextend + lvextend + resize2fs` grows the
+# mount in place. The fjall keyspace paths stay unchanged, the
+# pointer file (`kiseki-tier-paths.json`) stays unchanged, and the
+# I-CP-Move guard stays silent. fjall sees the bigger `statvfs()`
+# total on next compaction. The default `fast_*_disks=1` is a
+# degenerate single-disk striped LV so this script has ONE shape
+# regardless of starting disk count.
+#
+# Variables: node_id, node_ip, all_peers, raft_port, raw_devices,
+#            device_class, meta_dir, fast_small_disks, fast_meta_disks
 set -eo pipefail
 
 # GCE metadata runner doesn't set HOME or full PATH — fix it
 export HOME="$${HOME:-/root}"
-export PATH="$$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$${PATH:-}"
+export PATH="$${HOME}/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$${PATH:-}"
 
 echo "=== Kiseki storage node ${node_id} (${device_class}) ==="
 
-# ADR-049 phase 5a runtime wiring: peel the LAST TWO raw devices off
-# the list and format ext4. The second-to-last becomes the small-files
-# mount (`fast-small`); the last becomes the metadata mount
-# (`fast-meta`). The remaining devices form the chunk-store DevicePool.
-#
-# Trade-off: on c3-standard-22-lssd this drops chunk-store raw
-# capacity from 4×375 GB = 1.5 TB/node to 2×375 GB = 0.75 TB/node.
-# That's the operational cost of isolating IntentStore writes from
-# SmallObject compaction storms — without isolation, intent_put p99
-# tail latency on the hot PUT path was contention-bound.
+# Install LVM tools early — needed before any of the PV/VG/LV setup
+dnf install -y --allowerasing lvm2 2>&1 | tail -2 || true
+
 IFS=',' read -ra ALL_RAW_DEVS <<< "${raw_devices}"
 NUM_RAW=$${#ALL_RAW_DEVS[@]}
-if [ "$$NUM_RAW" -lt 3 ]; then
-  echo "ERROR: ADR-049 fast-small + fast-meta split requires at least 3 raw devices (have $$NUM_RAW)" >&2
+FAST_SMALL_N=${fast_small_disks}
+FAST_META_N=${fast_meta_disks}
+TOTAL_PEEL=$((FAST_SMALL_N + FAST_META_N))
+
+if [ "$${NUM_RAW}" -lt $((TOTAL_PEEL + 1)) ]; then
+  echo "ERROR: ADR-049 §D8.2 split requires at least $((TOTAL_PEEL + 1)) raw devices" \
+       "(fast_small=$${FAST_SMALL_N} + fast_meta=$${FAST_META_N} + chunks >= 1) — have $${NUM_RAW}" >&2
   exit 1
 fi
-META_DEV="$${ALL_RAW_DEVS[-1]}"
-SMALL_DEV="$${ALL_RAW_DEVS[-2]}"
-unset 'ALL_RAW_DEVS[-1]'
-unset 'ALL_RAW_DEVS[-1]'
-CHUNK_RAW_DEVICES=$(IFS=','; echo "$${ALL_RAW_DEVS[*]}")
-META_MOUNT=/mnt/kiseki-meta
-SMALL_MOUNT=/mnt/kiseki-small
 
-format_and_mount() {
-  local dev="$1"
-  local mount="$2"
-  local label="$3"
-  echo "ADR-049 $$label: $$dev → $$mount (ext4)"
-  mkdir -p "$$mount"
-  if ! blkid "$$dev" 2>/dev/null | grep -q 'TYPE="ext4"'; then
-    mkfs.ext4 -F -L "$$label" -E lazy_itable_init=0,lazy_journal_init=0 "$$dev"
+# Peel trailing entries: last FAST_META_N for the meta VG, the
+# FAST_SMALL_N before that for the small VG, leading remainder for
+# the chunk pool.
+META_DEVS=("$${ALL_RAW_DEVS[@]: -$${FAST_META_N}}")
+SMALL_DEVS=("$${ALL_RAW_DEVS[@]: -$((FAST_META_N + FAST_SMALL_N)) : $${FAST_SMALL_N}}")
+CHUNK_DEVS=("$${ALL_RAW_DEVS[@]:0:$((NUM_RAW - TOTAL_PEEL))}")
+CHUNK_RAW_DEVICES=$(IFS=','; echo "$${CHUNK_DEVS[*]}")
+
+SMALL_MOUNT=/mnt/fast-small
+META_MOUNT=/mnt/fast-meta
+
+provision_lvm_mount() {
+  local vg="$${1}"; shift
+  local lv="$${1}"; shift
+  local mount="$${1}"; shift
+  local label="$${1}"; shift
+  # Remaining args are the PV device paths.
+  local stripes=$${#}
+  echo "ADR-049 $${label}: VG=$${vg} LV=$${lv} stripes=$${stripes} → $${mount}"
+  local dev
+  for dev in "$${@}"; do
+    if ! pvs --noheadings "$${dev}" >/dev/null 2>&1; then
+      pvcreate -f "$${dev}"
+    fi
+  done
+  if ! vgs --noheadings "$${vg}" >/dev/null 2>&1; then
+    vgcreate "$${vg}" "$${@}"
   fi
-  mount -o noatime,discard "$$dev" "$$mount"
-  chmod 0755 "$$mount"
-  local uuid
-  uuid=$(blkid -s UUID -o value "$$dev")
-  if ! grep -q "$$uuid" /etc/fstab; then
-    echo "UUID=$$uuid $$mount ext4 noatime,discard 0 0" >> /etc/fstab
+  if ! lvs --noheadings "/dev/$${vg}/$${lv}" >/dev/null 2>&1; then
+    # -i N -I 64k: stripe across N PVs with 64 KiB stripe width.
+    # Single-disk N=1 is a degenerate stripe — same shape as multi-disk.
+    lvcreate -y -n "$${lv}" -l 100%FREE -i "$${stripes}" -I 64k "$${vg}"
+  fi
+  local lv_dev="/dev/$${vg}/$${lv}"
+  if ! blkid "$${lv_dev}" 2>/dev/null | grep -q 'TYPE="ext4"'; then
+    mkfs.ext4 -F -L "$${label}" -E lazy_itable_init=0,lazy_journal_init=0 "$${lv_dev}"
+  fi
+  mkdir -p "$${mount}"
+  if ! mountpoint -q "$${mount}"; then
+    mount -o noatime,discard "$${lv_dev}" "$${mount}"
+  fi
+  chmod 0755 "$${mount}"
+  # Persist via /etc/fstab using the LV device path (stable across reboots).
+  if ! grep -q "$${lv_dev} $${mount}" /etc/fstab; then
+    echo "$${lv_dev} $${mount} ext4 noatime,discard 0 0" >> /etc/fstab
   fi
 }
 
-format_and_mount "$$SMALL_DEV" "$$SMALL_MOUNT" kiseki-small
-format_and_mount "$$META_DEV"  "$$META_MOUNT"  kiseki-meta
-echo "Chunk-store raw devices: $$CHUNK_RAW_DEVICES"
+provision_lvm_mount kiseki_small data "$${SMALL_MOUNT}" fast-small "$${SMALL_DEVS[@]}"
+provision_lvm_mount kiseki_meta  data "$${META_MOUNT}"  fast-meta  "$${META_DEVS[@]}"
+echo "Chunk-store raw devices: $${CHUNK_RAW_DEVICES}"
 
 # Install runtime dependencies
 dnf install -y --allowerasing openssl-libs unzip iperf3 fio curl bc tar gzip 2>&1 | tail -3
@@ -214,7 +246,7 @@ Environment=KISEKI_DATA_DIR=${meta_dir}
 # entries go via `KISEKI_RAW_DEVICES` above (orthogonal axis per
 # §D11.1). Operator can extend this list when additional mount
 # points are configured.
-Environment=KISEKI_DEVICE_TAGS=${meta_dir}=data-dir-default,$$SMALL_MOUNT=fast-small,$$META_MOUNT=fast-meta
+Environment=KISEKI_DEVICE_TAGS=${meta_dir}=data-dir-default,$${SMALL_MOUNT}=fast-small,$${META_MOUNT}=fast-meta
 # ADR-049 §D2.5: Raft log path is bootstrap-only — never resolver-
 # routed. Defaults to `${meta_dir}/raft` when unset; we set it
 # explicitly so an operator changing `KISEKI_DATA_DIR` later
@@ -236,7 +268,7 @@ Environment=KISEKI_RAFT_ADDR=${node_ip}:${raft_port}
 # Raw device paths for DeviceBackend (comma-separated). One device
 # has been peeled off for ADR-049 fast-tier metadata mount above;
 # this list excludes it.
-Environment=KISEKI_RAW_DEVICES=$$CHUNK_RAW_DEVICES
+Environment=KISEKI_RAW_DEVICES=$${CHUNK_RAW_DEVICES}
 
 # Raft runtime threads — needs to exceed max concurrent writes to avoid
 # blocking on redb I/O in the state machine apply path.

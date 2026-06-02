@@ -42,23 +42,50 @@ Extend `DeviceClass` to cover the full storage hierarchy:
 Server node:
 ├── System partition (RAID-1 on 2× SSD)
 │   ├── /boot, /root, OS
-│   ├── /var/lib/kiseki/redb/       ← Raft log, metadata index
+│   ├── /var/lib/kiseki/raft/       ← Raft log (RaftLog tier, bootstrap-only per ADR-049 §D2.5)
+│   ├── /var/lib/kiseki/keys/       ← node KMS material
 │   └── /var/lib/kiseki/config/     ← Node config, certs
 │
-├── Data devices (JBOD, managed by Kiseki)
-│   ├── /dev/nvme0n1 → pool "fast-nvme"  (device member)
-│   ├── /dev/nvme1n1 → pool "fast-nvme"  (device member)
-│   ├── /dev/sda     → pool "bulk-ssd"   (device member)
-│   ├── /dev/sdb     → pool "cold-hdd"   (device member)
+├── Fast-tier mounts (LVM-striped — ADR-049 §D8.2)
+│   ├── /mnt/fast-small ← VG `kiseki_small`, striped LV across N × NVMe
+│   │                     hosts SmallObjectStore fjall keyspace
+│   └── /mnt/fast-meta  ← VG `kiseki_meta`,  striped LV across M × NVMe
+│                         hosts 3 metadata fjall keyspaces
+│                         (IntentStore, CompositionMeta, ChunkMeta)
+│
+├── Data devices (JBOD, managed by Kiseki — raw block, no FS)
+│   ├── /dev/nvme0n1 → pool "fast-nvme"  (chunk store DeviceBackend)
+│   ├── /dev/nvme1n1 → pool "fast-nvme"  (chunk store DeviceBackend)
+│   ├── /dev/sda     → pool "bulk-ssd"
+│   ├── /dev/sdb     → pool "cold-hdd"
 │   └── ...
 │
 └── Optional: CXL memory → pool "pmem" (hot cache tier)
 ```
 
-**JBOD for data, RAID-1 for system.** Kiseki manages data durability
-via EC/replication across JBOD members. The system partition uses
-traditional RAID-1 because redb and Raft log must survive single-disk
-failure without Kiseki's own repair mechanism.
+**Three storage axes, kept orthogonal:**
+
+1. **System partition (RAID-1 mdadm/ext4)** — survives single-disk
+   loss via OS-level redundancy. Hosts the Raft log
+   (RaftLog tier is bootstrap-only per ADR-049 §D2.5, can't be
+   resolver-routed), keys, and node config.
+2. **Fast-tier FS mounts (LVM stripe + ext4)** — the catalog-
+   resolved fjall keyspaces (SmallObject + 3 metadata). LVM
+   striping per ADR-049 §D8.2 makes capacity expansion an online
+   OS operation (`vgextend + lvextend + resize2fs`) — kiseki sees
+   only the growing `statvfs()` total via its existing inventory
+   refresh.
+3. **Data devices (JBOD, raw block, no FS, no LVM)** — chunk
+   fragments only. Kiseki manages data durability via
+   EC/replication across JBOD members (ADR-029). A device used as
+   an LVM PV under axis #2 MUST NOT also appear in this list.
+
+The system partition uses RAID-1 because the Raft log + KMS must
+survive single-disk failure without kiseki's own repair
+mechanism. The fast-tier mounts don't need RAID-1 because the
+fjall keyspaces they host are *cluster-replicated*: a node
+losing its `/mnt/fast-small` is a node-loss event handled by
+ADR-005 EC repair against peers, not by local RAID.
 
 ### Pool capacity management
 

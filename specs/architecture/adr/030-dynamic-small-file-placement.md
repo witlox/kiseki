@@ -38,14 +38,26 @@ makes 256 GB root disks insufficient.
 
 ### 1. System disk auto-detection and budget calculation
 
-At server boot, detect the system partition's capacity and media type.
-Compute a metadata budget with configurable soft and hard limits.
+At server boot, detect each catalog-resolved mount's capacity and
+media type. Compute a per-mount budget with configurable soft and
+hard limits.
 
 ```
-KISEKI_DATA_DIR → stat() → total_bytes, fs_type
+mount_path → statvfs() → total_bytes, fs_type
 /sys/block/{dev}/queue/rotational → 0 = SSD/NVMe, 1 = HDD
 /sys/block/{dev}/device/model → device identification
 ```
+
+**Note (ADR-049 §D8.2 — LVM-aggregated mounts):** when the mount
+is an LVM logical volume, `statvfs()` reports the *aggregated LV
+size* across all PVs in the VG. An operator extending the VG
+(`vgextend + lvextend + resize2fs`) grows the reported total
+without any kiseki involvement; the budget recompute picks up the
+new total on the next `InventoryReporter` tick (60 s default).
+Media-type detection reads the *slowest* PV's rotational flag —
+mixed-media VGs report the conservative class, so operators
+should keep one media class per VG (NVMe-only on `kiseki_small`
+/ `kiseki_meta`; never mix NVMe + HDD in a single fast-tier VG).
 
 **Defaults** (configurable via env or config file):
 
