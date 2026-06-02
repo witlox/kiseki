@@ -582,25 +582,82 @@ pub async fn run_main(
     };
     let key_store_inner = Arc::new(key_store);
 
+    // ADR-049 phase 5a continued: load the pointer file that the
+    // PRIOR boot's phase5_boot wrote. From here through the chunk
+    // store init, every fjall keyspace consults `boot_paths` for
+    // its resolved path.
+    //
+    // First-boot path: no pointer file exists yet. We can't call
+    // `phase5_boot::run` because the control-plane Raft isn't up yet.
+    // Instead, `first_boot_local_resolve` does a *local* resolution
+    // using only this node's inventory + the built-in default policy
+    // (which every node carries identically), writes the pointer
+    // file, and the same boot then opens fjall stores at the resolved
+    // paths. The mounts a single node picks are stable regardless of
+    // cluster size, so this is consistent with what `phase5_boot::run`
+    // would produce once Raft is up — and the I-CP-Move check inside
+    // `phase5_boot::run` later this boot would Ok on the freshly-
+    // written pointer.
+    //
+    // A corrupt pointer file is treated as RefuseToOpen (Q23 / N-2):
+    // refuse to start rather than silently relocating data.
+    let boot_paths: crate::cluster_control::boot_paths::BootTierPaths = if let Some(ref dir) =
+        cfg.data_dir
+    {
+        // Best-effort first-boot resolve. Errors are logged but
+        // don't block startup — fall back to data_dir-relative
+        // paths if the resolver fails (matches pre-ADR-049
+        // behaviour on degenerate single-disk deployments).
+        let tags_env = std::env::var("KISEKI_DEVICE_TAGS").unwrap_or_default();
+        let tags = crate::cluster_control::device_discovery::DeviceTagMap::parse(&tags_env);
+        match crate::cluster_control::phase5_boot::first_boot_local_resolve(
+            kiseki_common::ids::NodeId(cfg.node_id),
+            dir,
+            &tags,
+        ) {
+            Ok(true) => tracing::info!("ADR-049 first-boot local resolve: pointer file written"),
+            Ok(false) => {} // pointer already existed
+            Err(e) => tracing::warn!(
+                error = %e,
+                "ADR-049 first-boot local resolve failed — falling back to data_dir paths"
+            ),
+        }
+        crate::cluster_control::boot_paths::BootTierPaths::load(dir).map_err(|e| {
+            format!(
+                "ADR-049 boot tier-paths pointer file unreadable at {} — \
+                     refuse to start (corrupt pointer file is not first-boot, \
+                     see ADR-049 Q23 / N-2). Underlying error: {e}",
+                dir.display(),
+            )
+        })?
+    } else {
+        crate::cluster_control::boot_paths::BootTierPaths::default()
+    };
+    if boot_paths.has_resolved() {
+        tracing::info!("ADR-049 boot using pointer-resolved tier paths (kiseki-tier-paths.json)");
+    } else {
+        tracing::info!("ADR-049 boot: no pointer file — using data_dir-relative tier paths");
+    }
+
     // Small object store for inline files (ADR-030).
     // Created before the log store so Raft state machines can use it.
     let small_store: Option<std::sync::Arc<kiseki_chunk::SmallObjectStore>> =
         if let Some(ref dir) = cfg.data_dir {
-            // ADR-022 rev-5 (#129 unblock): SmallObjectStore moved from
-            // redb to fjall. Path becomes a directory under
-            // `small/objects/` instead of the legacy `small/objects.redb`
-            // file. Phase 5b: this hardcoded path is the LAST stop before
-            // the ADR-049 resolver replaces it with
-            // `<resolved SmallObject mount>/kiseki/small-object/` — that
-            // wiring lands as part of the runtime.rs boot reorder
-            // (phase 5a continued); until then, the data_dir-relative
-            // path keeps single-host development clusters working.
-            std::fs::create_dir_all(dir.join("small")).ok();
-            let store = kiseki_chunk::SmallObjectStore::open(&dir.join("small").join("objects"))
-                .map_err(|e| format!("small object store: {e}"))?;
+            // ADR-022 rev-5 (#129 unblock): SmallObjectStore moved
+            // from redb to fjall. ADR-049 phase 5a continued: path
+            // now comes from `boot_paths` — pointer-resolved mount
+            // with `kiseki/small-object/` subdir when pointer
+            // present, else falls back to `<data_dir>/small/objects`.
+            let path = boot_paths.small_object(dir);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            let store = kiseki_chunk::SmallObjectStore::open(&path)
+                .map_err(|e| format!("small object store at {}: {e}", path.display()))?;
             tracing::info!(
-                path = %dir.display(),
-                "small object store: persistent (fjall, ADR-022 rev-5)",
+                path = %path.display(),
+                resolved = boot_paths.has_resolved(),
+                "small object store: persistent (fjall, ADR-022 rev-5, ADR-049-routed)",
             );
             Some(std::sync::Arc::new(store))
         } else {
@@ -705,6 +762,15 @@ pub async fn run_main(
         if let Some(ref ss) = small_store {
             store = store.with_inline_store(std::sync::Arc::clone(ss)
                 as std::sync::Arc<dyn kiseki_common::inline_store::InlineStore>);
+        }
+        // ADR-049 phase 5a continued: tell RaftShardStore where each
+        // per-shard FjallIntentStore should open. With the pointer
+        // file present, this routes intents to the fast-tier mount
+        // (typically NVMe) instead of the boot disk. Without it,
+        // `intent_store_base == data_dir` and behaviour matches the
+        // pre-ADR-049 path.
+        if let Some(ref dir) = cfg.data_dir {
+            store = store.with_intent_store_base(boot_paths.intent_store_base(dir));
         }
         // ADR-041 §"Observability": wire transport metrics BEFORE the
         // first create_shard so the lazy-init listener picks them up.
@@ -1055,7 +1121,14 @@ pub async fn run_main(
         std::fs::create_dir_all(dir.join("chunks")).ok();
         // ADR-022 rev-4: chunk meta moved off JSON to fjall. Path
         // is now a keyspace directory (no extension).
-        let meta_path = dir.join("chunks").join("meta");
+        // ADR-049 phase 5a continued: ChunkMeta tier resolved via
+        // boot_paths. The raw chunk data still lives on the
+        // `KISEKI_RAW_DEVICES` block-device pool — only the fjall
+        // envelope/extent metadata moves to the resolved mount.
+        let meta_path = boot_paths.chunk_meta(dir);
+        if let Some(parent) = meta_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
         // ADR-024 + ADR-029: when the operator provisioned raw JBOD
         // data devices (`KISEKI_RAW_DEVICES`), open each as a
         // `RawBlockDevice` — probe-driven `O_DIRECT` for SSD/NVMe,
@@ -1814,14 +1887,19 @@ pub async fn run_main(
     // `fsync_pending` hook registration further down.
     let comp_storage: Box<dyn kiseki_composition::persistent::CompositionStorage> =
         if let Some(ref dir) = cfg.data_dir {
-            let meta_dir = dir.join("metadata");
-            std::fs::create_dir_all(&meta_dir).map_err(|e| {
-                format!(
-                    "create persistent composition dir {}: {e}",
-                    meta_dir.display()
-                )
-            })?;
-            let path = meta_dir.join("compositions");
+            // ADR-049 phase 5a continued: CompositionMeta resolved
+            // via boot_paths. Falls back to `<data_dir>/metadata/
+            // compositions/` when the pointer doesn't supply a
+            // CompositionMeta tier.
+            let path = boot_paths.composition_meta(dir);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "create persistent composition dir {}: {e}",
+                        parent.display()
+                    )
+                })?;
+            }
             // Group commit (FUSE p99 fix): every put / bind_name
             // would otherwise trigger an inline fsync. fjall's
             // `PersistMode::Buffer` + a periodic flusher that calls

@@ -91,7 +91,7 @@ all-NVMe cluster the policy is exercised but every tier is `fast`.
 ## 4. Drive each protocol BY HAND (distinct payloads, cross-node, check errors)
 
 ### 4a. Native bench FIRST — and the full PARALLEL 3-client run
-The `kiseki-client bench` tool is the headline native-throughput driver. Two
+The `kiseki-client bench` tool is the headline native-throughput driver. Three
 hard-won gotchas:
 
 1. **The bench namespace MUST be created under the bench tenant** — use
@@ -104,28 +104,97 @@ hard-won gotchas:
    the **namespace registration**, not the request. If you must hand-create,
    pass `--tenant 179e565c-d506-5c59-8f82-7ae6e13f0aff`, or create any namespace
    under that tenant and point the bench at it with `--tenant <id> --namespace <id>`.
-2. **3 client nodes = parallel distributed load** (the whole point of the 3
-   clients). Run the bench on all three concurrently against the cluster:
-   ```bash
-   for c in kiseki-client-1 kiseki-client-2 kiseki-client-3; do
-     gcloud compute ssh "$c" ... --command="kiseki-client bench \
-       --endpoint kiseki://10.0.0.10:9103 --tenant 179e565c-... --namespace <bench-ns> \
-       --shape get-heavy --concurrency 16 --object-size 65536 --duration-secs 30 --json" &
-   done; wait        # then sum ops_per_sec + mib_per_sec across the 3 JSON lines
-   ```
-   Reference (2026-05-27, default profile, 64 KB): **get-heavy ≈ 10.6k ops/s ·
-   662 MiB/s aggregate** (3×~3.5k), p99 ~90 ms, 0 errors. **put-heavy ≈ 264 ops/s
-   · 16.5 MiB/s aggregate** — commit-bound on the distributed multi-shard write
-   path (per-write composition + forward + Raft commit); writes are correct but
-   throughput is low, a known multi-node write characteristic.
+2. **Create the namespace with `--shards 18`**, NOT the default 6. The 18-shard
+   topology is what every recent A/B in `specs/performance/2026-06-0*.md` uses
+   and what the L4 / W12 / W11 baselines compare against. Six shards × six nodes
+   = one leader per node and dramatically lower per-shard concurrency density;
+   the coalescer barely fills.
+3. **Each client → distinct storage IP** (NOT all three pointed at storage-1).
+   Per-client endpoint `kiseki://10.0.0.1<c>:9103` where `<c>` ∈ {0, 1, 2}
+   addresses storage-{1, 2, 3} respectively. Pointing all three at one node
+   pays the forward-to-leader hop on 5/6 of writes and crushes the headline
+   number by ~8× (verified 2026-06-02 — operator mistake).
 
-### 4b. The other protocols
-S3 is path-style, no auth: `http://<ip>:9000/<bucket>/<key>`.
-- iperf3 baseline (wire ceiling).
-- S3 PUT distinct objects (`head -c <size> /dev/urandom`) to one node; GET from
-  ANOTHER node; `cmp` to verify; **capture HTTP codes** (`curl -w "%{http_code}"`) —
-  a backgrounded `curl -sf` hides 500s. Allow a few seconds settle before cross-node
-  GET (Raft composition replication lag, else false MISMATCH).
+#### Pass A — internal re-baseline (vs L4 / W12 / W11)
+Same shape as every recent A/B. 5 min wall-clock, 3 shapes.
+
+```bash
+NS=6658810a-1c4d-564c-a888-7564b5e9e576       # bench namespace
+TEN=179e565c-d506-5c59-8f82-7ae6e13f0aff      # bench tenant
+
+for shape in put-heavy get-heavy mixed; do
+  for c in 1 2 3; do
+    gcloud compute ssh "kiseki-client-$c" ... --command="kiseki-client bench \
+      --endpoint kiseki://10.0.0.1$((c-1)):9103 \
+      --tenant $TEN --namespace $NS \
+      --shape $shape --concurrency 32 --object-size 65536 \
+      --duration-secs 60 --json" &
+  done
+  wait
+done | tee pass-a.json
+```
+
+**L4 baseline (2026-06-02, last clean A/B before #129):** put-heavy
+**8 707 op/s**, get-heavy **97 053 op/s**, mixed **13 270 op/s**. If Pass A is
+below those by more than 10%, suspect regression and chase the per-PR
+metrics — start with `kiseki_intent_coalesce_wait_seconds` and
+`kiseki_intent_put_batch_size` on storage-6 (typical mixed-leader). The L4
+writeup (`specs/performance/2026-06-02-gcp-l4-mutex-notify-coalescer.md`) is
+the diagnostic reference.
+
+#### Pass B/C — 4 KB IOPS (competitive — ADR-042 + ADR-047 design point)
+Same loop, `--object-size 4096`. This is the **headline competitive cell**
+(`docs/performance/competitive-targets.md`): Ceph 5–20k, Lustre 30–80k
+(MDS-bound), VAST 50–150k (without Optane), kiseki target 360k. If aggregate
+PUT lands above 20k, we beat Ceph small-file IOPS for the first time. ~5 min.
+
+Pre-flight: verify per-shard `inline_threshold_bytes ≥ 4096`. The recompute
+task may bump it to 65536 within the first 60 s after namespace create; check
+via `kiseki-admin --endpoint http://10.0.0.10:9090 shards | head -2` (look for
+the bumped value). At 4 KB ≤ threshold, #129's `inline_payloads` Raft-replicated
+path fires; each replica writes the ciphertext to its local SmallObjectStore
+and reads resolve locally — no chunk-fabric round-trip.
+
+#### Pass G (optional) — concurrency sweep (W12 §O-3 prediction)
+Same as Pass A but `--concurrency 128`. W12 writeup predicts put 12–15k op/s
+from higher per-shard density alone. No code change, env-var free. Free lift
+if the prediction holds.
+
+#### Pass D — native bulk (competitive — bytes/sec, not IOPS)
+Same 3-client × distinct-leader loop as Pass A, larger objects to drive the
+**aggregate bandwidth** competitive cells. Target 5.2 GB/s aggregate write
+@ EC-4+2 (vs Ceph ~5 GB/s R-3, Lustre ~5-8 R-1 no-durability, VAST ~3 GB/s
+without Optane); 16 GB/s aggregate read (NIC ceiling, Ceph 11-13, Lustre
+8-10, VAST 12-14).
+
+```bash
+for shape in put-heavy get-heavy; do
+  for c in 1 2 3; do
+    gcloud compute ssh "kiseki-client-$c" ... --command="kiseki-client bench \
+      --endpoint kiseki://10.0.0.1$((c-1)):9103 \
+      --tenant $TEN --namespace $NS \
+      --shape $shape --concurrency 8 --object-size 1048576 \
+      --duration-secs 60 --json" &
+  done
+  wait
+done | tee pass-d.json
+# mib_per_sec × 3 clients = aggregate. /1024 for GiB/s.
+```
+
+(1 MiB objects, conc=8 per client — drive bandwidth not IOPS. Larger
+sizes are NIC-bound and don't tell us more.)
+
+### 4c — only if explicitly testing other surfaces
+S3 / FUSE / NFS / pNFS commands kept below for reference, but **the
+default perf run is native only.** Add a surface here only when its
+specific change has landed and you need to validate it.
+
+S3 is path-style, no auth: `http://<ip>:9000/<bucket>/<key>`. Cross-node
+smoke: PUT distinct objects (`head -c <size> /dev/urandom`) to one node;
+GET from ANOTHER node; `cmp` to verify; **capture HTTP codes**
+(`curl -w "%{http_code}"`) — a backgrounded `curl -sf` hides 500s. Allow
+a few seconds settle before cross-node GET (Raft composition replication
+lag, else false MISMATCH).
 - NFS / pNFS / FUSE: one mount at a time. **Reads need a pre-written file** — the
   2026-05-27 "NFS read inconclusive" was an `fio --rw=read` over a file that was
   never written. Pre-write a small file, then read it back with `--direct=1` so the

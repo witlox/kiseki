@@ -356,7 +356,13 @@ impl WorkloadParams {
 ///
 /// Mutated through `ControlCommand::SetPlacementPolicy` apply.
 /// Read by every node at boot to drive the resolver.
-#[derive(Clone, Debug, Eq, PartialEq, Default, Serialize, Deserialize)]
+///
+/// `Default` is the [`Self::built_in_default`] policy (tag-first then `Nvme` → `Ssd` →
+/// `DataDir` preference per metadata tier) so a fresh cluster routes
+/// fjall metadata to fast media without an explicit operator
+/// `SetPlacementPolicy` apply. Custom is via
+/// `kiseki-admin topology placement-policy set-store-prefs`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PlacementPolicy {
     /// One [`TierPolicy`] per [`FjallStoreTier`]. The implementer
     /// MUST validate that exactly the four catalog-resolved tiers
@@ -366,17 +372,37 @@ pub struct PlacementPolicy {
     pub tiers: Vec<TierPolicy>,
 }
 
+impl Default for PlacementPolicy {
+    fn default() -> Self {
+        Self::built_in_default()
+    }
+}
+
 impl PlacementPolicy {
-    /// Built-in default policy per ADR-049 §D4 table. Every
-    /// catalog-resolved tier prefers `Nvme → Ssd → DataDir` with
-    /// `BestEffort` mode. `SmallObject` gets the bulk of the fast
-    /// tier (80% target, 50 GiB × `N_nodes` floor); the three
-    /// Metadata-class tiers share an `Auto{30% ceiling, 10 GiB ×
-    /// N floor}` capacity slot via the §D4.5 formula's
-    /// `metadata_budget` clamp.
+    /// Built-in default policy per ADR-049 §D4 table.
+    ///
+    /// `SmallObject` prefers `Tag("fast-small")` first so operators
+    /// can dedicate a small-files disk and avoid contention with the
+    /// hot `IntentStore` latency path. The three Metadata-class tiers
+    /// prefer `Tag("fast-meta")` first for the same reason. Both fall
+    /// back through `Class(Nvme) → Class(Ssd) → DataDir` so single-
+    /// `Nvme` / dev / CI deployments still pick a sensible disk
+    /// without operator tagging.
+    ///
+    /// Capacity slots: `SmallObject` gets the bulk of the fast tier
+    /// (80% target, 50 GiB × `N_nodes` floor); the three Metadata-
+    /// class tiers share an `Auto{30% ceiling, 10 GiB × N floor}`
+    /// slot via the §D4.5 formula's `metadata_budget` clamp.
     #[must_use]
     pub fn built_in_default() -> Self {
-        let prefs = vec![
+        let small_prefs = vec![
+            DeviceMatcher::Tag("fast-small".to_string()),
+            DeviceMatcher::Class(MediaType::Nvme),
+            DeviceMatcher::Class(MediaType::Ssd),
+            DeviceMatcher::DataDir,
+        ];
+        let meta_prefs = vec![
+            DeviceMatcher::Tag("fast-meta".to_string()),
             DeviceMatcher::Class(MediaType::Nvme),
             DeviceMatcher::Class(MediaType::Ssd),
             DeviceMatcher::DataDir,
@@ -395,25 +421,25 @@ impl PlacementPolicy {
             tiers: vec![
                 TierPolicy {
                     tier: FjallStoreTier::SmallObject,
-                    preferences: prefs.clone(),
+                    preferences: small_prefs,
                     mode: PolicyMode::BestEffort,
                     capacity: small_capacity,
                 },
                 TierPolicy {
                     tier: FjallStoreTier::IntentStore,
-                    preferences: prefs.clone(),
+                    preferences: meta_prefs.clone(),
                     mode: PolicyMode::BestEffort,
                     capacity: metadata_capacity.clone(),
                 },
                 TierPolicy {
                     tier: FjallStoreTier::CompositionMeta,
-                    preferences: prefs.clone(),
+                    preferences: meta_prefs.clone(),
                     mode: PolicyMode::BestEffort,
                     capacity: metadata_capacity.clone(),
                 },
                 TierPolicy {
                     tier: FjallStoreTier::ChunkMeta,
-                    preferences: prefs,
+                    preferences: meta_prefs,
                     mode: PolicyMode::BestEffort,
                     capacity: metadata_capacity,
                 },

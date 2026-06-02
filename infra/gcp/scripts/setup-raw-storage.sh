@@ -1,6 +1,17 @@
 #!/bin/bash
 # Setup script for Kiseki storage nodes with RAW block devices.
-# Disks are NOT mounted — Kiseki DeviceBackend manages them directly.
+# Most disks are NOT mounted — Kiseki DeviceBackend manages them
+# directly via the raw-block fast-path. Two devices are peeled off,
+# formatted ext4, and mounted to host the two ADR-049 fjall fast
+# tiers:
+#
+#   /mnt/kiseki-small  ← tag "fast-small"  → SmallObjectStore
+#   /mnt/kiseki-meta   ← tag "fast-meta"   → IntentStore + CompositionMeta + ChunkMeta
+#
+# Splitting small files off the metadata mount removes contention on
+# the hot IntentStore latency path (otherwise SmallObject's LSM
+# compaction storms collide with intent_put fsync on the same NVMe
+# device queue).
 #
 # Variables: node_id, node_ip, all_peers, raft_port, raw_devices, device_class, meta_dir
 set -eo pipefail
@@ -10,6 +21,52 @@ export HOME="$${HOME:-/root}"
 export PATH="$$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$${PATH:-}"
 
 echo "=== Kiseki storage node ${node_id} (${device_class}) ==="
+
+# ADR-049 phase 5a runtime wiring: peel the LAST TWO raw devices off
+# the list and format ext4. The second-to-last becomes the small-files
+# mount (`fast-small`); the last becomes the metadata mount
+# (`fast-meta`). The remaining devices form the chunk-store DevicePool.
+#
+# Trade-off: on c3-standard-22-lssd this drops chunk-store raw
+# capacity from 4×375 GB = 1.5 TB/node to 2×375 GB = 0.75 TB/node.
+# That's the operational cost of isolating IntentStore writes from
+# SmallObject compaction storms — without isolation, intent_put p99
+# tail latency on the hot PUT path was contention-bound.
+IFS=',' read -ra ALL_RAW_DEVS <<< "${raw_devices}"
+NUM_RAW=$${#ALL_RAW_DEVS[@]}
+if [ "$$NUM_RAW" -lt 3 ]; then
+  echo "ERROR: ADR-049 fast-small + fast-meta split requires at least 3 raw devices (have $$NUM_RAW)" >&2
+  exit 1
+fi
+META_DEV="$${ALL_RAW_DEVS[-1]}"
+SMALL_DEV="$${ALL_RAW_DEVS[-2]}"
+unset 'ALL_RAW_DEVS[-1]'
+unset 'ALL_RAW_DEVS[-1]'
+CHUNK_RAW_DEVICES=$(IFS=','; echo "$${ALL_RAW_DEVS[*]}")
+META_MOUNT=/mnt/kiseki-meta
+SMALL_MOUNT=/mnt/kiseki-small
+
+format_and_mount() {
+  local dev="$1"
+  local mount="$2"
+  local label="$3"
+  echo "ADR-049 $$label: $$dev → $$mount (ext4)"
+  mkdir -p "$$mount"
+  if ! blkid "$$dev" 2>/dev/null | grep -q 'TYPE="ext4"'; then
+    mkfs.ext4 -F -L "$$label" -E lazy_itable_init=0,lazy_journal_init=0 "$$dev"
+  fi
+  mount -o noatime,discard "$$dev" "$$mount"
+  chmod 0755 "$$mount"
+  local uuid
+  uuid=$(blkid -s UUID -o value "$$dev")
+  if ! grep -q "$$uuid" /etc/fstab; then
+    echo "UUID=$$uuid $$mount ext4 noatime,discard 0 0" >> /etc/fstab
+  fi
+}
+
+format_and_mount "$$SMALL_DEV" "$$SMALL_MOUNT" kiseki-small
+format_and_mount "$$META_DEV"  "$$META_MOUNT"  kiseki-meta
+echo "Chunk-store raw devices: $$CHUNK_RAW_DEVICES"
 
 # Install runtime dependencies
 dnf install -y --allowerasing openssl-libs unzip iperf3 fio curl bc tar gzip 2>&1 | tail -3
@@ -157,7 +214,7 @@ Environment=KISEKI_DATA_DIR=${meta_dir}
 # entries go via `KISEKI_RAW_DEVICES` above (orthogonal axis per
 # §D11.1). Operator can extend this list when additional mount
 # points are configured.
-Environment=KISEKI_DEVICE_TAGS=${meta_dir}=data-dir-default
+Environment=KISEKI_DEVICE_TAGS=${meta_dir}=data-dir-default,$$SMALL_MOUNT=fast-small,$$META_MOUNT=fast-meta
 # ADR-049 §D2.5: Raft log path is bootstrap-only — never resolver-
 # routed. Defaults to `${meta_dir}/raft` when unset; we set it
 # explicitly so an operator changing `KISEKI_DATA_DIR` later
@@ -176,8 +233,10 @@ Environment=KISEKI_NODE_ID=${node_id}
 Environment=KISEKI_RAFT_PEERS=${all_peers}
 Environment=KISEKI_RAFT_ADDR=${node_ip}:${raft_port}
 
-# Raw device paths for DeviceBackend (comma-separated)
-Environment=KISEKI_RAW_DEVICES=${raw_devices}
+# Raw device paths for DeviceBackend (comma-separated). One device
+# has been peeled off for ADR-049 fast-tier metadata mount above;
+# this list excludes it.
+Environment=KISEKI_RAW_DEVICES=$$CHUNK_RAW_DEVICES
 
 # Raft runtime threads — needs to exceed max concurrent writes to avoid
 # blocking on redb I/O in the state machine apply path.

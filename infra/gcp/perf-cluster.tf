@@ -60,9 +60,11 @@ variable "profile" {
   description = <<-EOT
     Cluster profile — selects the shape *and* which benchmark suite the ctrl runs:
 
-      "default"   — broad coverage. 6 × c3-standard-22 storage with 4 × local NVMe each
-                    (1.5 TB / node), 3 × c3-standard-22 client. 6 nodes ≥ EC-4+2 minimum,
-                    pure-NVMe device pool, Tier_1 50 Gbps. Runs perf-suite.sh.
+      "default"   — broad coverage. 6 × c3-standard-22 storage with 4 × local NVMe each:
+                    2 NVMe as raw chunk pool (0.75 TB), 1 NVMe ext4 → /mnt/kiseki-small
+                    (SmallObjectStore), 1 NVMe ext4 → /mnt/kiseki-meta (3 metadata fjall
+                    keyspaces). 3 × c3-standard-22 client. 6 nodes ≥ EC-4+2 minimum,
+                    Tier_1 50 Gbps. Runs perf-suite.sh.
       "transport" — protocol/NIC ceiling. 3 × c3-standard-88 storage with 8 × local NVMe
                     each (3 TB / node), 3 × c3-standard-44 client. Tier_1 100 Gbps, disks
                     deliberately faster than the wire so any cap is gateway/grpc, not I/O.
