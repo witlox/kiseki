@@ -1325,7 +1325,14 @@ impl LogOps for RaftShardStore {
             tracing::warn!(error = %e, "log append_chunk_and_delta: shard lookup failed");
         })?;
         store
-            .append_chunk_and_delta(req.delta, req.new_chunks)
+            .append_chunk_and_delta(
+                req.delta,
+                req.new_chunks,
+                req.inline_payloads
+                    .into_iter()
+                    .map(|(c, b)| (c.0, b))
+                    .collect(),
+            )
             .await
             .inspect_err(|e| {
                 log_append_err(e, "log append_chunk_and_delta");
@@ -1346,7 +1353,14 @@ impl LogOps for RaftShardStore {
             );
         })?;
         store
-            .append_chunk_and_delta_with_forwarding(req.delta, req.new_chunks)
+            .append_chunk_and_delta_with_forwarding(
+                req.delta,
+                req.new_chunks,
+                req.inline_payloads
+                    .into_iter()
+                    .map(|(c, b)| (c.0, b))
+                    .collect(),
+            )
             .await
             .inspect_err(|e| {
                 log_append_err(e, "log append_chunk_and_delta_with_forwarding");

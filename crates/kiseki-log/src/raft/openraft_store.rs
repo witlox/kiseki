@@ -576,6 +576,7 @@ impl OpenRaftLogStore {
         &self,
         req: AppendDeltaRequest,
         new_chunks: Vec<crate::raft_store::NewChunkMeta>,
+        inline_payloads: Vec<([u8; 32], Vec<u8>)>,
     ) -> Result<SequenceNumber, LogError> {
         {
             let inner = self.state.lock().await;
@@ -592,6 +593,7 @@ impl OpenRaftLogStore {
             payload: req.payload,
             has_inline_data: req.has_inline_data,
             new_chunks,
+            inline_payloads,
         };
 
         let resp = self.raft.client_write(cmd).await.map_err(|e| {
@@ -670,6 +672,7 @@ impl OpenRaftLogStore {
         &self,
         req: AppendDeltaRequest,
         new_chunks: Vec<crate::raft_store::NewChunkMeta>,
+        inline_payloads: Vec<([u8; 32], Vec<u8>)>,
     ) -> Result<SequenceNumber, LogError> {
         {
             let inner = self.state.lock().await;
@@ -686,6 +689,7 @@ impl OpenRaftLogStore {
             payload: req.payload,
             has_inline_data: req.has_inline_data,
             new_chunks,
+            inline_payloads,
         };
 
         let resp = self

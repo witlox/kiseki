@@ -67,6 +67,15 @@ pub enum LogCommand {
         /// `(tenant_id, chunk_id)`. Empty list means "delta only,
         /// no new chunks" (e.g., delete operation).
         new_chunks: Vec<NewChunkMeta>,
+        /// #129 — inline small-file payloads written to each
+        /// replica's `InlineStore` at apply time. `(chunk_id,
+        /// env_bytes)` per entry; the gateway read path resolves
+        /// `chunk_refs[i]` via `small_store.get(&chunk_id.0)`
+        /// first before falling back to the chunk store. Empty
+        /// for non-inline writes — pre-prod wipe-and-redeploy
+        /// clears persisted history of the legacy
+        /// `has_inline_data` offload path.
+        inline_payloads: Vec<([u8; 32], Vec<u8>)>,
     },
     /// Increment the refcount of an existing `cluster_chunk_state`
     /// entry. Used when a second composition references an already-
@@ -168,6 +177,9 @@ pub enum LogCommand {
         /// The committer-assigned perspective-seq for this intent (mandatory —
         /// this variant is only ever produced by the async-commit path).
         perspective_seq: kiseki_common::time::HybridLogicalClock,
+        /// #129 — inline small-file payloads (see
+        /// [`Self::ChunkAndDelta::inline_payloads`]).
+        inline_payloads: Vec<([u8; 32], Vec<u8>)>,
     },
     /// ADR-047 PART 8 §U — batched async-committed intents.
     ///
@@ -212,6 +224,9 @@ pub struct IncorporateItem {
     pub new_chunks: Vec<NewChunkMeta>,
     /// The committer-assigned perspective-seq for this intent.
     pub perspective_seq: kiseki_common::time::HybridLogicalClock,
+    /// #129 — inline small-file payloads (see
+    /// [`LogCommand::ChunkAndDelta::inline_payloads`]).
+    pub inline_payloads: Vec<([u8; 32], Vec<u8>)>,
 }
 
 /// New `cluster_chunk_state` entry to be created as part of a
@@ -478,6 +493,7 @@ impl RaftLogStore {
                 payload,
                 has_inline_data,
                 new_chunks: _,
+                inline_payloads: _,
             }
             | LogCommand::IncorporateIntent {
                 tenant_id_bytes,
@@ -488,6 +504,7 @@ impl RaftLogStore {
                 has_inline_data,
                 new_chunks: _,
                 perspective_seq: _,
+                inline_payloads: _,
             } => {
                 // The simple in-memory RaftLogStore doesn't track
                 // cluster_chunk_state — that lives in the openraft
@@ -923,6 +940,7 @@ mod tests {
                 payload: vec![],
                 has_inline_data: false,
                 new_chunks: vec![],
+                inline_payloads: vec![],
             }),
             1,
             "ChunkAndDelta must stay variant 1"
@@ -938,6 +956,7 @@ mod tests {
                 has_inline_data: false,
                 new_chunks: vec![],
                 perspective_seq: kiseki_common::time::HybridLogicalClock::zero(NodeId(0)),
+                inline_payloads: vec![],
             }),
             9,
             "IncorporateIntent index pinned at 9 since ADR-047 phase 5a"
@@ -977,6 +996,7 @@ mod tests {
                     has_inline_data: true,
                     new_chunks: vec![],
                     perspective_seq: seq_a,
+                    inline_payloads: vec![],
                 },
                 IncorporateItem {
                     tenant_id_bytes: [0xAB; 16],
@@ -987,6 +1007,7 @@ mod tests {
                     has_inline_data: false,
                     new_chunks: vec![],
                     perspective_seq: seq_b,
+                    inline_payloads: vec![],
                 },
             ],
         };
@@ -1020,6 +1041,7 @@ mod tests {
             has_inline_data: true,
             new_chunks: vec![],
             perspective_seq: seq,
+            inline_payloads: vec![],
         };
         let bytes = postcard::to_stdvec(&cmd).expect("encode");
         let back: LogCommand = postcard::from_bytes(&bytes).expect("decode");

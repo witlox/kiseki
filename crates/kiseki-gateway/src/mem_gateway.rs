@@ -2265,6 +2265,7 @@ impl GatewayOps for InMemoryGateway {
                 Vec::new(),
                 payload,
                 Vec::new(),
+                Vec::new(),
             )
             .await
             .map_err(|e| {
@@ -2672,6 +2673,14 @@ impl InMemoryGateway {
         // Staged envelopes alongside `landed`, indexed by piece. For
         // dedup-hit chunks the slot is `None` (no write to issue).
         let mut staged_envelopes: Vec<Option<envelope::Envelope>> = Vec::with_capacity(pieces_len);
+        // #129 — inline small-file ciphertexts collected during the
+        // per-piece loop. When non-empty these ride on the
+        // `AppendChunkAndDeltaRequest.inline_payloads` field; each
+        // replica's state-machine apply writes them to its local
+        // SmallObjectStore (ADR-022 rev-5) keyed by `chunk_id`
+        // (ADR-030 §2 canonical key). Multi-node-correct: a GET on
+        // any replica resolves the bytes from its local small store.
+        let mut inline_payloads_for_delta: Vec<(kiseki_common::ids::ChunkId, Vec<u8>)> = Vec::new();
 
         for piece in raw_pieces {
             // ADR-047 hot-path timer (per-piece chunk-id derivation —
@@ -2784,8 +2793,19 @@ impl InMemoryGateway {
                             tracing::debug!(
                                 ?chunk_id,
                                 inline_threshold = self.inline_threshold,
-                                "gateway write: inline path",
+                                "gateway write: inline path (local put + staged for delta)",
                             );
+                            // #129 — ALSO stage the inline ciphertext on
+                            // the delta so non-leader replicas write it
+                            // to their local SmallObjectStore via SM
+                            // apply (keyed by `chunk_id`, ADR-030 §2).
+                            // The local put above is the single-node /
+                            // leader-side write that keeps the existing
+                            // single-host path snappy; the delta-borne
+                            // copy is what makes cross-node GET work in
+                            // a multi-node cluster. Both writes are
+                            // idempotent on the chunk_id key.
+                            inline_payloads_for_delta.push((chunk_id, env_bytes));
                             took_inline = true;
                         }
                         Err(e) => {
@@ -3112,7 +3132,7 @@ impl InMemoryGateway {
                 // the AppendChunkAndDeltaRequest construction including
                 // the chunk-refs / new-chunks copies it folds in.
                 let append = kiseki_tracing::hot_span!("gw.build_append", {
-                    kiseki_composition::log_bridge::build_chunk_and_delta_request(
+                    let mut a = kiseki_composition::log_bridge::build_chunk_and_delta_request(
                         shard_id,
                         emit_params.1,
                         kiseki_log::delta::OperationType::Create,
@@ -3120,7 +3140,13 @@ impl InMemoryGateway {
                         emit_params.3.clone(),
                         async_comp_payload,
                         new_chunks.clone(),
-                    )
+                    );
+                    // #129 — attach inline ciphertexts so each replica's
+                    // state-machine apply writes them to its local
+                    // SmallObjectStore (ADR-030 §2 keyed by chunk_id).
+                    a.delta.has_inline_data = !inline_payloads_for_delta.is_empty();
+                    a.inline_payloads.clone_from(&inline_payloads_for_delta);
+                    a
                 });
                 // Idempotency: reuse the request-supplied key when it is
                 // exactly 16 bytes (the intent key width); otherwise `None`
@@ -3319,6 +3345,7 @@ impl InMemoryGateway {
                 emit_params.3,
                 comp_payload,
                 new_chunks,
+                std::mem::take(&mut inline_payloads_for_delta),
             )
             .await;
             self.observe_put_phase("raft_commit", raft_commit_started.elapsed());

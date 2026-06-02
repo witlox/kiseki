@@ -489,6 +489,25 @@ impl ShardSmInner {
         kiseki_tracing::hot_span!("sm.apply_new_chunks", {
             self.apply_new_chunks(&item.tenant_id_bytes, &item.new_chunks, log_index);
         });
+        // #129: inline small-file payloads write to the local
+        // InlineStore keyed by chunk_id (ADR-030 §2 canonical key).
+        // Same as the ChunkAndDelta apply branch above — every
+        // replica that applies this intent gets the bytes locally
+        // so the gateway read path on ANY node finds them via
+        // small_store.get(&chunk_id.0).
+        if !item.inline_payloads.is_empty() {
+            if let Some(ref store) = self.inline_store {
+                for (chunk_id, bytes) in &item.inline_payloads {
+                    if let Err(e) = store.put(chunk_id, bytes) {
+                        tracing::warn!(
+                            chunk_id = ?chunk_id,
+                            error = %e,
+                            "sm.apply_one_incorporate: inline_store.put failed (#129); fallback via chunk tier",
+                        );
+                    }
+                }
+            }
+        }
         // ADR-047 hot-path timer (sm.append_delta_inner) — THE
         // per-apply cost: tip bump + delta append + (optional)
         // inline offload. Per the escalation this is one of the
@@ -675,12 +694,32 @@ impl ShardSmInner {
                 payload,
                 has_inline_data,
                 new_chunks,
+                inline_payloads,
             } => {
                 // Atomic per D-4 round 2: chunk_meta entries are
                 // created BEFORE the delta is appended so a reader
                 // observing the delta after this apply step always
                 // finds the corresponding cluster_chunk_state.
                 self.apply_new_chunks(tenant_id_bytes, new_chunks, log_index);
+                // #129: write inline small-file payloads to the
+                // local inline store keyed by chunk_id (ADR-030
+                // §2 canonical key). Every replica that applies
+                // this entry executes this branch, so the gateway
+                // read path on ANY node finds the bytes locally
+                // via `small_store.get(&chunk_id.0)`.
+                if !inline_payloads.is_empty() {
+                    if let Some(ref store) = self.inline_store {
+                        for (chunk_id, bytes) in inline_payloads {
+                            if let Err(e) = store.put(chunk_id, bytes) {
+                                tracing::warn!(
+                                    chunk_id = ?chunk_id,
+                                    error = %e,
+                                    "sm.apply: inline_store.put failed (#129); write replicated via chunk tier fallback",
+                                );
+                            }
+                        }
+                    }
+                }
                 let tip = self.append_delta_inner(
                     tenant_id_bytes,
                     *operation,
@@ -716,6 +755,7 @@ impl ShardSmInner {
                 has_inline_data,
                 new_chunks,
                 perspective_seq,
+                inline_payloads,
             } => {
                 let item = IncorporateItem {
                     tenant_id_bytes: *tenant_id_bytes,
@@ -726,6 +766,7 @@ impl ShardSmInner {
                     has_inline_data: *has_inline_data,
                     new_chunks: new_chunks.clone(),
                     perspective_seq: *perspective_seq,
+                    inline_payloads: inline_payloads.clone(),
                 };
                 let tip = self.apply_one_incorporate(&item, log_index, now_ms);
                 LogResponse::Appended(tip)
@@ -1112,6 +1153,70 @@ mod tests {
         [b; 32]
     }
 
+    /// #129 — applying `LogCommand::ChunkAndDelta` with
+    /// `inline_payloads` writes each (chunk_id, bytes) pair into the
+    /// SM's local `InlineStore` (keyed by chunk_id, ADR-030 §2). This
+    /// is the multi-node correctness contract for the inline write
+    /// path: every replica's SM apply lands the bytes on its local
+    /// SmallObjectStore so a cross-node GET resolves locally.
+    #[test]
+    fn chunk_and_delta_with_inline_payloads_writes_to_local_inline_store() {
+        use kiseki_common::inline_store::InlineStore;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct CapturingInlineStore {
+            puts: Mutex<Vec<([u8; 32], Vec<u8>)>>,
+        }
+        impl InlineStore for CapturingInlineStore {
+            fn put(&self, key: &[u8; 32], data: &[u8]) -> std::io::Result<bool> {
+                self.puts.lock().unwrap().push((*key, data.to_vec()));
+                Ok(true)
+            }
+            fn get(&self, _: &[u8; 32]) -> std::io::Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn delete(&self, _: &[u8; 32]) -> std::io::Result<bool> {
+                Ok(false)
+            }
+        }
+
+        let store = std::sync::Arc::new(CapturingInlineStore::default());
+        let mut inner = fresh_inner();
+        inner.inline_store = Some(std::sync::Arc::clone(&store) as std::sync::Arc<dyn InlineStore>);
+
+        let tenant = org(7);
+        let chunk_a = chunk(0xA1);
+        let chunk_b = chunk(0xB2);
+        let cmd = LogCommand::ChunkAndDelta {
+            tenant_id_bytes: tenant,
+            operation: 0,
+            hashed_key: [0x11; 32],
+            chunk_refs: vec![chunk_a, chunk_b],
+            payload: vec![],
+            // false so the legacy `derive_inline_key`-keyed offload
+            // (pre-#129, hashed_key XOR seq) does NOT fire — this
+            // test asserts only the #129 chunk_id-keyed path.
+            has_inline_data: false,
+            new_chunks: vec![],
+            inline_payloads: vec![
+                (chunk_a, vec![0xDE, 0xAD, 0xBE, 0xEF]),
+                (chunk_b, vec![0xCA, 0xFE]),
+            ],
+        };
+        let _ = inner.apply_command(&cmd, 1);
+
+        let puts = store.puts.lock().unwrap();
+        assert_eq!(puts.len(), 2, "both inline payloads must reach store");
+        assert_eq!(
+            puts[0].0, chunk_a,
+            "first put keyed by chunk_id (ADR-030 §2)"
+        );
+        assert_eq!(puts[0].1, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(puts[1].0, chunk_b);
+        assert_eq!(puts[1].1, vec![0xCA, 0xFE]);
+    }
+
     /// Combined proposal: delta append + chunk meta create.
     /// Applying must produce BOTH a new delta AND a new
     /// `cluster_chunk_state` entry — atomically, in a single apply
@@ -1133,6 +1238,7 @@ mod tests {
                 placement: vec![1, 2, 3],
                 original_len: 1024,
             }],
+            inline_payloads: vec![],
         };
 
         let _ = inner.apply_command(&cmd, 1);
@@ -1182,6 +1288,7 @@ mod tests {
                     placement: vec![1, 2, 3],
                     original_len: 0,
                 }],
+                inline_payloads: vec![],
             };
             let _ = inner.apply_command(&cmd, 1);
         }
@@ -1223,6 +1330,7 @@ mod tests {
                     placement: vec![1, 2, 3],
                     original_len: 0,
                 }],
+                inline_payloads: vec![],
             },
             1,
         );
@@ -1262,6 +1370,7 @@ mod tests {
                     placement: vec![1, 2, 3],
                     original_len: 0,
                 }],
+                inline_payloads: vec![],
             },
             1,
         );
@@ -1309,6 +1418,7 @@ mod tests {
             has_inline_data: false,
             new_chunks: vec![],
             perspective_seq: seq,
+            inline_payloads: vec![],
         }
     }
 
@@ -1567,6 +1677,7 @@ mod tests {
                     has_inline_data: false,
                     new_chunks: vec![],
                     perspective_seq: already_seq,
+                    inline_payloads: vec![],
                 },
                 IncorporateItem {
                     tenant_id_bytes: tenant,
@@ -1577,6 +1688,7 @@ mod tests {
                     has_inline_data: false,
                     new_chunks: vec![],
                     perspective_seq: fresh_seq,
+                    inline_payloads: vec![],
                 },
                 // Ancient: log_index for the WHOLE batch is below the cutoff
                 // (the apply uses the entry's log_index for every item — by
@@ -1591,6 +1703,7 @@ mod tests {
                     has_inline_data: false,
                     new_chunks: vec![],
                     perspective_seq: hlc(60, 0, 1),
+                    inline_payloads: vec![],
                 },
             ],
         };

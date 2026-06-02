@@ -95,6 +95,20 @@ Feature: Dynamic small-file placement and metadata capacity (ADR-030)
     Then 10 orphan entries are detected
     And an alert is emitted for investigation
 
+  # === #129 — multi-node inline correctness ===
+
+  @integration
+  Scenario: Inline small file PUT on node 1 is GET-able on node 3
+    Given a 3-node Kiseki cluster
+    And every node has its SmallObjectStore mounted
+    When a 1 KB inline-eligible object is PUT through the gateway on node 1
+    Then the AppendChunkAndDeltaRequest carries the ciphertext in inline_payloads
+    And the Raft state-machine apply on every replica writes the ciphertext to its local SmallObjectStore keyed by chunk_id
+    When the same object is GET through the gateway on node 3
+    Then the gateway resolves the bytes from node 3's local SmallObjectStore
+    And the returned bytes are identical to the PUT bytes
+    And no chunk-fabric round-trip is made for the read
+
   # === Workload-driven shard placement ===
 
   @library

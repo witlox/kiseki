@@ -110,6 +110,12 @@ impl<A: IntentLogAppender> IncorporationSink for RaftLogIncorporationSink<A> {
                 has_inline_data: intent.append.delta.has_inline_data,
                 new_chunks: intent.append.new_chunks.clone(),
                 perspective_seq: intent.perspective_seq.0,
+                inline_payloads: intent
+                    .append
+                    .inline_payloads
+                    .iter()
+                    .map(|(c, b)| (c.0, b.clone()))
+                    .collect(),
             })
             .collect();
         block_on_maybe_in_place(&self.handle, self.appender.append_intents(items))
@@ -174,6 +180,7 @@ mod tests {
                     has_inline_data: false,
                 },
                 new_chunks: vec![],
+                inline_payloads: vec![],
             },
         }
     }
