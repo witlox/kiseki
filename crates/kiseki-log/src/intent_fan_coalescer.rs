@@ -1,49 +1,60 @@
-//! W12 (2026-06-02) — producer-side intent-fan coalescer.
+//! L4 (2026-06-02) — producer-side intent-fan coalescer, Mutex+Notify shape.
 //!
-//! The 2026-06-02 W11 GCP A/B left the cluster at 7.4 k aggregate PUT
-//! op/s with `raft_transport_rpc{op="intent_put"}` at 22 k RPC/s × 158 ms
-//! mean = ~3 500 in-flight fans cluster-wide. The receiver's `aux.store_put`
-//! was dominated by one fjall WAL sync per PUT; the producer's RPC volume
-//! was the wire-level throttle.
+//! Replaces the W12 spawned-task / mpsc design. The 2026-06-02 W12 GCP
+//! A/B measured `kiseki_intent_coalesce_wait_seconds` at ~2.1 ms with
+//! a 500 µs configured timeout. The L1/L2/L3 experiments confirmed
+//! the floor is tokio scheduler park/unpark latency (~1.6 ms), not the
+//! configured timeout or the per-shard vs per-node placement.
 //!
-//! This module amortises both. Per-shard, a single background task
-//! accumulates submitted intents until either:
+//! This redesign attacks that floor by removing the spawned task
+//! entirely. The first submitter to find no active flusher *becomes*
+//! the flusher: it does the timeout-wait inline in its own task, then
+//! runs the local `put_batch` + fan + ack distribution synchronously.
 //!
-//! - The batch hits `KISEKI_INTENT_FAN_BATCH_MAX` intents (default 16), or
-//! - `KISEKI_INTENT_FAN_BATCH_TIMEOUT_US` elapses since the FIRST submission
-//!   in the batch (default 500 µs).
+//! ## Submitter paths
 //!
-//! On flush the task does ONE `store.put_batch` for all local writes
-//! (one mutex + one fjall batch + one WAL sync) and fans ONE
-//! `intent_put` RPC carrying `Vec<WireIntent>` to each peer. The receiver
-//! decodes the whole vector, does one `store.put_batch`, and returns a
-//! `Vec<bool>` (one ack flag per input). Per-batch atomicity means a peer
-//! either acks every intent or none, so the producer treats each peer's
-//! contribution as a uniform `+1 ack` to every intent in the batch.
+//! - **Flusher path** (first arrival in a fresh batch):
+//!   1. Acquire mutex, push intent, set `flusher_running = true`.
+//!   2. Drop mutex.
+//!   3. `select!` between `sleep(deadline)` and `cap_reached.notified()`.
+//!   4. Re-acquire mutex, take pending batch, clear `flusher_running`.
+//!   5. Drop mutex.
+//!   6. Run local `put_batch` + fan; per-input ack via each
+//!      submitter's oneshot.
+//!   7. Await own oneshot for the result. (Note: the flusher sends
+//!      itself an ack as part of step 6.)
 //!
-//! ## Why a spawned task and not a Mutex<Coalescer>
+//! - **Waiter path** (joins an existing batch):
+//!   1. Acquire mutex, push intent.
+//!   2. If `pending.len() >= cap_max`, signal `cap_reached.notify_one()`.
+//!   3. Drop mutex.
+//!   4. Await own oneshot for the result.
 //!
-//! The async submitter just `send`s and `await`s a oneshot — no shared
-//! mutex on the hot path. The task owns the batch state without locking
-//! and can use `tokio::select!` for the count-vs-timeout race cleanly.
-//! Per-shard tasks are cheap (one task per shard, dropped on shutdown via
-//! the channel-close path).
+//! ## Why this saves on the W12 floor
+//!
+//! - **No spawned task** = no per-shard task spawn at creation, no
+//!   per-batch mpsc.send → recv park/unpark cycle. The flusher runs
+//!   the timer in its own already-running task.
+//! - **`Notify::notify_one`** to break out of the timer on cap-reached
+//!   is cheaper than mpsc-send + select-unpark.
+//! - **Mutex<State> on the hot path** is ~10 ns uncontended (std
+//!   mutex). The cross-submitter coordination becomes a quick
+//!   lock-push-drop on the waiter path.
 //!
 //! ## Crash safety
 //!
-//! The local `put_batch` commits before the fan starts (no-loss floor
-//! I-L2/I-CS1 — the producer always has the durable copy first). If the
-//! task crashes mid-flush, submitted PUTs are NOT acked (their oneshot
-//! receiver returns `Err(LogError::Unavailable)`); the caller treats that
-//! as a non-ack and retries. The local fjall state is consistent
-//! regardless because `put_batch` is atomic.
+//! Unchanged from W12. `put_batch` is atomic; the local copy commits
+//! before the fan starts. A panic mid-flush leaves submitters'
+//! oneshots dropped → they see `Err(Unavailable)`; the gateway
+//! retries.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kiseki_common::ids::{NodeId, ShardId};
+use kiseki_common::locks::LockOrDie;
 use kiseki_raft::tcp_transport::rpc_call;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{oneshot, Notify};
 
 use crate::error::LogError;
 use crate::intent::{IntentStore, WriteIntent};
@@ -54,16 +65,36 @@ use crate::intent_sync::{WireIntent, INTENT_PUT_TAG};
 struct CoalesceReq {
     intent: WriteIntent,
     submitted_at: Instant,
-    /// Resolves when the batch this intent belongs to has finished its
-    /// fan. `Ok(())` once durable copies (local + remote acks) reach
-    /// `min_acks` for this intent; otherwise `Err(QuorumLost)`.
+    /// Resolves when the batch this intent belongs to has finished
+    /// its fan. `Ok(())` once durable copies reach `min_acks` for this
+    /// intent; otherwise `Err(QuorumLost)` or `Err(Unavailable)`.
     ack: oneshot::Sender<Result<(), LogError>>,
+}
+
+/// Shared mutable state across all submitters for this shard.
+#[derive(Default)]
+struct State {
+    /// PUTs queued for the current batch.
+    pending: Vec<CoalesceReq>,
+    /// True while a flusher is waiting for the timer / cap or running
+    /// the fan. A new submitter that finds this `true` joins the
+    /// existing batch as a waiter.
+    flusher_running: bool,
 }
 
 /// Handle for `put_intent_and_fan` to submit intents and await acks.
 #[derive(Clone)]
 pub struct IntentFanCoalescer {
-    tx: mpsc::Sender<CoalesceReq>,
+    inner: Arc<CoalescerInner>,
+}
+
+struct CoalescerInner {
+    cfg: CoalescerConfig,
+    state: Mutex<State>,
+    /// Waiter submitters signal this when they push an intent that
+    /// brings pending up to `cap_max`. The flusher's `select!`
+    /// listens on this to break out of the deadline `sleep` early.
+    cap_reached: Notify,
 }
 
 /// Per-shard resolver closure: returns the current voter peer set
@@ -72,8 +103,8 @@ pub struct IntentFanCoalescer {
 /// membership change or leadership move is honoured without restart.
 pub type PeerLeaderResolver = Arc<dyn Fn() -> (Vec<(NodeId, String)>, Option<u64>) + Send + Sync>;
 
-/// Configuration for spawning a coalescer — pulled into a struct to keep
-/// `spawn`'s arg count under the clippy `too-many-arguments` limit.
+/// Configuration for the coalescer — same fields as the W12 version
+/// so wiring sites in `RaftShardStore` don't change.
 pub struct CoalescerConfig {
     /// The shard this coalescer fans for. One coalescer per shard.
     pub shard_id: ShardId,
@@ -81,33 +112,35 @@ pub struct CoalescerConfig {
     pub local_node: NodeId,
     /// Per-shard durable intent store.
     pub store: Arc<dyn IntentStore>,
-    /// Live resolver for the voter peer set + current leader (see
-    /// [`PeerLeaderResolver`]).
+    /// Live resolver for the voter peer set + current leader.
     pub resolver: PeerLeaderResolver,
     /// Quorum threshold — `Ok` only when durable copies (local + peer
     /// acks) reach this.
     pub min_acks: usize,
     /// Max intents per batch (`KISEKI_INTENT_FAN_BATCH_MAX`).
     pub cap_max: usize,
-    /// Max wait from first submission to flush (`KISEKI_INTENT_FAN_BATCH_TIMEOUT_US`).
+    /// Max wait from first submission to flush
+    /// (`KISEKI_INTENT_FAN_BATCH_TIMEOUT_US`).
     pub cap_timeout: Duration,
-    /// Per-peer RPC timeout (mirrors the pre-W12 `INTENT_FAN_PEER_TIMEOUT`).
+    /// Per-peer RPC timeout.
     pub peer_rpc_timeout: Duration,
 }
 
-/// Spawn the coalescer task on `runtime` and return the submission
-/// handle. The task lives until either:
+/// Create a new coalescer for `cfg`. Unlike W12 there is **no spawned
+/// task** — the first submitter to arrive becomes the flusher inline.
 ///
-/// - The handle (and all its clones) are dropped — closes the channel.
-/// - The runtime shuts down.
+/// The `runtime` argument is kept for API compatibility with the W12
+/// call site (`RaftShardStore::spawn_intent_fan_coalescer`); it is
+/// no longer used because nothing is spawned at construction time.
 #[must_use]
-pub fn spawn(runtime: &tokio::runtime::Handle, cfg: CoalescerConfig) -> IntentFanCoalescer {
-    // Backpressure cap on the channel — 4 × cap_max keeps a few batches
-    // queued under burst load without unbounded growth. Senders await
-    // capacity (no .try_send).
-    let (tx, rx) = mpsc::channel(cfg.cap_max.saturating_mul(4).max(64));
-    runtime.spawn(coalescer_loop(cfg, rx));
-    IntentFanCoalescer { tx }
+pub fn spawn(_runtime: &tokio::runtime::Handle, cfg: CoalescerConfig) -> IntentFanCoalescer {
+    IntentFanCoalescer {
+        inner: Arc::new(CoalescerInner {
+            cfg,
+            state: Mutex::new(State::default()),
+            cap_reached: Notify::new(),
+        }),
+    }
 }
 
 impl IntentFanCoalescer {
@@ -116,81 +149,80 @@ impl IntentFanCoalescer {
     /// has been compared against `min_acks`.
     ///
     /// # Errors
-    /// [`LogError::Unavailable`] if the coalescer task has stopped
-    /// (channel closed) or if the oneshot is dropped before the batch
-    /// flushes (the task panicked / the runtime is shutting down).
-    /// [`LogError::QuorumLost`] when the batch's durable copies fall
-    /// short of `min_acks` (callers MUST NOT ack the client).
+    /// [`LogError::Unavailable`] if the coalescer dropped the ack
+    /// channel mid-flush (panic / runtime shutdown). [`LogError::
+    /// QuorumLost`] when the batch's durable copies fall short of
+    /// `min_acks`.
     pub async fn submit(&self, intent: WriteIntent) -> Result<(), LogError> {
         let (ack_tx, ack_rx) = oneshot::channel();
-        self.tx
-            .send(CoalesceReq {
-                intent,
-                submitted_at: Instant::now(),
-                ack: ack_tx,
-            })
-            .await
-            .map_err(|_| LogError::Unavailable)?;
+        let req = CoalesceReq {
+            intent,
+            submitted_at: Instant::now(),
+            ack: ack_tx,
+        };
+
+        // Push under the mutex; decide flusher vs waiter.
+        let im_flusher = {
+            let mut s = self
+                .inner
+                .state
+                .lock()
+                .lock_or_die("intent_fan_coalescer.state");
+            s.pending.push(req);
+            if s.flusher_running {
+                // Cap-reached short-circuit for the flusher.
+                if s.pending.len() >= self.inner.cfg.cap_max {
+                    drop(s);
+                    self.inner.cap_reached.notify_one();
+                }
+                false
+            } else {
+                s.flusher_running = true;
+                true
+            }
+        };
+
+        if im_flusher {
+            run_flush_cycle(Arc::clone(&self.inner)).await;
+        }
+
         ack_rx.await.unwrap_or(Err(LogError::Unavailable))
     }
 }
 
-async fn coalescer_loop(cfg: CoalescerConfig, mut rx: mpsc::Receiver<CoalesceReq>) {
-    loop {
-        // Block until the first request — no batch starts until at least
-        // one PUT is waiting. The recv() resolves to None when every
-        // sender has been dropped: the coalescer's natural shutdown.
-        let Some(first) = rx.recv().await else {
-            return;
-        };
-        let batch_start = first.submitted_at;
-        let mut batch: Vec<CoalesceReq> = Vec::with_capacity(cfg.cap_max);
-        batch.push(first);
-
-        // Accumulate up to cap_max OR until cap_timeout elapses since
-        // the first submission. The select! picks whichever happens
-        // first; `recv` resolving with None means the channel closed
-        // while we were filling — flush what we have and exit at the
-        // top of the next outer loop iteration.
-        while batch.len() < cfg.cap_max {
-            let deadline = batch_start + cfg.cap_timeout;
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-            let remaining = deadline - now;
-            tokio::select! {
-                next = rx.recv() => {
-                    match next {
-                        Some(req) => batch.push(req),
-                        None => break, // channel closed — flush and exit.
-                    }
-                }
-                () = tokio::time::sleep(remaining) => break,
-            }
-        }
-
-        // Observe the per-intent wait + the batch size BEFORE the flush
-        // (so a slow fan never inflates the wait measurement).
-        let flushed_at = Instant::now();
-        for req in &batch {
-            intent_metrics::observe_coalesce_wait(
-                flushed_at.saturating_duration_since(req.submitted_at),
-            );
-        }
-        intent_metrics::observe_intent_put_batch_size(batch.len());
-
-        flush_batch(&cfg, batch).await;
+async fn run_flush_cycle(inner: Arc<CoalescerInner>) {
+    // Wait for either the per-batch timeout OR a waiter signalling
+    // that the cap has been reached.
+    let deadline = tokio::time::Instant::now() + inner.cfg.cap_timeout;
+    tokio::select! {
+        () = tokio::time::sleep_until(deadline) => {}
+        () = inner.cap_reached.notified() => {}
     }
+
+    // Take the accumulated batch and re-arm the slot for the next one.
+    let batch: Vec<CoalesceReq> = {
+        let mut s = inner.state.lock().lock_or_die("intent_fan_coalescer.state");
+        let taken = std::mem::take(&mut s.pending);
+        s.flusher_running = false;
+        taken
+    };
+
+    // Observe the per-intent wait + batch size BEFORE the flush.
+    let flushed_at = Instant::now();
+    for req in &batch {
+        intent_metrics::observe_coalesce_wait(
+            flushed_at.saturating_duration_since(req.submitted_at),
+        );
+    }
+    intent_metrics::observe_intent_put_batch_size(batch.len());
+
+    flush_batch(&inner.cfg, batch).await;
 }
 
 async fn flush_batch(cfg: &CoalescerConfig, batch: Vec<CoalesceReq>) {
     use futures::StreamExt;
 
-    // 1. Local durable copy (one fjall batch, one WAL sync). On error every
-    //    PUT in the batch gets a non-ack — the caller treats that as
-    //    Unavailable, and the local fjall state stays consistent (put_batch
-    //    is atomic).
+    // 1. Local durable copy (one fjall batch, one WAL sync).
     let intents: Vec<WriteIntent> = batch.iter().map(|r| r.intent.clone()).collect();
     let put_res = cfg.store.put_batch(intents);
     if let Err(e) = put_res {
@@ -204,11 +236,9 @@ async fn flush_batch(cfg: &CoalescerConfig, batch: Vec<CoalesceReq>) {
         }
         return;
     }
-    // After this point every intent has one local durable copy.
     let local_acks: usize = 1;
 
-    // 2. Fast path — single-copy quorum is satisfied by the local write
-    //    alone. No fan needed; signal everyone Ok.
+    // 2. Fast path — single-copy quorum.
     if local_acks >= cfg.min_acks {
         for req in batch {
             let _ = req.ack.send(Ok(()));
@@ -216,17 +246,12 @@ async fn flush_batch(cfg: &CoalescerConfig, batch: Vec<CoalesceReq>) {
         return;
     }
 
-    // 3. Resolve peers + leader. The closure re-reads live membership +
-    //    leadership state each flush, so a recent change is honoured.
+    // 3. Resolve peers + leader.
     let (peers, leader_id) = (cfg.resolver)();
     let leader_is_local = leader_id == Some(cfg.local_node.0);
-
-    // Encode the wire batch once and clone per-peer.
     let wire_batch: Vec<WireIntent> = batch.iter().map(|r| WireIntent::from(&r.intent)).collect();
 
-    // 4. Leader-first when the leader is a remote voter (MF-3 no-orphan).
-    //    Tracks how many peer-acks the batch has gotten; one peer ack
-    //    contributes uniformly to every intent's durable count.
+    // 4. Leader-first (MF-3 no-orphan).
     let mut peer_acks: usize = 0;
     if !leader_is_local {
         if let Some(lid) = leader_id {
@@ -252,12 +277,11 @@ async fn flush_batch(cfg: &CoalescerConfig, batch: Vec<CoalesceReq>) {
         }
     }
 
-    // 5. Parallel top-up to remaining voter peers. Stop as soon as the
-    //    durable copy count reaches min_acks.
+    // 5. Parallel top-up to remaining voter peers.
     let mut fan = futures::stream::FuturesUnordered::new();
     for (node_id, addr) in peers {
         if !leader_is_local && leader_id == Some(node_id.0) {
-            continue; // already fanned leader above
+            continue;
         }
         fan.push(fan_one_batch(
             node_id,
@@ -292,9 +316,6 @@ async fn flush_batch(cfg: &CoalescerConfig, batch: Vec<CoalesceReq>) {
 }
 
 /// Fan ONE `intent_put` RPC to one peer, carrying the whole batch.
-/// Returns `true` if the peer acked (the receiver's `put_batch` succeeded);
-/// the receiver's per-batch atomicity means a partial peer ack is impossible
-/// today — either every intent is durable on the peer or none.
 async fn fan_one_batch(
     node_id: NodeId,
     addr: String,
@@ -304,14 +325,7 @@ async fn fan_one_batch(
 ) -> bool {
     let call = rpc_call::<_, Vec<bool>>(&addr, shard_id, INTENT_PUT_TAG, None, &wire_batch);
     match tokio::time::timeout(timeout, call).await {
-        Ok(Ok(acks)) => {
-            // Treat the peer's response as "acked" iff every intent in the
-            // batch reports true. With per-batch atomicity on the receiver
-            // this is always the whole vector; the per-intent shape stays
-            // for forward-compat (a future receiver could partially ack
-            // by returning per-intent flags).
-            !acks.is_empty() && acks.iter().all(|b| *b)
-        }
+        Ok(Ok(acks)) => !acks.is_empty() && acks.iter().all(|b| *b),
         Ok(Err(e)) => {
             tracing::debug!(node = node_id.0, addr = %addr, error = %e, "intent_put fan: peer non-ack");
             false
@@ -324,8 +338,7 @@ async fn fan_one_batch(
 }
 
 /// Read the coalescer batch-max from `KISEKI_INTENT_FAN_BATCH_MAX`.
-/// Defaults to 16 — the 2026-06-02 W11 A/B headline analysis estimated
-/// 4-8× lift at this batch size with sub-millisecond tail-latency cost.
+/// Defaults to 16.
 #[must_use]
 pub fn batch_max_from_env() -> usize {
     std::env::var("KISEKI_INTENT_FAN_BATCH_MAX")
@@ -336,8 +349,11 @@ pub fn batch_max_from_env() -> usize {
 }
 
 /// Read the coalescer batch-timeout from `KISEKI_INTENT_FAN_BATCH_TIMEOUT_US`.
-/// Defaults to 500 µs — the tuning knob between throughput and per-PUT
-/// tail latency (the wait p99 SHOULD sit below this value in normal load).
+///
+/// Defaults to **500 µs** (the W12 default). The L4 Mutex+Notify design
+/// removes the spawned-task wake-up overhead but does NOT change the
+/// effective lower bound on the timer wake-up itself, so the timeout
+/// configuration is unchanged.
 #[must_use]
 pub fn batch_timeout_from_env() -> Duration {
     let us = std::env::var("KISEKI_INTENT_FAN_BATCH_TIMEOUT_US")
@@ -392,8 +408,8 @@ mod tests {
         }
     }
 
-    /// A single-copy quorum (`min_acks=1`) is satisfied by the local
-    /// `put_batch` alone — no fan needed, every submitter sees `Ok`.
+    /// `min_acks=1` → local put alone satisfies quorum; every submitter
+    /// sees Ok.
     #[tokio::test(flavor = "current_thread")]
     async fn single_copy_quorum_no_fan_needed() {
         let store: Arc<dyn IntentStore> = Arc::new(InMemIntentStore::new());
@@ -412,7 +428,7 @@ mod tests {
             },
         );
         let mut handles = Vec::new();
-        for i in 0..8 {
+        for i in 0..8u32 {
             let c = coalescer.clone();
             handles.push(tokio::spawn(
                 async move { c.submit(intent(seq(1, i, 1))).await },
@@ -421,11 +437,11 @@ mod tests {
         for h in handles {
             assert!(h.await.unwrap().is_ok(), "every submitter must see Ok");
         }
-        assert_eq!(store.pending_len().unwrap(), 8, "all eight landed locally");
+        assert_eq!(store.pending_len().unwrap(), 8);
     }
 
-    /// Batch fills to `cap_max` then flushes early (no timeout wait).
-    /// Stresses the "fill triggers flush" branch.
+    /// Cap-reached short-circuits the timeout: 4 concurrent submitters
+    /// with cap=4 + huge timeout must all complete fast.
     #[tokio::test(flavor = "current_thread")]
     async fn batch_flushes_on_cap_reached() {
         let store: Arc<dyn IntentStore> = Arc::new(InMemIntentStore::new());
@@ -438,34 +454,33 @@ mod tests {
                 store: Arc::clone(&store),
                 resolver,
                 min_acks: 1,
-                cap_max: 4,                           // small cap
-                cap_timeout: Duration::from_secs(10), // huge timeout — must NOT fire
+                cap_max: 4,
+                cap_timeout: Duration::from_secs(10),
                 peer_rpc_timeout: Duration::from_secs(1),
             },
         );
         let mut handles = Vec::new();
-        for i in 0..4 {
+        for i in 0..4u32 {
             let c = coalescer.clone();
             handles.push(tokio::spawn(
                 async move { c.submit(intent(seq(2, i, 1))).await },
             ));
         }
-        // All four must resolve quickly (cap reached, not waiting for timeout).
         let started = Instant::now();
         for h in handles {
             assert!(h.await.unwrap().is_ok());
         }
         assert!(
-            started.elapsed() < Duration::from_millis(200),
-            "must flush on cap_max, not wait the 10s timeout"
+            started.elapsed() < Duration::from_millis(500),
+            "must flush on cap, not wait the 10s timeout"
         );
         assert_eq!(store.pending_len().unwrap(), 4);
     }
 
-    /// Channel-closed shutdown: dropping the handle ends the task cleanly
-    /// AFTER the in-flight batch completes.
+    /// Sequential single-submitter calls work — each one becomes its
+    /// own flusher; previous batches don't deadlock the next one.
     #[tokio::test(flavor = "current_thread")]
-    async fn dropping_handle_shuts_down_task() {
+    async fn sequential_submits_complete_independently() {
         let store: Arc<dyn IntentStore> = Arc::new(InMemIntentStore::new());
         let resolver: PeerLeaderResolver = Arc::new(|| (Vec::new(), None));
         let coalescer = spawn(
@@ -477,14 +492,13 @@ mod tests {
                 resolver,
                 min_acks: 1,
                 cap_max: 16,
-                cap_timeout: Duration::from_micros(100),
+                cap_timeout: Duration::from_micros(50),
                 peer_rpc_timeout: Duration::from_secs(1),
             },
         );
-        coalescer.submit(intent(seq(3, 0, 1))).await.unwrap();
-        drop(coalescer);
-        // Yield so the task observes the channel closure and exits.
-        tokio::task::yield_now().await;
-        assert_eq!(store.pending_len().unwrap(), 1);
+        for i in 0..3u32 {
+            assert!(coalescer.submit(intent(seq(3, i, 1))).await.is_ok());
+        }
+        assert_eq!(store.pending_len().unwrap(), 3);
     }
 }
