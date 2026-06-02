@@ -490,6 +490,7 @@ mod tests {
                     placement: vec![7, 9],
                     original_len: 4096,
                 }],
+                inline_payloads: vec![(ChunkId([0x33u8; 32]), vec![0xc0, 0xff, 0xee, 0x00])],
             },
         }
     }
@@ -510,6 +511,15 @@ mod tests {
             assert_eq!(x.chunk_id, y.chunk_id, "new_chunk.chunk_id");
             assert_eq!(x.placement, y.placement, "new_chunk.placement");
             assert_eq!(x.original_len, y.original_len, "new_chunk.original_len");
+        }
+        assert_eq!(
+            a.inline_payloads.len(),
+            b.inline_payloads.len(),
+            "inline_payloads len",
+        );
+        for ((ac, ab), (bc, bb)) in a.inline_payloads.iter().zip(&b.inline_payloads) {
+            assert_eq!(ac, bc, "inline_payload.chunk_id");
+            assert_eq!(ab, bb, "inline_payload.bytes");
         }
     }
 

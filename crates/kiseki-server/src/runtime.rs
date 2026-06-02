@@ -2052,30 +2052,20 @@ pub async fn run_main(
             // gateway so operators can see whether they're hitting
             // the configurable budget.
             .with_retry_metrics(Arc::clone(&metrics.gateway_retry));
-    // The inline path (mem_gateway.rs PUT path: writes ≤ inline_threshold
-    // go to local small_store keyed by chunk_id) is single-node-only. In a
-    // multi-node cluster the inline write lands on one node's redb and the
-    // Raft-replicated composition metadata leads other nodes to look up
-    // chunk_ids that aren't in their small_store → cross-node GET returns
-    // 404. ADR-026 sketches a "small writes inline in delta → Raft only"
-    // optimization keyed by hashed_key XOR seq, but mem_gateway and the
-    // Raft state-machine apply path use incompatible key spaces, so until
-    // that path is unified we route ALL writes through the chunk/fabric
-    // path when fabric peers are present. Single-node clusters keep the
-    // inline optimization.
+    // #129 — inline write path is now multi-node-correct via Raft replication
+    // of `AppendChunkAndDeltaRequest.inline_payloads`. The gateway stages the
+    // sealed envelope as `(chunk_id, env_bytes)` on the delta; each replica's
+    // state-machine apply writes it to its local SmallObjectStore (ADR-022
+    // rev-5 fjall-backed, keyed by chunk_id per ADR-030 §2). Cross-node GETs
+    // read the local SmallObjectStore by the same chunk_id that the
+    // composition references — no fabric round-trip for small files.
     let multi_node = !fabric_peers_for_scrub.is_empty();
     if let Some(ref ss) = small_store {
-        if multi_node {
-            tracing::info!(
-                "inline write path disabled in multi-node cluster — small writes go through fabric (Phase 16a)",
-            );
-        } else {
-            gw_builder = gw_builder.with_inline_threshold(
-                kiseki_log::ShardConfig::default().inline_threshold_bytes,
-                std::sync::Arc::clone(ss)
-                    as std::sync::Arc<dyn kiseki_common::inline_store::InlineStore>,
-            );
-        }
+        gw_builder = gw_builder.with_inline_threshold(
+            kiseki_log::ShardConfig::default().inline_threshold_bytes,
+            std::sync::Arc::clone(ss)
+                as std::sync::Arc<dyn kiseki_common::inline_store::InlineStore>,
+        );
     }
     let gw = Arc::new(gw_builder);
 

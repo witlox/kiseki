@@ -67,6 +67,13 @@ message NewChunkMeta {
   uint64 original_len  = 3; // pre-encode ciphertext length (#107)
 }
 
+// #129 — an inline small-file ciphertext keyed by chunk_id, applied to each
+// replica's `SmallObjectStore` at SM apply time (ADR-030 §2 canonical key).
+message InlinePayload {
+  bytes chunk_id = 1; // 32 bytes (matches NewChunkMeta + ChunkId)
+  bytes bytes    = 2; // ciphertext envelope to write to SmallObjectStore
+}
+
 message AppendChunkAndDeltaRequest {
   ShardId   shard_id        = 1;
   OrgId     tenant_id       = 2;
@@ -77,6 +84,10 @@ message AppendChunkAndDeltaRequest {
   bytes     payload         = 7; // encrypted payload
   bool      has_inline_data = 8;
   repeated NewChunkMeta new_chunks = 9;
+  // #129 — inline small-file ciphertexts. Applied to each replica's
+  // SmallObjectStore at SM apply time so a multi-node GET can fetch the
+  // bytes locally instead of round-tripping through the chunk tier.
+  repeated InlinePayload inline_payloads = 10;
 }
 
 message ReadDeltasRequest {

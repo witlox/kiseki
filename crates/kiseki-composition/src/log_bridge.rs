@@ -137,8 +137,12 @@ pub async fn emit_chunk_and_delta<L: LogOps + ?Sized>(
     if new_chunks.is_empty() {
         log.append_delta(delta).await
     } else {
-        log.append_chunk_and_delta(AppendChunkAndDeltaRequest { delta, new_chunks })
-            .await
+        log.append_chunk_and_delta(AppendChunkAndDeltaRequest {
+            delta,
+            new_chunks,
+            inline_payloads: vec![],
+        })
+        .await
     }
 }
 
@@ -173,8 +177,12 @@ pub async fn emit_chunk_and_delta_with_forwarding<L: LogOps + ?Sized>(
     if new_chunks.is_empty() {
         log.append_delta_with_forwarding(delta).await
     } else {
-        log.append_chunk_and_delta_with_forwarding(AppendChunkAndDeltaRequest { delta, new_chunks })
-            .await
+        log.append_chunk_and_delta_with_forwarding(AppendChunkAndDeltaRequest {
+            delta,
+            new_chunks,
+            inline_payloads: vec![],
+        })
+        .await
     }
 }
 
@@ -214,6 +222,10 @@ pub fn build_chunk_and_delta_request(
             has_inline_data: false,
         },
         new_chunks,
+        // #129 — populated by callers (the gateway sets this on the
+        // inline-eligible write path); empty here so the existing
+        // non-inline callers keep working.
+        inline_payloads: vec![],
     }
 }
 
@@ -236,6 +248,7 @@ pub async fn emit_chunk_and_delta_forwarding_to<L: LogOps + ?Sized>(
     chunk_refs: Vec<ChunkId>,
     payload: Vec<u8>,
     new_chunks: Vec<NewChunkMeta>,
+    inline_payloads: Vec<(ChunkId, Vec<u8>)>,
 ) -> Result<SequenceNumber, LogError> {
     let timestamp = now_timestamp();
     let delta = AppendDeltaRequest {
@@ -246,7 +259,7 @@ pub async fn emit_chunk_and_delta_forwarding_to<L: LogOps + ?Sized>(
         hashed_key,
         chunk_refs,
         payload,
-        has_inline_data: false,
+        has_inline_data: !inline_payloads.is_empty(),
     };
     // Keep a copy of the built append for the forward path (the local
     // attempt consumes its inputs). The payload here is the composition
@@ -254,12 +267,21 @@ pub async fn emit_chunk_and_delta_forwarding_to<L: LogOps + ?Sized>(
     let forward_req = AppendChunkAndDeltaRequest {
         delta: delta.clone(),
         new_chunks: new_chunks.clone(),
+        inline_payloads: inline_payloads.clone(),
     };
-    let local = if new_chunks.is_empty() {
+    // #129 — when the inline path produced ciphertexts, every replica's
+    // SM apply needs them, so route through `append_chunk_and_delta_*`
+    // even if `new_chunks` is empty (small-file PUTs typically have no
+    // new chunk fabric rows — the bytes live in SmallObjectStore only).
+    let local = if new_chunks.is_empty() && inline_payloads.is_empty() {
         log.append_delta_with_forwarding(delta).await
     } else {
-        log.append_chunk_and_delta_with_forwarding(AppendChunkAndDeltaRequest { delta, new_chunks })
-            .await
+        log.append_chunk_and_delta_with_forwarding(AppendChunkAndDeltaRequest {
+            delta,
+            new_chunks,
+            inline_payloads,
+        })
+        .await
     };
     match local {
         Err(LogError::ForwardToLeader {

@@ -315,14 +315,14 @@ fn measure_openraft_round_latency() {
     rt.block_on(async {
         // warmup
         for i in 0..10 {
-            n1.append_chunk_and_delta(mk(i), vec![])
+            n1.append_chunk_and_delta(mk(i), vec![], vec![])
                 .await
                 .expect("warmup append");
         }
         let mut lat: Vec<Duration> = Vec::new();
         for i in 10..110 {
             let t = std::time::Instant::now();
-            n1.append_chunk_and_delta(mk(i), vec![])
+            n1.append_chunk_and_delta(mk(i), vec![], vec![])
                 .await
                 .expect("timed append");
             lat.push(t.elapsed());
@@ -414,14 +414,14 @@ fn measure_openraft_round_latency_fjall() {
     };
     rt.block_on(async {
         for i in 0..10 {
-            n1.append_chunk_and_delta(mk(i), vec![])
+            n1.append_chunk_and_delta(mk(i), vec![], vec![])
                 .await
                 .expect("warmup");
         }
         let mut lat: Vec<Duration> = Vec::new();
         for i in 10..110 {
             let t = std::time::Instant::now();
-            n1.append_chunk_and_delta(mk(i), vec![])
+            n1.append_chunk_and_delta(mk(i), vec![], vec![])
                 .await
                 .expect("timed");
             lat.push(t.elapsed());
@@ -505,6 +505,7 @@ fn measure_round_latency_raftshardstore() {
             has_inline_data: false,
         },
         new_chunks: vec![],
+        inline_payloads: vec![],
     };
 
     let rt = make_runtime();
@@ -613,7 +614,7 @@ fn measure_sm_mutex_contention() {
     // Grow the log to ~1500 deltas so read_deltas([1,tip]) is a big O(N) scan.
     rt.block_on(async {
         for i in 0..1500 {
-            n1.append_chunk_and_delta(mk(i), vec![])
+            n1.append_chunk_and_delta(mk(i), vec![], vec![])
                 .await
                 .expect("grow");
         }
@@ -624,7 +625,7 @@ fn measure_sm_mutex_contention() {
         let mut v = Vec::new();
         for i in 1500..1560 {
             let t = std::time::Instant::now();
-            n1.append_chunk_and_delta(mk(i), vec![])
+            n1.append_chunk_and_delta(mk(i), vec![], vec![])
                 .await
                 .expect("base");
             v.push(t.elapsed());
@@ -657,7 +658,7 @@ fn measure_sm_mutex_contention() {
         let mut v = Vec::new();
         for i in 1560..1620 {
             let t = std::time::Instant::now();
-            n1.append_chunk_and_delta(mk(i), vec![])
+            n1.append_chunk_and_delta(mk(i), vec![], vec![])
                 .await
                 .expect("cont");
             v.push(t.elapsed());
@@ -704,6 +705,7 @@ fn mk_ca(i: u64) -> kiseki_log::traits::AppendChunkAndDeltaRequest {
             has_inline_data: false,
         },
         new_chunks: vec![],
+        inline_payloads: vec![],
     }
 }
 
