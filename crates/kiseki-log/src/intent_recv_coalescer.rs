@@ -1,107 +1,109 @@
-//! Lever 1 (2026-06-02) — receiver-side `intent_put` fan coalescer.
+//! L3 (2026-06-02) — per-node CROSS-SHARD receiver-side `intent_put`
+//! coalescer.
 //!
-//! Mirror of [`crate::intent_fan_coalescer`] on the RECEIVER side. The
-//! 2026-06-02 W12 GCP A/B (#172) measured the producer-side coalescer
-//! batching at mean **1.17 intents/fan** because the bench's per-shard
-//! arrival rate (~5.3 in-flight × 5.3 ms latency = ~1 PUT/ms/shard)
-//! cannot feed batches of 4-8 within a sub-millisecond window.
+//! **The L1 design was wrong; this is the fix.** The 2026-06-02 L1+L2
+//! GCP A/B measured the per-shard receiver coalescer batching at mean
+//! 1.17 intents/flush — same as the producer-side coalescer — because
+//! each shard has exactly ONE leader = ONE producer. Per-shard
+//! receiver concurrency is bounded by the producer's pipeline depth,
+//! not by aggregation across the cluster as I'd predicted.
 //!
-//! Receiver-side concurrency is much higher: a storage node accepts
-//! `intent_put` from every shard-leader it follows. At 6 nodes ×
-//! 18 shards × ~5 in-flight per shard, each receiver sees dozens of
-//! concurrent RPCs at any moment. That's the right batching point.
+//! The real aggregation point is the **node**. A storage node hosts
+//! ~3 shards (18 shards / 6 nodes) and sees `intent_put` for all of
+//! them: ~3.75 k RPCs/s/node in the W12 workload. A single per-node
+//! coalescer can batch across shards, then dispatch per-shard
+//! `put_batch` calls IN PARALLEL — saving the tokio scheduler
+//! park/unpark overhead and amortising the fjall WAL syncs across
+//! more callers per window.
 //!
-//! This module accumulates incoming RPCs' `Vec<WriteIntent>` payloads
-//! into a single `store.put_batch` per coalesce window, then distributes
-//! per-RPC acks back via the oneshots each dispatcher submitted with.
-//! Wire format is unchanged: each RPC still carries `Vec<WireIntent>`
-//! in and `Vec<bool>` out — only the *local* batching point changes.
+//! ## Shape
 //!
-//! ## Why a spawned task and not a Mutex<State>
-//!
-//! Same reason as the producer-side coalescer: the dispatcher closures
-//! just `send`+`await`, no shared mutex on the hot path. The task owns
-//! the batch state without locking and uses `tokio::select!` for the
-//! intent-count-vs-timeout race cleanly. One task per shard.
+//! - ONE coalescer task per node (singleton, shared by every shard's
+//!   aux dispatcher).
+//! - On flush: group accumulated requests by `shard_id`, run
+//!   `store.put_batch` for each shard concurrently via
+//!   `FuturesUnordered`, then distribute per-RPC ack slices back via
+//!   the oneshots.
+//! - Per-shard atomicity is preserved (each `put_batch` is its own
+//!   fjall `WriteBatch` + WAL sync). What changes is the per-PARK cost
+//!   — instead of N park/unpark cycles per N concurrent RPCs, we pay
+//!   one per coalesce window.
 //!
 //! ## Crash safety
 //!
-//! `put_batch` is atomic in fjall — either every intent in the
-//! coalesced flush commits or none. On error every submitter's
-//! oneshot resolves with a non-ack (`Vec<false>`); the producer's
-//! `aux.handle_intent_put_total` path encodes that as `ParseError`,
-//! which the producer-side coalescer treats as a non-ack and the
-//! eventual gateway path retries.
+//! Each shard's `put_batch` is atomic in fjall. A task panic or
+//! runtime shutdown resolves every pending oneshot with non-ack
+//! (`Vec<false>`), the producer treats it as a non-ack, the gateway
+//! retries.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use kiseki_common::ids::ShardId;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::intent::{IntentError, IntentStore, WriteIntent};
 use crate::intent_metrics;
 
-/// One submitted RPC's payload + ack channel.
+/// One submitted RPC: which shard, which store, intents, and the
+/// ack channel back to the dispatcher.
 struct RecvReq {
+    shard_id: ShardId,
+    store: Arc<dyn IntentStore>,
     intents: Vec<WriteIntent>,
     submitted_at: Instant,
-    /// Resolves with one bool per input intent (true = durable on this
-    /// replica). On `put_batch` error, every position is `false`.
     ack: oneshot::Sender<Result<Vec<bool>, IntentError>>,
 }
 
-/// Handle for the `INTENT_PUT_TAG` dispatcher to submit incoming
-/// `Vec<WireIntent>` payloads and await per-input acks.
+/// Per-node handle. Cloned into every shard's aux dispatcher.
 #[derive(Clone)]
-pub struct IntentRecvCoalescer {
+pub struct NodeIntentRecvCoalescer {
     tx: mpsc::Sender<RecvReq>,
 }
 
-/// Configuration for spawning a receiver coalescer — mirrors
-/// [`crate::intent_fan_coalescer::CoalescerConfig`].
-pub struct RecvConfig {
-    /// The shard this coalescer flushes for.
-    pub shard_id: ShardId,
-    /// Per-shard durable intent store. The flusher calls `put_batch`
-    /// directly on this.
-    pub store: Arc<dyn IntentStore>,
-    /// Max intents per coalesced flush (`KISEKI_INTENT_RECV_BATCH_MAX`).
+/// Configuration for the per-node receiver coalescer.
+pub struct NodeRecvConfig {
+    /// Soft cap on TOTAL intents per coalesce window (across all
+    /// shards). `KISEKI_INTENT_RECV_BATCH_MAX`.
     pub cap_max: usize,
-    /// Max wait from first incoming RPC to flush
-    /// (`KISEKI_INTENT_RECV_BATCH_TIMEOUT_US`).
+    /// Max wait from first incoming RPC to flush.
+    /// `KISEKI_INTENT_RECV_BATCH_TIMEOUT_US`.
     pub cap_timeout: Duration,
 }
 
-/// Spawn the coalescer task on `runtime` and return the submission
-/// handle. The task lives until either:
-///
-/// - The handle (and all clones) are dropped — closes the channel.
-/// - The runtime shuts down.
+/// Spawn the per-node coalescer task on `runtime`.
 #[must_use]
-pub fn spawn(runtime: &tokio::runtime::Handle, cfg: RecvConfig) -> IntentRecvCoalescer {
+pub fn spawn(runtime: &tokio::runtime::Handle, cfg: NodeRecvConfig) -> NodeIntentRecvCoalescer {
     let (tx, rx) = mpsc::channel(cfg.cap_max.saturating_mul(4).max(64));
     runtime.spawn(coalescer_loop(cfg, rx));
-    IntentRecvCoalescer { tx }
+    NodeIntentRecvCoalescer { tx }
 }
 
-impl IntentRecvCoalescer {
-    /// Submit one RPC's worth of intents. Returns once the coalesce
-    /// window containing this RPC has flushed.
+impl NodeIntentRecvCoalescer {
+    /// Submit one RPC's worth of intents for shard `shard_id`. Returns
+    /// the per-input ack vector once the coalesce window containing
+    /// this RPC has flushed and the shard's `put_batch` has committed.
     ///
     /// # Errors
-    ///
     /// `IntentError::Fjall` (rendered) if the coalescer task has
     /// stopped (channel closed, runtime shutdown) OR if the underlying
-    /// `put_batch` failed for the whole flush. In both cases the
-    /// dispatcher should map to `DispatchOutcome::ParseError` so the
-    /// producer treats it as a non-ack.
-    pub async fn submit(&self, intents: Vec<WriteIntent>) -> Result<Vec<bool>, IntentError> {
+    /// `put_batch` failed for this shard's flush.
+    pub async fn submit(
+        &self,
+        shard_id: ShardId,
+        store: Arc<dyn IntentStore>,
+        intents: Vec<WriteIntent>,
+    ) -> Result<Vec<bool>, IntentError> {
         let n = intents.len();
         let (ack_tx, ack_rx) = oneshot::channel();
         self.tx
             .send(RecvReq {
+                shard_id,
+                store,
                 intents,
                 submitted_at: Instant::now(),
                 ack: ack_tx,
@@ -111,30 +113,22 @@ impl IntentRecvCoalescer {
         match ack_rx.await {
             Ok(Ok(acks)) => Ok(acks),
             Ok(Err(e)) => Err(e),
-            Err(_) => {
-                // Task dropped without sending — treat as all-non-ack so
-                // the producer retries every intent in the original RPC.
-                Ok(vec![false; n])
-            }
+            Err(_) => Ok(vec![false; n]),
         }
     }
 }
 
-async fn coalescer_loop(cfg: RecvConfig, mut rx: mpsc::Receiver<RecvReq>) {
+async fn coalescer_loop(cfg: NodeRecvConfig, mut rx: mpsc::Receiver<RecvReq>) {
     loop {
-        // Block until the first request.
         let Some(first) = rx.recv().await else {
             return;
         };
         let batch_start = first.submitted_at;
-        let mut pending: Vec<RecvReq> = Vec::with_capacity(8);
+        let mut pending: Vec<RecvReq> = Vec::with_capacity(16);
         let mut total_intents = first.intents.len();
         pending.push(first);
 
-        // Accumulate up to cap_max TOTAL intents OR until cap_timeout
-        // elapses since the first RPC. A request never spans two
-        // flushes — cap_max is a soft cap on the *intent count*, not
-        // RPC count, and we always include a full incoming RPC.
+        // Accumulate up to cap_max total intents OR until cap_timeout.
         while total_intents < cfg.cap_max {
             let deadline = batch_start + cfg.cap_timeout;
             let now = Instant::now();
@@ -165,57 +159,68 @@ async fn coalescer_loop(cfg: RecvConfig, mut rx: mpsc::Receiver<RecvReq>) {
         }
         intent_metrics::observe_intent_recv_batch_size(total_intents);
 
-        flush_pending(&cfg, pending, total_intents);
+        flush_pending(pending).await;
     }
 }
 
-/// (ack-channel, slice-of-`all_intents` belonging to that RPC).
-/// Aliased so the `flush_pending` body stays inside the
+/// (ack-channel, slice-of-the-shard-`Vec<WriteIntent>` belonging to that RPC).
+/// Aliased so the per-shard tracking stays inside the
 /// `type_complexity` clippy budget.
 type AckBoundary = (
     oneshot::Sender<Result<Vec<bool>, IntentError>>,
     Range<usize>,
 );
 
-fn flush_pending(cfg: &RecvConfig, pending: Vec<RecvReq>, total: usize) {
-    // Flatten every RPC's intents into one Vec for the single `put_batch`
-    // call. Remember each RPC's slice so we can split the result back.
-    let mut all_intents: Vec<WriteIntent> = Vec::with_capacity(total);
-    let mut boundaries: Vec<AckBoundary> = Vec::with_capacity(pending.len());
+struct PerShardBatch {
+    store: Arc<dyn IntentStore>,
+    intents: Vec<WriteIntent>,
+    boundaries: Vec<AckBoundary>,
+}
+
+async fn flush_pending(pending: Vec<RecvReq>) {
+    // Group requests by shard_id. Each shard gets its own put_batch
+    // call; we run them concurrently via FuturesUnordered so multi-
+    // shard nodes amortise the tokio wake-up across N shards rather
+    // than serialising N WAL syncs.
+    let mut by_shard: HashMap<ShardId, PerShardBatch> = HashMap::new();
     for req in pending {
-        let start = all_intents.len();
-        all_intents.extend(req.intents);
-        let end = all_intents.len();
-        boundaries.push((req.ack, start..end));
+        let entry = by_shard
+            .entry(req.shard_id)
+            .or_insert_with(|| PerShardBatch {
+                store: Arc::clone(&req.store),
+                intents: Vec::new(),
+                boundaries: Vec::new(),
+            });
+        let start = entry.intents.len();
+        entry.intents.extend(req.intents);
+        let end = entry.intents.len();
+        entry.boundaries.push((req.ack, start..end));
     }
 
-    // One fjall WAL sync for the whole coalesced flush.
-    let put_res = cfg.store.put_batch(all_intents);
+    let mut fut = FuturesUnordered::new();
+    for (shard_id, batch) in by_shard {
+        fut.push(async move { (shard_id, flush_one_shard(batch)) });
+    }
+    while let Some((_shard_id, ())) = fut.next().await {
+        // Acks were sent inside flush_one_shard.
+    }
+}
 
+fn flush_one_shard(batch: PerShardBatch) {
+    let total = batch.intents.len();
+    let put_res = batch.store.put_batch(batch.intents);
     match put_res {
         Ok(outcomes) => {
-            debug_assert_eq!(
-                outcomes.len(),
-                total,
-                "put_batch must return one outcome per input"
-            );
-            for (ack, range) in boundaries {
-                // Every PutOutcome (Recorded or Duplicate) means the intent
-                // is now durable — ack uniformly.
+            debug_assert_eq!(outcomes.len(), total);
+            for (ack, range) in batch.boundaries {
                 let acks: Vec<bool> = outcomes[range].iter().map(|_| true).collect();
                 let _ = ack.send(Ok(acks));
             }
         }
         Err(e) => {
-            tracing::warn!(
-                shard_id = %cfg.shard_id.0,
-                error = %e,
-                "intent recv coalescer: put_batch failed; non-acking the flush",
-            );
-            // Clone the error per-RPC. IntentError is not Clone, so render
-            // to string and reconstruct as the Fjall variant.
+            tracing::warn!(error = %e, "intent recv coalescer: put_batch failed; non-acking this shard's flush");
             let err_str = e.to_string();
-            for (ack, _range) in boundaries {
+            for (ack, _range) in batch.boundaries {
                 let _ = ack.send(Err(IntentError::Fjall(err_str.clone())));
             }
         }
@@ -223,9 +228,7 @@ fn flush_pending(cfg: &RecvConfig, pending: Vec<RecvReq>, total: usize) {
 }
 
 /// Read the receiver coalescer batch-max from
-/// `KISEKI_INTENT_RECV_BATCH_MAX`. Defaults to **128** — much higher
-/// than the producer-side default because the receiver naturally
-/// aggregates much higher concurrency.
+/// `KISEKI_INTENT_RECV_BATCH_MAX`. Defaults to **128** total intents.
 #[must_use]
 pub fn recv_batch_max_from_env() -> usize {
     std::env::var("KISEKI_INTENT_RECV_BATCH_MAX")
@@ -236,16 +239,18 @@ pub fn recv_batch_max_from_env() -> usize {
 }
 
 /// Read the receiver coalescer batch-timeout from
-/// `KISEKI_INTENT_RECV_BATCH_TIMEOUT_US`. Defaults to **100 µs** — the
-/// same value as the producer-side default after Lever 2 (#174). The
-/// receiver typically fills the cap well before the timeout fires.
+/// `KISEKI_INTENT_RECV_BATCH_TIMEOUT_US`. Defaults to **500 µs** — L3
+/// bumped this from L1's 100 µs because the math says we need a
+/// longer window to actually collect partners at the cluster's
+/// arrival rate. The cost is per-PUT tail latency; the win is fjall
+/// WAL sync amortisation across more concurrent producers.
 #[must_use]
 pub fn recv_batch_timeout_from_env() -> Duration {
     let us = std::env::var("KISEKI_INTENT_RECV_BATCH_TIMEOUT_US")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|n: &u64| *n >= 1)
-        .unwrap_or(100);
+        .unwrap_or(500);
     Duration::from_micros(us)
 }
 
@@ -293,82 +298,77 @@ mod tests {
         }
     }
 
-    /// One RPC carrying N intents is acked correctly even with no
-    /// partners arriving — the timer flushes it.
+    /// One RPC for one shard — flushes on timeout, lands in that shard's store.
     #[tokio::test(flavor = "current_thread")]
-    async fn single_rpc_flushes_on_timeout() {
+    async fn single_shard_single_rpc_flushes_on_timeout() {
         let store: Arc<dyn IntentStore> = Arc::new(InMemIntentStore::new());
         let coalescer = spawn(
             &tokio::runtime::Handle::current(),
-            RecvConfig {
-                shard_id: ShardId(uuid::Uuid::from_u128(1)),
-                store: Arc::clone(&store),
+            NodeRecvConfig {
                 cap_max: 128,
                 cap_timeout: Duration::from_micros(50),
             },
         );
-        let intents = vec![intent(seq(1, 0, 1)), intent(seq(1, 1, 1))];
-        let acks = coalescer.submit(intents).await.unwrap();
-        assert_eq!(acks, vec![true, true]);
-        assert_eq!(store.pending_len().unwrap(), 2);
+        let shard = ShardId(uuid::Uuid::from_u128(1));
+        let acks = coalescer
+            .submit(shard, Arc::clone(&store), vec![intent(seq(1, 0, 1))])
+            .await
+            .unwrap();
+        assert_eq!(acks, vec![true]);
+        assert_eq!(store.pending_len().unwrap(), 1);
     }
 
-    /// Multiple concurrent RPCs are coalesced into one `put_batch` —
-    /// every submitter sees the per-RPC ack slice in input order, and
-    /// the store ends with all intents from all RPCs present.
+    /// Two shards arrive in the same coalesce window — both flush
+    /// concurrently, both stores end with their RPCs' intents.
     #[tokio::test(flavor = "current_thread")]
-    async fn concurrent_rpcs_coalesce_into_one_put_batch() {
-        let store: Arc<dyn IntentStore> = Arc::new(InMemIntentStore::new());
-        // Long timeout so we test the cap-reached path. cap_max=8 with
-        // 4 RPCs × 2 intents each = 8 intents = exactly cap.
+    async fn cross_shard_flush_dispatches_parallel_put_batches() {
+        let store_a: Arc<dyn IntentStore> = Arc::new(InMemIntentStore::new());
+        let store_b: Arc<dyn IntentStore> = Arc::new(InMemIntentStore::new());
+        // Long timeout so both arrivals share the same window via cap.
         let coalescer = spawn(
             &tokio::runtime::Handle::current(),
-            RecvConfig {
-                shard_id: ShardId(uuid::Uuid::from_u128(2)),
-                store: Arc::clone(&store),
-                cap_max: 8,
+            NodeRecvConfig {
+                cap_max: 4,
                 cap_timeout: Duration::from_secs(5),
             },
         );
-        let mut handles = Vec::new();
-        for rpc_idx in 0..4u32 {
-            let c = coalescer.clone();
-            handles.push(tokio::spawn(async move {
-                let intents = vec![
-                    intent(seq(2, rpc_idx * 2, 1)),
-                    intent(seq(2, rpc_idx * 2 + 1, 1)),
-                ];
-                c.submit(intents).await
-            }));
-        }
-        for h in handles {
-            let acks = h.await.unwrap().unwrap();
-            assert_eq!(acks.len(), 2);
-            assert!(acks.iter().all(|b| *b));
-        }
-        assert_eq!(
-            store.pending_len().unwrap(),
-            8,
-            "all four RPCs landed via one coalesced put_batch"
+        let shard_a = ShardId(uuid::Uuid::from_u128(0xa));
+        let shard_b = ShardId(uuid::Uuid::from_u128(0xb));
+        let (a_intents, b_intents) = (
+            vec![intent(seq(1, 0, 1)), intent(seq(1, 1, 1))],
+            vec![intent(seq(1, 2, 1)), intent(seq(1, 3, 1))],
         );
+        let ca = coalescer.clone();
+        let sa = Arc::clone(&store_a);
+        let h_a = tokio::spawn(async move { ca.submit(shard_a, sa, a_intents).await });
+        let cb = coalescer.clone();
+        let sb = Arc::clone(&store_b);
+        let h_b = tokio::spawn(async move { cb.submit(shard_b, sb, b_intents).await });
+        let acks_a = h_a.await.unwrap().unwrap();
+        let acks_b = h_b.await.unwrap().unwrap();
+        assert_eq!(acks_a, vec![true, true]);
+        assert_eq!(acks_b, vec![true, true]);
+        assert_eq!(store_a.pending_len().unwrap(), 2);
+        assert_eq!(store_b.pending_len().unwrap(), 2);
     }
 
-    /// Channel-closed shutdown: dropping the handle ends the task
-    /// cleanly AFTER the in-flight flush completes.
+    /// Channel-closed shutdown ends the task cleanly after the
+    /// in-flight flush completes.
     #[tokio::test(flavor = "current_thread")]
     async fn dropping_handle_shuts_down_task() {
         let store: Arc<dyn IntentStore> = Arc::new(InMemIntentStore::new());
         let coalescer = spawn(
             &tokio::runtime::Handle::current(),
-            RecvConfig {
-                shard_id: ShardId(uuid::Uuid::from_u128(3)),
-                store: Arc::clone(&store),
+            NodeRecvConfig {
                 cap_max: 128,
                 cap_timeout: Duration::from_micros(50),
             },
         );
-        let acks = coalescer.submit(vec![intent(seq(3, 0, 1))]).await.unwrap();
-        assert_eq!(acks, vec![true]);
+        let shard = ShardId(uuid::Uuid::from_u128(1));
+        coalescer
+            .submit(shard, Arc::clone(&store), vec![intent(seq(1, 0, 1))])
+            .await
+            .unwrap();
         drop(coalescer);
         tokio::task::yield_now().await;
         assert_eq!(store.pending_len().unwrap(), 1);

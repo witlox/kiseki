@@ -147,8 +147,9 @@ impl WireIntent {
 /// encode fault also degrades to `ParseError` rather than escaping as a panic.
 #[must_use]
 pub fn build_intent_dispatcher(
+    shard_id: ShardId,
     store: Arc<dyn IntentStore>,
-    recv_coalescer: Option<Arc<crate::intent_recv_coalescer::IntentRecvCoalescer>>,
+    recv_coalescer: Option<Arc<crate::intent_recv_coalescer::NodeIntentRecvCoalescer>>,
 ) -> ShardDispatch {
     Arc::new(
         move |tag: &str, payload: &[u8]| -> BoxFuture<'_, DispatchOutcome> {
@@ -240,7 +241,7 @@ pub fn build_intent_dispatcher(
                         // histogram to split wait vs commit.
                         let put_res = kiseki_tracing::hot_span!("aux.store_put", {
                             match recv_coalescer {
-                                Some(c) => c.submit(intents).await,
+                                Some(c) => c.submit(shard_id, Arc::clone(&store), intents).await,
                                 None => store
                                     .put_batch(intents)
                                     .map(|outcomes| outcomes.iter().map(|_| true).collect()),
@@ -552,7 +553,7 @@ mod tests {
         let i2 = rich_intent(seq(2, 0, 1), None);
         store.put(i1.clone()).unwrap();
         store.put(i2.clone()).unwrap();
-        let dispatch = build_intent_dispatcher(store, None);
+        let dispatch = build_intent_dispatcher(ShardId(uuid::Uuid::nil()), store, None);
 
         let outcome = dispatch(INTENT_GATHER_PENDING_TAG, &[]).await;
         let DispatchOutcome::Ok(bytes) = outcome else {
@@ -582,7 +583,8 @@ mod tests {
     #[tokio::test]
     async fn dispatcher_intent_put_stores_fanned_intent() {
         let store: Arc<dyn IntentStore> = Arc::new(InMemIntentStore::new());
-        let dispatch = build_intent_dispatcher(Arc::clone(&store), None);
+        let dispatch =
+            build_intent_dispatcher(ShardId(uuid::Uuid::nil()), Arc::clone(&store), None);
 
         let one = rich_intent(seq(7, 3, 2), Some([0xa1u8; 16]));
         let two = rich_intent(seq(7, 4, 2), Some([0xa2u8; 16]));
@@ -617,7 +619,8 @@ mod tests {
     #[tokio::test]
     async fn dispatcher_intent_put_bad_payload_is_parse_error() {
         let store: Arc<dyn IntentStore> = Arc::new(InMemIntentStore::new());
-        let dispatch = build_intent_dispatcher(Arc::clone(&store), None);
+        let dispatch =
+            build_intent_dispatcher(ShardId(uuid::Uuid::nil()), Arc::clone(&store), None);
         let outcome = dispatch(INTENT_PUT_TAG, &[0xff, 0x00, 0x13, 0x37]).await;
         assert!(matches!(outcome, DispatchOutcome::ParseError));
         assert_eq!(store.pending_len().unwrap(), 0, "nothing recorded");
@@ -628,7 +631,7 @@ mod tests {
     #[tokio::test]
     async fn dispatcher_unknown_tag_falls_through() {
         let store = Arc::new(InMemIntentStore::new());
-        let dispatch = build_intent_dispatcher(store, None);
+        let dispatch = build_intent_dispatcher(ShardId(uuid::Uuid::nil()), store, None);
         let outcome = dispatch("not_an_intent_tag", &[]).await;
         assert!(matches!(outcome, DispatchOutcome::UnknownTag));
     }

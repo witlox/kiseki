@@ -337,21 +337,19 @@ pub fn batch_max_from_env() -> usize {
 
 /// Read the coalescer batch-timeout from `KISEKI_INTENT_FAN_BATCH_TIMEOUT_US`.
 ///
-/// Defaults to **100 µs** (#174 — was 500 µs pre-W12-followups). The
-/// 2026-06-02 W12 GCP A/B measured `kiseki_intent_put_batch_size` at
-/// mean 1.17 with the 500 µs default: 86 % of fans carried a single
-/// intent because the bench's per-shard arrival rate (~1 PUT/ms/shard)
-/// could not feed batches of 4-8 within the window. Holding the timeout
-/// at 500 µs added per-PUT latency without throughput benefit. 100 µs
-/// preserves the 14 % of fans that genuinely had concurrent partners
-/// while cutting the no-partner wait by 5×.
+/// Defaults to **500 µs**. Lever 2 (#174) lowered this to 100 µs but the
+/// L1+L2 GCP A/B confirmed that the actual wait is bounded by tokio
+/// task wake-up latency (~1.6 ms), not the configured timeout — making
+/// the change effectively a no-op. Reverted to 500 µs so the L3
+/// receiver-side coalescer's effect is measurable without the L2
+/// confound.
 #[must_use]
 pub fn batch_timeout_from_env() -> Duration {
     let us = std::env::var("KISEKI_INTENT_FAN_BATCH_TIMEOUT_US")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|n: &u64| *n >= 1)
-        .unwrap_or(100);
+        .unwrap_or(500);
     Duration::from_micros(us)
 }
 

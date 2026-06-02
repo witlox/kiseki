@@ -139,15 +139,14 @@ pub struct RaftShardStore {
     /// local `put_batch` + one `intent_put` RPC per peer, amortising the
     /// fjall WAL sync and dropping the cluster-wide fan RPC volume by 4-8×.
     intent_fan_coalescers: IntentFanCoalescerMap,
-    /// Lever 1 (2026-06-02): per-shard receiver-side `intent_put` fan
-    /// coalescer. Spawned alongside the producer-side fan coalescer
-    /// for every shard whose intent store opened durably. Mirrors the
-    /// W12 producer-side design on the RECEIVER: aggregates incoming
-    /// `intent_put` RPCs from multiple producers into one fjall
-    /// `put_batch` per coalesce window, since receiver-side concurrency
-    /// is naturally much higher than any one producer's per-shard
-    /// concurrency.
-    intent_recv_coalescers: IntentRecvCoalescerMap,
+    /// L3 (2026-06-02): per-NODE cross-shard receiver-side `intent_put`
+    /// coalescer. Replaces L1's per-shard receiver coalescer (which the
+    /// L1+L2 GCP A/B showed batching at mean 1.17 because each shard
+    /// has exactly one leader-producer). Lazily spawned on first
+    /// durable `create_shard`; shared across every shard's aux
+    /// dispatcher. Flushes group requests by `shard_id` and run each
+    /// shard's `put_batch` concurrently via `FuturesUnordered`.
+    intent_recv_coalescer: NodeIntentRecvCoalescerCell,
 }
 
 /// W12 (2026-06-02): per-shard handle map for the intent-fan coalescer.
@@ -156,11 +155,9 @@ pub struct RaftShardStore {
 type IntentFanCoalescerMap =
     Mutex<HashMap<ShardId, crate::intent_fan_coalescer::IntentFanCoalescer>>;
 
-/// Lever 1 (2026-06-02): per-shard handle map for the receiver-side
-/// `intent_put` coalescer. Aliased for the same reason as
-/// [`IntentFanCoalescerMap`].
-type IntentRecvCoalescerMap =
-    Mutex<HashMap<ShardId, crate::intent_recv_coalescer::IntentRecvCoalescer>>;
+/// L3 (2026-06-02): singleton handle for the per-node receiver coalescer.
+type NodeIntentRecvCoalescerCell =
+    Mutex<Option<Arc<crate::intent_recv_coalescer::NodeIntentRecvCoalescer>>>;
 
 impl RaftShardStore {
     /// Create a new (empty) Raft shard store.
@@ -221,7 +218,7 @@ impl RaftShardStore {
             listener_registry: Mutex::new(None),
             transport_metrics: Mutex::new(None),
             intent_fan_coalescers: Mutex::new(HashMap::new()),
-            intent_recv_coalescers: Mutex::new(HashMap::new()),
+            intent_recv_coalescer: Mutex::new(None),
         }
     }
 
@@ -535,17 +532,16 @@ impl RaftShardStore {
             .lock()
             .lock_or_die("raft_shard_store.durable_intent_shards")
             .remove(&shard_id);
-        // W12: drop the coalescer handle — closes the mpsc channel, the
-        // background task observes the closure and exits cleanly.
+        // W12: drop the producer-side coalescer handle — closes the
+        // mpsc channel, the background task observes the closure and
+        // exits cleanly.
         self.intent_fan_coalescers
             .lock()
             .lock_or_die("raft_shard_store.intent_fan_coalescers")
             .remove(&shard_id);
-        // Lever 1: same teardown for the receiver-side coalescer.
-        self.intent_recv_coalescers
-            .lock()
-            .lock_or_die("raft_shard_store.intent_recv_coalescers")
-            .remove(&shard_id);
+        // L3: the per-node receiver coalescer is a singleton shared
+        // across shards — it stays alive until the RaftShardStore drops
+        // (no shard-local handle to remove).
         self.shards
             .lock()
             .lock_or_die("raft_shard_store.shards")
@@ -709,29 +705,27 @@ impl RaftShardStore {
                 .insert(shard_id);
         }
 
-        // Lever 1 (2026-06-02): spawn the per-shard receiver-side
-        // intent_put coalescer on the Raft runtime. The dispatcher we
-        // hand to the listener routes inbound `intent_put` RPCs
-        // through it so multiple producers' RPCs share one fjall
-        // put_batch per coalesce window. Only spawned for durable
-        // intent stores — a non-durable shard refuses
-        // put_intent_and_fan upstream anyway and would never receive a
-        // production intent_put fan.
+        // L3 (2026-06-02): lazily spawn the per-NODE cross-shard
+        // receiver coalescer on the Raft runtime. Shared across every
+        // shard's aux dispatcher so the receiver batches incoming
+        // intent_put RPCs across shards — the actual concurrency shape
+        // we needed (each shard has only one producer; the cluster's
+        // aggregation point is the node, not the shard).
         let recv_coalescer = if intent_store_durable {
-            let coalescer = crate::intent_recv_coalescer::spawn(
-                self.rt.handle(),
-                crate::intent_recv_coalescer::RecvConfig {
-                    shard_id,
-                    store: Arc::clone(&intent_store),
-                    cap_max: crate::intent_recv_coalescer::recv_batch_max_from_env(),
-                    cap_timeout: crate::intent_recv_coalescer::recv_batch_timeout_from_env(),
-                },
-            );
-            self.intent_recv_coalescers
+            let mut guard = self
+                .intent_recv_coalescer
                 .lock()
-                .lock_or_die("raft_shard_store.intent_recv_coalescers")
-                .insert(shard_id, coalescer.clone());
-            Some(Arc::new(coalescer))
+                .lock_or_die("raft_shard_store.intent_recv_coalescer");
+            let handle = guard.get_or_insert_with(|| {
+                Arc::new(crate::intent_recv_coalescer::spawn(
+                    self.rt.handle(),
+                    crate::intent_recv_coalescer::NodeRecvConfig {
+                        cap_max: crate::intent_recv_coalescer::recv_batch_max_from_env(),
+                        cap_timeout: crate::intent_recv_coalescer::recv_batch_timeout_from_env(),
+                    },
+                ))
+            });
+            Some(Arc::clone(handle))
         } else {
             None
         };
@@ -748,7 +742,7 @@ impl RaftShardStore {
             // untouched.
             reg.register_aux(
                 shard_id,
-                build_intent_dispatcher(Arc::clone(&intent_store), recv_coalescer.clone()),
+                build_intent_dispatcher(shard_id, Arc::clone(&intent_store), recv_coalescer),
             );
             tracing::info!(shard_id = %shard_id.0, "shard registered with Raft RPC listener");
         }
