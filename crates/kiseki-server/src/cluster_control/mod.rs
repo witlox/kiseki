@@ -35,6 +35,9 @@ pub mod store;
 #[allow(missing_docs)]
 pub mod types;
 
+// ADR-049 phase 2: per-node device discovery + InventoryReporter.
+pub mod device_discovery;
+
 pub use commands::ControlCommand;
 pub use metrics::ClusterControlMetrics;
 // Re-exports kept for the follow-up subtask that switches admin

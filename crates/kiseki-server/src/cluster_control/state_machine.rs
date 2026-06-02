@@ -1031,8 +1031,10 @@ mod tests {
     fn set_workload_params_bumps_revision_and_quiescence_clock() {
         let mut sm = StateMachineInner::new();
         let before_rev = sm.catalog.policy_revision;
-        let mut params = kiseki_common::WorkloadParams::default();
-        params.avg_file_bytes = 64 * 1024;
+        let params = kiseki_common::WorkloadParams {
+            avg_file_bytes: 64 * 1024,
+            ..kiseki_common::WorkloadParams::default()
+        };
         let resp = sm.apply_command(&ControlCommand::SetWorkloadParams { params });
         assert_eq!(resp, ControlResponse::Applied);
         assert_eq!(sm.catalog.policy_revision, before_rev + 1);
