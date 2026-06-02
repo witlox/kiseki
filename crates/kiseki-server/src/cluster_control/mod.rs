@@ -46,6 +46,11 @@ pub mod resolver;
 // alongside the boot reorder (phase 5a continued).
 pub mod tier_paths;
 
+// ADR-049 phase 5a continued: boot-time integration helper.
+// Wraps discovery → publish → resolve → I-CP-Move → save-pointer
+// in one call.
+pub mod phase5_boot;
+
 pub use commands::ControlCommand;
 pub use metrics::ClusterControlMetrics;
 // Re-exports kept for the follow-up subtask that switches admin
