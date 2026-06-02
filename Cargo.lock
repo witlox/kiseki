@@ -2116,7 +2116,6 @@ dependencies = [
  "postcard",
  "prometheus",
  "proptest",
- "redb",
  "reed-solomon-erasure",
  "serde",
  "serde_json",

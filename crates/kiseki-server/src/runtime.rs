@@ -584,20 +584,28 @@ pub async fn run_main(
 
     // Small object store for inline files (ADR-030).
     // Created before the log store so Raft state machines can use it.
-    let small_store: Option<std::sync::Arc<kiseki_chunk::SmallObjectStore>> = if let Some(ref dir) =
-        cfg.data_dir
-    {
-        std::fs::create_dir_all(dir.join("small")).ok();
-        let store = kiseki_chunk::SmallObjectStore::open(&dir.join("small").join("objects.redb"))
-            .map_err(|e| format!("small object store: {e}"))?;
-        tracing::info!(
-            path = %dir.display(),
-            "small object store: persistent (redb)",
-        );
-        Some(std::sync::Arc::new(store))
-    } else {
-        None
-    };
+    let small_store: Option<std::sync::Arc<kiseki_chunk::SmallObjectStore>> =
+        if let Some(ref dir) = cfg.data_dir {
+            // ADR-022 rev-5 (#129 unblock): SmallObjectStore moved from
+            // redb to fjall. Path becomes a directory under
+            // `small/objects/` instead of the legacy `small/objects.redb`
+            // file. Phase 5b: this hardcoded path is the LAST stop before
+            // the ADR-049 resolver replaces it with
+            // `<resolved SmallObject mount>/kiseki/small-object/` — that
+            // wiring lands as part of the runtime.rs boot reorder
+            // (phase 5a continued); until then, the data_dir-relative
+            // path keeps single-host development clusters working.
+            std::fs::create_dir_all(dir.join("small")).ok();
+            let store = kiseki_chunk::SmallObjectStore::open(&dir.join("small").join("objects"))
+                .map_err(|e| format!("small object store: {e}"))?;
+            tracing::info!(
+                path = %dir.display(),
+                "small object store: persistent (fjall, ADR-022 rev-5)",
+            );
+            Some(std::sync::Arc::new(store))
+        } else {
+            None
+        };
 
     // Metrics: built early so per-shard `RaftRpcListener` metrics
     // (ADR-041 §"Observability") are wired into the listener BEFORE

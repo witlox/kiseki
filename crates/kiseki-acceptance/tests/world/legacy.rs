@@ -102,7 +102,7 @@ impl LegacyState {
 
         let inline_temp_dir = tempfile::tempdir().expect("tempdir for inline small_object store");
         let inline_store = Arc::new(
-            kiseki_chunk::SmallObjectStore::open(&inline_temp_dir.path().join("objects.redb"))
+            kiseki_chunk::SmallObjectStore::open(&inline_temp_dir.path().join("objects"))
                 .expect("open small_object store"),
         );
         let _ = mem_shard_store.set_inline_store(
