@@ -23,6 +23,8 @@ pub mod grpc;
 pub mod instrumented;
 pub mod intent;
 pub mod intent_committer;
+pub mod intent_fan_coalescer;
+pub mod intent_metrics;
 pub mod intent_sync;
 pub mod merge;
 pub mod metrics;

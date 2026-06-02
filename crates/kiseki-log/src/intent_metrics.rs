@@ -1,0 +1,132 @@
+//! W12 (2026-06-02) — intent-fan coalescing metrics.
+//!
+//! Two Prometheus histograms register at server boot and are observed
+//! from the hot path via free functions:
+//!
+//! - `kiseki_intent_put_batch_size` — distribution of intents per fanned
+//!   `intent_put` RPC. Pairs with the existing
+//!   `kiseki_raft_transport_rpc_duration_seconds{op="intent_put"}` so
+//!   the per-RPC mean is interpretable post-W12 (a higher mean now means
+//!   bigger batches, not slower receivers).
+//! - `kiseki_intent_coalesce_wait_seconds` — per-intent wait inside the
+//!   producer coalescer (submission → flush). The tuning knob between
+//!   throughput (bigger batches) and per-PUT tail latency.
+//!
+//! Both are simple single-instance histograms (no labels) — they
+//! aggregate across all shards. Cardinality is bounded by the bucket
+//! list alone, so adding labels would be the only way to inflate the
+//! scrape, and we deliberately don't.
+//!
+//! Calls fire silently before [`register`] runs (pre-boot, unit tests).
+
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use prometheus::{Histogram, HistogramOpts, Registry};
+
+/// `kiseki_intent_put_batch_size` — exposed on `/metrics`.
+pub const BATCH_SIZE_METRIC_NAME: &str = "kiseki_intent_put_batch_size";
+
+/// `kiseki_intent_coalesce_wait_seconds` — exposed on `/metrics`.
+pub const COALESCE_WAIT_METRIC_NAME: &str = "kiseki_intent_coalesce_wait_seconds";
+
+/// Batch-size buckets — powers-of-two from 1 → 128. `KISEKI_INTENT_FAN_BATCH_MAX`
+/// defaults to 16, so the 1, 2, 4, 8, 16 buckets capture the steady-state
+/// distribution; higher buckets are for capacity/headroom analysis.
+const BATCH_SIZE_BUCKETS: &[f64] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
+
+/// Coalesce-wait buckets (seconds) — 1 µs → 10 ms. The
+/// `KISEKI_INTENT_FAN_BATCH_TIMEOUT_US` default is 500 µs, so the wait
+/// p99 should sit inside the 1 µs–500 µs window in normal load.
+const COALESCE_WAIT_BUCKETS: &[f64] = &[
+    0.000_001, 0.000_005, 0.000_01, 0.000_05, 0.000_1, 0.000_25, 0.000_5, 0.001, 0.0025, 0.005,
+    0.01,
+];
+
+static BATCH_SIZE: OnceLock<Histogram> = OnceLock::new();
+static COALESCE_WAIT: OnceLock<Histogram> = OnceLock::new();
+
+/// Register the W12 intent-coalescing histograms into the given
+/// Prometheus [`Registry`]. Idempotent: a second call after the
+/// histograms latch is a no-op.
+///
+/// # Errors
+///
+/// Propagates `prometheus::Error` on a registry collision (e.g. a
+/// duplicate metric name from elsewhere in the same registry). Both
+/// names are unique within the workspace.
+pub fn register(registry: &Registry) -> Result<(), prometheus::Error> {
+    if BATCH_SIZE.get().is_none() {
+        let h = Histogram::with_opts(
+            HistogramOpts::new(
+                BATCH_SIZE_METRIC_NAME,
+                "Number of intents per fanned intent_put RPC (W12 producer-side coalescing). \
+                 Pairs with kiseki_raft_transport_rpc_duration_seconds{op=\"intent_put\"} so the \
+                 per-RPC mean stays interpretable after batching.",
+            )
+            .buckets(BATCH_SIZE_BUCKETS.to_vec()),
+        )?;
+        registry.register(Box::new(h.clone()))?;
+        let _ = BATCH_SIZE.set(h);
+    }
+    if COALESCE_WAIT.get().is_none() {
+        let h = Histogram::with_opts(
+            HistogramOpts::new(
+                COALESCE_WAIT_METRIC_NAME,
+                "Per-intent wait inside the producer-side coalescer, from submission to flush \
+                 (W12). The throughput-vs-tail-latency tuning knob — \
+                 KISEKI_INTENT_FAN_BATCH_TIMEOUT_US is the upper bound.",
+            )
+            .buckets(COALESCE_WAIT_BUCKETS.to_vec()),
+        )?;
+        registry.register(Box::new(h.clone()))?;
+        let _ = COALESCE_WAIT.set(h);
+    }
+    Ok(())
+}
+
+/// Observe one fanned-batch size. Called from the receiver-side
+/// `intent_put` dispatcher and the producer-side coalescer (both
+/// observe the same `n`; aggregating across all nodes gives the cluster
+/// distribution).
+pub fn observe_intent_put_batch_size(n: usize) {
+    if let Some(h) = BATCH_SIZE.get() {
+        // Clamp at 2^52 so the f64 mantissa never overflows. Real batches
+        // are bounded by KISEKI_INTENT_FAN_BATCH_MAX (≤ 128 in any sane
+        // config); this is defensive only.
+        let clamped = u64::try_from(n).unwrap_or(u64::MAX).min(1u64 << 52);
+        // u64 fits in f64 mantissa once clamped ≤ 2^52 — no precision loss.
+        #[allow(clippy::cast_precision_loss)]
+        let v = clamped as f64;
+        h.observe(v);
+    }
+}
+
+/// Observe one per-intent coalesce wait. Called by the producer
+/// coalescer when each PUT is included in a flushed batch.
+pub fn observe_coalesce_wait(d: Duration) {
+    if let Some(h) = COALESCE_WAIT.get() {
+        h.observe(d.as_secs_f64());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use prometheus::Registry;
+
+    #[test]
+    fn register_is_idempotent() {
+        let reg = Registry::new();
+        register(&reg).expect("first");
+        register(&reg).expect("second (no-op)");
+    }
+
+    #[test]
+    fn observe_before_register_does_not_panic() {
+        // No-op when the global isn't latched — the assertion is "no panic".
+        observe_intent_put_batch_size(8);
+        observe_coalesce_wait(Duration::from_micros(250));
+    }
+}
