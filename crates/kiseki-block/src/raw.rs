@@ -97,9 +97,25 @@ fn open_flags(strategy: IoStrategy) -> i32 {
 }
 
 /// Raw block-device implementation of [`DeviceBackend`].
+///
+/// **2026-06-01 — `file` is not behind a `Mutex`.** The previous
+/// `Mutex<File>` serialized every `write_all_at` / `read_exact_at`
+/// through one critical section, even though those calls are
+/// `pwrite(2)` / `pread(2)` — both POSIX-thread-safe with concurrent
+/// `(offset, buffer)` pairs. On the 2026-06-01 GCP n=6 / 18-shard /
+/// 32-conc PUT-heavy bench this serialized ~120 concurrent writes
+/// per device behind one lock, inflating
+/// `chunk_persistent_write{phase=extent_io}` to 6.3 ms (vs. a
+/// 30–100 µs single-queue floor for a 64 KiB write to local `NVMe`).
+/// See `specs/performance/2026-06-01-gcp-cap-fix-validation.md`
+/// § "`extent_io` = 6.3 ms is real".
+///
+/// The allocator stays behind a Mutex — its `BitmapAllocator` is not
+/// thread-safe. Sync is also fine without the file mutex
+/// (`File::sync_all` takes `&self` and is thread-safe on Linux).
 pub struct RawBlockDevice {
     _path: PathBuf,
-    file: Mutex<File>,
+    file: File,
     superblock: Superblock,
     allocator: Mutex<BitmapAllocator>,
     characteristics: DeviceCharacteristics,
@@ -180,7 +196,7 @@ impl RawBlockDevice {
 
         Ok(Self {
             _path: path.to_owned(),
-            file: Mutex::new(file),
+            file,
             superblock,
             allocator: Mutex::new(allocator),
             characteristics: chars,
@@ -198,9 +214,11 @@ impl RawBlockDevice {
         let region = bitmap_region_bytes(&self.superblock);
         let mut buf = AlignedBuf::new(region, align);
         buf.as_mut_slice()[..bitmap.len()].copy_from_slice(&bitmap);
-        let file = self.file.lock().lock_or_die("raw.file");
-        file.write_all_at(buf.as_slice(), self.superblock.bitmap_offset)?;
-        file.write_all_at(buf.as_slice(), self.superblock.bitmap_mirror_offset)?;
+        // pwrite is thread-safe; the file is shared without a mutex.
+        self.file
+            .write_all_at(buf.as_slice(), self.superblock.bitmap_offset)?;
+        self.file
+            .write_all_at(buf.as_slice(), self.superblock.bitmap_mirror_offset)?;
         Ok(())
     }
 }
@@ -249,8 +267,10 @@ impl DeviceBackend for RawBlockDevice {
             s[crc_at..crc_at + CRC_SIZE].copy_from_slice(&crc.to_le_bytes());
         }
         let abs_offset = self.superblock.data_offset + extent.offset;
-        let file = self.file.lock().lock_or_die("raw.file");
-        file.write_all_at(buf.as_slice(), abs_offset)
+        // pwrite is thread-safe — concurrent writes to disjoint offsets
+        // run in parallel without external locking.
+        self.file
+            .write_all_at(buf.as_slice(), abs_offset)
             .inspect_err(|e| {
                 tracing::warn!(error = %e, abs_offset, "raw write: write_all_at failed");
             })?;
@@ -263,13 +283,13 @@ impl DeviceBackend for RawBlockDevice {
         #[allow(clippy::cast_possible_truncation)] // extent.length is bounded by MAX_EXTENT_BYTES
         let mut buf = AlignedBuf::new(extent.length as usize, align);
         let abs_offset = self.superblock.data_offset + extent.offset;
-        {
-            let file = self.file.lock().lock_or_die("raw.file");
-            file.read_exact_at(buf.as_mut_slice(), abs_offset)
-                .inspect_err(|e| {
-                    tracing::warn!(error = %e, abs_offset, "raw read: read_exact_at failed");
-                })?;
-        }
+        // pread is thread-safe — concurrent reads at disjoint offsets
+        // run in parallel without external locking.
+        self.file
+            .read_exact_at(buf.as_mut_slice(), abs_offset)
+            .inspect_err(|e| {
+                tracing::warn!(error = %e, abs_offset, "raw read: read_exact_at failed");
+            })?;
         let s = buf.as_slice();
         let mut len_buf = [0u8; HEADER_SIZE];
         len_buf.copy_from_slice(&s[0..HEADER_SIZE]);
@@ -319,8 +339,8 @@ impl DeviceBackend for RawBlockDevice {
 
     fn sync(&self) -> Result<(), BlockError> {
         self.flush_bitmap()?;
-        let file = self.file.lock().lock_or_die("raw.file");
-        file.sync_all()?;
+        // File::sync_all is thread-safe; no mutex needed.
+        self.file.sync_all()?;
         Ok(())
     }
 
