@@ -1,0 +1,16 @@
+{
+  "label": "baseline_s3_get-heavy_65536",
+  "pool_type": "baseline",
+  "protocol": "s3",
+  "shape": "get-heavy",
+  "object_size": 65536,
+  "ok": true,
+  "rc": 0,
+  "wall_s": 30.591567965049762,
+  "ops": 700440,
+  "ops_per_s": 70044.0,
+  "mib_per_s": 4377.75,
+  "p50_us": 206,
+  "p95_us": 407,
+  "p99_us": 600
+}

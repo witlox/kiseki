@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
 //! Integration test: single-node Raft log store.
 //!
 //! Exercises the full path: `Raft::new` -> initialize -> `client_write` ->
@@ -244,4 +244,42 @@ async fn compact_shard_deduplicates() {
         .await
         .unwrap();
     assert_eq!(remaining.len(), 2);
+}
+
+/// Binary-search range read (read_deltas O(log N + range) fix, #133):
+/// pins the boundary cases `partition_point` + `take_while` must get
+/// exactly right. A wrong search would make the hydrator miss deltas
+/// (composition divergence), so these are correctness-critical:
+/// full range, strict subset, single, to-past-last (clamp), tail, and
+/// from-past-last (empty).
+#[tokio::test]
+async fn read_deltas_range_binary_search_boundaries() {
+    let store = bootstrap_single(None).await;
+    // 20 deltas → seqs 1..=20 (the membership entry is not a delta).
+    for i in 0u8..20 {
+        store.append_delta(make_append_req(i)).await.unwrap();
+    }
+
+    let cases: Vec<(u64, u64, Vec<u64>)> = vec![
+        (1, 20, (1..=20).collect()),
+        (5, 10, (5..=10).collect()),
+        (7, 7, vec![7]),
+        (1, 100, (1..=20).collect()),
+        (15, 100, (15..=20).collect()),
+        (100, 200, vec![]),
+    ];
+    for (from, to, expected) in cases {
+        let got: Vec<u64> = store
+            .read_deltas(ReadDeltasRequest {
+                shard_id: test_shard(),
+                from: SequenceNumber(from),
+                to: SequenceNumber(to),
+            })
+            .await
+            .unwrap()
+            .iter()
+            .map(|d| d.header.sequence.0)
+            .collect();
+        assert_eq!(got, expected, "read_deltas range [{from}, {to}]");
+    }
 }

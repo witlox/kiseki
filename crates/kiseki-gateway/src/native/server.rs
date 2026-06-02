@@ -38,7 +38,7 @@ use kiseki_proto::v1::native as np;
 use tonic::Status;
 
 use crate::error::GatewayError;
-use crate::ops::{GatewayOps, ReadRequest, WriteConditional, WriteRequest};
+use crate::ops::{GatewayOps, ReadRequest, WriteConditional, WriteRequest, WriteSurface};
 
 use super::lease_store::{AcquireOutcome, LeaseStore, ReleaseOutcome, RenewOutcome};
 use super::proxy_client::ProxyClient;
@@ -355,6 +355,7 @@ fn map_gateway_error(e: GatewayError) -> Status {
             Status::out_of_range(format!("key out of range for shard {shard_id:?}"))
         }
         GatewayError::ReadOnlyNamespace => Status::failed_precondition("namespace is read-only"),
+        GatewayError::InsufficientStorage(m) => Status::resource_exhausted(m),
         GatewayError::ServiceUnavailable(m) => Status::unavailable(m),
         GatewayError::PreconditionFailed(m) => Status::failed_precondition(m),
         // Both NotFound (composition missing) and NamespaceNotFound
@@ -517,6 +518,14 @@ impl ServerImpl {
                 idempotency_key: Some(cf.idempotency_key.clone()),
                 forwarded_from_node: cf.forwarded_from_node,
                 comp_id_override: None,
+                tier: None,
+                // ADR-047: native gRPC write is async-ack-eligible (object
+                // semantics, bounded-stale per ADR-014).
+                surface: WriteSurface::Native,
+                // #146 — native PutObject writes the full body in one
+                // shot; no chain.
+                base_composition_id: None,
+                base_bytes: 0,
             };
             match self.ops.write_with_forwarding(wreq).await {
                 Ok(r) => r,
@@ -582,6 +591,14 @@ impl ServerImpl {
                 idempotency_key: Some(cf.idempotency_key.clone()),
                 forwarded_from_node: cf.forwarded_from_node,
                 comp_id_override: None,
+                tier: None,
+                // ADR-047: native gRPC write is async-ack-eligible (object
+                // semantics, bounded-stale per ADR-014).
+                surface: WriteSurface::Native,
+                // #146 — native PutObject writes the full body in one
+                // shot; no chain.
+                base_composition_id: None,
+                base_bytes: 0,
             };
             self.ops.write(wreq).await.map_err(map_gateway_error)?
         };
@@ -1330,6 +1347,9 @@ mod tests {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         })
         .await;
     }

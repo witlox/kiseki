@@ -81,6 +81,28 @@ pub(crate) fn compute_s3_peer_addrs(
         .collect()
 }
 
+/// Parse `KISEKI_PEER_DATA_ADDRS=id=host:port,id=host:port,…` into
+/// `(node_id, "host:port")` pairs for the native proxy fallback (#103).
+/// Malformed entries (no `=`, non-numeric id) are skipped — the caller
+/// falls back to uniform-port derivation if the result is empty.
+/// Mirrors the `KISEKI_DS_PEERS` shape used for the fabric.
+fn parse_peer_data_addrs(env: Option<&str>) -> Vec<(u64, String)> {
+    let Some(raw) = env else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .filter_map(|entry| {
+            let (id, addr) = entry.trim().split_once('=')?;
+            let id = id.trim().parse::<u64>().ok()?;
+            let addr = addr.trim();
+            if addr.is_empty() {
+                return None;
+            }
+            Some((id, addr.to_owned()))
+        })
+        .collect()
+}
+
 /// Pick the per-node identity source for the at-rest key store
 /// (Phase 14e). Precedence: SPIFFE > mTLS > file-in-data-dir.
 ///
@@ -194,6 +216,101 @@ fn fabric_addr_from_raft_peer(raft_peer: &str, data_port: u16) -> String {
         || raft_peer.to_owned(),
         |(host, _port)| format!("{host}:{data_port}"),
     )
+}
+
+/// 2026-06-01: read the cluster CA + node cert + key off disk and
+/// build a `rustls::ServerConfig` for the fabric TCP-framed listener.
+/// Delegates to `kiseki_transport::TlsConfig::server_config` so the
+/// rustls posture matches the cluster's mTLS chain (same root the
+/// gRPC fabric service trusts). Returns the rustls error verbatim
+/// so an operator sees the same diagnostic regardless of which
+/// transport asked.
+fn build_fabric_tls_server_config(tls_files: &TlsFiles) -> Result<rustls::ServerConfig, String> {
+    let ca_pem = std::fs::read(&tls_files.ca_path)
+        .map_err(|e| format!("read CA {}: {e}", tls_files.ca_path.display()))?;
+    let cert_pem = std::fs::read(&tls_files.cert_path)
+        .map_err(|e| format!("read cert {}: {e}", tls_files.cert_path.display()))?;
+    let key_pem = std::fs::read(&tls_files.key_path)
+        .map_err(|e| format!("read key {}: {e}", tls_files.key_path.display()))?;
+    kiseki_transport::TlsConfig::server_config(&ca_pem, &cert_pem, &key_pem)
+        .map_err(|e| format!("rustls server_config: {e}"))
+}
+
+/// 2026-06-01: derive the TCP-framed-postcard fabric address from the
+/// gRPC fabric address by adding a fixed port offset. ADR-042 §2.2
+/// reserves the gRPC port for back-compat; the TCP-framed listener
+/// binds a separate port (default = `data_port + 50`). Same host,
+/// different port — so the existing per-peer hostname derivation
+/// (gRPC) feeds straight into this with no new resolver step.
+fn derive_tcp_fabric_addr(grpc_fabric_addr: &str, offset: u16) -> String {
+    grpc_fabric_addr.rsplit_once(':').map_or_else(
+        || grpc_fabric_addr.to_owned(),
+        |(host, port_s)| {
+            let port: u16 = port_s.parse().unwrap_or(0);
+            format!("{host}:{}", port.saturating_add(offset))
+        },
+    )
+}
+
+/// ADR-030 §3 multi-voter aggregation: convert a Raft-peer address
+/// (`host:raft_port`) into the canonical metrics scrape URL. The
+/// metrics port follows `KISEKI_METRICS_PORT` (default 9090, which is
+/// the prom convention used elsewhere in the codebase). The Raft port
+/// itself doesn't serve `/metrics` — the metrics server runs on a
+/// distinct port managed by `run_metrics_server`.
+fn metrics_url_from_raft_peer(raft_peer: &str) -> String {
+    let metrics_port: u16 = std::env::var("KISEKI_METRICS_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9090);
+    let host = raft_peer
+        .rsplit_once(':')
+        .map_or(raft_peer, |(host, _)| host);
+    format!("http://{host}:{metrics_port}/metrics")
+}
+
+/// Parse the `kiseki_node_metadata_capacity_bytes{kind="soft_limit"}`
+/// gauge from a Prometheus text exposition payload. Returns the
+/// integer byte value, or `None` if the line isn't present (the peer
+/// hasn't run the Phase 2 capacity emitter yet — older binary or
+/// mid-startup).
+fn parse_node_metadata_soft_limit_from_metrics(text: &str) -> Option<u64> {
+    const METRIC: &str = "kiseki_node_metadata_capacity_bytes";
+    for line in text.lines() {
+        let line = line.trim_start();
+        if !line.starts_with(METRIC) {
+            continue;
+        }
+        // Quickly skip TYPE/HELP comment lines and prefix-extended
+        // metric names (e.g. `..._sum`).
+        if line.starts_with('#') {
+            continue;
+        }
+        let after = &line[METRIC.len()..];
+        // The labels start with `{`; bail on any other prefix
+        // (a `_total` suffixed counter, e.g.).
+        if !after.starts_with('{') {
+            continue;
+        }
+        let close = after.find('}')?;
+        let labels = &after[1..close];
+        if !labels.contains("kind=\"soft_limit\"") {
+            continue;
+        }
+        let value = after[close + 1..].split_whitespace().next()?;
+        if let Ok(v) = value.parse::<u64>() {
+            return Some(v);
+        }
+        // Some Prom encoders emit `1.23e9` floats; fall back to f64.
+        if let Ok(v) = value.parse::<f64>() {
+            if v.is_finite() && v >= 0.0 {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let truncated = v as u64;
+                return Some(truncated);
+            }
+        }
+    }
+    None
 }
 
 /// `NamespaceProvisioner` impl backed by the control-plane Raft group.
@@ -393,8 +510,10 @@ pub async fn run_main(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // --- Context construction ---
 
-    // System disk detection (ADR-030).
-    if let Some(ref dir) = cfg.data_dir {
+    // System disk detection (ADR-030). Boot-time snapshot — metric
+    // emission happens after the metrics handle exists; here we just
+    // log + warn so operators see the device class in the boot trace.
+    let boot_capacity = cfg.data_dir.as_ref().map(|dir| {
         let capacity = crate::system_disk::compute_capacity(
             dir,
             cfg.meta_soft_limit_pct,
@@ -406,9 +525,12 @@ pub async fn run_main(
             total_gb = capacity.total_bytes / (1024 * 1024 * 1024),
             soft_limit_gb = capacity.soft_limit_bytes / (1024 * 1024 * 1024),
             budget_gb = capacity.small_file_budget_bytes / (1024 * 1024 * 1024),
-            "system disk detected",
+            cluster_max_files_estimate =
+                capacity.soft_limit_bytes / crate::system_disk::PER_FILE_METADATA_FOOTPRINT_BYTES,
+            "system disk detected (ADR-030 metadata-role device)",
         );
-    }
+        capacity
+    });
 
     // Node identity for multi-node Raft.
     if cfg.node_id > 0 {
@@ -462,20 +584,28 @@ pub async fn run_main(
 
     // Small object store for inline files (ADR-030).
     // Created before the log store so Raft state machines can use it.
-    let small_store: Option<std::sync::Arc<kiseki_chunk::SmallObjectStore>> = if let Some(ref dir) =
-        cfg.data_dir
-    {
-        std::fs::create_dir_all(dir.join("small")).ok();
-        let store = kiseki_chunk::SmallObjectStore::open(&dir.join("small").join("objects.redb"))
-            .map_err(|e| format!("small object store: {e}"))?;
-        tracing::info!(
-            path = %dir.display(),
-            "small object store: persistent (redb)",
-        );
-        Some(std::sync::Arc::new(store))
-    } else {
-        None
-    };
+    let small_store: Option<std::sync::Arc<kiseki_chunk::SmallObjectStore>> =
+        if let Some(ref dir) = cfg.data_dir {
+            // ADR-022 rev-5 (#129 unblock): SmallObjectStore moved from
+            // redb to fjall. Path becomes a directory under
+            // `small/objects/` instead of the legacy `small/objects.redb`
+            // file. Phase 5b: this hardcoded path is the LAST stop before
+            // the ADR-049 resolver replaces it with
+            // `<resolved SmallObject mount>/kiseki/small-object/` — that
+            // wiring lands as part of the runtime.rs boot reorder
+            // (phase 5a continued); until then, the data_dir-relative
+            // path keeps single-host development clusters working.
+            std::fs::create_dir_all(dir.join("small")).ok();
+            let store = kiseki_chunk::SmallObjectStore::open(&dir.join("small").join("objects"))
+                .map_err(|e| format!("small object store: {e}"))?;
+            tracing::info!(
+                path = %dir.display(),
+                "small object store: persistent (fjall, ADR-022 rev-5)",
+            );
+            Some(std::sync::Arc::new(store))
+        } else {
+            None
+        };
 
     // Metrics: built early so per-shard `RaftRpcListener` metrics
     // (ADR-041 §"Observability") are wired into the listener BEFORE
@@ -483,6 +613,14 @@ pub async fn run_main(
     // gateway, etc.) thread `Arc<...>` clones from this same struct
     // throughout setup.
     let metrics = crate::metrics::KisekiMetrics::new();
+
+    // ADR-030 amendment §"admin-driven metadata device role": seed
+    // the per-node metadata-capacity gauges from the boot-time
+    // snapshot so the cluster aggregator has a real value before the
+    // first periodic tick (30 s default).
+    if let Some(ref cap) = boot_capacity {
+        crate::system_disk::emit_capacity_metrics(&metrics, cap);
+    }
 
     // Observability opt-out for performance benchmarks. Defaults
     // ON for production deployments; the `infra/gcp/transport`
@@ -558,6 +696,10 @@ pub async fn run_main(
         let raft_addr_str = cfg
             .raft_addr
             .map_or_else(|| "0.0.0.0:9300".to_owned(), |a| a.to_string());
+        // ADR-047 decoupled-ack is THE write path for async-eligible
+        // surfaces (S3, Native) — no capability gate. POSIX surfaces
+        // (NFS, FUSE) keep the synchronous semantic via
+        // `WriteSurface::is_async_ack_eligible` (ADR-013/014).
         let mut store =
             kiseki_log::RaftShardStore::new(cfg.node_id, peers.clone(), cfg.data_dir.clone());
         if let Some(ref ss) = small_store {
@@ -696,6 +838,73 @@ pub async fn run_main(
         // (admin API + dedicated `--bench-namespace`) rather than
         // targeting `default`. See `infra/gcp/benchmarks/setup-shards.sh`
         // for the operator script.
+
+        // ADR-049 phase 5a: now that the control-plane Raft is up,
+        // run the boot helper. This: (1) discovers local devices via
+        // `/proc/mounts`, (2) submits `UpsertNodeInventory` to the
+        // catalog, (3) reads policy, (4) computes resolved tier
+        // paths, (5) checks I-CP-Move against the prior pointer
+        // file, (6) saves the pointer file with the resolved paths.
+        // In phase 5a the resolved paths are advisory — actual
+        // fjall stores (already opened above at `data_dir`-relative
+        // paths) get reconciled by the phase-6 `storage migrate`
+        // CLI command. The pointer file IS the I-CP-Move guard
+        // for the NEXT boot.
+        if let Some(ref data_dir) = cfg.data_dir {
+            use crate::cluster_control::{device_discovery, phase5_boot};
+            let tags_env = std::env::var("KISEKI_DEVICE_TAGS").unwrap_or_default();
+            let tags = device_discovery::DeviceTagMap::parse(&tags_env);
+            let catalog_for_phase5 = Arc::new(ctrl_store.state());
+            let ctrl_for_submit = Arc::clone(&ctrl_store);
+            let submit: phase5_boot::SubmitInventoryFn = Box::new(move |cmd| {
+                Box::pin(async move {
+                    ctrl_for_submit
+                        .submit(cmd)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| format!("UpsertNodeInventory submit: {e}"))
+                })
+            });
+            let boot_inputs = phase5_boot::Phase5BootInputs {
+                node_id: kiseki_common::ids::NodeId(cfg.node_id),
+                data_dir: data_dir.as_path(),
+                tags: &tags,
+                catalog: catalog_for_phase5,
+                submit_inventory: submit,
+            };
+            match phase5_boot::run(boot_inputs).await {
+                Ok(resolved) => {
+                    tracing::info!(
+                        node_id = cfg.node_id,
+                        devices = resolved.inventory.devices.len(),
+                        "ADR-049 phase 5a boot: catalog populated, pointer file saved",
+                    );
+                }
+                Err(phase5_boot::Phase5BootError::PathVersionMismatch {
+                    tier_label,
+                    prior,
+                    resolved,
+                    ..
+                }) => {
+                    return Err(format!(
+                        "ADR-049 I-CP-Move tripped on tier {tier_label}: prior={} resolved={}. \
+                         Run `kiseki-admin storage migrate --tier={tier_label} --node={}` before retrying.",
+                        prior.display(),
+                        resolved.display(),
+                        cfg.node_id,
+                    )
+                    .into());
+                }
+                Err(e) => {
+                    // Non-fatal at phase 5a: log + continue so the
+                    // cluster doesn't refuse to boot under partial
+                    // ADR-049 wiring. The pointer file gets written
+                    // on the next successful boot once the issue is
+                    // resolved (catalog reachable, policy set, etc.).
+                    tracing::warn!(error = %e, "ADR-049 phase 5a boot non-fatal error (continuing)");
+                }
+            }
+        }
 
         cluster_control_store = Some(ctrl_store);
         raft_shard_store_for_admin = Some(Arc::clone(&store_arc));
@@ -844,16 +1053,66 @@ pub async fn run_main(
         cfg.data_dir
     {
         std::fs::create_dir_all(dir.join("chunks")).ok();
-        let dev_path = dir.join("chunks").join("data.dev");
         // ADR-022 rev-4: chunk meta moved off JSON to fjall. Path
         // is now a keyspace directory (no extension).
         let meta_path = dir.join("chunks").join("meta");
-        // Resolve the device backend through the selector — emits
-        // the `device backend: io_uring` tracing::info! line when
-        // `KISEKI_IO_URING=1` and the feature is compiled in, so the
-        // deploy path is observable from `/var/log`.
-        let device = kiseki_block::open_or_init_device(&dev_path, 4 * 1024 * 1024 * 1024)
-            .map_err(|e| format!("chunk device backend init: {e}"))?;
+        // ADR-024 + ADR-029: when the operator provisioned raw JBOD
+        // data devices (`KISEKI_RAW_DEVICES`), open each as a
+        // `RawBlockDevice` — probe-driven `O_DIRECT` for SSD/NVMe,
+        // buffered for HDD — and span them into one capacity pool so
+        // the node uses its full provisioned storage. Otherwise fall
+        // back to a single file-backed device on `KISEKI_DATA_DIR`
+        // (VMs / CI / single-node dev), sized from
+        // `KISEKI_CHUNK_DEVICE_BYTES` (default 4 GiB). The hard-coded
+        // 4 GiB file was GH #115 — it capped every node at 4 GiB and
+        // silently ignored the provisioned NVMe.
+        let device: std::sync::Arc<dyn kiseki_block::DeviceBackend> = if cfg.raw_devices.is_empty()
+        {
+            let dev_path = dir.join("chunks").join("data.dev");
+            let size = std::env::var("KISEKI_CHUNK_DEVICE_BYTES")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(4 * 1024 * 1024 * 1024);
+            tracing::info!(
+                path = %dev_path.display(),
+                size_gb = size / (1024 * 1024 * 1024),
+                "chunk store: file-backed device (no KISEKI_RAW_DEVICES configured)",
+            );
+            kiseki_block::open_or_init_device(&dev_path, size)
+                .map_err(|e| format!("chunk device backend init: {e}"))?
+        } else {
+            let mut members: Vec<std::sync::Arc<dyn kiseki_block::DeviceBackend>> = Vec::new();
+            for dev_path in &cfg.raw_devices {
+                match kiseki_block::RawBlockDevice::open_or_init(std::path::Path::new(dev_path)) {
+                    Ok(d) => members.push(std::sync::Arc::new(d)),
+                    Err(e) => {
+                        tracing::error!(
+                            device = dev_path,
+                            error = %e,
+                            "raw device open failed — excluding from pool",
+                        );
+                    }
+                }
+            }
+            if members.is_empty() {
+                return Err(format!(
+                    "KISEKI_RAW_DEVICES set ({} device(s)) but none could be opened",
+                    cfg.raw_devices.len()
+                )
+                .into());
+            }
+            let n_members = members.len();
+            let pool = kiseki_block::DevicePool::new(members)
+                .map_err(|e| format!("device pool init: {e}"))?;
+            let total = kiseki_block::DeviceBackend::capacity(&pool).1;
+            tracing::info!(
+                devices = n_members,
+                configured = cfg.raw_devices.len(),
+                total_gb = total / (1024 * 1024 * 1024),
+                "chunk store: raw block-device pool (KISEKI_RAW_DEVICES)",
+            );
+            std::sync::Arc::new(pool)
+        };
         let store = kiseki_chunk::PersistentChunkStore::from_device(device, &meta_path)
             .map_err(|e| format!("persistent chunk store from_device: {e}"))?;
         // Receiver-side write_chunk phase histogram so /metrics shows
@@ -951,6 +1210,329 @@ pub async fn run_main(
         tracing::info!(gc_interval_s, "chunk store: periodic GC task spawned");
     }
 
+    // Capacity + dedup metrics refresher (GH #115). Populates the
+    // node-level storage gauges (used to be dead) and the per-device
+    // breakdown gauge from `storage_stats()` + `device_breakdown()`.
+    // These feed the cluster aggregator and `kiseki-admin capacity`.
+    {
+        let stats_store = Arc::clone(&local_chunk_store);
+        let stats_device = chunk_device_for_fsync.clone();
+        let g_used = metrics.storage_device_used_bytes.clone();
+        let g_total = metrics.storage_device_total_bytes.clone();
+        let g_logical = metrics.storage_logical_bytes.clone();
+        let g_physical = metrics.storage_physical_bytes.clone();
+        let g_count = metrics.storage_chunk_count.clone();
+        let g_dev = metrics.pool_device_capacity_bytes.clone();
+        let g_meta = metrics.storage_meta_bytes.clone();
+        let g_small = metrics.storage_small_bytes.clone();
+        // ADR-030 2026-05-31 amendment §"admin-driven metadata device
+        // role" — clone the metrics handle + capture data_dir for
+        // periodic NodeMetadataCapacity refresh inside the same tick.
+        let metrics_for_meta = metrics.clone();
+        let meta_data_dir = cfg.data_dir.clone();
+        let meta_soft_pct = cfg.meta_soft_limit_pct;
+        let meta_hard_pct = cfg.meta_hard_limit_pct;
+        let g_tier = [
+            (
+                metrics.storage_tier_fast_used.clone(),
+                metrics.storage_tier_fast_total.clone(),
+            ),
+            (
+                metrics.storage_tier_bulk_used.clone(),
+                metrics.storage_tier_bulk_total.clone(),
+            ),
+            (
+                metrics.storage_tier_cold_used.clone(),
+                metrics.storage_tier_cold_total.clone(),
+            ),
+        ];
+        // System-disk tier dirs (ADR-030 last-resort tier guardrail).
+        let meta_dir = cfg.data_dir.as_ref().map(|d| d.join("metadata"));
+        let small_dir = cfg.data_dir.as_ref().map(|d| d.join("small"));
+        let interval_s = std::env::var("KISEKI_CAPACITY_REFRESH_INTERVAL_S")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(30);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_s));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let s = stats_store.storage_stats().await;
+                let to_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+                g_used.set(to_i64(s.device_used_bytes));
+                g_total.set(to_i64(s.device_total_bytes));
+                g_logical.set(to_i64(s.logical_bytes));
+                g_physical.set(to_i64(s.physical_bytes));
+                g_count.set(to_i64(s.chunk_count));
+                if let Some(ref md) = meta_dir {
+                    g_meta.set(to_i64(dir_size_recursive(md)));
+                }
+                if let Some(ref sd) = small_dir {
+                    g_small.set(to_i64(dir_size_recursive(sd)));
+                }
+                if let Some(dev) = &stats_device {
+                    // Aggregate per-device usage by cost/performance tier
+                    // (ADR-024) for the cluster-wide per-class view.
+                    let mut tier_used = [0u64; 3];
+                    let mut tier_total = [0u64; 3];
+                    for d in dev.device_breakdown() {
+                        let id = uuid::Uuid::from_bytes(d.device_id).to_string();
+                        let free = d.total_bytes.saturating_sub(d.used_bytes);
+                        g_dev
+                            .with_label_values(&["data", &id, "total"])
+                            .set(to_i64(d.total_bytes));
+                        g_dev
+                            .with_label_values(&["data", &id, "used"])
+                            .set(to_i64(d.used_bytes));
+                        g_dev
+                            .with_label_values(&["data", &id, "free"])
+                            .set(to_i64(free));
+                        let t = match kiseki_block::StorageTier::of(d.medium) {
+                            kiseki_block::StorageTier::Fast => 0,
+                            kiseki_block::StorageTier::Bulk => 1,
+                            kiseki_block::StorageTier::Cold => 2,
+                        };
+                        tier_used[t] = tier_used[t].saturating_add(d.used_bytes);
+                        tier_total[t] = tier_total[t].saturating_add(d.total_bytes);
+                    }
+                    for (i, (gu, gt)) in g_tier.iter().enumerate() {
+                        gu.set(to_i64(tier_used[i]));
+                        gt.set(to_i64(tier_total[i]));
+                    }
+                }
+                // ADR-030 2026-05-31 amendment — refresh the
+                // metadata-role device's capacity snapshot in the same
+                // tick. `compute_capacity` is df(1) + a sysfs read,
+                // cheap relative to the 30s cadence. used_bytes drifts
+                // as the data_dir fills; total/soft/hard are stable
+                // for any sane mount.
+                if let Some(ref dir) = meta_data_dir {
+                    let cap =
+                        crate::system_disk::compute_capacity(dir, meta_soft_pct, meta_hard_pct);
+                    crate::system_disk::emit_capacity_metrics(&metrics_for_meta, &cap);
+                }
+            }
+        });
+        tracing::info!(
+            interval_s,
+            "chunk store: capacity/dedup metrics refresher spawned"
+        );
+    }
+
+    // ADR-030 §3 + 2026-05-31 amendment §"throughput guard" —
+    // per-shard inline-threshold recompute task (leader-only). Polls
+    // the metrics handle for the local node's `small_file_budget`,
+    // and per shard the delta_count + current ShardConfig. The
+    // formula clamps to `[inline_floor, inline_ceiling]`; the
+    // throughput guard drops the effective value to floor when the
+    // shard's recent inline write rate exceeds
+    // `KISEKI_RAFT_INLINE_MBPS` (default 10 MB/s, ADR-030 SF-ADV-1).
+    //
+    // Only fires `set_shard_config` when the new value differs from
+    // the current — keeps the Raft log noise-free and avoids spurious
+    // apply-hook work.
+    // ADR-030 §3 — gateway slot the recompute task pushes the
+    // committed per-shard threshold into. Constructed here so the
+    // task can capture a clone; the gateway-build block below stores
+    // a `Weak<InMemoryGateway>` once the gateway exists. Until then
+    // the slot holds `None` and the per-shard push step no-ops
+    // (still drives the Raft commit + multi-voter aggregation).
+    let gateway_for_threshold_push: Arc<
+        parking_lot::RwLock<Option<std::sync::Weak<kiseki_gateway::InMemoryGateway>>>,
+    > = Arc::new(parking_lot::RwLock::new(None));
+    if let Some(ref shard_store_for_recompute) = raft_shard_store_for_admin {
+        let store = Arc::clone(shard_store_for_recompute);
+        let metrics_for_recompute = metrics.clone();
+        let gateway_slot = Arc::clone(&gateway_for_threshold_push);
+        // ADR-030 §3 multi-voter aggregation: scrape every peer's
+        // `/metrics` endpoint over the cfg-known address list and
+        // compute `min(soft_limit)` across the voter set. An
+        // unreachable peer falls back to its last successful scrape
+        // for the duration of `voter_soft_limit_stale_after`; beyond
+        // that we treat its budget as `u64::MAX` (don't bind below
+        // the local node's view on a transient flap).
+        let peer_metrics_urls: Vec<String> = cfg
+            .raft_peers
+            .iter()
+            .filter(|(id, _)| *id != cfg.node_id)
+            .map(|(_, addr)| metrics_url_from_raft_peer(addr))
+            .collect();
+        let interval_s = std::env::var("KISEKI_INLINE_THRESHOLD_RECOMPUTE_S")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(60);
+        let mbps_limit = std::env::var("KISEKI_RAFT_INLINE_MBPS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(10);
+        tokio::spawn(async move {
+            use std::collections::HashMap;
+            use std::time::Instant;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_s));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Per-shard throughput guards live for the lifetime of the
+            // task (one entry per shard the leader has seen). On
+            // leadership loss the guard's stale samples are harmless;
+            // they fall out of the 10 s window before this node ever
+            // recomputes again.
+            let mut guards: HashMap<
+                kiseki_common::ids::ShardId,
+                kiseki_log::shard_inline_threshold::InlineThroughputGuard,
+            > = HashMap::new();
+            // Per-peer last-good soft_limit cache for the multi-voter
+            // `min(soft_limit)` aggregation. Survives scrape errors
+            // up to `voter_soft_limit_stale_after`; beyond that the
+            // stale value is dropped.
+            let voter_soft_limit_stale_after = std::time::Duration::from_secs(interval_s * 3);
+            let mut peer_soft_limit_cache: HashMap<String, (u64, Instant)> = HashMap::new();
+            loop {
+                tick.tick().await;
+                let now = Instant::now();
+                // Local node's soft_limit, surfaced via the gauge the
+                // Phase 2 capacity-emit task feeds.
+                let local_soft_limit = u64::try_from(
+                    metrics_for_recompute
+                        .node_metadata_capacity_bytes
+                        .with_label_values(&["soft_limit"])
+                        .get()
+                        .max(0),
+                )
+                .unwrap_or(0);
+                // ADR-030 SF-ADV-4 emergency reduction: when the
+                // local node's used > hard_limit, force the formula
+                // to clamp at the configured floor. The Raft commit
+                // on the leader path below picks this up; followers
+                // see it via their own gauge readings on the next
+                // tick.
+                let local_used = u64::try_from(
+                    metrics_for_recompute
+                        .node_metadata_capacity_bytes
+                        .with_label_values(&["used"])
+                        .get()
+                        .max(0),
+                )
+                .unwrap_or(0);
+                let local_hard_limit = u64::try_from(
+                    metrics_for_recompute
+                        .node_metadata_capacity_bytes
+                        .with_label_values(&["hard_limit"])
+                        .get()
+                        .max(0),
+                )
+                .unwrap_or(u64::MAX);
+                let force_floor = local_hard_limit > 0 && local_used >= local_hard_limit;
+                // ADR-030 §3 multi-voter min. Scrape every peer's
+                // `/metrics` over HTTP; parse the
+                // `kiseki_node_metadata_capacity_bytes{kind="soft_limit"}`
+                // sample. Fold the local value in too.
+                let mut budgets: Vec<u64> = vec![local_soft_limit];
+                for url in &peer_metrics_urls {
+                    if let Some(text) = crate::web::aggregator::reqwest_get_body(url).await {
+                        if let Some(v) = parse_node_metadata_soft_limit_from_metrics(&text) {
+                            budgets.push(v);
+                            peer_soft_limit_cache.insert(url.clone(), (v, now));
+                            continue;
+                        }
+                    }
+                    // Fall through: use cached value if still fresh.
+                    if let Some(&(v, when)) = peer_soft_limit_cache.get(url) {
+                        if now.duration_since(when) <= voter_soft_limit_stale_after {
+                            budgets.push(v);
+                        }
+                    }
+                }
+                let available_bytes = budgets.iter().copied().min().unwrap_or(local_soft_limit);
+                for shard_id in store.shard_ids() {
+                    // Read shard_health on every node so each can
+                    // update its own gateway from the Raft-committed
+                    // config. Leader is additionally responsible for
+                    // recomputing + committing a new value when the
+                    // formula + guard say so.
+                    let info =
+                        match kiseki_log::traits::LogOps::shard_health(store.as_ref(), shard_id)
+                            .await
+                        {
+                            Ok(i) => i,
+                            Err(e) => {
+                                tracing::debug!(
+                                    shard_id = %shard_id.0,
+                                    error = %e,
+                                    "inline-threshold recompute: shard_health unavailable",
+                                );
+                                continue;
+                            }
+                        };
+                    // Push the committed threshold into the local
+                    // gateway's per-shard map. Every node does this
+                    // (leader OR follower) so the gateway-side write
+                    // path consults the live value instead of the
+                    // boot-time global.
+                    if let Some(weak) = gateway_slot.read().clone() {
+                        if let Some(gw) = weak.upgrade() {
+                            gw.set_shard_inline_threshold(
+                                shard_id,
+                                info.config.inline_threshold_bytes,
+                            );
+                        }
+                    }
+                    if !store.is_shard_leader(shard_id) {
+                        continue;
+                    }
+                    let raw = if force_floor {
+                        // SF-ADV-4 emergency reduction overrides the
+                        // formula; the leader still goes through Raft
+                        // so followers' gateways converge after their
+                        // next recompute tick.
+                        info.config.inline_floor_bytes
+                    } else {
+                        kiseki_log::shard_inline_threshold::compute_shard_inline_threshold(
+                            available_bytes,
+                            info.delta_count,
+                            info.config.inline_floor_bytes,
+                            info.config.inline_ceiling_bytes,
+                        )
+                    };
+                    let guard = guards.entry(shard_id).or_insert_with(|| {
+                        kiseki_log::shard_inline_threshold::InlineThroughputGuard::with_limit(
+                            std::time::Duration::from_secs(10),
+                            mbps_limit,
+                        )
+                    });
+                    let effective =
+                        guard.effective_threshold(now, raw, info.config.inline_floor_bytes);
+                    if effective == info.config.inline_threshold_bytes {
+                        continue;
+                    }
+                    let mut new_config = info.config.clone();
+                    new_config.inline_threshold_bytes = effective;
+                    if let Err(e) = store.submit_shard_config(shard_id, new_config) {
+                        tracing::warn!(
+                            shard_id = %shard_id.0,
+                            error = %e,
+                            "inline-threshold recompute: SetShardConfig failed",
+                        );
+                    } else {
+                        tracing::info!(
+                            shard_id = %shard_id.0,
+                            previous = info.config.inline_threshold_bytes,
+                            effective,
+                            "inline-threshold recompute: SetShardConfig committed",
+                        );
+                    }
+                }
+            }
+        });
+        tracing::info!(
+            interval_s,
+            mbps_limit,
+            "ADR-030 inline-threshold recompute task spawned (leader-only per shard)",
+        );
+    }
+
     // Cluster chunk fabric (Phase 16a step 12). For each *other* peer
     // in raft_peers we open a lazy mTLS gRPC Channel to its data-path
     // port and wrap it in GrpcFabricPeer. For a 1-node cluster peers
@@ -964,6 +1546,32 @@ pub async fn run_main(
     let bootstrap_tenant_for_cluster = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
     let mut fabric_peers: Vec<Arc<dyn kiseki_chunk_cluster::FabricPeer>> = Vec::new();
     let data_port = cfg.data_addr.port();
+    // 2026-06-01 fabric transport selection. ADR-042 §2.2 calls for
+    // TCP-framed-postcard as the default to escape the gRPC/h2 tax;
+    // the 2026-06-01 3-node loopback profile confirmed the fabric edge
+    // was paying ~14× the receiver-work cost in gRPC overhead alone.
+    // **DEFAULT IS TCP** — gRPC stays only as an explicit fallback so
+    // a future implementer cannot regress this silently:
+    //
+    //   KISEKI_FABRIC_TRANSPORT=tcp     (default; ADR-042 §2.2)
+    //   KISEKI_FABRIC_TRANSPORT=grpc    (explicit fallback)
+    //
+    // The TCP-framed fabric listener binds on `data_port + 50`; the
+    // gRPC fabric service stays on `data_port` for back-compat during
+    // rolling upgrades. Peers chosen at startup based on this flag.
+    let fabric_transport_is_tcp = std::env::var("KISEKI_FABRIC_TRANSPORT")
+        .ok()
+        .map(|v| v.to_ascii_lowercase())
+        .is_none_or(|v| !matches!(v.as_str(), "grpc" | "g"));
+    let fabric_tcp_port_offset: u16 = 50;
+    tracing::info!(
+        transport = if fabric_transport_is_tcp {
+            "tcp-framed-postcard (ADR-042 §2.2 default)"
+        } else {
+            "grpc (KISEKI_FABRIC_TRANSPORT=grpc fallback)"
+        },
+        "fabric peer transport selected",
+    );
     // Build a peer-id → fabric address map. `KISEKI_FABRIC_PEERS`
     // (cfg.fabric_peers) overrides the per-port derivation below,
     // which is the only path that works when every node binds a
@@ -981,24 +1589,45 @@ pub async fn run_main(
             || fabric_addr_from_raft_peer(raft_peer_addr, data_port),
             |s| (*s).to_owned(),
         );
-        match build_fabric_channel(&fabric_addr, cfg.tls.as_ref()) {
-            Ok(channel) => {
-                let name = format!("node-{peer_id}");
-                fabric_peers.push(Arc::new(
-                    kiseki_chunk_cluster::GrpcFabricPeer::new(name, channel)
-                        .with_metrics(Arc::clone(&metrics.fabric)),
-                ));
-                tracing::info!(
-                    peer_id,
-                    fabric_addr,
-                    "fabric peer registered for cross-node chunks",
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    peer_id, fabric_addr, error = %e,
-                    "fabric peer channel build failed — peer skipped (cluster may run degraded)",
-                );
+        let name = format!("node-{peer_id}");
+        if fabric_transport_is_tcp {
+            // TCP-framed-postcard fabric (ADR-042 §2.2 default).
+            // Derive the TCP-framed address by adding the port
+            // offset to the gRPC fabric address; same host, port+50.
+            // Lazy construction — the connect happens on first call,
+            // matching tonic Channel semantics. The runtime can come
+            // up regardless of peer reachability at startup.
+            let tcp_addr = derive_tcp_fabric_addr(&fabric_addr, fabric_tcp_port_offset);
+            let peer =
+                kiseki_chunk_cluster::TcpFramedFabricPeer::new_lazy(name.clone(), tcp_addr.clone());
+            fabric_peers.push(peer);
+            tracing::info!(
+                peer_id,
+                fabric_addr = %tcp_addr,
+                transport = "tcp-framed-postcard (lazy connect)",
+                "fabric peer registered for cross-node chunks",
+            );
+        } else {
+            // gRPC fabric (legacy fallback).
+            match build_fabric_channel(&fabric_addr, cfg.tls.as_ref()) {
+                Ok(channel) => {
+                    fabric_peers.push(Arc::new(
+                        kiseki_chunk_cluster::GrpcFabricPeer::new(name, channel)
+                            .with_metrics(Arc::clone(&metrics.fabric)),
+                    ));
+                    tracing::info!(
+                        peer_id,
+                        fabric_addr,
+                        transport = "grpc",
+                        "fabric peer registered for cross-node chunks",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        peer_id, fabric_addr, error = %e,
+                        "fabric peer channel build failed — peer skipped (cluster may run degraded)",
+                    );
+                }
             }
         }
     }
@@ -1073,7 +1702,11 @@ pub async fn run_main(
     } else {
         kiseki_chunk_cluster::ChunkEnvelopeRegistry::default()
     };
-    let chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> = Arc::new(
+    // ADR-048 §"Decision" — keep a typed Arc to the ClusteredChunkStore
+    // so we can hand it to `FabricSlabStore::open` after the gateway is
+    // built (the trait-object form below can't be down-cast back to the
+    // concrete type).
+    let clustered_chunk_store: Arc<kiseki_chunk_cluster::ClusteredChunkStore> = Arc::new(
         kiseki_chunk_cluster::ClusteredChunkStore::new(
             Arc::clone(&local_chunk_store),
             fabric_peers,
@@ -1082,6 +1715,8 @@ pub async fn run_main(
         .with_metrics(Arc::clone(&metrics.fabric))
         .with_envelope_registry(envelope_registry.clone()),
     );
+    let chunk_store: Arc<dyn kiseki_chunk::AsyncChunkOps> =
+        Arc::clone(&clustered_chunk_store) as Arc<dyn kiseki_chunk::AsyncChunkOps>;
 
     // Phase 16d step 4: spawn the periodic scrub scheduler when
     // running on a real cluster (>=1 peer; in single-node mode
@@ -1155,23 +1790,11 @@ pub async fn run_main(
             Some(scheduler)
         };
 
-    // Raw device discovery (KISEKI_RAW_DEVICES).
-    // This is the discovery phase — actual device opening via DeviceBackend
-    // is deferred until the RawBlockDevice implementation is wired.
-    if !cfg.raw_devices.is_empty() {
-        tracing::info!(
-            devices = cfg.raw_devices.len(),
-            "raw block devices configured"
-        );
-        for dev_path in &cfg.raw_devices {
-            let path = std::path::Path::new(dev_path);
-            if path.exists() {
-                tracing::info!(device = dev_path, "raw device detected");
-            } else {
-                tracing::warn!(device = dev_path, "raw device not found — skipping");
-            }
-        }
-    }
+    // Raw device discovery (KISEKI_RAW_DEVICES) is no longer a
+    // separate log-only phase: the chunk-store construction above opens
+    // each device as a `RawBlockDevice` and spans them into a
+    // `DevicePool` (GH #115). This block previously only logged and
+    // dropped the devices on the floor.
 
     // Composition: wired to log for delta emission. ADR-040 + ADR-022
     // successor: when KISEKI_DATA_DIR is set we back the comp_id →
@@ -1310,6 +1933,9 @@ pub async fn run_main(
         read_only: false,
         versioning_enabled: false,
         compliance_tags: Vec::new(),
+        tier_policy: Vec::new(),
+
+        size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
     });
     let _ = view_store.write().create_view(kiseki_view::ViewDescriptor {
         view_id: bootstrap_view,
@@ -1359,50 +1985,286 @@ pub async fn run_main(
     // empty (the gateway carries vec![] in NewChunkMeta), matching
     // the single-node-degenerate path.
     let cluster_placement: Vec<u64> = cfg.raft_peers.iter().map(|(id, _)| *id).collect();
-    let mut gw_builder = kiseki_gateway::InMemoryGateway::new(comp_store, chunk_store, master_key)
-        .with_view_store(Arc::clone(&view_store))
-        // ADR-044: tenant-isolated content-addressed dedup.
-        .with_dedup_policy(
-            kiseki_common::tenancy::DedupPolicy::TenantIsolated,
-            Some(tenant_dedup_key),
-        )
-        .with_cluster_placement(cluster_placement)
-        // Phase 16c step 2: cap per-chunk placement at the
-        // size-derived `copies` so a 6-node Replication-3 cluster
-        // doesn't list all 6 nodes in every cluster_chunk_state row.
-        .with_target_copies(usize::from(durability.copies))
-        // ADR-040 §D7 + §D10 / F-4 closure: thread the read-path
-        // retry counters (`kiseki_gateway_read_retry_total` and
-        // `kiseki_gateway_read_retry_exhausted_total`) into the
-        // gateway so operators can see whether they're hitting
-        // the configurable budget.
-        .with_retry_metrics(Arc::clone(&metrics.gateway_retry));
-    // The inline path (mem_gateway.rs PUT path: writes ≤ inline_threshold
-    // go to local small_store keyed by chunk_id) is single-node-only. In a
-    // multi-node cluster the inline write lands on one node's redb and the
-    // Raft-replicated composition metadata leads other nodes to look up
-    // chunk_ids that aren't in their small_store → cross-node GET returns
-    // 404. ADR-026 sketches a "small writes inline in delta → Raft only"
-    // optimization keyed by hashed_key XOR seq, but mem_gateway and the
-    // Raft state-machine apply path use incompatible key spaces, so until
-    // that path is unified we route ALL writes through the chunk/fabric
-    // path when fabric peers are present. Single-node clusters keep the
-    // inline optimization.
-    let multi_node = !fabric_peers_for_scrub.is_empty();
-    if let Some(ref ss) = small_store {
-        if multi_node {
-            tracing::info!(
-                "inline write path disabled in multi-node cluster — small writes go through fabric (Phase 16a)",
-            );
+    // ADR-042 §4 / #103 / #111: proxy-fallback channel pool, constructed
+    // BEFORE the gateway so it backs both the native server's proxy AND
+    // the gateway's append-forwarder (#111 — forward writes/deletes/
+    // multipart to a remote shard leader for every ingress). Peer
+    // registration precedence: `KISEKI_PEER_DATA_ADDRS` (localhost-multi-
+    // node test harness) else uniform per-node data port (prod posture).
+    let proxy_client_for_native =
+        std::sync::Arc::new(kiseki_gateway::native::proxy_client::ProxyClient::new(
+            kiseki_common::ids::NodeId(cfg.node_id),
+        ));
+    {
+        let registered =
+            parse_peer_data_addrs(std::env::var("KISEKI_PEER_DATA_ADDRS").ok().as_deref());
+        if registered.is_empty() {
+            let peer_data_port = cfg.data_addr.port();
+            for (peer_id, peer_addr) in &cfg.raft_peers {
+                if *peer_id == cfg.node_id {
+                    continue;
+                }
+                let host = peer_addr
+                    .rsplit_once(':')
+                    .map_or(peer_addr.as_str(), |(h, _)| h);
+                proxy_client_for_native.register_node(
+                    kiseki_common::ids::NodeId(*peer_id),
+                    format!("{host}:{peer_data_port}"),
+                );
+            }
         } else {
-            gw_builder = gw_builder.with_inline_threshold(
-                kiseki_log::ShardConfig::default().inline_threshold_bytes,
-                std::sync::Arc::clone(ss)
-                    as std::sync::Arc<dyn kiseki_common::inline_store::InlineStore>,
-            );
+            for (peer_id, data_addr) in registered {
+                if peer_id == cfg.node_id {
+                    continue;
+                }
+                proxy_client_for_native
+                    .register_node(kiseki_common::ids::NodeId(peer_id), data_addr);
+            }
         }
     }
+    let mut gw_builder =
+        kiseki_gateway::InMemoryGateway::new(comp_store, Arc::clone(&chunk_store), master_key)
+            // ADR-047: this node's id seeds the per-node perspective clock
+            // (the PerspectiveSeq tie-breaker). Decoupled-ack is THE path for
+            // async-eligible surfaces (no capability gate).
+            .with_node_id(cfg.node_id)
+            .with_view_store(Arc::clone(&view_store))
+            // ADR-044: tenant-isolated content-addressed dedup.
+            .with_dedup_policy(
+                kiseki_common::tenancy::DedupPolicy::TenantIsolated,
+                Some(tenant_dedup_key),
+            )
+            // #111: forward a remote-led shard's metadata mutation to the
+            // leader's LogService (write/delete/multipart, every ingress).
+            .with_append_forwarder(std::sync::Arc::new(
+                kiseki_gateway::native::append_forwarder::ProxyAppendForwarder::new(
+                    std::sync::Arc::clone(&proxy_client_for_native),
+                ),
+            ))
+            .with_cluster_placement(cluster_placement)
+            // Phase 16c step 2: cap per-chunk placement at the
+            // size-derived `copies` so a 6-node Replication-3 cluster
+            // doesn't list all 6 nodes in every cluster_chunk_state row.
+            .with_target_copies(usize::from(durability.copies))
+            // ADR-040 §D7 + §D10 / F-4 closure: thread the read-path
+            // retry counters (`kiseki_gateway_read_retry_total` and
+            // `kiseki_gateway_read_retry_exhausted_total`) into the
+            // gateway so operators can see whether they're hitting
+            // the configurable budget.
+            .with_retry_metrics(Arc::clone(&metrics.gateway_retry));
+    // #129 — inline write path is now multi-node-correct via Raft replication
+    // of `AppendChunkAndDeltaRequest.inline_payloads`. The gateway stages the
+    // sealed envelope as `(chunk_id, env_bytes)` on the delta; each replica's
+    // state-machine apply writes it to its local SmallObjectStore (ADR-022
+    // rev-5 fjall-backed, keyed by chunk_id per ADR-030 §2). Cross-node GETs
+    // read the local SmallObjectStore by the same chunk_id that the
+    // composition references — no fabric round-trip for small files.
+    let multi_node = !fabric_peers_for_scrub.is_empty();
+    if let Some(ref ss) = small_store {
+        gw_builder = gw_builder.with_inline_threshold(
+            kiseki_log::ShardConfig::default().inline_threshold_bytes,
+            std::sync::Arc::clone(ss)
+                as std::sync::Arc<dyn kiseki_common::inline_store::InlineStore>,
+        );
+    }
     let gw = Arc::new(gw_builder);
+
+    // ADR-048 boot wiring — for every pool flagged
+    // `requires_migration`, construct a `FabricSlabStore`, register
+    // the per-pool backlog tracker, and spawn the slab-EC compactor
+    // task on every node that has a Raft shard. The gateway's
+    // cold-path read branch consults the slab store; the gateway's
+    // `pool_is_async_ack_eligible` consults the backlog registry;
+    // the compactor task emits `MigrateChunkLocations` deltas as it
+    // flushes slabs.
+    //
+    // Wired AFTER `gw` exists so the per-pool calls below can
+    // attach. Skipped entirely when no peer fabric is configured
+    // (`fabric_peers_for_scrub.is_empty()`) — slab-EC requires the
+    // fabric for fragment distribution, and a single-node cluster
+    // has nothing to scatter across.
+    let slab_backlog_registry: Arc<
+        parking_lot::RwLock<
+            std::collections::HashMap<
+                String,
+                Arc<parking_lot::Mutex<kiseki_chunk::slab::SlabBacklog>>,
+            >,
+        >,
+    > = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+    if let Some(ref data_dir) = cfg.data_dir {
+        if fabric_peers_for_scrub.is_empty() {
+            tracing::debug!("slab-EC boot: skipped (single-node cluster, no fabric peers)");
+        } else {
+            let pool_snapshot = chunk_store.snapshot_pools().await;
+            let placement_nodes_for_slab: Vec<u64> =
+                cfg.raft_peers.iter().map(|(id, _)| *id).collect();
+            // Register the backlog tracker on the gateway eagerly —
+            // the registry is shared between every pool's
+            // compactor and the gateway's `is_async_ack_eligible`
+            // gate.
+            gw.set_slab_backlog_registry(Arc::clone(&slab_backlog_registry));
+            let mut migration_pools: Vec<String> = Vec::new();
+            for pool in &pool_snapshot {
+                if !pool.requires_migration {
+                    continue;
+                }
+                migration_pools.push(pool.name.clone());
+                let ec_strategy = match pool.durability {
+                    kiseki_chunk::DurabilityStrategy::ErasureCoding {
+                        data_shards,
+                        parity_shards,
+                    } => kiseki_chunk_cluster::ec::EcStrategy::Ec {
+                        data: data_shards,
+                        parity: parity_shards,
+                    },
+                    // Replication pools migrate to EC by default —
+                    // the cold tier is EC-4+2 regardless of the
+                    // hot-tier replication factor.
+                    _ => kiseki_chunk_cluster::ec::EcStrategy::Ec { data: 4, parity: 2 },
+                };
+                let slab_data_dir = data_dir.join("slab_pools").join(&pool.name);
+                let slab_store = match kiseki_chunk_cluster::slab_store::FabricSlabStore::open(
+                    Arc::clone(&clustered_chunk_store),
+                    placement_nodes_for_slab.clone(),
+                    ec_strategy,
+                    &slab_data_dir,
+                    pool.name.clone(),
+                ) {
+                    Ok(s) => Arc::new(s),
+                    Err(e) => {
+                        tracing::warn!(
+                            pool = %pool.name,
+                            error = %e,
+                            "slab-EC boot: FabricSlabStore::open failed (compactor skipped for this pool)",
+                        );
+                        continue;
+                    }
+                };
+                // Hand the FIRST migration-eligible pool's store to
+                // the gateway as the cold-tier resolver. The
+                // gateway today routes by chunk_locations' embedded
+                // pool name, but it only holds one SlabStore handle;
+                // a per-pool handle map is a follow-up if a single
+                // cluster runs multiple migration-eligible pools.
+                gw.set_slab_store(
+                    Arc::clone(&slab_store) as Arc<dyn kiseki_chunk::slab::SlabStore>,
+                );
+                // Register backlog tracker in the shared registry so
+                // the gateway sees it on `pool_is_async_ack_eligible`.
+                let backlog = Arc::new(parking_lot::Mutex::new(
+                    kiseki_chunk::slab::SlabBacklog::new(),
+                ));
+                slab_backlog_registry
+                    .write()
+                    .insert(pool.name.clone(), Arc::clone(&backlog));
+
+                // Spawn the compactor task. `namespaces` is filled
+                // by the runtime's namespace-discovery hook at
+                // startup; until then the compactor scans the
+                // bootstrap namespace (UUIDv4 0..0 + 1 from the
+                // bootstrap_view setup at the top of run_main).
+                // Subsequent namespaces register dynamically via
+                // the control-plane apply path; a periodic
+                // namespace-snapshot refresh inside the compactor
+                // loop is a follow-up.
+                let compositions_for_task = gw.compositions_handle();
+                let cfg_for_task = kiseki_chunk_cluster::slab_compactor::CompactorCfg {
+                    pool: pool.name.clone(),
+                    sweep_interval: std::time::Duration::from_secs(5),
+                    data_shards: 4,
+                    parity_shards: 2,
+                    namespaces: compositions_for_task
+                        .list_namespaces()
+                        .into_iter()
+                        .map(|n| n.id)
+                        .collect(),
+                    tenant_id: kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1)),
+                    shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
+                };
+                // Carve out a slab-store handle the compactor owns
+                // (separate Arc from the one passed to the gateway).
+                let slab_store_for_task: Arc<dyn kiseki_chunk::slab::SlabStore> =
+                    Arc::clone(&slab_store) as _;
+                let log_for_task: Arc<dyn kiseki_log::traits::LogOps + Send + Sync> =
+                    Arc::clone(&log_store) as _;
+                let registry_for_task =
+                    Arc::new(kiseki_chunk_cluster::slab_store::SlabBacklogRegistry::new());
+                // Seed the registry with the per-pool backlog so
+                // `get_or_insert(pool)` returns the same handle the
+                // gateway is reading from. The compactor's `spawn`
+                // helper does its own `get_or_insert`; we mirror
+                // the entry here.
+                {
+                    let _ = registry_for_task.get_or_insert(&pool.name);
+                }
+                let local_for_task: Arc<dyn kiseki_chunk::AsyncChunkOps> =
+                    Arc::clone(&local_chunk_store);
+                kiseki_chunk_cluster::slab_compactor::spawn(
+                    cfg_for_task,
+                    compositions_for_task,
+                    local_for_task,
+                    Arc::clone(&slab_store_for_task),
+                    Arc::clone(&log_for_task),
+                    registry_for_task,
+                );
+
+                // ADR-048 §"Slab GC" maintenance rewrite pass.
+                // Runs at 50 s cadence (10× the compactor sweep) —
+                // rewrites a fragmented slab is heavier than
+                // flushing a fresh one, so the pass is deliberately
+                // slow.
+                let maintenance_pool = pool.name.clone();
+                let maintenance_store = Arc::clone(&slab_store);
+                let maintenance_log = Arc::clone(&log_for_task);
+                let maintenance_tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(1));
+                let maintenance_shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
+                let maintenance_threshold = std::env::var("KISEKI_SLAB_REWRITE_RATIO")
+                    .ok()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|r| (0.0..=1.0).contains(r))
+                    .unwrap_or(0.5);
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(50));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tick.tick().await;
+                        let rewritten = kiseki_chunk_cluster::slab_compactor::run_maintenance_pass(
+                            &maintenance_pool,
+                            4,
+                            2,
+                            maintenance_tenant,
+                            maintenance_shard,
+                            &*maintenance_store,
+                            maintenance_log.as_ref(),
+                            maintenance_threshold,
+                        )
+                        .await;
+                        if rewritten > 0 {
+                            tracing::info!(
+                                pool = %maintenance_pool,
+                                rewritten,
+                                "slab-EC maintenance: rewrite pass complete",
+                            );
+                        }
+                    }
+                });
+
+                tracing::info!(
+                    pool = %pool.name,
+                    "slab-EC boot: compactor + maintenance spawned (sweep 5s, rewrite 50s)",
+                );
+            }
+            if migration_pools.is_empty() {
+                tracing::debug!("slab-EC boot: no pools flagged requires_migration");
+            }
+        }
+    }
+
+    // ADR-030 §3 — register the gateway with the inline-threshold
+    // recompute task so it can push committed per-shard values back
+    // into `set_shard_inline_threshold`. Stored as `Weak` so the
+    // task doesn't keep the gateway alive past shutdown.
+    *gateway_for_threshold_push.write() = Some(Arc::downgrade(&gw));
     // Wire the shared workflow table + Prometheus counter so the
     // gateway's `x-kiseki-workflow-ref` header validation
     // (mem_gateway::write) is fully observable end-to-end. Without
@@ -2173,14 +3035,67 @@ pub async fn run_main(
         .add_service(log_svc)
         .add_service(admin_svc)
         .add_service(storage_admin_svc);
+    // 2026-06-01: spawn the TCP-framed fabric listener BEFORE moving
+    // `cluster_chunk_server` into the tonic Router. Both listeners
+    // share the same handler via Arc — a fragment arriving on either
+    // transport hits the same `local` ops. The TCP-framed listener
+    // is on by default (ADR-042 §2.2); the gRPC listener stays for
+    // peer back-compat during rolling upgrades.
+    {
+        let fabric_tcp_port = data_port.saturating_add(fabric_tcp_port_offset);
+        let fabric_tcp_addr: std::net::SocketAddr = format!("0.0.0.0:{fabric_tcp_port}")
+            .parse()
+            .expect("valid fabric TCP-framed addr");
+        let handler = std::sync::Arc::new(cluster_chunk_server.clone_for_tcp_framed_handler());
+        // TLS posture matches the gateway TCP-framed listener: API is
+        // wired (`TcpFramedFabricListener::with_tls`) but the runtime
+        // builds a rustls::ServerConfig from cfg.tls only when set.
+        // Plaintext development mode otherwise — same posture the
+        // gRPC fabric service takes when cfg.tls is None.
+        let listener = match cfg.tls.as_ref() {
+            Some(tls_files) => match build_fabric_tls_server_config(tls_files) {
+                Ok(sc) => {
+                    tracing::info!(
+                        addr = %fabric_tcp_addr,
+                        "fabric TCP-framed: mTLS enabled (cluster CA chain)",
+                    );
+                    kiseki_chunk_cluster::TcpFramedFabricListener::with_tls(
+                        fabric_tcp_addr,
+                        handler,
+                        std::sync::Arc::new(sc),
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        addr = %fabric_tcp_addr,
+                        error = %e,
+                        "fabric TCP-framed: TLS build failed, falling back to plaintext",
+                    );
+                    kiseki_chunk_cluster::TcpFramedFabricListener::new(fabric_tcp_addr, handler)
+                }
+            },
+            None => kiseki_chunk_cluster::TcpFramedFabricListener::new(fabric_tcp_addr, handler),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = listener.run().await {
+                tracing::error!(error = %e, addr = %fabric_tcp_addr, "fabric TCP-framed listener exited");
+            }
+        });
+        tracing::info!(
+            addr = %fabric_tcp_addr,
+            "fabric TCP-framed listener spawned (ADR-042 §2.2 default for inter-node hop)",
+        );
+    }
     if cluster_chunk_svc_intercepted {
         router = router.add_service(cluster_chunk_server.into_tonic_server_with_san_check());
-        tracing::info!("ClusterChunkService: SAN-role interceptor active (mTLS)");
+        tracing::info!(
+            "ClusterChunkService gRPC: SAN-role interceptor active (mTLS) — kept for back-compat"
+        );
     } else {
         router = router.add_service(cluster_chunk_server.into_tonic_server());
         tracing::warn!(
-            "ClusterChunkService: NO SAN interceptor (plaintext development mode — \
-             cross-node fabric is not protected against tenant certs)",
+            "ClusterChunkService gRPC: NO SAN interceptor (plaintext development mode — \
+             cross-node fabric is not protected against tenant certs); TCP-framed is the perf path",
         );
     }
     // ADR-042 Phase 4: register the native GatewayDataService alongside
@@ -2197,37 +3112,9 @@ pub async fn run_main(
             cfg.tls.is_some(),
         ),
     );
-    // ADR-042 §4 — proxy fallback channel pool. The runtime wires this
-    // unconditionally so a runtime-toggled
-    // `KISEKI_NATIVE_PROXY_FALLBACK` flip doesn't need to allocate
-    // the pool on the hot path. `register_node` for peer addresses is
-    // populated below from the cluster topology (the data_addr port
-    // is shared across nodes in `docker-compose` deployments;
-    // localhost-multi-node test harnesses populate it via the
-    // `peer_data_addrs` config — Step C wiring lands per node when
-    // topology gossip becomes available).
-    let proxy_client_for_native =
-        std::sync::Arc::new(kiseki_gateway::native::proxy_client::ProxyClient::new(
-            kiseki_common::ids::NodeId(cfg.node_id),
-        ));
-    // Best-effort peer registration: for every Raft peer we know the
-    // address of, register a placeholder data_addr derived from the
-    // local data_addr port. This mirrors what `config.rs` does for
-    // the fabric path. Operators with non-uniform port deployments
-    // override via `KISEKI_PEER_DATA_ADDRS=id=host:port,…` (Step C
-    // makes this the topology-published source). Empty unless the
-    // local node has peers.
-    let peer_data_port = cfg.data_addr.port();
-    for (peer_id, peer_addr) in &cfg.raft_peers {
-        if *peer_id == cfg.node_id {
-            continue;
-        }
-        let host = peer_addr
-            .rsplit_once(':')
-            .map_or(peer_addr.as_str(), |(h, _)| h);
-        let data_addr = format!("{host}:{peer_data_port}");
-        proxy_client_for_native.register_node(kiseki_common::ids::NodeId(*peer_id), data_addr);
-    }
+    // `proxy_client_for_native` was constructed + peer-registered above
+    // (before the gateway, so it backs both the gateway's #111
+    // append-forwarder and the native server's proxy below).
     let proxy_fallback_enabled = std::env::var("KISEKI_NATIVE_PROXY_FALLBACK")
         .ok()
         .as_deref()
@@ -2620,6 +3507,27 @@ mod tests {
     /// `KISEKI_DS_PEERS` wins outright — it's the only mode that can
     /// represent localhost-multi-node where every peer has a distinct
     /// ephemeral DS port.
+    /// #103: `KISEKI_PEER_DATA_ADDRS` parses to per-node native-data
+    /// endpoints; malformed entries are skipped; absent → empty (caller
+    /// falls back to uniform-port derivation).
+    #[test]
+    fn parse_peer_data_addrs_explicit_and_malformed() {
+        assert!(super::parse_peer_data_addrs(None).is_empty());
+        assert!(super::parse_peer_data_addrs(Some("")).is_empty());
+        let got = super::parse_peer_data_addrs(Some(
+            "1=127.0.0.1:41001, 2=127.0.0.1:41002 ,bad,3=,=127.0.0.1:9,4=127.0.0.1:41004",
+        ));
+        assert_eq!(
+            got,
+            vec![
+                (1, "127.0.0.1:41001".to_string()),
+                (2, "127.0.0.1:41002".to_string()),
+                (4, "127.0.0.1:41004".to_string()),
+            ],
+            "explicit entries parsed; `bad` (no =), `3=` (empty addr), `=…` (empty id) skipped"
+        );
+    }
+
     #[test]
     fn ds_peers_take_priority() {
         let ds_peers = vec![

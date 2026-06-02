@@ -17,6 +17,13 @@ default = []
 gpu-cuda = ["libc"]
 # AMD ROCm GPU-direct via HIP (requires ROCm toolkit).
 gpu-rocm = ["libc"]
+# ADR-047 escalation — propagation pass-through for the hot-path
+# timers. kiseki-chunk itself isn't instrumented today (the cluster
+# wrapper in kiseki-chunk-cluster carries the timers); the feature
+# exists here so a single `cargo build -p kiseki-server
+# --features hot-path-trace` toggles everything via the workspace
+# graph. OFF by default.
+hot-path-trace = ["kiseki-tracing/hot-path-trace"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -24,6 +31,10 @@ libc = { workspace = true, optional = true }
 kiseki-block = { workspace = true }
 kiseki-common = { workspace = true }
 kiseki-crypto = { workspace = true }
+# Propagation pass-through for the ADR-047 hot-path timers (see
+# `hot-path-trace` feature above). Heavy deps inside kiseki-tracing
+# are feature-gated; OFF expansion is `()`.
+kiseki-tracing = { workspace = true }
 parking_lot = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 # `serde_json` retained for the small-object inline store + the
@@ -43,9 +54,10 @@ fjall = "3.1"
 postcard = { workspace = true }
 kiseki-keymanager = { workspace = true }
 prometheus = { workspace = true }
-# `redb` retained for `SmallObjectStore` (low-frequency ADR-030
-# inline-data path; not on the chunk hot path).
-redb = "4"
+# `redb` was retained for `SmallObjectStore` pre-rev-5; ADR-022
+# rev-5 (#129 unblock) moved the inline path to fjall — see
+# `small_object_store.rs`. fjall is already a workspace dep
+# above so no new line is needed.
 reed-solomon-erasure = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

@@ -34,14 +34,64 @@ mkdir -p ${meta_dir}/{raft,keys,small,chunks}
 # Verify raw devices exist
 echo "Raw devices (${device_class}):"
 IFS=',' read -ra DEVS <<< "${raw_devices}"
+FAST_DEV_COUNT=0
 for dev in "$${DEVS[@]}"; do
   if [ -b "$dev" ]; then
     SIZE=$(blockdev --getsize64 "$dev" 2>/dev/null || echo "?")
     echo "  $dev: $((SIZE / 1024 / 1024 / 1024)) GB — raw (no filesystem)"
+    # Detect fast storage: /sys/block/<dev>/queue/rotational == 0
+    # signals SSD/NVMe (per ADR-030 §1). A node with no fast device is
+    # operationally "boot-disk fallback" — the runtime will warn at
+    # boot per ADR-030 amendment.
+    DEV_BASENAME=$(basename "$dev")
+    ROTATIONAL_PATH="/sys/block/$${DEV_BASENAME}/queue/rotational"
+    if [ -r "$${ROTATIONAL_PATH}" ] && [ "$(cat $${ROTATIONAL_PATH})" = "0" ]; then
+      FAST_DEV_COUNT=$((FAST_DEV_COUNT + 1))
+    fi
   else
     echo "  $dev: NOT FOUND"
   fi
 done
+
+# ADR-030 (2026-05-31 amendment) — admin-driven metadata device role.
+# `setup-raw-storage.sh` does NOT auto-promote any device to the
+# metadata role; every raw device goes to the chunk pool. The runtime
+# emits its own loud `cluster_warnings` ERROR when KISEKI_DATA_DIR
+# lives on the boot disk and no device has been assigned to the
+# metadata role via `kiseki-admin pool add-device metadata-pool ...`.
+#
+# Mirror that warning here at provision time so operators see the
+# guidance early — before the cluster boots and the runtime warning
+# starts firing.
+if [ "$${FAST_DEV_COUNT}" -gt 0 ]; then
+  cat <<WARNING
+==========================================================================
+NOTICE (ADR-030 2026-05-31 amendment): $${FAST_DEV_COUNT} fast (NVMe/SSD)
+device(s) detected, but NONE is currently assigned to the metadata-pool
+role. Metadata + small-tier writes will live on the boot disk until
+operator action.
+
+Recommended for production:
+  kiseki-admin pool add-device metadata-pool <one-of-the-fast-devices>
+
+The runtime will emit a persistent cluster_warning until this is done.
+See specs/architecture/adr/030-dynamic-small-file-placement.md and
+docs/performance/capacity-planning.md.
+==========================================================================
+WARNING
+else
+  cat <<WARNING
+==========================================================================
+WARNING (ADR-030): NO fast (NVMe/SSD) device detected on this node.
+Metadata + small-tier writes will live on the boot disk. This is
+"emergency fallback" mode per ADR-030 amendment and is operationally
+unsuitable for production (boot-disk write latency, capacity ceiling).
+
+Provision at least one NVMe/SSD device per node and assign it to the
+metadata pool via `kiseki-admin pool add-device metadata-pool <dev>`.
+==========================================================================
+WARNING
+fi
 
 # Create Kiseki device config — lists raw block devices for DeviceBackend
 # The server reads this to initialize its device pool
@@ -101,6 +151,18 @@ Environment=KISEKI_METRICS_ADDR=0.0.0.0:9090
 
 # Metadata on boot disk (fast SSD), data on raw devices
 Environment=KISEKI_DATA_DIR=${meta_dir}
+# ADR-049 phase 5a: device-inventory tags so the catalog policy
+# can target `Tag("nvme-fast")` etc. The boot SSD hosts
+# `KISEKI_DATA_DIR` (metadata + raft log fjall). Raw-block-device
+# entries go via `KISEKI_RAW_DEVICES` above (orthogonal axis per
+# §D11.1). Operator can extend this list when additional mount
+# points are configured.
+Environment=KISEKI_DEVICE_TAGS=${meta_dir}=data-dir-default
+# ADR-049 §D2.5: Raft log path is bootstrap-only — never resolver-
+# routed. Defaults to `${meta_dir}/raft` when unset; we set it
+# explicitly so an operator changing `KISEKI_DATA_DIR` later
+# doesn't accidentally orphan the Raft log.
+Environment=KISEKI_RAFT_LOG_DIR=${meta_dir}/raft
 # Only node 1 bootstraps (seeds the Raft cluster).
 # Other nodes join as followers via Raft RPCs from the leader.
 %{ if node_id == 1 ~}
@@ -171,12 +233,37 @@ Environment=KISEKI_RAFT_FLUSH_INTERVAL_MS=100
 Environment=KISEKI_COMPOSITION_FLUSH_INTERVAL_MS=100
 Environment=KISEKI_CHUNK_FLUSH_INTERVAL_MS=100
 
+# 2026-06-01 — Raft TCP transport per-peer connection cap. The in-code
+# default was raised to 256 in the same commit that added these lines;
+# they are written here explicitly so future operators see the choice
+# in the systemd unit and can tune without rebuilding.
+#
+# Why this matters: on the 2026-06-01 instrumented run (default cap = 16
+# at the time), `raft_transport_rpc{op=append_entries}` mean ballooned
+# to 129 ms (vs ~150 µs same-zone GCP RTT floor). Journals showed
+# `rejecting Raft RPC connection — per-peer cap exceeded peer=… active=17`.
+# 18 shards × min_acks=2 fan = up to 36 inflight per follower; the
+# 16-slot cap rejected, leader retried, AppendEntries RTT exploded.
+# See specs/performance/2026-06-01-gcp-instrumented-single-client.md.
+#
+#   * KISEKI_RAFT_PER_PEER_MAX — server-side inbound cap.
+#   * KISEKI_RAFT_CONN_POOL_PER_PEER — client-side outbound pool size.
+#
+# 128 is double the typical 18-shard fan × 2 followers = 36 with
+# headroom for retransmits + the leaderless quorum-write producer.
+Environment=KISEKI_RAFT_PER_PEER_MAX=128
+Environment=KISEKI_RAFT_CONN_POOL_PER_PEER=128
+
 # 2026-05-09: bump kiseki_chunk_cluster to debug so wrapper-layer
 # warnings (peer GetFragment timeouts → surfaced as ChunkError::Io
 # per the wrapper fix in commit a69e490) land in the journal. Lets
 # us post-mortem any read-path stall on the cluster instead of
 # only seeing the user-visible Io error.
 Environment=RUST_LOG=info,kiseki_chunk_cluster=debug
+
+# pprof CPU flamegraph dump on graceful shutdown (pprof feature). Harmless
+# when the binary was built without the feature — the env var is unread.
+Environment=KISEKI_PPROF_OUT=/var/log/kiseki-pprof.svg
 
 [Install]
 WantedBy=multi-user.target

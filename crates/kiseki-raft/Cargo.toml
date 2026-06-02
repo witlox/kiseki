@@ -27,6 +27,7 @@ prometheus = { workspace = true }
 # WAL append + memtable insert into one journal write per
 # `WriteBatch`, matching the durability contract openraft expects.
 fjall = "3.1"
+parking_lot = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 thiserror = { workspace = true }
 postcard = { workspace = true }

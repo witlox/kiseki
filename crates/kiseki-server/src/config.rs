@@ -4,6 +4,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 /// Server configuration — populated from environment or defaults.
+// An env-derived config DTO: each `bool` is an independent capability flag
+// (`bootstrap`, `pnfs_enabled`, `allow_plaintext_nfs`), not interacting state —
+// the "refactor bools into a state machine" advice does not apply.
+#[allow(clippy::struct_excessive_bools)]
 pub struct ServerConfig {
     /// Address for the data-path gRPC listener.
     pub data_addr: SocketAddr,

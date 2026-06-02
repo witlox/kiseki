@@ -663,6 +663,13 @@ impl OpenRaftControlStore {
             } => {
                 hook.on_retire(namespace_id, *shard_id);
             }
+            // ADR-049 catalog mutations don't drive per-node side
+            // effects via the apply hook. The catalog read side
+            // (`ControlStateMachine::catalog()`) is consumed
+            // directly by the resolver + admin RPC at boot.
+            ControlCommand::UpsertNodeInventory { .. }
+            | ControlCommand::SetPlacementPolicy { .. }
+            | ControlCommand::SetWorkloadParams { .. } => {}
         }
     }
 }

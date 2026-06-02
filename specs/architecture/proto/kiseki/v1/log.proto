@@ -25,6 +25,15 @@ service LogService {
   // Append a delta to a shard. Returns the assigned sequence number.
   rpc AppendDelta(AppendDeltaRequest) returns (AppendDeltaResponse);
 
+  // Append a delta + its new cluster_chunk_state rows atomically
+  // (the `ChunkAndDelta` Raft command). #111: a follower gateway that
+  // hits `ForwardToLeader` for the target shard re-issues the
+  // already-built append here against the shard LEADER, which commits
+  // it locally and replicates back to all members. Covers
+  // write / delete / multipart-complete uniformly (refcount mutations
+  // ride inside those flows).
+  rpc AppendChunkAndDelta(AppendChunkAndDeltaRequest) returns (AppendDeltaResponse);
+
   // Read deltas in [from, to] inclusive from a shard.
   rpc ReadDeltas(ReadDeltasRequest) returns (ReadDeltasResponse);
 
@@ -48,6 +57,37 @@ message AppendDeltaRequest {
 
 message AppendDeltaResponse {
   uint64 sequence = 1; // assigned sequence number
+}
+
+// A new cluster_chunk_state row, carried alongside the delta in the
+// atomic `ChunkAndDelta` command. Mirrors `kiseki_log::raft_store::NewChunkMeta`.
+message NewChunkMeta {
+  bytes  chunk_id     = 1; // 32 bytes
+  repeated uint64 placement = 2; // node ids holding fragments
+  uint64 original_len  = 3; // pre-encode ciphertext length (#107)
+}
+
+// #129 — an inline small-file ciphertext keyed by chunk_id, applied to each
+// replica's `SmallObjectStore` at SM apply time (ADR-030 §2 canonical key).
+message InlinePayload {
+  bytes chunk_id = 1; // 32 bytes (matches NewChunkMeta + ChunkId)
+  bytes bytes    = 2; // ciphertext envelope to write to SmallObjectStore
+}
+
+message AppendChunkAndDeltaRequest {
+  ShardId   shard_id        = 1;
+  OrgId     tenant_id       = 2;
+  OperationType operation   = 3;
+  DeltaTimestamp timestamp  = 4;
+  bytes     hashed_key      = 5; // 32 bytes
+  repeated ChunkId chunk_refs = 6;
+  bytes     payload         = 7; // encrypted payload
+  bool      has_inline_data = 8;
+  repeated NewChunkMeta new_chunks = 9;
+  // #129 — inline small-file ciphertexts. Applied to each replica's
+  // SmallObjectStore at SM apply time so a multi-node GET can fetch the
+  // bytes locally instead of round-tripping through the chunk tier.
+  repeated InlinePayload inline_payloads = 10;
 }
 
 message ReadDeltasRequest {

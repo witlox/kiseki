@@ -23,6 +23,19 @@ pprof = ["dep:pprof"]
 # on exit. The instrumented allocator is significantly slower; only
 # build with this feature for one-off heap captures.
 dhat = ["dep:dhat"]
+# ADR-047 escalation — fine-grained per-step write-path timers across
+# the gateway / log / hydrator / chunk-cluster crates. Single-button
+# fan-out: enabling this on kiseki-server flips every downstream crate
+# that re-exposes `hot-path-trace`. OFF by default (macros expand to
+# `()`; zero runtime cost in production builds).
+hot-path-trace = [
+    "kiseki-tracing/hot-path-trace",
+    "kiseki-log/hot-path-trace",
+    "kiseki-gateway/hot-path-trace",
+    "kiseki-composition/hot-path-trace",
+    "kiseki-chunk/hot-path-trace",
+    "kiseki-chunk-cluster/hot-path-trace",
+]
 
 [[bin]]
 name = "kiseki-server"

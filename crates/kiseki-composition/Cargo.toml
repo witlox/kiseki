@@ -11,10 +11,22 @@ publish = false  # internal crate; only kiseki-client publishes (release.yml)
 [lints]
 workspace = true
 
+[features]
+default = []
+# ADR-047 escalation — fine-grained per-step write-path timers.
+# Propagates `kiseki-tracing/hot-path-trace`. OFF by default (zero
+# runtime cost; macros expand to `()`).
+hot-path-trace = ["kiseki-tracing/hot-path-trace"]
+
 [dependencies]
 async-trait = { workspace = true }
 kiseki-common = { workspace = true }
 kiseki-log = { workspace = true }
+# Used for the ADR-047 `hot_timer!` / `hot_span!` macros in the
+# hydrator hot path. The crate is a hard dep (so the macros resolve
+# even with `hot-path-trace` off, where they expand to `()`); the
+# heavy prometheus dep inside kiseki-tracing is itself feature-gated.
+kiseki-tracing = { workspace = true }
 thiserror = { workspace = true }
 # tokio is needed at lib level for the hydrator's async poll + the
 # Arc<tokio::sync::Mutex<CompositionStore>> handle shared with the gateway.

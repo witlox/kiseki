@@ -47,6 +47,46 @@ pub struct AppendChunkAndDeltaRequest {
     /// `cluster_chunk_state[(tenant, chunk_id)]` row with refcount=1
     /// and the leader-side placement list.
     pub new_chunks: Vec<NewChunkMeta>,
+    /// #129 — inline small-file payloads to write to each
+    /// replica's `InlineStore` (ADR-022 rev-5 fjall-backed
+    /// `SmallObjectStore`) at apply time. `(chunk_id, env_bytes)`
+    /// per entry; the gateway read path resolves `chunk_refs[i]`
+    /// via `small_store.get(&chunk_id.0)` first before falling
+    /// back to the chunk store. Empty for non-inline writes;
+    /// every pre-#129 emitter passes `Vec::new()` and pre-prod
+    /// wipe-and-redeploy clears persisted history of the legacy
+    /// `has_inline_data` offload path. Keyed by `chunk_id` per
+    /// ADR-030 §2 (replaces the pre-#129
+    /// `derive_inline_key(hashed_key, seq)` shape).
+    pub inline_payloads: Vec<(ChunkId, Vec<u8>)>,
+}
+
+/// Forwards an already-built `ChunkAndDelta` append to the shard's
+/// Raft **leader** on another node (#111).
+///
+/// When the local node is a follower for the target shard,
+/// `append_chunk_and_delta_with_forwarding` returns
+/// [`LogError::ForwardToLeader`]. Rather than surface that to the
+/// client (the old behaviour — a 500 on S3/NFS), the gateway re-issues
+/// the *same* built append to the leader through this trait; the leader
+/// `client_write`s it locally and replicates back to all members.
+///
+/// One mechanism covers every metadata mutation — write, delete,
+/// multipart-complete — because they all funnel through the shard's
+/// append (refcount inc/dec ride inside those flows). The production
+/// impl dials the leader's `LogService.AppendChunkAndDelta`; tests use
+/// a mock.
+#[async_trait::async_trait]
+pub trait AppendForwarder: Send + Sync {
+    /// Re-issue `req` against `leader_node`'s shard log and return the
+    /// assigned sequence. The implementation MUST be loop-safe (it dials
+    /// the leader's `LogService`, which commits locally and does not
+    /// re-forward).
+    async fn forward_append(
+        &self,
+        leader_node: NodeId,
+        req: AppendChunkAndDeltaRequest,
+    ) -> Result<SequenceNumber, LogError>;
 }
 
 /// Request to read a range of deltas.
@@ -151,6 +191,33 @@ pub trait LogOps: Send + Sync {
     ) -> Result<bool, LogError> {
         Ok(false)
     }
+
+    /// ADR-047 decoupled-ack: durably record `intent` on a quorum so the
+    /// gateway can fast-ack a write BEFORE the synchronous Raft round.
+    ///
+    /// This is THE write path for async-eligible surfaces (S3, Native) —
+    /// no capability gate. Implementations must record the local per-shard
+    /// intent store (one durable copy) and fan the intent to the shard's
+    /// voter peers in parallel, returning `Ok` ONLY once the total durable
+    /// copies reach `min_acks`. On a shortfall they return `Err` and the
+    /// gateway propagates the failure to the client — an acked write is
+    /// guaranteed on `≥ min_acks` replicas (no-loss, I-L2/I-CS1).
+    ///
+    /// Single-node stores ([`crate::MemShardStore`],
+    /// [`crate::PersistentShardStore`]) satisfy `min_acks = 1` with a
+    /// synchronous local append (no peers to fan to). The Raft-backed
+    /// [`crate::RaftShardStore`] does the real quorum intent-write.
+    ///
+    /// # Errors
+    /// [`LogError::Unavailable`] when the shard's intent store is non-durable
+    /// (e.g. an in-memory test cluster) or the local store write fails;
+    /// [`LogError::QuorumLost`] when durable copies fall short of `min_acks`;
+    /// otherwise a shard-lookup or transport error.
+    async fn put_intent_and_fan(
+        &self,
+        shard_id: ShardId,
+        intent: crate::intent::WriteIntent,
+    ) -> Result<(), LogError>;
 
     /// Read deltas in `[from, to]` inclusive from a shard.
     async fn read_deltas(&self, req: ReadDeltasRequest) -> Result<Vec<Delta>, LogError>;

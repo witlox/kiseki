@@ -53,7 +53,7 @@ const CONCURRENT_PER_PLACEMENT: usize = 24;
 const DEADLINE: Duration = Duration::from_secs(120);
 
 fn local_bridge(pool: &str, capacity: u64) -> Arc<dyn AsyncChunkOps> {
-    let mut store = ChunkStore::new();
+    let store = ChunkStore::new();
     store.add_pool(AffinityPool {
         name: pool.to_owned(),
         device_class: DeviceClass::NvmeSsd,
@@ -61,6 +61,8 @@ fn local_bridge(pool: &str, capacity: u64) -> Arc<dyn AsyncChunkOps> {
         devices: vec![],
         capacity_bytes: capacity,
         used_bytes: 0,
+        requires_migration: false,
+        ..Default::default()
     });
     Arc::new(SyncBridge::new(store))
 }

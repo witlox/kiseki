@@ -1,0 +1,16 @@
+{
+  "label": "slabec_fuse_mixed_4194304",
+  "pool_type": "slabec",
+  "protocol": "fuse",
+  "shape": "mixed",
+  "object_size": 4194304,
+  "ok": true,
+  "rc": 0,
+  "wall_s": 32.43962444801582,
+  "ops": 1286,
+  "ops_per_s": 128.6,
+  "mib_per_s": 514.4,
+  "p50_us": 116162,
+  "p95_us": 199425,
+  "p99_us": 236311
+}

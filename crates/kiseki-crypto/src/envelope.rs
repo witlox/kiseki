@@ -14,7 +14,7 @@ use zeroize::Zeroizing;
 
 use crate::aead::{self, Aead, GCM_NONCE_LEN, GCM_TAG_LEN};
 use crate::error::CryptoError;
-use crate::hkdf::{derive_convergent_nonce, derive_system_dek};
+use crate::hkdf::{derive_system_dek, derive_system_dek_and_nonce};
 use crate::keys::{SystemMasterKey, TenantKek};
 
 /// Complete envelope for an encrypted chunk or delta payload.
@@ -41,41 +41,46 @@ pub struct Envelope {
 /// Encrypt plaintext into an envelope using the system master key.
 ///
 /// The chunk ID is used as HKDF salt (ADR-003) and as AAD for the AEAD.
-#[tracing::instrument(skip(aead_ctx, master, plaintext), fields(plaintext_len = plaintext.len(), epoch = master.epoch.0))]
+///
+/// #155: `#[tracing::instrument]` was dropped from this signature —
+/// per-call span allocation + field formatting is measurable on the
+/// hot path even when the subscriber filters DEBUG out (S10/S11 in
+/// `docs/performance/optimization-backlog.md`). The internal
+/// `tracing::warn!` calls below are kept; they only fire on error.
 pub fn seal_envelope(
     aead_ctx: &Aead,
     master: &SystemMasterKey,
     chunk_id: &ChunkId,
     plaintext: &[u8],
 ) -> Result<Envelope, CryptoError> {
-    let dek = derive_system_dek(master, chunk_id).inspect_err(|e| {
-        tracing::warn!(error = %e, "seal_envelope: derive_system_dek failed");
-    })?;
-
-    // ADR-044 convergent encryption: derive the nonce deterministically
-    // from `(master, chunk_id)` instead of at random, so identical
-    // content (⇒ identical content-addressed `chunk_id`) seals to
-    // identical ciphertext. Without this, content-addressed dedup tears
-    // on the EC cluster path (GH #102). GCM-safe: the DEK is unique per
-    // `chunk_id`, so each (key, nonce) seals exactly one plaintext.
-    let nonce = derive_convergent_nonce(master, chunk_id).inspect_err(|e| {
-        tracing::warn!(error = %e, "seal_envelope: derive_convergent_nonce failed");
+    // #155 Win 1: derive DEK + convergent nonce from a single HKDF
+    // Extract instead of two. ADR-044 + RFC 5869 §3.2 — same primitives,
+    // same FIPS-validated aws-lc-rs path, bit-identical output to the
+    // pair of single-purpose calls.
+    let (dek, nonce) = derive_system_dek_and_nonce(master, chunk_id).inspect_err(|e| {
+        tracing::warn!(error = %e, "seal_envelope: derive_system_dek_and_nonce failed");
     })?;
 
     // AAD = chunk_id bytes — binds ciphertext to this specific chunk.
-    let ciphertext_with_tag = aead_ctx
+    let mut ciphertext_with_tag = aead_ctx
         .seal_with_nonce(&dek, nonce, plaintext, &chunk_id.0)
         .inspect_err(|e| {
             tracing::warn!(error = %e, "seal_envelope: AEAD seal failed");
         })?;
 
-    // Split tag from ciphertext. aws-lc-rs appends the tag.
+    // #155 Win 2: split tag from ciphertext **in place**. aws-lc-rs
+    // appends a 16-byte tag, so the trailing GCM_TAG_LEN bytes are the
+    // tag; we copy those out and `truncate` the Vec down to the
+    // ciphertext length. The Vec's allocation is reused as the
+    // envelope's `ciphertext` — no second 64 KB heap alloc, no
+    // second 64 KB memcpy. Pre-fix: `ciphertext = bytes[..tag_start].to_vec()`
+    // allocated + copied the whole plaintext-sized region a second time.
     let tag_start = ciphertext_with_tag.len() - GCM_TAG_LEN;
-    let ciphertext = ciphertext_with_tag[..tag_start].to_vec();
     let mut auth_tag = [0u8; GCM_TAG_LEN];
     auth_tag.copy_from_slice(&ciphertext_with_tag[tag_start..]);
+    ciphertext_with_tag.truncate(tag_start);
+    let ciphertext = ciphertext_with_tag;
 
-    tracing::trace!(ciphertext_len = ciphertext.len(), "seal_envelope: ok");
     Ok(Envelope {
         ciphertext,
         auth_tag,
@@ -88,7 +93,10 @@ pub fn seal_envelope(
 }
 
 /// Decrypt an envelope using the system master key (system-layer only).
-#[tracing::instrument(skip(aead_ctx, master, envelope), fields(ciphertext_len = envelope.ciphertext.len(), epoch = envelope.system_epoch.0))]
+///
+/// #155: `#[tracing::instrument]` dropped — same rationale as
+/// `seal_envelope`. AEAD verify failures still warn via the internal
+/// `inspect_err`, which is the security-relevant signal.
 pub fn open_envelope(
     aead_ctx: &Aead,
     master: &SystemMasterKey,
@@ -98,8 +106,13 @@ pub fn open_envelope(
         tracing::warn!(error = %e, "open_envelope: derive_system_dek failed");
     })?;
 
-    // Reconstruct ciphertext+tag for aws-lc-rs.
-    let mut ciphertext_with_tag = envelope.ciphertext.clone();
+    // #155 Win 2 (read side): one alloc with the exact final capacity
+    // (`ciphertext.len() + GCM_TAG_LEN`), two `extend_from_slice` memcpys.
+    // Pre-fix: `ciphertext.clone()` allocated at exact ciphertext
+    // capacity, then `extend_from_slice(&auth_tag)` reallocated to a
+    // larger Vec — two allocations + two copies. Single alloc here.
+    let mut ciphertext_with_tag = Vec::with_capacity(envelope.ciphertext.len() + GCM_TAG_LEN);
+    ciphertext_with_tag.extend_from_slice(&envelope.ciphertext);
     ciphertext_with_tag.extend_from_slice(&envelope.auth_tag);
 
     aead_ctx

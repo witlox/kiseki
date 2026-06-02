@@ -43,6 +43,32 @@ pub struct NodeSummary {
     pub transport_connections: i64,
     /// Shard delta count (aggregate).
     pub shard_deltas: u64,
+    /// Chunk-store device bytes used (GH #115).
+    pub storage_used_bytes: u64,
+    /// Chunk-store device total capacity.
+    pub storage_total_bytes: u64,
+    /// Logical bytes addressed by clients (dedup numerator).
+    pub storage_logical_bytes: u64,
+    /// Unique stored payload bytes (dedup denominator).
+    pub storage_physical_bytes: u64,
+    /// Unique chunk count.
+    pub storage_chunk_count: u64,
+    /// Metadata tier on-disk bytes (system disk, ADR-030 guardrail).
+    pub storage_meta_bytes: u64,
+    /// Small-object inline tier on-disk bytes (system disk).
+    pub storage_small_bytes: u64,
+    /// Fast-tier (`NVMe`) used / total bytes (ADR-024 per-class).
+    pub storage_tier_fast_used: u64,
+    /// Fast-tier (`NVMe`) total bytes.
+    pub storage_tier_fast_total: u64,
+    /// Bulk-tier (`SSD`) used bytes.
+    pub storage_tier_bulk_used: u64,
+    /// Bulk-tier (`SSD`) total bytes.
+    pub storage_tier_bulk_total: u64,
+    /// Cold-tier (`HDD`) used bytes.
+    pub storage_tier_cold_used: u64,
+    /// Cold-tier (`HDD`) total bytes.
+    pub storage_tier_cold_total: u64,
 }
 
 /// Cluster-wide metrics aggregator.
@@ -142,6 +168,19 @@ impl MetricsAggregator {
             total.gateway_requests += s.summary.gateway_requests;
             total.transport_connections += s.summary.transport_connections;
             total.shard_deltas += s.summary.shard_deltas;
+            total.storage_used_bytes += s.summary.storage_used_bytes;
+            total.storage_total_bytes += s.summary.storage_total_bytes;
+            total.storage_logical_bytes += s.summary.storage_logical_bytes;
+            total.storage_physical_bytes += s.summary.storage_physical_bytes;
+            total.storage_chunk_count += s.summary.storage_chunk_count;
+            total.storage_meta_bytes += s.summary.storage_meta_bytes;
+            total.storage_small_bytes += s.summary.storage_small_bytes;
+            total.storage_tier_fast_used += s.summary.storage_tier_fast_used;
+            total.storage_tier_fast_total += s.summary.storage_tier_fast_total;
+            total.storage_tier_bulk_used += s.summary.storage_tier_bulk_used;
+            total.storage_tier_bulk_total += s.summary.storage_tier_bulk_total;
+            total.storage_tier_cold_used += s.summary.storage_tier_cold_used;
+            total.storage_tier_cold_total += s.summary.storage_tier_cold_total;
         }
 
         ClusterSummary {
@@ -181,6 +220,25 @@ fn parse_summary(text: &str) -> NodeSummary {
                 "kiseki_chunk_write_bytes_total" => summary.chunk_write_bytes = v as u64,
                 "kiseki_chunk_read_bytes_total" => summary.chunk_read_bytes = v as u64,
                 "kiseki_transport_connections_active" => summary.transport_connections = v as i64,
+                "kiseki_storage_device_used_bytes" => summary.storage_used_bytes = v as u64,
+                "kiseki_storage_device_total_bytes" => summary.storage_total_bytes = v as u64,
+                "kiseki_storage_logical_bytes" => summary.storage_logical_bytes = v as u64,
+                "kiseki_storage_physical_bytes" => summary.storage_physical_bytes = v as u64,
+                "kiseki_storage_chunk_count" => summary.storage_chunk_count = v as u64,
+                "kiseki_storage_meta_bytes" => summary.storage_meta_bytes = v as u64,
+                "kiseki_storage_small_bytes" => summary.storage_small_bytes = v as u64,
+                "kiseki_storage_tier_fast_used_bytes" => summary.storage_tier_fast_used = v as u64,
+                "kiseki_storage_tier_fast_total_bytes" => {
+                    summary.storage_tier_fast_total = v as u64;
+                }
+                "kiseki_storage_tier_bulk_used_bytes" => summary.storage_tier_bulk_used = v as u64,
+                "kiseki_storage_tier_bulk_total_bytes" => {
+                    summary.storage_tier_bulk_total = v as u64;
+                }
+                "kiseki_storage_tier_cold_used_bytes" => summary.storage_tier_cold_used = v as u64,
+                "kiseki_storage_tier_cold_total_bytes" => {
+                    summary.storage_tier_cold_total = v as u64;
+                }
                 _ => {
                     if key.starts_with("kiseki_gateway_requests_total") {
                         summary.gateway_requests += v as u64;
@@ -203,7 +261,7 @@ async fn reqwest_get_ok(url: &str) -> bool {
 
 /// Simple HTTP GET that returns the body as a string.
 #[allow(clippy::items_after_statements)]
-async fn reqwest_get_body(url: &str) -> Option<String> {
+pub(crate) async fn reqwest_get_body(url: &str) -> Option<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let stream = tokio::time::timeout(

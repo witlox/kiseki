@@ -1,0 +1,16 @@
+{
+  "label": "baseline_s3_mixed_4194304",
+  "pool_type": "baseline",
+  "protocol": "s3",
+  "shape": "mixed",
+  "object_size": 4194304,
+  "ok": true,
+  "rc": 0,
+  "wall_s": 29.982328999962192,
+  "ops": 1281,
+  "ops_per_s": 128.1,
+  "mib_per_s": 512.4,
+  "p50_us": 125204,
+  "p95_us": 184792,
+  "p99_us": 213525
+}

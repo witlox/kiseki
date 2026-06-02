@@ -9,7 +9,7 @@ use kiseki_common::time::{ClockQuality, DeltaTimestamp, HybridLogicalClock, Wall
 use kiseki_log::delta::OperationType;
 use kiseki_log::error::LogError;
 use kiseki_log::raft_store::NewChunkMeta;
-use kiseki_log::traits::{AppendChunkAndDeltaRequest, AppendDeltaRequest, LogOps};
+use kiseki_log::traits::{AppendChunkAndDeltaRequest, AppendDeltaRequest, AppendForwarder, LogOps};
 
 /// Emit a delta to the log for a composition mutation.
 ///
@@ -40,6 +40,42 @@ pub async fn emit_delta<L: LogOps + ?Sized>(
         has_inline_data: false,
     };
     log.append_delta(req).await
+}
+
+/// ADR-048 — emit a `MigrateChunkLocations` delta after the
+/// slab-EC compactor has confirmed a slab is durable on `min_acks`
+/// placement nodes. The hydrator-side apply mutates
+/// `Composition.chunk_locations` and triggers hot-tier eviction on
+/// the migrated chunks (I-SE1 + I-SE4).
+pub async fn emit_migrate_chunk_locations<L: LogOps + ?Sized>(
+    log: &L,
+    shard_id: ShardId,
+    tenant_id: OrgId,
+    composition_id: kiseki_common::ids::CompositionId,
+    pool_name: &str,
+    slab_id: kiseki_common::SlabId,
+    entries: &[(u32, u64, u32)],
+) -> Result<SequenceNumber, LogError> {
+    // Key the delta by the composition id so per-shard compaction
+    // groups migrations against the same object together.
+    let mut hashed_key = [0u8; 32];
+    hashed_key[..16].copy_from_slice(composition_id.0.as_bytes());
+    let payload = crate::composition::encode_migrate_chunk_locations_payload(
+        composition_id,
+        pool_name,
+        slab_id,
+        entries,
+    );
+    emit_delta(
+        log,
+        shard_id,
+        tenant_id,
+        OperationType::MigrateChunkLocations,
+        hashed_key,
+        Vec::new(),
+        payload,
+    )
+    .await
 }
 
 /// ADR-040 Phase 18 — emit a `NamespaceCreate` delta to replicate a
@@ -101,8 +137,12 @@ pub async fn emit_chunk_and_delta<L: LogOps + ?Sized>(
     if new_chunks.is_empty() {
         log.append_delta(delta).await
     } else {
-        log.append_chunk_and_delta(AppendChunkAndDeltaRequest { delta, new_chunks })
-            .await
+        log.append_chunk_and_delta(AppendChunkAndDeltaRequest {
+            delta,
+            new_chunks,
+            inline_payloads: vec![],
+        })
+        .await
     }
 }
 
@@ -137,8 +177,124 @@ pub async fn emit_chunk_and_delta_with_forwarding<L: LogOps + ?Sized>(
     if new_chunks.is_empty() {
         log.append_delta_with_forwarding(delta).await
     } else {
-        log.append_chunk_and_delta_with_forwarding(AppendChunkAndDeltaRequest { delta, new_chunks })
-            .await
+        log.append_chunk_and_delta_with_forwarding(AppendChunkAndDeltaRequest {
+            delta,
+            new_chunks,
+            inline_payloads: vec![],
+        })
+        .await
+    }
+}
+
+/// Build the exact [`AppendChunkAndDeltaRequest`] that
+/// [`emit_chunk_and_delta_forwarding_to`] would commit, stamping a fresh
+/// HLC timestamp via [`now_timestamp`].
+///
+/// ADR-047 decoupled-ack: the gateway producer calls this to construct the
+/// `append` field of a [`kiseki_log::intent::WriteIntent`] so the intent
+/// carries byte-for-byte the same delta + `new_chunks` the synchronous
+/// emit would — guaranteeing the async committer incorporates an identical
+/// append. The `delta.timestamp` HLC here is independent of the intent's
+/// `perspective_seq` (that ingress order is minted by the gateway's
+/// per-node clock); this timestamp is the delta's own event time, exactly
+/// as the synchronous path stamps it.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn build_chunk_and_delta_request(
+    shard_id: ShardId,
+    tenant_id: OrgId,
+    operation: OperationType,
+    hashed_key: [u8; 32],
+    chunk_refs: Vec<ChunkId>,
+    payload: Vec<u8>,
+    new_chunks: Vec<NewChunkMeta>,
+) -> AppendChunkAndDeltaRequest {
+    let timestamp = now_timestamp();
+    AppendChunkAndDeltaRequest {
+        delta: AppendDeltaRequest {
+            shard_id,
+            tenant_id,
+            operation,
+            timestamp,
+            hashed_key,
+            chunk_refs,
+            payload,
+            has_inline_data: false,
+        },
+        new_chunks,
+        // #129 — populated by callers (the gateway sets this on the
+        // inline-eligible write path); empty here so the existing
+        // non-inline callers keep working.
+        inline_payloads: vec![],
+    }
+}
+
+/// #111: forward-aware emit. Builds the append, attempts the local
+/// commit, and on `ForwardToLeader` re-issues the **same** built append
+/// to the leader via `forwarder` (if present), so the write commits on
+/// the shard leader regardless of which node the client hit. Covers
+/// write / delete / multipart-complete uniformly. Local behaviour is
+/// preserved (delta-only emits still use `append_delta`); only the
+/// follower-forward path is new. With `forwarder == None` it degrades
+/// to surfacing the `ForwardToLeader` hint (single-node / tests).
+#[allow(clippy::too_many_arguments)]
+pub async fn emit_chunk_and_delta_forwarding_to<L: LogOps + ?Sized>(
+    log: &L,
+    forwarder: Option<&dyn AppendForwarder>,
+    shard_id: ShardId,
+    tenant_id: OrgId,
+    operation: OperationType,
+    hashed_key: [u8; 32],
+    chunk_refs: Vec<ChunkId>,
+    payload: Vec<u8>,
+    new_chunks: Vec<NewChunkMeta>,
+    inline_payloads: Vec<(ChunkId, Vec<u8>)>,
+) -> Result<SequenceNumber, LogError> {
+    let timestamp = now_timestamp();
+    let delta = AppendDeltaRequest {
+        shard_id,
+        tenant_id,
+        operation,
+        timestamp,
+        hashed_key,
+        chunk_refs,
+        payload,
+        has_inline_data: !inline_payloads.is_empty(),
+    };
+    // Keep a copy of the built append for the forward path (the local
+    // attempt consumes its inputs). The payload here is the composition
+    // metadata, not the file data, so the clone is cheap.
+    let forward_req = AppendChunkAndDeltaRequest {
+        delta: delta.clone(),
+        new_chunks: new_chunks.clone(),
+        inline_payloads: inline_payloads.clone(),
+    };
+    // #129 — when the inline path produced ciphertexts, every replica's
+    // SM apply needs them, so route through `append_chunk_and_delta_*`
+    // even if `new_chunks` is empty (small-file PUTs typically have no
+    // new chunk fabric rows — the bytes live in SmallObjectStore only).
+    let local = if new_chunks.is_empty() && inline_payloads.is_empty() {
+        log.append_delta_with_forwarding(delta).await
+    } else {
+        log.append_chunk_and_delta_with_forwarding(AppendChunkAndDeltaRequest {
+            delta,
+            new_chunks,
+            inline_payloads,
+        })
+        .await
+    };
+    match local {
+        Err(LogError::ForwardToLeader {
+            shard_id: sid,
+            leader_node_id,
+        }) => match forwarder {
+            Some(fwd) => fwd.forward_append(leader_node_id, forward_req).await,
+            None => Err(LogError::ForwardToLeader {
+                shard_id: sid,
+                leader_node_id,
+            }),
+        },
+        other => other,
     }
 }
 
@@ -188,6 +344,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LogOps for RecordingLog {
+        async fn put_intent_and_fan(
+            &self,
+            _shard_id: ShardId,
+            _intent: kiseki_log::intent::WriteIntent,
+        ) -> Result<(), LogError> {
+            // log_bridge tests drive the synchronous emit path directly —
+            // the decoupled-ack producer is in mem_gateway, not here.
+            Err(LogError::Unavailable)
+        }
+
         async fn append_delta(&self, req: AppendDeltaRequest) -> Result<SequenceNumber, LogError> {
             self.plain_calls.lock().unwrap().push(req);
             Ok(SequenceNumber(1))

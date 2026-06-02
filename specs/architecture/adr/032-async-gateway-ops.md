@@ -83,7 +83,7 @@ happens-before ordering via `.await`:
 
 | Invariant | Guarantee |
 |-----------|-----------|
-| I-L2 | Gateway awaits Raft commit before returning to client |
+| I-L2 | Gateway awaits Raft commit before returning to client — the *current synchronous* form. ADR-047 (Proposed) relaxes this for async surfaces (S3/object/native): ack on the quorum-durable intent, Raft ordering applied async. POSIX/NFS/FUSE keep this synchronous await (close-to-open, ADR-013). |
 | I-L5 | Chunk writes awaited before composition finalize delta |
 | I-V3 | Read-your-writes: `last_written_seq` set after awaited write |
 | I-C2 | Refcount ops after awaited chunk confirm |

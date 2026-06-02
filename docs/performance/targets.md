@@ -10,6 +10,18 @@ target, something is wrong (bug, regression, contention) and should be
 investigated. If a measurement *exceeds* a target, the derivation is
 likely too pessimistic — update the derivation, don't celebrate.
 
+> The **gap analysis + plan** for closing these targets on the 6-node
+> `default` profile lives in [`roadmap.md`](roadmap.md). Short version:
+> the writes are commit-bound (one Raft round per write, #126), not
+> NIC/disk/CPU-bound — so the per-node ceilings below are not the binding
+> constraint on writes until batched commit (W1) lands.
+>
+> The **competitive view** — these same targets compared against
+> Lustre / Ceph / VAST on identical GCP hardware — lives in
+> [`competitive-targets.md`](competitive-targets.md). Use it to
+> sanity-check whether a re-measurement is in striking distance of
+> what other well-hardened systems achieve on the same shape.
+
 This doc is the missing layer between
 [`specs/architecture/adr/042-native-gateway-data-service.md` §14](https://github.com/witlox/kiseki/blob/main/specs/architecture/adr/042-native-gateway-data-service.md)
 (native binding per-node targets, single CPU class) and the

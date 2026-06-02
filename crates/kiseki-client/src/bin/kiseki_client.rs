@@ -382,6 +382,11 @@ fn handle_mount(args: &[String]) {
                         .map(|s| s.trim_start_matches("kiseki://").to_owned())
                         .collect()
                 };
+                println!(
+                    "Connecting native gateway pool ({pool} conns) to {} \
+                     (10s/conn timeout)…",
+                    candidates.join(", "),
+                );
                 let mut last_err: Option<std::io::Error> = None;
                 let mut gw_opt = None;
                 for candidate in &candidates {
@@ -405,12 +410,11 @@ fn handle_mount(args: &[String]) {
                     }
                 }
                 let gw = gw_opt.unwrap_or_else(|| {
-                    let msg = last_err
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "no seeds".into());
+                    let msg = last_err.map_or_else(|| "no seeds".into(), |e| e.to_string());
                     eprintln!("Error: native connect failed (all seeds): {msg}");
                     std::process::exit(1);
                 });
+                println!("Connected; attaching FUSE session at {mountpoint}…");
                 let fuse = kiseki_client::fuse_fs::KisekiFuse::new(gw, tenant, namespace);
                 kiseki_client::fuse_daemon::mount(fuse, Path::new(&mountpoint), read_write)
                     .expect("FUSE mount failed");
@@ -487,6 +491,9 @@ fn handle_mount(args: &[String]) {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         });
         let master_key = kiseki_crypto::keys::SystemMasterKey::new(
             [0x42; 32],

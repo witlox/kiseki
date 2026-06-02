@@ -336,8 +336,17 @@ async fn reply_write<G: GatewayOps>(
     w.write_bool(false); // pre-op
     w.write_bool(false); // post-op
     w.write_u32(count);
-    w.write_u32(stable);
-    w.write_opaque_fixed(&[0u8; 8]); // write verifier
+    // committed = UNSTABLE (0), NOT the client's requested `stable`. The
+    // #50 fix BUFFERS every WRITE and flushes only on COMMIT, so the data
+    // is NOT on stable storage when we reply. Echoing the client's
+    // FILE_SYNC back (RFC 1813 §3.3.7 `committed`) tells the kernel the
+    // bytes are durable → it skips COMMIT → the buffer never flushes →
+    // silent data loss (`echo > f` lands a size-0 file; verified live on
+    // GCP 2026-05-28). Replying UNSTABLE forces the kernel to COMMIT,
+    // which is where `flush_writes` runs. Same contract the pNFS DS WRITE
+    // path already enforces (committed=UNSTABLE).
+    w.write_u32(0); // NFS3_UNSTABLE — force the client to COMMIT
+    w.write_opaque_fixed(&[0u8; 8]); // write verifier (stable across session)
 
     w.into_bytes()
 }
@@ -471,7 +480,7 @@ async fn reply_rename<G: GatewayOps>(
     let _to_dir = reader.read_opaque().unwrap_or_default();
     let to_name = reader.read_string().unwrap_or_default();
 
-    match ctx.rename_file(&from_name, &to_name) {
+    match ctx.rename_file(&from_name, &to_name).await {
         Ok(()) => {
             w.write_u32(status::NFS3_OK);
             // from dir wcc + to dir wcc (both absent)
@@ -1038,6 +1047,9 @@ mod tests {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         });
         let gw = InMemoryGateway::new(
             store,
@@ -1134,7 +1146,73 @@ mod tests {
         let count = r.read_u32().unwrap();
         assert_eq!(count, 16, "count should equal bytes written");
         let committed = r.read_u32().unwrap();
-        assert_eq!(committed, 2, "committed should be FILE_SYNC (2)");
+        // MUST be UNSTABLE (0) even though the client requested FILE_SYNC:
+        // the WRITE is buffered and only flushes on COMMIT (#50), so
+        // claiming FILE_SYNC would make the kernel skip COMMIT → silent
+        // data loss. See reply_write + write_filesync_then_commit_persists_data.
+        assert_eq!(committed, 0, "WRITE must reply UNSTABLE to force a COMMIT");
+    }
+
+    /// Regression for the NFSv3 silent-data-loss bug (verified live on
+    /// GCP 2026-05-28): `echo > f` produced a size-0 file because the
+    /// WRITE reply claimed FILE_SYNC, the kernel skipped COMMIT, and the
+    /// buffered bytes (deferred to COMMIT by the #50 fix) never flushed.
+    /// With the reply forced to UNSTABLE the kernel COMMITs; after
+    /// WRITE→COMMIT the file MUST be non-empty and read back its bytes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_filesync_then_commit_persists_data() {
+        let ctx = test_ctx();
+        let payload = b"hello-nfs3-persist";
+
+        // CREATE persist.txt
+        let header = make_header(proc::CREATE);
+        let mut body = XdrWriter::new();
+        let root_fh = ctx.handles.root_handle(ctx.namespace_id, ctx.tenant_id);
+        body.write_opaque(&root_fh);
+        body.write_string("persist.txt");
+        let bb = body.into_bytes();
+        let mut r = XdrReader::new(&bb);
+        let _ = dispatch_nfs3(&header, &mut r, &ctx).await;
+
+        let (fh, _) = ctx.lookup_by_name("persist.txt").await.expect("created");
+
+        // WRITE with FILE_SYNC (what `echo`/coreutils send).
+        let header = make_header(proc::WRITE);
+        let mut body = XdrWriter::new();
+        body.write_opaque(&fh);
+        body.write_u64(0);
+        body.write_u32(u32::try_from(payload.len()).unwrap());
+        body.write_u32(2); // stable = FILE_SYNC
+        body.write_opaque(payload);
+        let bb = body.into_bytes();
+        let mut r = XdrReader::new(&bb);
+        let _ = dispatch_nfs3(&header, &mut r, &ctx).await;
+
+        // COMMIT — the flush point. The kernel sends this because the
+        // WRITE replied UNSTABLE.
+        let header = make_header(proc::COMMIT);
+        let mut body = XdrWriter::new();
+        body.write_opaque(&fh);
+        body.write_u64(0);
+        body.write_u32(0);
+        let bb = body.into_bytes();
+        let mut r = XdrReader::new(&bb);
+        let _ = dispatch_nfs3(&header, &mut r, &ctx).await;
+
+        // Re-LOOKUP (as the kernel does) → committed comp, non-empty.
+        let (fh2, attrs) = ctx
+            .lookup_by_name("persist.txt")
+            .await
+            .expect("file resolves post-commit");
+        assert!(
+            attrs.size > 0,
+            "post-COMMIT file must be non-empty (was size 0 pre-fix)"
+        );
+        let resp = ctx
+            .read(&fh2, 0, u32::try_from(payload.len()).unwrap())
+            .await
+            .expect("read post-commit");
+        assert_eq!(&resp.data[..], payload, "read back the written bytes");
     }
 
     // ---------- WRITE bad handle (§3.3.7) ----------

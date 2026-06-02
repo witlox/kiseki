@@ -44,10 +44,12 @@
 use std::path::Path;
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
-use kiseki_common::ids::{CompositionId, NamespaceId, SequenceNumber, ShardId};
+use kiseki_common::ids::{CompositionId, NamespaceId, NodeId, SequenceNumber, ShardId};
+use kiseki_common::time::HybridLogicalClock;
+use kiseki_log::intent::PerspectiveSeq;
 
 use super::error::PersistentStoreError;
-use super::storage::{CompositionStorage, HydrationBatch};
+use super::storage::{lww_accepts_bind, CompositionStorage, HydrationBatch};
 use crate::composition::Composition;
 
 use super::encoding::{
@@ -56,12 +58,49 @@ use super::encoding::{
 };
 
 // Each fjall keyspace is its own physical LSM-tree (column-family
-// equivalent). We split into four so writes to disjoint axes don't
-// share a memtable / flush trigger.
+// equivalent). We split into five so writes to disjoint axes don't
+// share a memtable / flush trigger. KS_NAME_SEQS is the ADR-047
+// MF-1 per-name perspective-seq stamp used by the LWW guard at
+// hydration apply time.
 const KS_COMPS: &str = "comps";
 const KS_NAMES: &str = "names";
 const KS_NAMES_REV: &str = "names_rev";
+const KS_NAME_SEQS: &str = "name_seqs";
 const KS_META: &str = "meta";
+
+/// Wire size of a stored `PerspectiveSeq` value: `[physical_ms:8 LE]
+/// [logical:4 LE][node_id:8 LE]` = 20 bytes. Mirrors the on-the-wire
+/// suffix in `composition.rs`.
+const NAME_SEQ_VALUE_LEN: usize = 20;
+
+#[must_use]
+fn encode_name_seq(seq: PerspectiveSeq) -> [u8; NAME_SEQ_VALUE_LEN] {
+    let mut buf = [0u8; NAME_SEQ_VALUE_LEN];
+    buf[0..8].copy_from_slice(&seq.0.physical_ms.to_le_bytes());
+    buf[8..12].copy_from_slice(&seq.0.logical.to_le_bytes());
+    buf[12..20].copy_from_slice(&seq.0.node_id.0.to_le_bytes());
+    buf
+}
+
+fn decode_name_seq(bytes: &[u8]) -> Result<PerspectiveSeq, PersistentStoreError> {
+    if bytes.len() != NAME_SEQ_VALUE_LEN {
+        return Err(PersistentStoreError::Decode(format!(
+            "name seq value has wrong length: {}",
+            bytes.len()
+        )));
+    }
+    let mut phys = [0u8; 8];
+    phys.copy_from_slice(&bytes[0..8]);
+    let mut logical = [0u8; 4];
+    logical.copy_from_slice(&bytes[8..12]);
+    let mut node = [0u8; 8];
+    node.copy_from_slice(&bytes[12..20]);
+    Ok(PerspectiveSeq(HybridLogicalClock {
+        physical_ms: u64::from_le_bytes(phys),
+        logical: u32::from_le_bytes(logical),
+        node_id: NodeId(u64::from_le_bytes(node)),
+    }))
+}
 
 mod meta_keys {
     use kiseki_common::ids::ShardId;
@@ -106,6 +145,11 @@ pub struct FjallStorage {
     comps: Keyspace,
     names: Keyspace,
     names_rev: Keyspace,
+    /// ADR-047 MF-1 — per-name `(ns, name) → PerspectiveSeq` stamp.
+    /// Separate keyspace so sync-write traffic (which clears the
+    /// stamp) and async writes (which set it) stay off the names
+    /// memtable's hot path.
+    name_seqs: Keyspace,
     meta: Keyspace,
     /// When set, every write commits with `PersistMode::SyncAll`
     /// inline — POSIX-fsync semantics, slow. When unset, writes
@@ -123,6 +167,7 @@ impl FjallStorage {
         let comps = db.keyspace(KS_COMPS, KeyspaceCreateOptions::default)?;
         let names = db.keyspace(KS_NAMES, KeyspaceCreateOptions::default)?;
         let names_rev = db.keyspace(KS_NAMES_REV, KeyspaceCreateOptions::default)?;
+        let name_seqs = db.keyspace(KS_NAME_SEQS, KeyspaceCreateOptions::default)?;
         let meta = db.keyspace(KS_META, KeyspaceCreateOptions::default)?;
 
         // First-open: stamp the schema version. Subsequent opens
@@ -153,6 +198,7 @@ impl FjallStorage {
             comps,
             names,
             names_rev,
+            name_seqs,
             meta,
             sync_per_write: true,
         })
@@ -266,8 +312,9 @@ impl CompositionStorage for FjallStorage {
 
     fn remove(&self, id: CompositionId) -> Result<bool, PersistentStoreError> {
         // Atomic batch: drop the comp row + cascade-drop the name
-        // binding so a future PUT-by-name doesn't resolve to a
-        // dangling composition_id. Mirrors the redb path.
+        // binding (forward + reverse + seq stamp) so a future
+        // PUT-by-name doesn't resolve to a dangling composition_id
+        // and the LWW seq state stays consistent with the binding.
         let existed = self.comps.get(id.0.as_bytes())?.is_some();
         let prior_name = self.names_rev.get(id.0.as_bytes())?.map(|s| s.to_vec());
 
@@ -276,6 +323,7 @@ impl CompositionStorage for FjallStorage {
         if let Some(ref name_key_bytes) = prior_name {
             batch.remove(&self.names, name_key_bytes.clone());
             batch.remove(&self.names_rev, id.0.as_bytes().to_vec());
+            batch.remove(&self.name_seqs, name_key_bytes.clone());
         }
         batch.commit()?;
         self.persist_after_write()?;
@@ -343,6 +391,11 @@ impl CompositionStorage for FjallStorage {
         // reverse entry; if id had a different prior name, drop
         // the old forward entry. Pre-flight conditional checks are
         // the caller's job.
+        //
+        // **Cross-surface seq contract (ADR-047 MF-9):** plain
+        // `name_insert` is the sync-surface path — clears any
+        // stored perspective-seq stamp for this name (so the next
+        // async write with `Some(seq)` wins LWW).
         let prev_id = self.names.get(&new_key)?.map(|s| s.to_vec());
         let old_rev_for_id = self.names_rev.get(id_bytes)?.map(|s| s.to_vec());
 
@@ -354,11 +407,42 @@ impl CompositionStorage for FjallStorage {
         }
         if let Some(old_rev) = old_rev_for_id {
             if old_rev != new_key {
-                batch.remove(&self.names, old_rev);
+                batch.remove(&self.names, old_rev.clone());
+                batch.remove(&self.name_seqs, old_rev);
             }
         }
         batch.insert(&self.names, new_key.clone(), id_bytes.to_vec());
-        batch.insert(&self.names_rev, id_bytes.to_vec(), new_key);
+        batch.insert(&self.names_rev, id_bytes.to_vec(), new_key.clone());
+        // Sync write: clear the seq stamp (treat sync as -∞).
+        batch.remove(&self.name_seqs, new_key);
+        batch.commit()?;
+        self.persist_after_write()
+    }
+
+    fn name_seq_lookup(
+        &self,
+        ns: NamespaceId,
+        name: &str,
+    ) -> Result<Option<PerspectiveSeq>, PersistentStoreError> {
+        let key = name_key(ns, name);
+        match self.name_seqs.get(&key)? {
+            None => Ok(None),
+            Some(slice) => Ok(Some(decode_name_seq(slice.as_ref())?)),
+        }
+    }
+
+    fn name_seq_record(
+        &self,
+        ns: NamespaceId,
+        name: String,
+        seq: Option<PerspectiveSeq>,
+    ) -> Result<(), PersistentStoreError> {
+        let key = name_key(ns, &name);
+        let mut batch = self.db.batch();
+        match seq {
+            Some(s) => batch.insert(&self.name_seqs, key, encode_name_seq(s).to_vec()),
+            None => batch.remove(&self.name_seqs, key),
+        }
         batch.commit()?;
         self.persist_after_write()
     }
@@ -367,6 +451,8 @@ impl CompositionStorage for FjallStorage {
         let key = name_key(ns, name);
         let existed_id = self.names.get(&key)?.map(|s| s.to_vec());
         let mut batch = self.db.batch();
+        // Sync unbind: clear the seq stamp unconditionally.
+        batch.remove(&self.name_seqs, key.clone());
         let removed = if let Some(id_bytes) = existed_id {
             batch.remove(&self.names, key);
             batch.remove(&self.names_rev, id_bytes);
@@ -486,14 +572,41 @@ impl CompositionStorage for FjallStorage {
             let prior_name = self.names_rev.get(id.0.as_bytes())?.map(|s| s.to_vec());
             wb.remove(&self.comps, id.0.as_bytes().to_vec());
             if let Some(name_key_bytes) = prior_name {
-                wb.remove(&self.names, name_key_bytes);
+                wb.remove(&self.names, name_key_bytes.clone());
                 wb.remove(&self.names_rev, id.0.as_bytes().to_vec());
+                wb.remove(&self.name_seqs, name_key_bytes);
             }
         }
-        for (ns, name, id) in batch.name_inserts {
+        // ADR-047 MF-1 / MF-9 — per-name LWW guard. For each insert,
+        // bind iff `lww_accepts_bind(stored, incoming)`. Sync surface
+        // (`incoming = None`) binds unconditionally AND clears the
+        // stored seq; async (`Some(seq)`) records the new seq on
+        // accept. We READ the current seq before mutating so the
+        // guard sees the pre-batch state — incremental updates within
+        // one batch are not exercised today (one hydrator tick =
+        // one batch = at most one bind per name in practice; the
+        // hydrator's staging vec is appended in delta order). If
+        // multiple binds for the same name ever land in one batch,
+        // the LWW guard's commutativity (a stale write loses
+        // regardless of arrival order vs. a fresh one) keeps the
+        // outcome correct on next-tick re-apply.
+        for (ns, name, id, incoming_seq) in batch.name_inserts {
             let new_key = name_key(ns, &name);
             let id_bytes = id.0.as_bytes();
-            // Overwrite-replace cascade — match `name_insert`.
+            let stored = match self.name_seqs.get(&new_key)? {
+                Some(slice) => Some(decode_name_seq(slice.as_ref())?),
+                None => None,
+            };
+            if !lww_accepts_bind(stored, incoming_seq) {
+                tracing::debug!(
+                    ns = %ns.0,
+                    name = %name,
+                    stored = ?stored,
+                    incoming = ?incoming_seq,
+                    "name-bind: skipped (LWW guard: incoming seq < stored)",
+                );
+                continue;
+            }
             let prev_id = self.names.get(&new_key)?.map(|s| s.to_vec());
             let old_rev = self.names_rev.get(id_bytes)?.map(|s| s.to_vec());
             if let Some(prev) = prev_id {
@@ -503,16 +616,36 @@ impl CompositionStorage for FjallStorage {
             }
             if let Some(old) = old_rev {
                 if old != new_key {
-                    wb.remove(&self.names, old);
+                    wb.remove(&self.names, old.clone());
+                    wb.remove(&self.name_seqs, old);
                 }
             }
             wb.insert(&self.names, new_key.clone(), id_bytes.to_vec());
-            wb.insert(&self.names_rev, id_bytes.to_vec(), new_key);
+            wb.insert(&self.names_rev, id_bytes.to_vec(), new_key.clone());
+            match incoming_seq {
+                Some(s) => wb.insert(&self.name_seqs, new_key, encode_name_seq(s).to_vec()),
+                None => wb.remove(&self.name_seqs, new_key),
+            }
         }
-        for (ns, name) in batch.name_removes {
+        for (ns, name, incoming_seq) in batch.name_removes {
             let key = name_key(ns, &name);
+            let stored = match self.name_seqs.get(&key)? {
+                Some(slice) => Some(decode_name_seq(slice.as_ref())?),
+                None => None,
+            };
+            if !lww_accepts_bind(stored, incoming_seq) {
+                tracing::debug!(
+                    ns = %ns.0,
+                    name = %name,
+                    stored = ?stored,
+                    incoming = ?incoming_seq,
+                    "name-unbind: skipped (LWW guard: incoming seq < stored)",
+                );
+                continue;
+            }
             let existed_id = self.names.get(&key)?.map(|s| s.to_vec());
-            wb.remove(&self.names, key);
+            wb.remove(&self.names, key.clone());
+            wb.remove(&self.name_seqs, key);
             if let Some(id_bytes) = existed_id {
                 wb.remove(&self.names_rev, id_bytes);
             }
@@ -589,7 +722,11 @@ impl CompositionStorage for FjallStorage {
             }
         }
         batch.insert(&self.names, new_key.clone(), id_bytes.to_vec());
-        batch.insert(&self.names_rev, id_bytes.to_vec(), new_key);
+        batch.insert(&self.names_rev, id_bytes.to_vec(), new_key.clone());
+        // Sync surface (gateway create_with_name): clear the
+        // perspective-seq stamp (ADR-047 MF-9). Async producers
+        // call name_insert_with_seq instead.
+        batch.remove(&self.name_seqs, new_key);
         batch.commit()?;
         self.persist_after_write()
     }
@@ -614,6 +751,7 @@ mod tests {
             has_inline_data: false,
             content_type: None,
             chunk_plaintext_lens: Vec::new(),
+            chunk_locations: Vec::new(),
         }
     }
 
@@ -665,5 +803,92 @@ mod tests {
         }
         let store = FjallStorage::open(dir.path()).unwrap();
         assert_eq!(store.get(comp.id).unwrap(), Some(comp));
+    }
+
+    // -- ADR-047 MF-1 / MF-9 LWW guard, persistent backend --------------
+
+    fn ps(physical_ms: u64, logical: u32, node: u64) -> PerspectiveSeq {
+        PerspectiveSeq(HybridLogicalClock {
+            physical_ms,
+            logical,
+            node_id: NodeId(node),
+        })
+    }
+
+    #[test]
+    fn fjall_bind_guard_async_newer_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStorage::open(dir.path()).unwrap();
+        let ns = NamespaceId(uuid::Uuid::from_u128(2));
+        let id1 = CompositionId(uuid::Uuid::from_u128(1));
+        let id2 = CompositionId(uuid::Uuid::from_u128(2));
+        assert!(store
+            .name_insert_with_seq(ns, "k".into(), id1, Some(ps(2, 0, 1)))
+            .unwrap());
+        assert!(store
+            .name_insert_with_seq(ns, "k".into(), id2, Some(ps(3, 0, 1)))
+            .unwrap());
+        assert_eq!(store.name_lookup(ns, "k").unwrap(), Some(id2));
+        assert_eq!(store.name_seq_lookup(ns, "k").unwrap(), Some(ps(3, 0, 1)));
+    }
+
+    #[test]
+    fn fjall_bind_guard_async_older_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStorage::open(dir.path()).unwrap();
+        let ns = NamespaceId(uuid::Uuid::from_u128(2));
+        let id1 = CompositionId(uuid::Uuid::from_u128(1));
+        let id2 = CompositionId(uuid::Uuid::from_u128(2));
+        assert!(store
+            .name_insert_with_seq(ns, "k".into(), id1, Some(ps(3, 0, 1)))
+            .unwrap());
+        assert!(!store
+            .name_insert_with_seq(ns, "k".into(), id2, Some(ps(2, 0, 1)))
+            .unwrap());
+        assert_eq!(store.name_lookup(ns, "k").unwrap(), Some(id1));
+        assert_eq!(store.name_seq_lookup(ns, "k").unwrap(), Some(ps(3, 0, 1)));
+    }
+
+    #[test]
+    fn fjall_name_index_snapshot_round_trip_preserves_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let ns = NamespaceId(uuid::Uuid::from_u128(2));
+        let id1 = CompositionId(uuid::Uuid::from_u128(1));
+        {
+            let store = FjallStorage::open(dir.path()).unwrap();
+            assert!(store
+                .name_insert_with_seq(ns, "k".into(), id1, Some(ps(42, 7, 9)))
+                .unwrap());
+        }
+        // Re-open: the per-name seq must survive a restart (fjall WAL).
+        let store = FjallStorage::open(dir.path()).unwrap();
+        assert_eq!(store.name_lookup(ns, "k").unwrap(), Some(id1));
+        assert_eq!(store.name_seq_lookup(ns, "k").unwrap(), Some(ps(42, 7, 9)));
+        // And the LWW guard still works post-restart.
+        assert!(!store
+            .name_insert_with_seq(
+                ns,
+                "k".into(),
+                CompositionId(uuid::Uuid::from_u128(99)),
+                Some(ps(41, 0, 0))
+            )
+            .unwrap());
+        assert_eq!(store.name_lookup(ns, "k").unwrap(), Some(id1));
+    }
+
+    #[test]
+    fn fjall_sync_clears_seq_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallStorage::open(dir.path()).unwrap();
+        let ns = NamespaceId(uuid::Uuid::from_u128(2));
+        let id1 = CompositionId(uuid::Uuid::from_u128(1));
+        let id2 = CompositionId(uuid::Uuid::from_u128(2));
+        assert!(store
+            .name_insert_with_seq(ns, "k".into(), id1, Some(ps(5, 0, 1)))
+            .unwrap());
+        // Sync overwrite clears the stamp.
+        store.name_insert(ns, "k".into(), id2).unwrap();
+        assert_eq!(store.name_lookup(ns, "k").unwrap(), Some(id2));
+        assert_eq!(store.name_seq_lookup(ns, "k").unwrap(), None);
     }
 }

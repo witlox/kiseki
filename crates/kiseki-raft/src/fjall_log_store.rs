@@ -45,6 +45,8 @@ use std::path::Path;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode};
 use serde::{de::DeserializeOwned, Serialize};
 
+use crate::fsync_coalescer::FsyncCoalescer;
+
 const KS_LOG: &str = "raft_log";
 const KS_META: &str = "raft_meta";
 
@@ -101,6 +103,16 @@ pub struct FjallLogStore {
     /// When `false`, writes use `PersistMode::Buffer` instead of
     /// `SyncAll`. Toggle via [`Self::with_eventual_durability`].
     sync_per_write: bool,
+    /// #151 (W6) — when `Some`, writes use `PersistMode::Buffer` for
+    /// the batch and route the durability barrier through the
+    /// coalescer. Off-by-default; opt in via
+    /// [`Self::with_fsync_coalescing`].
+    ///
+    /// Independent of `sync_per_write`: when set, the coalescer
+    /// always wins (we do `Buffer` on the batch + coalesced fsync).
+    /// When unset, `sync_per_write` controls the batch's own
+    /// durability mode as before.
+    coalescer: Option<FsyncCoalescer>,
 }
 
 fn io_err<E: std::fmt::Display>(e: E) -> io::Error {
@@ -129,6 +141,7 @@ impl FjallLogStore {
             log_ks,
             meta_ks,
             sync_per_write: true,
+            coalescer: None,
         })
     }
 
@@ -141,6 +154,71 @@ impl FjallLogStore {
     pub fn with_eventual_durability(mut self, eventual: bool) -> Self {
         self.sync_per_write = !eventual;
         self
+    }
+
+    /// #151 (W6) — enable group-commit fsync coalescing. When set,
+    /// `append` / `truncate_*` use `PersistMode::Buffer` on the
+    /// individual batch (i.e. the WAL append still happens; only the
+    /// device sync is deferred), and the durability barrier is
+    /// served by the coalescer's merged fsync. Multiple concurrent
+    /// callers within `window_us` (capped at `max_batch` waiters)
+    /// share one physical `Database::persist(SyncAll)`.
+    ///
+    /// Off by default. See [`crate::fsync_coalescer`] for the
+    /// contract and tuning guidance. Returns `self` for builder
+    /// chaining.
+    ///
+    /// # Errors
+    /// Returns `Err` if `window_us == 0` (which would degenerate into
+    /// busy-spin per fsync). Use `with_fsync_coalescing(1, 1)` as the
+    /// effective opt-out — a single-waiter window of 1 µs.
+    #[must_use]
+    pub fn with_fsync_coalescing(mut self, window_us: u64, max_batch: usize) -> Self {
+        if window_us == 0 {
+            // 1 µs floor — the window timer's tokio::time resolution
+            // is ~50 µs anyway; this just rejects the obvious bug.
+            self.coalescer = Some(FsyncCoalescer::new(self.db.clone(), 1, max_batch));
+        } else {
+            self.coalescer = Some(FsyncCoalescer::new(self.db.clone(), window_us, max_batch));
+        }
+        self
+    }
+
+    /// Run the durability barrier appropriate for the current
+    /// configuration.
+    ///
+    /// - **Coalescer on:** join the next merged-fsync window. Returns
+    ///   when the merged `Database::persist(SyncAll)` completes.
+    /// - **Coalescer off, `sync_per_write == true`** (the default
+    ///   inline-SyncAll path): this is a **no-op** — the preceding
+    ///   `commit_batch` already issued `PersistMode::SyncAll`, so the
+    ///   write is durable on return. Avoids a redundant second fsync
+    ///   when the openraft `append` path calls this for uniformity.
+    /// - **Coalescer off, `sync_per_write == false`** (legacy
+    ///   eventual-durability path): calls `Database::persist(SyncAll)`
+    ///   so callers that previously relied on `flush()` keep their
+    ///   guarantee.
+    ///
+    /// Internal helper used by the openraft `append` path; exposed
+    /// `pub(crate)` for the few sites (truncate / vote save) that
+    /// emulate the same pattern. Outside callers should prefer
+    /// [`Self::flush`].
+    pub(crate) async fn fsync_barrier(&self) -> io::Result<()> {
+        if let Some(coalescer) = self.coalescer.clone() {
+            coalescer.flush().await
+        } else if self.sync_per_write {
+            // Inline-SyncAll already happened in `commit_batch`'s
+            // `OwnedWriteBatch::commit` — nothing more to do.
+            Ok(())
+        } else {
+            self.db.persist(PersistMode::SyncAll).map_err(io_err)
+        }
+    }
+
+    /// Whether group-commit fsync coalescing is enabled on this store.
+    #[must_use]
+    pub fn has_fsync_coalescer(&self) -> bool {
+        self.coalescer.is_some()
     }
 
     /// Append a single log entry. Each call commits inline with
@@ -334,11 +412,18 @@ impl FjallLogStore {
     /// `PersistMode::SyncAll` (default, fsync per write) or
     /// `PersistMode::Buffer` (eventual, periodic flusher drives
     /// durability).
+    ///
+    /// #151 (W6) — when the fsync coalescer is set, batches use
+    /// `Buffer` and the durability barrier is served by
+    /// [`Self::fsync_barrier`] (called by the openraft `append`
+    /// path after the batch commits). This is the path that yields
+    /// the group-commit win: many concurrent batches each `Buffer`
+    /// their WAL append; one merged fsync covers them all.
     fn commit_batch(&self) -> OwnedWriteBatch {
-        let mode = if self.sync_per_write {
-            PersistMode::SyncAll
-        } else {
+        let mode = if self.coalescer.is_some() || !self.sync_per_write {
             PersistMode::Buffer
+        } else {
+            PersistMode::SyncAll
         };
         self.db.batch().durability(Some(mode))
     }

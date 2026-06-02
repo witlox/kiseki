@@ -21,17 +21,21 @@ pub const INLINE_DATA_THRESHOLD: u64 = 4096;
 // Each operation uses its own fixed-size payload format. The discriminator
 // is the delta header's `operation` field (already present, already
 // decoded by the hydrator), so the payload layouts don't need a leading
-// op byte. Decoders are length-checked and return `None` on mismatch so
-// the hydrator can defensively skip records from a future or legacy
-// encoding without getting stuck.
+// op byte. Decoders return `None` when the wire shape does not parse —
+// the hydrator treats that as a permanent skip so a malformed delta
+// doesn't wedge the loop.
 
-/// Wire size of the **Create** payload (40 bytes).
+/// Wire size of the fixed prefix of the **Create** payload (40 bytes).
 ///
 /// Layout (little-endian where applicable):
 ///   `[0..16)`  `composition_id` UUID
 ///   `[16..32)` `namespace_id` UUID
 ///   `[32..40)` `bytes_written` (u64 LE)
-pub const COMPOSITION_CREATE_PAYLOAD_LEN: usize = 40;
+///
+/// The Create payload always continues past this prefix with a
+/// length-prefixed name + lens + perspective-seq tail; see
+/// [`encode_composition_create_payload`] for the full shape.
+pub const COMPOSITION_CREATE_PAYLOAD_PREFIX_LEN: usize = 40;
 
 /// Wire size of the **Update** payload (24 bytes).
 ///
@@ -85,7 +89,163 @@ pub fn encode_namespace_create_payload(ns: &crate::namespace::Namespace) -> Vec<
         flags |= 0b0000_0010;
     }
     out.push(flags);
+    // ADR-045 §D3 tier policy, appended after the fixed prefix:
+    // [count:1]{ [name_len:1][name utf8][quota_bytes:8 LE] }*.
+    // A 49-byte payload (no appended section) decodes to an empty
+    // policy, so pre-tier records stay readable.
+    #[allow(clippy::cast_possible_truncation)] // tier count/name len bounded by CLI parsing
+    {
+        out.push(ns.tier_policy.len() as u8);
+        for t in &ns.tier_policy {
+            out.push(t.tier.len() as u8);
+            out.extend_from_slice(t.tier.as_bytes());
+            out.extend_from_slice(&t.quota_bytes.to_le_bytes());
+        }
+    }
+    // ADR-024 2026-05-31 amendment §"three-tier durability" — append
+    // the per-namespace size-band pool selector after the tier policy.
+    // Wire shape:
+    //   [bands_flag:1]   bits: 0=inline, 1=replicated, 2=ec
+    //   for each set bit, in band order:
+    //     [name_len:1][name utf8]
+    // A truncated payload (no bands section) decodes to empty
+    // `size_band_pools`, so namespaces created before the amendment
+    // still round-trip cleanly.
+    #[allow(clippy::cast_possible_truncation)] // name len bounded by CLI parsing (admin input)
+    {
+        let mut bands_flag: u8 = 0;
+        if ns.size_band_pools.inline.is_some() {
+            bands_flag |= 0b0000_0001;
+        }
+        if ns.size_band_pools.replicated.is_some() {
+            bands_flag |= 0b0000_0010;
+        }
+        if ns.size_band_pools.ec.is_some() {
+            bands_flag |= 0b0000_0100;
+        }
+        out.push(bands_flag);
+        for band in [
+            ns.size_band_pools.inline.as_deref(),
+            ns.size_band_pools.replicated.as_deref(),
+            ns.size_band_pools.ec.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            out.push(band.len() as u8);
+            out.extend_from_slice(band.as_bytes());
+        }
+    }
     out
+}
+
+/// ADR-048 — encode a `MigrateChunkLocations` delta payload.
+///
+/// Wire layout:
+/// ```text
+/// [comp_id          : 16]  composition UUID
+/// [pool_name_len u8 : 1 ]
+/// [pool_name utf8   : N ]
+/// [slab_id          : 16]  shared across every migrated chunk
+/// [entry_count u32 LE: 4 ]
+///   per entry:
+///     [chunk_idx u32 LE    : 4 ]
+///     [offset_in_slab u64 LE: 8 ]
+///     [length u32 LE       : 4 ]
+/// ```
+/// All migrated chunks in one payload share the same destination
+/// `pool_name + slab_id` — the compactor flushes one slab at a time,
+/// so this is the natural batch. A composition that has chunks
+/// landing in different slabs gets one delta per slab.
+#[must_use]
+pub fn encode_migrate_chunk_locations_payload(
+    comp_id: CompositionId,
+    pool_name: &str,
+    slab_id: kiseki_common::SlabId,
+    entries: &[(u32, u64, u32)], // (chunk_idx, offset_in_slab, length)
+) -> Vec<u8> {
+    let name_bytes = pool_name.as_bytes();
+    let cap = 16 + 1 + name_bytes.len() + 16 + 4 + entries.len() * 16;
+    let mut out = Vec::with_capacity(cap);
+    out.extend_from_slice(comp_id.0.as_bytes());
+    #[allow(clippy::cast_possible_truncation)] // pool names bounded by admin CLI parsing
+    out.push(name_bytes.len() as u8);
+    out.extend_from_slice(name_bytes);
+    out.extend_from_slice(slab_id.0.as_bytes());
+    #[allow(clippy::cast_possible_truncation)]
+    // entry counts bounded by per-slab cap (≤ DEFAULT_SLAB_MAX_CHUNKS)
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (idx, off, len) in entries {
+        out.extend_from_slice(&idx.to_le_bytes());
+        out.extend_from_slice(&off.to_le_bytes());
+        out.extend_from_slice(&len.to_le_bytes());
+    }
+    out
+}
+
+/// ADR-048 — decoded `MigrateChunkLocations` payload returned by
+/// [`decode_migrate_chunk_locations_payload`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodedMigrateChunkLocations {
+    /// Target composition.
+    pub composition_id: CompositionId,
+    /// Pool that owns the slab.
+    pub pool_name: String,
+    /// Slab the migrated chunks now live in.
+    pub slab_id: kiseki_common::SlabId,
+    /// `(chunk_idx, offset_in_slab, length)` per migrated entry. The
+    /// hydrator uses these to overwrite the corresponding entries in
+    /// `Composition.chunk_locations`.
+    pub entries: Vec<(u32, u64, u32)>,
+}
+
+/// Decode a `MigrateChunkLocations` payload. Returns `None` on a
+/// truncated or malformed payload — the apply path treats the delta
+/// as a no-op rather than crashing the state machine (defense in
+/// depth; the encoder shouldn't ever emit a malformed payload, but
+/// the hydrator is one of the few places where a corrupt delta
+/// reaches user-visible state).
+#[must_use]
+pub fn decode_migrate_chunk_locations_payload(
+    payload: &[u8],
+) -> Option<DecodedMigrateChunkLocations> {
+    if payload.len() < 16 + 1 {
+        return None;
+    }
+    let comp_uuid = uuid::Uuid::from_slice(&payload[0..16]).ok()?;
+    let name_len = payload[16] as usize;
+    let mut pos = 17;
+    let name_end = pos + name_len;
+    if name_end + 16 + 4 > payload.len() {
+        return None;
+    }
+    let pool_name = std::str::from_utf8(&payload[pos..name_end])
+        .ok()?
+        .to_owned();
+    pos = name_end;
+    let slab_uuid = uuid::Uuid::from_slice(&payload[pos..pos + 16]).ok()?;
+    pos += 16;
+    let count = u32::from_le_bytes(payload[pos..pos + 4].try_into().ok()?) as usize;
+    pos += 4;
+    if pos + count * 16 > payload.len() {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let idx = u32::from_le_bytes(payload[pos..pos + 4].try_into().ok()?);
+        pos += 4;
+        let off = u64::from_le_bytes(payload[pos..pos + 8].try_into().ok()?);
+        pos += 8;
+        let len = u32::from_le_bytes(payload[pos..pos + 4].try_into().ok()?);
+        pos += 4;
+        entries.push((idx, off, len));
+    }
+    Some(DecodedMigrateChunkLocations {
+        composition_id: CompositionId(comp_uuid),
+        pool_name,
+        slab_id: kiseki_common::SlabId(slab_uuid),
+        entries,
+    })
 }
 
 /// Decode a `NamespaceCreate` delta payload. Returns `None` if the
@@ -93,13 +253,82 @@ pub fn encode_namespace_create_payload(ns: &crate::namespace::Namespace) -> Vec<
 /// fails to parse. `compliance_tags` is always empty in v1.
 #[must_use]
 pub fn decode_namespace_create_payload(payload: &[u8]) -> Option<crate::namespace::Namespace> {
-    if payload.len() != NAMESPACE_CREATE_PAYLOAD_LEN {
+    // The fixed prefix is exactly NAMESPACE_CREATE_PAYLOAD_LEN; anything
+    // beyond it is the ADR-045 tier-policy section (optional).
+    if payload.len() < NAMESPACE_CREATE_PAYLOAD_LEN {
         return None;
     }
     let ns_uuid = uuid::Uuid::from_slice(&payload[0..16]).ok()?;
     let tenant_uuid = uuid::Uuid::from_slice(&payload[16..32]).ok()?;
     let shard_uuid = uuid::Uuid::from_slice(&payload[32..48]).ok()?;
     let flags = payload[48];
+
+    // Parse the appended tier policy, if present. Malformed/truncated
+    // trailing bytes degrade to an empty policy rather than failing the
+    // whole decode (a namespace without a policy is valid).
+    let mut tier_policy = Vec::new();
+    let mut pos = NAMESPACE_CREATE_PAYLOAD_LEN;
+    if let Some(&count) = payload.get(pos) {
+        pos += 1;
+        for _ in 0..count {
+            let Some(&name_len) = payload.get(pos) else {
+                break;
+            };
+            pos += 1;
+            let name_end = pos + name_len as usize;
+            let quota_end = name_end + 8;
+            if quota_end > payload.len() {
+                break;
+            }
+            let Ok(name) = std::str::from_utf8(&payload[pos..name_end]) else {
+                break;
+            };
+            let mut q = [0u8; 8];
+            q.copy_from_slice(&payload[name_end..quota_end]);
+            tier_policy.push(crate::namespace::TierQuota {
+                tier: name.to_owned(),
+                quota_bytes: u64::from_le_bytes(q),
+            });
+            pos = quota_end;
+        }
+    }
+
+    // Optional per-namespace size-band pool selector (ADR-024 amendment
+    // 2026-05-31). Decoded best-effort — a truncated/malformed bands
+    // section degrades to the default (empty) `NamespaceSizeBandPools`,
+    // never failing the whole decode.
+    let mut size_band_pools = crate::namespace::NamespaceSizeBandPools::default();
+    if let Some(&bands_flag) = payload.get(pos) {
+        pos += 1;
+        for (bit, slot) in [
+            (0b0000_0001u8, 0usize),
+            (0b0000_0010u8, 1usize),
+            (0b0000_0100u8, 2usize),
+        ] {
+            if bands_flag & bit == 0 {
+                continue;
+            }
+            let Some(&name_len) = payload.get(pos) else {
+                break;
+            };
+            pos += 1;
+            let name_end = pos + name_len as usize;
+            if name_end > payload.len() {
+                break;
+            }
+            let Ok(name) = std::str::from_utf8(&payload[pos..name_end]) else {
+                break;
+            };
+            let value = Some(name.to_owned());
+            match slot {
+                0 => size_band_pools.inline = value,
+                1 => size_band_pools.replicated = value,
+                _ => size_band_pools.ec = value,
+            }
+            pos = name_end;
+        }
+    }
+
     Some(crate::namespace::Namespace {
         id: NamespaceId(ns_uuid),
         tenant_id: kiseki_common::ids::OrgId(tenant_uuid),
@@ -107,109 +336,131 @@ pub fn decode_namespace_create_payload(payload: &[u8]) -> Option<crate::namespac
         read_only: flags & 0b0000_0001 != 0,
         versioning_enabled: flags & 0b0000_0010 != 0,
         compliance_tags: Vec::new(),
+        tier_policy,
+        size_band_pools,
     })
 }
 
-/// Encode a composition-create delta payload (legacy v1: 40 bytes,
-/// no name).
-#[must_use]
-pub fn encode_composition_create_payload(
-    comp_id: CompositionId,
-    namespace_id: NamespaceId,
-    bytes_written: u64,
-) -> Vec<u8> {
-    encode_composition_create_payload_named(comp_id, namespace_id, bytes_written, None, &[])
-}
-
-/// Encode a composition-create delta payload with an optional name
-/// (S3 PUT key) and an optional per-chunk plaintext-length vector.
-///
-/// Wire format:
-/// - Legacy v1 (no name, no lens): 40 bytes — `[comp_id 16][ns_id 16][size 8]`.
-/// - v2 (name only): 44 + `name_len` bytes — v1 + `[name_len 4][name]`.
-/// - v3 (name + per-chunk lens): v2 + `[lens_count 4][lens_count × u32 LE]`.
-///   Requires `name.is_some()` so the form is unambiguously
-///   length-distinguishable from v1/v2; pass `Some("")` if the
-///   composition is anonymous and lens are still needed.
-///
-/// Length-based dispatch (no magic byte) keeps backwards compatibility
-/// with existing on-the-wire deltas the hydrator may still see during
-/// rolling upgrades. `chunk_plaintext_lens` is currently set only by
-/// `complete_multipart`: regular PUTs follow the
-/// `MAX_PLAINTEXT_PER_CHUNK` grid and the read path uses index math.
-#[must_use]
-pub fn encode_composition_create_payload_named(
-    comp_id: CompositionId,
-    namespace_id: NamespaceId,
-    bytes_written: u64,
-    name: Option<&str>,
-    chunk_plaintext_lens: &[u32],
-) -> Vec<u8> {
-    // v3 requires a name to be encoded (so the v2 framing is present).
-    // Callers that need lens with no name should pass Some("").
-    let has_lens = !chunk_plaintext_lens.is_empty();
-    let effective_name = if has_lens { name.or(Some("")) } else { name };
-    let name_bytes = effective_name.unwrap_or("").as_bytes();
-    let cap = if effective_name.is_some() {
-        COMPOSITION_CREATE_PAYLOAD_LEN
-            + 4
-            + name_bytes.len()
-            + if has_lens {
-                4 + 4 * chunk_plaintext_lens.len()
-            } else {
-                0
-            }
-    } else {
-        COMPOSITION_CREATE_PAYLOAD_LEN
-    };
-    let mut out = Vec::with_capacity(cap);
-    out.extend_from_slice(comp_id.0.as_bytes());
-    out.extend_from_slice(namespace_id.0.as_bytes());
-    out.extend_from_slice(&bytes_written.to_le_bytes());
-    if effective_name.is_some() {
-        let name_len = u32::try_from(name_bytes.len()).unwrap_or(u32::MAX);
-        out.extend_from_slice(&name_len.to_le_bytes());
-        out.extend_from_slice(name_bytes);
-    }
-    if has_lens {
-        let lens_count = u32::try_from(chunk_plaintext_lens.len()).unwrap_or(u32::MAX);
-        out.extend_from_slice(&lens_count.to_le_bytes());
-        for &len in chunk_plaintext_lens {
-            out.extend_from_slice(&len.to_le_bytes());
-        }
-    }
-    out
-}
-
-/// Decode a composition-create delta payload (legacy 3-tuple form,
-/// drops the optional name + lens). Kept for callers that don't yet
-/// care about the additional fields; new callers should use
-/// [`decode_composition_create_payload_named`].
-#[must_use]
-pub fn decode_composition_create_payload(
-    payload: &[u8],
-) -> Option<(CompositionId, NamespaceId, u64)> {
-    decode_composition_create_payload_named(payload).map(|(c, n, s, _, _)| (c, n, s))
-}
-
 /// Decoded composition-create delta payload — see
-/// [`decode_composition_create_payload_named`].
+/// [`decode_composition_create_payload`].
+///
+/// Tuple: `(comp_id, namespace_id, size, name, chunk_plaintext_lens,
+/// perspective_seq)`. `name` is `Some(_)` when the Create carried a
+/// per-key binding (S3 / FUSE / NFS named PUT) and `None` for nameless
+/// internal creates. `chunk_plaintext_lens` is `Some(_)` only for
+/// multipart uploads (parts have arbitrary plaintext sizes); regular
+/// PUTs leave it `None` and the read path uses the
+/// `MAX_PLAINTEXT_PER_CHUNK` grid math. `perspective_seq` is `Some(_)`
+/// when the async (decoupled-ack) producer minted an ingress HLC for
+/// the per-name LWW guard, and `None` for sync surfaces.
 pub type DecodedCompositionCreate = (
     CompositionId,
     NamespaceId,
     u64,
     Option<String>,
     Option<Vec<u32>>,
+    Option<kiseki_log::intent::PerspectiveSeq>,
 );
 
-/// Decode a composition-create delta payload, including the optional
-/// name and the optional per-chunk plaintext lens. Recognizes:
-/// - v1 (40 bytes): name = None, lens = None.
-/// - v2 (44 + `name_len`): name = Some, lens = None.
-/// - v3 (v2 + `[4 lens_count][n × u32]`): name = Some, lens = Some(Vec).
+/// Encode a composition-create delta payload.
+///
+/// The wire shape is one fixed layout; there is no version dispatch.
+/// Every field after the fixed 40-byte prefix is present, with
+/// presence-bits / length-prefixes carrying the optional ones:
+///
+/// ```text
+/// [comp_id              : 16]
+/// [namespace_id         : 16]
+/// [bytes_written u64 LE : 8 ]   <- fixed 40-byte prefix
+/// [name_present u8      : 1 ]
+///   if 1: [name_len u32 LE : 4][name utf8 : name_len]
+/// [lens_count u32 LE    : 4 ]   <- 0 when no per-chunk lens carried
+///   for each: [chunk_plaintext_len u32 LE : 4]
+/// [seq_present u8       : 1 ]
+///   if 1: [physical_ms u64 LE : 8][logical u32 LE : 4][node_id u64 LE : 8]
+/// ```
+///
+/// `chunk_plaintext_lens` is currently set only by
+/// `complete_multipart`: regular PUTs follow the
+/// `MAX_PLAINTEXT_PER_CHUNK` grid and the read path uses index math,
+/// so they pass `&[]` (encoded as `lens_count = 0`).
+///
+/// **Cross-surface seq contract (ADR-047 MF-9):** the synchronous
+/// (POSIX / NFS / FUSE) gateway path passes `perspective_seq = None`
+/// — the name-bind for that write is unconditional, Raft-commit-order
+/// authoritative. The asynchronous (S3 / native decoupled-ack)
+/// producer mints a `PerspectiveSeq` per write and passes
+/// `Some(seq)`; the hydrator-side LWW guard then resolves concurrent
+/// async same-name binds by `Some(seq) > Some(stored_seq)`. `None`
+/// (sync) is treated as `-∞` for comparison so a sync-then-async
+/// sequence lets the async write win (it has a real HLC timestamp);
+/// an async-then-sync sequence lets the sync write win
+/// (unconditional). See per-site doc comments on the four bind /
+/// unbind sites for the full rule.
 #[must_use]
-pub fn decode_composition_create_payload_named(payload: &[u8]) -> Option<DecodedCompositionCreate> {
-    if payload.len() < COMPOSITION_CREATE_PAYLOAD_LEN {
+pub fn encode_composition_create_payload(
+    comp_id: CompositionId,
+    namespace_id: NamespaceId,
+    bytes_written: u64,
+    name: Option<&str>,
+    chunk_plaintext_lens: &[u32],
+    perspective_seq: Option<kiseki_log::intent::PerspectiveSeq>,
+) -> Vec<u8> {
+    let name_bytes = name.map(str::as_bytes);
+    let name_section_len = match name_bytes {
+        Some(b) => 1 + 4 + b.len(),
+        None => 1,
+    };
+    let lens_section_len = 4 + 4 * chunk_plaintext_lens.len();
+    let seq_section_len = 1 + if perspective_seq.is_some() { 20 } else { 0 };
+    let cap = COMPOSITION_CREATE_PAYLOAD_PREFIX_LEN
+        + name_section_len
+        + lens_section_len
+        + seq_section_len;
+
+    let mut out = Vec::with_capacity(cap);
+    // Fixed prefix.
+    out.extend_from_slice(comp_id.0.as_bytes());
+    out.extend_from_slice(namespace_id.0.as_bytes());
+    out.extend_from_slice(&bytes_written.to_le_bytes());
+    // Name section.
+    match name_bytes {
+        Some(b) => {
+            out.push(1);
+            let name_len = u32::try_from(b.len()).unwrap_or(u32::MAX);
+            out.extend_from_slice(&name_len.to_le_bytes());
+            out.extend_from_slice(b);
+        }
+        None => out.push(0),
+    }
+    // Lens section.
+    let lens_count = u32::try_from(chunk_plaintext_lens.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&lens_count.to_le_bytes());
+    for &len in chunk_plaintext_lens {
+        out.extend_from_slice(&len.to_le_bytes());
+    }
+    // Perspective-seq section.
+    match perspective_seq {
+        Some(seq) => {
+            out.push(1);
+            out.extend_from_slice(&seq.0.physical_ms.to_le_bytes());
+            out.extend_from_slice(&seq.0.logical.to_le_bytes());
+            out.extend_from_slice(&seq.0.node_id.0.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+    out
+}
+
+/// Decode a composition-create delta payload.
+///
+/// Returns `None` on any structural mismatch — the hydrator treats
+/// that as a permanent skip. The wire shape is the single layout
+/// produced by [`encode_composition_create_payload`]; any other shape
+/// is an error, not a recognised prior version.
+#[must_use]
+pub fn decode_composition_create_payload(payload: &[u8]) -> Option<DecodedCompositionCreate> {
+    if payload.len() < COMPOSITION_CREATE_PAYLOAD_PREFIX_LEN {
         return None;
     }
     let comp_uuid = uuid::Uuid::from_slice(&payload[0..16]).ok()?;
@@ -217,63 +468,98 @@ pub fn decode_composition_create_payload_named(payload: &[u8]) -> Option<Decoded
     let mut size_bytes = [0u8; 8];
     size_bytes.copy_from_slice(&payload[32..40]);
     let size = u64::from_le_bytes(size_bytes);
-    if payload.len() == COMPOSITION_CREATE_PAYLOAD_LEN {
-        return Some((
-            CompositionId(comp_uuid),
-            NamespaceId(ns_uuid),
-            size,
-            None,
-            None,
-        ));
-    }
-    // v2 / v3: must have at least 4 bytes for name_len.
-    if payload.len() < COMPOSITION_CREATE_PAYLOAD_LEN + 4 {
-        return None;
-    }
-    let mut len_bytes = [0u8; 4];
-    len_bytes.copy_from_slice(&payload[40..44]);
-    let name_len = u32::from_le_bytes(len_bytes) as usize;
-    let name_end = 44 + name_len;
-    if payload.len() < name_end {
-        return None;
-    }
-    let name_bytes = &payload[44..name_end];
-    let name = Some(std::str::from_utf8(name_bytes).ok()?.to_owned());
-    // v2 (no lens suffix): exact length match against v2.
-    if payload.len() == name_end {
-        return Some((
-            CompositionId(comp_uuid),
-            NamespaceId(ns_uuid),
-            size,
-            name,
-            None,
-        ));
-    }
-    // v3: `[4 lens_count][n × u32]` after the v2 form.
-    if payload.len() < name_end + 4 {
+
+    let mut pos = COMPOSITION_CREATE_PAYLOAD_PREFIX_LEN;
+
+    // Name section.
+    let name = {
+        let present = *payload.get(pos)?;
+        pos += 1;
+        match present {
+            0 => None,
+            1 => {
+                if payload.len() < pos + 4 {
+                    return None;
+                }
+                let mut len_bytes = [0u8; 4];
+                len_bytes.copy_from_slice(&payload[pos..pos + 4]);
+                pos += 4;
+                let name_len = u32::from_le_bytes(len_bytes) as usize;
+                if payload.len() < pos + name_len {
+                    return None;
+                }
+                let name = std::str::from_utf8(&payload[pos..pos + name_len])
+                    .ok()?
+                    .to_owned();
+                pos += name_len;
+                Some(name)
+            }
+            _ => return None,
+        }
+    };
+
+    // Lens section.
+    if payload.len() < pos + 4 {
         return None;
     }
     let mut count_bytes = [0u8; 4];
-    count_bytes.copy_from_slice(&payload[name_end..name_end + 4]);
+    count_bytes.copy_from_slice(&payload[pos..pos + 4]);
+    pos += 4;
     let lens_count = u32::from_le_bytes(count_bytes) as usize;
-    let lens_start = name_end + 4;
-    let lens_end = lens_start + 4 * lens_count;
-    if payload.len() != lens_end {
+    let lens_bytes = lens_count.checked_mul(4)?;
+    if payload.len() < pos + lens_bytes {
         return None;
     }
     let mut lens = Vec::with_capacity(lens_count);
-    for i in 0..lens_count {
-        let off = lens_start + 4 * i;
+    for _ in 0..lens_count {
         let mut b = [0u8; 4];
-        b.copy_from_slice(&payload[off..off + 4]);
+        b.copy_from_slice(&payload[pos..pos + 4]);
         lens.push(u32::from_le_bytes(b));
+        pos += 4;
     }
+    let lens = if lens_count == 0 { None } else { Some(lens) };
+
+    // Perspective-seq section.
+    let perspective_seq = {
+        let present = *payload.get(pos)?;
+        pos += 1;
+        match present {
+            0 => None,
+            1 => {
+                if payload.len() < pos + 20 {
+                    return None;
+                }
+                let mut phys = [0u8; 8];
+                phys.copy_from_slice(&payload[pos..pos + 8]);
+                let mut logical = [0u8; 4];
+                logical.copy_from_slice(&payload[pos + 8..pos + 12]);
+                let mut node = [0u8; 8];
+                node.copy_from_slice(&payload[pos + 12..pos + 20]);
+                pos += 20;
+                Some(kiseki_log::intent::PerspectiveSeq(
+                    kiseki_common::time::HybridLogicalClock {
+                        physical_ms: u64::from_le_bytes(phys),
+                        logical: u32::from_le_bytes(logical),
+                        node_id: kiseki_common::ids::NodeId(u64::from_le_bytes(node)),
+                    },
+                ))
+            }
+            _ => return None,
+        }
+    };
+
+    // Trailing bytes after the seq section are a structural error.
+    if pos != payload.len() {
+        return None;
+    }
+
     Some((
         CompositionId(comp_uuid),
         NamespaceId(ns_uuid),
         size,
         name,
-        Some(lens),
+        lens,
+        perspective_seq,
     ))
 }
 
@@ -367,6 +653,31 @@ pub struct Composition {
     /// `chunk_plaintext_lens[0..i].sum()`.
     #[serde(default)]
     pub chunk_plaintext_lens: Vec<u32>,
+    /// ADR-048 §"`ChunkRef` extends" per-chunk `Hot`/`Cold` tag. Empty (the
+    /// serde default) means every chunk is implicit `Hot` in the
+    /// pool the composition was created in — preserves backwards
+    /// compatibility with pre-ADR-048 records. A non-empty vec must
+    /// have the same length as `chunks`; entries flip to
+    /// `ChunkRefLocation::Cold { slab_id, offset_in_slab, length }`
+    /// when the slab-EC compactor migrates the chunk to a slab.
+    #[serde(default)]
+    pub chunk_locations: Vec<kiseki_common::ChunkRefLocation>,
+}
+
+impl Composition {
+    /// ADR-048 §"Read path" — resolve the storage location of
+    /// `chunks[i]`. When `chunk_locations` is empty (the
+    /// pre-amendment case), returns an implicit Hot in the empty
+    /// pool — callers fall through to the existing single-pool path.
+    /// Out-of-range index returns the same implicit Hot.
+    #[must_use]
+    pub fn location_for(&self, chunk_idx: usize) -> kiseki_common::ChunkRefLocation {
+        self.chunk_locations.get(chunk_idx).cloned().unwrap_or(
+            kiseki_common::ChunkRefLocation::Hot {
+                pool_name: String::new(),
+            },
+        )
+    }
 }
 
 /// Result of a delete operation.
@@ -554,6 +865,32 @@ pub struct CompositionStore {
     /// after a mutation either misses the cache (re-fetches from
     /// storage) or hits a fresh post-mutation entry.
     read_cache: parking_lot::Mutex<LruCache<CompositionId, Composition>>,
+    /// ADR-048 — hot-tier eviction hook invoked after a successful
+    /// hydration batch commit when `migrated_chunk_evictions` is
+    /// non-empty. The gateway wires this to the chunk store's
+    /// refcount-decrement path so chunks freshly migrated into a
+    /// slab can release their hot-tier copy (I-SE4). `None` on a
+    /// store that hasn't been wired (single-node test fixtures); the
+    /// commit path no-ops in that case.
+    eviction_sink: parking_lot::RwLock<Option<Arc<dyn ChunkEvictionSink + Send + Sync>>>,
+}
+
+/// ADR-048 hook the gateway implements to release a migrated chunk's
+/// hot-tier copy after the cold-tier slab is durable + the
+/// `MigrateChunkLocations` delta has applied.
+///
+/// `decrement_refcount` is called exactly once per `chunk_id` per
+/// committed migration batch on the hydrator-commit thread. The sink
+/// MUST be non-blocking — a blocking implementation back-pressures
+/// the hydrator loop. The chunk-GC sweep does the actual reclaim
+/// when refcount hits zero (I-SE4).
+pub trait ChunkEvictionSink: Send + Sync {
+    /// Decrement the local chunk store's refcount on every id in
+    /// `chunk_ids`. Implementations should treat unknown ids as a
+    /// silent no-op (deduped chunks that this node never persisted
+    /// surface as unknown here — and that's fine; some other
+    /// placement node persisted the bytes).
+    fn release_migrated_chunks(&self, chunk_ids: &[kiseki_common::ids::ChunkId]);
 }
 
 /// Number of shards in the per-name lock array. 256 keeps the
@@ -625,6 +962,33 @@ impl CompositionStore {
             multiparts: parking_lot::Mutex::new(HashMap::new()),
             log: parking_lot::RwLock::new(None),
             read_cache: parking_lot::Mutex::new(LruCache::new(read_cache_capacity())),
+            eviction_sink: parking_lot::RwLock::new(None),
+        }
+    }
+
+    /// ADR-048 — register the gateway-side chunk eviction sink. Called
+    /// once at startup. Subsequent registrations replace the previous
+    /// sink (useful for tests that swap a stub sink in mid-run).
+    pub fn set_eviction_sink(&self, sink: Arc<dyn ChunkEvictionSink + Send + Sync>) {
+        *self.eviction_sink.write() = Some(sink);
+    }
+
+    /// ADR-048 — list compositions in a namespace. Surfaced from the
+    /// storage trait so the slab-EC compactor can scan candidates
+    /// without taking a dep on the persistent layer.
+    pub fn list_namespace_compositions(&self, ns: NamespaceId) -> Vec<Composition> {
+        self.storage.list_in_namespace(ns).unwrap_or_default()
+    }
+
+    /// ADR-048 — invoke the eviction sink with the given chunk IDs.
+    /// No-op when no sink is wired. Called by the hydrator's commit
+    /// path after a successful `apply_hydration_batch`.
+    pub fn invoke_eviction_sink(&self, chunk_ids: &[kiseki_common::ids::ChunkId]) {
+        if chunk_ids.is_empty() {
+            return;
+        }
+        if let Some(sink) = self.eviction_sink.read().clone() {
+            sink.release_migrated_chunks(chunk_ids);
         }
     }
 
@@ -822,6 +1186,7 @@ impl CompositionStore {
             has_inline_data,
             content_type: None,
             chunk_plaintext_lens,
+            chunk_locations: Vec::new(),
         };
         self.storage.put(comp)?;
         Ok(id)
@@ -873,6 +1238,7 @@ impl CompositionStore {
             has_inline_data,
             content_type: None,
             chunk_plaintext_lens: Vec::new(),
+            chunk_locations: Vec::new(),
         };
         self.storage.put(comp)?;
         Ok(())
@@ -987,6 +1353,7 @@ impl CompositionStore {
             has_inline_data,
             content_type: None,
             chunk_plaintext_lens: Vec::new(),
+            chunk_locations: Vec::new(),
         };
 
         // Per-name shard lock holds across the lookup + (optional)
@@ -1151,6 +1518,7 @@ impl CompositionOps for CompositionStore {
             has_inline_data,
             content_type: None,
             chunk_plaintext_lens: Vec::new(),
+            chunk_locations: Vec::new(),
         };
         self.storage.put(comp)?;
         Ok(id)
@@ -1381,6 +1749,8 @@ mod tests {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
+            size_band_pools: crate::namespace::NamespaceSizeBandPools::default(),
         }
     }
 
@@ -1860,6 +2230,8 @@ mod tests {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: vec![ComplianceTag::RevFadp],
+            tier_policy: Vec::new(),
+            size_band_pools: crate::namespace::NamespaceSizeBandPools::default(),
         };
 
         let effective = ns.effective_compliance_tags(&org_tags);
@@ -1885,6 +2257,8 @@ mod tests {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: vec![ComplianceTag::Hipaa, ComplianceTag::Gdpr],
+            tier_policy: Vec::new(),
+            size_band_pools: crate::namespace::NamespaceSizeBandPools::default(),
         };
 
         let effective = ns.effective_compliance_tags(&org_tags);
@@ -2250,5 +2624,221 @@ mod tests {
         // values.
         assert_eq!(store.get(id_a).unwrap().size, 1);
         assert_eq!(store.get(id_b).unwrap().size, 2);
+    }
+
+    /// ADR-045 §D3: the tier policy round-trips through the
+    /// `NamespaceCreate` delta payload, and a legacy 49-byte payload
+    /// (no appended section) decodes to an empty policy.
+    #[test]
+    fn namespace_tier_policy_round_trips() {
+        use crate::namespace::{Namespace, TierQuota};
+        use kiseki_common::ids::{NamespaceId, OrgId, ShardId};
+        let ns = Namespace {
+            id: NamespaceId(uuid::Uuid::from_u128(7)),
+            tenant_id: OrgId(uuid::Uuid::from_u128(8)),
+            shard_id: ShardId(uuid::Uuid::from_u128(9)),
+            read_only: false,
+            versioning_enabled: true,
+            compliance_tags: Vec::new(),
+            tier_policy: vec![
+                TierQuota {
+                    tier: "fast".into(),
+                    quota_bytes: 10 * 1024 * 1024 * 1024 * 1024,
+                },
+                TierQuota {
+                    tier: "cold".into(),
+                    quota_bytes: 0,
+                },
+            ],
+            size_band_pools: crate::namespace::NamespaceSizeBandPools::default(),
+        };
+        let bytes = encode_namespace_create_payload(&ns);
+        let back = decode_namespace_create_payload(&bytes).expect("decode");
+        assert_eq!(back.tier_policy, ns.tier_policy);
+        assert!(back.versioning_enabled);
+
+        // Legacy fixed-length payload (no tier section) → empty policy.
+        let legacy = &bytes[..NAMESPACE_CREATE_PAYLOAD_LEN];
+        let back_legacy = decode_namespace_create_payload(legacy).expect("legacy decode");
+        assert!(back_legacy.tier_policy.is_empty());
+    }
+
+    /// ADR-048 — the `MigrateChunkLocations` payload round-trips
+    /// chunk-index → `(offset_in_slab, length)` entries through the
+    /// log delta encoding so followers see exactly the same
+    /// composition-state mutation the leader committed.
+    #[test]
+    fn migrate_chunk_locations_payload_round_trip() {
+        let comp = CompositionId(uuid::Uuid::from_u128(99));
+        let slab = kiseki_common::SlabId(uuid::Uuid::from_u128(77));
+        let entries = vec![(0u32, 0u64, 16u32), (1, 16, 32), (5, 1024, 65_536)];
+        let payload = encode_migrate_chunk_locations_payload(comp, "cold-ec", slab, &entries);
+        let decoded = decode_migrate_chunk_locations_payload(&payload).expect("decode");
+        assert_eq!(decoded.composition_id, comp);
+        assert_eq!(decoded.pool_name, "cold-ec");
+        assert_eq!(decoded.slab_id, slab);
+        assert_eq!(decoded.entries, entries);
+        // Truncated payload → None, never panics.
+        assert!(decode_migrate_chunk_locations_payload(&payload[..10]).is_none());
+        // Empty entries section is valid.
+        let empty = encode_migrate_chunk_locations_payload(comp, "p", slab, &[]);
+        let decoded = decode_migrate_chunk_locations_payload(&empty).expect("decode-empty");
+        assert!(decoded.entries.is_empty());
+    }
+
+    /// ADR-024 2026-05-31 amendment: the per-namespace size-band pool
+    /// selector round-trips through the `NamespaceCreate` payload, and
+    /// pre-amendment payloads (no bands section after `tier_policy`)
+    /// decode to the default empty selector.
+    #[test]
+    fn namespace_size_band_pools_round_trip() {
+        use crate::namespace::{Namespace, NamespaceSizeBandPools, TierQuota};
+        use kiseki_common::ids::{NamespaceId, OrgId, ShardId};
+
+        let ns = Namespace {
+            id: NamespaceId(uuid::Uuid::from_u128(11)),
+            tenant_id: OrgId(uuid::Uuid::from_u128(12)),
+            shard_id: ShardId(uuid::Uuid::from_u128(13)),
+            read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
+            tier_policy: vec![TierQuota {
+                tier: "fast".into(),
+                quota_bytes: 1024,
+            }],
+            size_band_pools: NamespaceSizeBandPools {
+                inline: Some("nvme-meta".into()),
+                replicated: None,
+                ec: Some("bulk-ec".into()),
+            },
+        };
+        let bytes = encode_namespace_create_payload(&ns);
+        let back = decode_namespace_create_payload(&bytes).expect("decode");
+        assert_eq!(back.size_band_pools, ns.size_band_pools);
+        assert_eq!(back.tier_policy, ns.tier_policy);
+
+        // Pre-amendment payload: tier policy present but no bands section.
+        // We truncate at the byte right after the tier-policy section by
+        // re-encoding with empty bands and chopping the trailing 1-byte
+        // flag (which is zero in that case).
+        let mut empty = ns.clone();
+        empty.size_band_pools = NamespaceSizeBandPools::default();
+        let mut empty_bytes = encode_namespace_create_payload(&empty);
+        // The last byte is the bands_flag = 0; drop it to simulate a
+        // record written before the amendment.
+        assert_eq!(empty_bytes.last(), Some(&0u8));
+        empty_bytes.pop();
+        let back_legacy =
+            decode_namespace_create_payload(&empty_bytes).expect("pre-amendment decode");
+        assert!(back_legacy.size_band_pools.is_empty());
+        assert_eq!(back_legacy.tier_policy, empty.tier_policy);
+    }
+
+    // -- Composition-create payload round-trip (the one wire shape) --------
+
+    #[test]
+    fn create_payload_round_trip_nameless() {
+        // Nameless Create (NFS / internal): no name, no lens, no seq.
+        let comp_id = CompositionId(uuid::Uuid::from_u128(1));
+        let ns_id = NamespaceId(uuid::Uuid::from_u128(2));
+        let bytes = encode_composition_create_payload(comp_id, ns_id, 7, None, &[], None);
+        let (c, n, s, name, lens, seq) =
+            decode_composition_create_payload(&bytes).expect("nameless decode");
+        assert_eq!(c, comp_id);
+        assert_eq!(n, ns_id);
+        assert_eq!(s, 7);
+        assert!(name.is_none());
+        assert!(lens.is_none());
+        assert!(seq.is_none());
+    }
+
+    #[test]
+    fn create_payload_round_trip_named_sync() {
+        // Sync-surface named Create: name present, no lens, no seq.
+        let comp_id = CompositionId(uuid::Uuid::from_u128(1));
+        let ns_id = NamespaceId(uuid::Uuid::from_u128(2));
+        let bytes =
+            encode_composition_create_payload(comp_id, ns_id, 32, Some("named/sync"), &[], None);
+        let (_c, _n, _s, name, lens, seq) =
+            decode_composition_create_payload(&bytes).expect("named-sync decode");
+        assert_eq!(name.as_deref(), Some("named/sync"));
+        assert!(lens.is_none());
+        assert!(seq.is_none());
+    }
+
+    #[test]
+    fn create_payload_round_trip_named_async_with_seq() {
+        use kiseki_common::ids::NodeId;
+        use kiseki_common::time::HybridLogicalClock;
+        use kiseki_log::intent::PerspectiveSeq;
+        let comp_id = CompositionId(uuid::Uuid::from_u128(7));
+        let ns_id = NamespaceId(uuid::Uuid::from_u128(13));
+        let seq = PerspectiveSeq(HybridLogicalClock {
+            physical_ms: 0xDEAD_BEEF,
+            logical: 0xCAFE,
+            node_id: NodeId(42),
+        });
+        let bytes = encode_composition_create_payload(
+            comp_id,
+            ns_id,
+            128,
+            Some("lww/file.bin"),
+            &[],
+            Some(seq),
+        );
+        let (c, n, s, name, lens, decoded_seq) =
+            decode_composition_create_payload(&bytes).expect("named-async decode");
+        assert_eq!(c, comp_id);
+        assert_eq!(n, ns_id);
+        assert_eq!(s, 128);
+        assert_eq!(name.as_deref(), Some("lww/file.bin"));
+        assert!(lens.is_none());
+        assert_eq!(decoded_seq, Some(seq));
+    }
+
+    #[test]
+    fn create_payload_round_trip_named_with_seq_and_lens() {
+        use kiseki_common::ids::NodeId;
+        use kiseki_common::time::HybridLogicalClock;
+        use kiseki_log::intent::PerspectiveSeq;
+        let comp_id = CompositionId(uuid::Uuid::from_u128(9));
+        let ns_id = NamespaceId(uuid::Uuid::from_u128(13));
+        let seq = PerspectiveSeq(HybridLogicalClock {
+            physical_ms: 1_000_000,
+            logical: 3,
+            node_id: NodeId(1),
+        });
+        let lens = vec![100u32, 200, 300];
+        let bytes = encode_composition_create_payload(
+            comp_id,
+            ns_id,
+            600,
+            Some("multipart/key"),
+            &lens,
+            Some(seq),
+        );
+        let (_c, _n, _s, name, decoded_lens, decoded_seq) =
+            decode_composition_create_payload(&bytes).expect("named+lens+seq decode");
+        assert_eq!(name.as_deref(), Some("multipart/key"));
+        assert_eq!(decoded_lens, Some(lens));
+        assert_eq!(decoded_seq, Some(seq));
+    }
+
+    #[test]
+    fn create_payload_rejects_trailing_bytes() {
+        // Trailing bytes after a well-formed payload are a structural
+        // error — the decoder returns None and the hydrator records a
+        // permanent skip.
+        let comp_id = CompositionId(uuid::Uuid::from_u128(1));
+        let ns_id = NamespaceId(uuid::Uuid::from_u128(2));
+        let mut bytes = encode_composition_create_payload(comp_id, ns_id, 7, None, &[], None);
+        bytes.push(0xAB);
+        assert!(decode_composition_create_payload(&bytes).is_none());
+    }
+
+    #[test]
+    fn create_payload_rejects_short_prefix() {
+        // Shorter than the fixed 40-byte prefix — structural failure.
+        assert!(decode_composition_create_payload(&[0u8; 5]).is_none());
     }
 }

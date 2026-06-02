@@ -392,6 +392,13 @@ mod tests {
 
     #[async_trait]
     impl LogOps for FakeLog {
+        async fn put_intent_and_fan(
+            &self,
+            _shard_id: ShardId,
+            _intent: kiseki_log::intent::WriteIntent,
+        ) -> Result<(), kiseki_log::error::LogError> {
+            unreachable!()
+        }
         async fn append_delta(
             &self,
             _req: kiseki_log::traits::AppendDeltaRequest,

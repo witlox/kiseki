@@ -1,0 +1,16 @@
+{
+  "label": "slabec_s3_get-heavy_4194304",
+  "pool_type": "slabec",
+  "protocol": "s3",
+  "shape": "get-heavy",
+  "object_size": 4194304,
+  "ok": true,
+  "rc": 0,
+  "wall_s": 30.727649673994165,
+  "ops": 6186,
+  "ops_per_s": 618.6,
+  "mib_per_s": 2474.4,
+  "p50_us": 25476,
+  "p95_us": 33742,
+  "p99_us": 37083
+}

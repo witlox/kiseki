@@ -32,6 +32,40 @@ pub struct ReadResponse {
     pub content_type: Option<String>,
 }
 
+/// Which protocol surface a [`WriteRequest`] entered through (ADR-047).
+///
+/// Selects the ack discipline: object surfaces (`S3`, `Native`) carry
+/// bounded-stale, read-your-writes object semantics (ADR-014) and are
+/// eligible for the decoupled fast-ack path; POSIX surfaces (`Nfs`,
+/// `Fuse`) require close-to-open consistency (ADR-013) and are NEVER
+/// decoupled — they always await the synchronous Raft commit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WriteSurface {
+    /// S3 HTTP gateway (`PutObject` / multipart). Async-eligible.
+    #[default]
+    S3,
+    /// Native gRPC data-path write. Async-eligible.
+    Native,
+    /// NFS (v3 / v4 / pNFS DS) data path. Always synchronous (POSIX).
+    Nfs,
+    /// FUSE client write-back. Always synchronous (POSIX).
+    Fuse,
+}
+
+impl WriteSurface {
+    /// Whether this surface may take the ADR-047 decoupled fast-ack path.
+    ///
+    /// Only object surfaces (`S3`, `Native`) qualify: their bounded-stale
+    /// object semantics (ADR-014) tolerate the brief window between the
+    /// quorum-durable intent and the eventual Raft incorporation. POSIX
+    /// surfaces (`Nfs`, `Fuse`) demand close-to-open consistency
+    /// (ADR-013) and must never fast-ack ahead of the commit.
+    #[must_use]
+    pub const fn is_async_ack_eligible(self) -> bool {
+        matches!(self, WriteSurface::S3 | WriteSurface::Native)
+    }
+}
+
 /// A write request from a protocol client.
 #[derive(Clone, Debug, Default)]
 pub struct WriteRequest {
@@ -96,6 +130,47 @@ pub struct WriteRequest {
     /// `None` for callers (S3 PUT, native, in-memory) that don't
     /// need a stable cross-protocol id.
     pub comp_id_override: Option<CompositionId>,
+    /// Optional placement-tier hint (ADR-045 §D4/D5). The reserved
+    /// names `fast` / `bulk` / `cold` steer the write onto a device
+    /// class; `None` (or any other value) means fastest-fit. Carried on
+    /// the existing chunk-store `pool` seam, so it propagates to every
+    /// node's local placement through the EC/replication fan-out without
+    /// changing durability placement. Per-protocol adapters populate it
+    /// (S3 `x-amz-storage-class`, a native field, or a namespace default
+    /// once namespace metadata is replicated — Phase 18 / ADR-045 §D3).
+    pub tier: Option<String>,
+    /// ADR-047 — the protocol surface this write entered through. Selects
+    /// the ack discipline: object surfaces (`S3`, `Native`) are eligible
+    /// for the decoupled fast-ack path; POSIX surfaces (`Nfs`, `Fuse`)
+    /// always take the synchronous commit path. Every production
+    /// construction site sets this explicitly; `Default` is `S3` for the
+    /// few literal-with-default test sites.
+    pub surface: WriteSurface,
+    /// #146 — chain root for a pNFS DS COMMIT that drains its in-memory
+    /// buffer after a cap-hit. When `Some(prior_id)`, the gateway
+    /// constructs the new composition as `prior_id`'s chunks +
+    /// chunks-derived-from-`data`, total size = `base_bytes + data.len()`.
+    /// The prior chunks are NOT re-encrypted / re-uploaded — they already
+    /// exist in the chunk store (refcount > 0 via `prior_id`); the new
+    /// composition just references them. This collapses the
+    /// "buffer-cap-NOSPC ↔ kernel-COMMIT-retry" loop that caused the
+    /// F-1 wedge into a normal flush-then-drain cycle while preserving
+    /// the `snapshot_for_commit` correctness from #74 (the new
+    /// composition still contains every byte ever written through this
+    /// fh, because the chain prepends them).
+    ///
+    /// `None` for all other callers — S3 PUT, native, FUSE flush, `NFSv3`
+    /// CLOSE flush — they always write the full buffer.
+    pub base_composition_id: Option<CompositionId>,
+    /// #146 — cumulative size of `base_composition_id` when chaining.
+    /// Used to compute the final composition size as `base_bytes +
+    /// data.len()` without re-reading the prior composition. The
+    /// gateway trusts this value; the only producer is
+    /// `op_commit_ds`, which sources it from the buffer's `base_bytes`
+    /// field after a successful inline drain.
+    ///
+    /// Ignored when `base_composition_id` is `None`.
+    pub base_bytes: u64,
 }
 
 /// HTTP-derived conditional check applied to a `WriteRequest` against
@@ -119,6 +194,13 @@ pub struct WriteResponse {
     /// Number of bytes written.
     pub bytes_written: u64,
 }
+
+// #111: write forwarding is handled below the gateway by
+// `kiseki_log::traits::AppendForwarder` (forward the built append to the
+// shard leader's LogService), covering write/delete/multipart uniformly.
+// The earlier gateway-level `WriteForwarder` (re-issue the whole write)
+// was superseded — re-issuing the op can't work for multipart-complete
+// (the upload's part-state is local to the origin node).
 
 /// Protocol-agnostic gateway operations.
 ///
@@ -263,6 +345,23 @@ pub trait GatewayOps: Send + Sync {
         Err(GatewayError::OperationNotSupported(
             "delete_by_name not supported".into(),
         ))
+    }
+
+    /// Drop ONLY a name→composition binding from the name index,
+    /// leaving the composition (and its chunks) intact. Distinct from
+    /// `delete_by_name`, which also deletes the composition. Used by the
+    /// NFS rename path (#127) to retire the old name. Returns `true` if
+    /// a binding existed.
+    ///
+    /// Default: `Ok(false)`.
+    async fn unbind_object_name(
+        &self,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+        name: &str,
+    ) -> Result<bool, GatewayError> {
+        let _ = (tenant_id, namespace_id, name);
+        Ok(false)
     }
 
     /// Enumerate `(name, composition_id, size)` for objects in a
@@ -425,6 +524,16 @@ impl<G: GatewayOps> GatewayOps for std::sync::Arc<G> {
     ) -> Result<bool, GatewayError> {
         (**self).delete_by_name(tenant_id, namespace_id, name).await
     }
+    async fn unbind_object_name(
+        &self,
+        tenant_id: OrgId,
+        namespace_id: NamespaceId,
+        name: &str,
+    ) -> Result<bool, GatewayError> {
+        (**self)
+            .unbind_object_name(tenant_id, namespace_id, name)
+            .await
+    }
     async fn list_named(
         &self,
         tenant_id: OrgId,
@@ -438,6 +547,18 @@ impl<G: GatewayOps> GatewayOps for std::sync::Arc<G> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR-047: only object surfaces (S3, native) may decouple the ack;
+    /// POSIX surfaces (NFS, FUSE) must always await the synchronous commit.
+    #[test]
+    fn write_surface_async_ack_eligibility() {
+        assert!(WriteSurface::S3.is_async_ack_eligible());
+        assert!(WriteSurface::Native.is_async_ack_eligible());
+        assert!(!WriteSurface::Nfs.is_async_ack_eligible());
+        assert!(!WriteSurface::Fuse.is_async_ack_eligible());
+        // The Default surface is the conservative object surface, S3.
+        assert_eq!(WriteSurface::default(), WriteSurface::S3);
+    }
 
     /// RED-first: I-NG5 (idempotency dedup byte-preserve through proxy)
     /// requires `WriteRequest` to carry the request's
@@ -459,6 +580,10 @@ mod tests {
             idempotency_key: Some(vec![0xAB; 16]),
             forwarded_from_node: None,
             comp_id_override: None,
+            tier: None,
+            surface: WriteSurface::S3,
+            base_composition_id: None,
+            base_bytes: 0,
         };
         let cloned = req.clone();
         assert_eq!(
@@ -486,6 +611,10 @@ mod tests {
             idempotency_key: Some(vec![1, 2, 3]),
             forwarded_from_node: Some(7),
             comp_id_override: None,
+            tier: None,
+            surface: WriteSurface::S3,
+            base_composition_id: None,
+            base_bytes: 0,
         };
         assert_eq!(req.clone().forwarded_from_node, Some(7));
     }

@@ -38,7 +38,7 @@ async fn given_admin_auth(w: &mut KisekiWorld) {
 
 #[when(regex = r#"^the admin adds device "([^"]*)" to pool "([^"]*)"$"#)]
 async fn when_add_device(w: &mut KisekiWorld, dev_path: String, pool: String) {
-    if let Some(p) = w.legacy.chunk_store.pool_mut(&pool) {
+    if let Some(mut p) = w.legacy.chunk_store.pool_mut(&pool) {
         p.devices.push(PoolDevice {
             id: dev_path.clone(),
             online: true,
@@ -130,7 +130,7 @@ async fn given_chunk_ec_fragments(w: &mut KisekiWorld, _chunk: String, _devices:
 
 #[when(regex = r#"^device "([^"]*)" fails \(unresponsive\)$"#)]
 async fn when_device_fails(w: &mut KisekiWorld, dev: String) {
-    if let Some(pool) = w.legacy.chunk_store.pool_mut("fast-nvme") {
+    if let Some(mut pool) = w.legacy.chunk_store.pool_mut("fast-nvme") {
         pool.set_device_online(&dev, false);
     }
 }
@@ -188,10 +188,10 @@ async fn then_remove_rejected(w: &mut KisekiWorld) {
 #[when(regex = r"^a write brings it to (\d+)%$")]
 async fn when_write_brings(w: &mut KisekiWorld, pct: u64) {
     // Simulate capacity increase by adjusting used_bytes.
-    if let Some(p) = w.legacy.chunk_store.pool_mut("fast-nvme") {
+    if let Some(mut p) = w.legacy.chunk_store.pool_mut("fast-nvme") {
         p.used_bytes = p.capacity_bytes * pct / 100;
     }
-    if let Some(p) = w.legacy.chunk_store.pool_mut("bulk-hdd") {
+    if let Some(mut p) = w.legacy.chunk_store.pool_mut("bulk-hdd") {
         p.used_bytes = p.capacity_bytes * pct / 100;
     }
 }
@@ -249,7 +249,7 @@ async fn then_pool_still(w: &mut KisekiWorld, expected: String) {
 
 #[given(regex = r#"^pool "([^"]*)" is at (\d+)% \(Full for NVMe\)$"#)]
 async fn given_pool_full(w: &mut KisekiWorld, pool: String, pct: u64) {
-    if let Some(p) = w.legacy.chunk_store.pool_mut(&pool) {
+    if let Some(mut p) = w.legacy.chunk_store.pool_mut(&pool) {
         p.used_bytes = p.capacity_bytes * pct / 100;
     }
 }
@@ -295,7 +295,7 @@ async fn given_pool_critical(w: &mut KisekiWorld, pool: String) {
             .with_devices(6),
         );
     }
-    if let Some(p) = w.legacy.chunk_store.pool_mut(&pool) {
+    if let Some(mut p) = w.legacy.chunk_store.pool_mut(&pool) {
         p.used_bytes = p.capacity_bytes * 90 / 100; // Above critical.
     }
 }
@@ -336,7 +336,7 @@ async fn then_no_hdd(w: &mut KisekiWorld) {
 
 #[given(regex = r#"^pool "([^"]*)" is the only NVMe pool and is Critical$"#)]
 async fn given_only_nvme_critical(w: &mut KisekiWorld, pool: String) {
-    if let Some(p) = w.legacy.chunk_store.pool_mut(&pool) {
+    if let Some(mut p) = w.legacy.chunk_store.pool_mut(&pool) {
         p.used_bytes = p.capacity_bytes * 90 / 100;
     }
 }
@@ -452,7 +452,7 @@ async fn then_no_sharing(w: &mut KisekiWorld) {
 
 #[given(regex = r#"^pool "([^"]*)" has only (\d+) healthy devices$"#)]
 async fn given_few_devices(w: &mut KisekiWorld, pool: String, n: usize) {
-    if let Some(p) = w.legacy.chunk_store.pool_mut(&pool) {
+    if let Some(mut p) = w.legacy.chunk_store.pool_mut(&pool) {
         // Keep only n devices online.
         for (i, d) in p.devices.iter_mut().enumerate() {
             d.online = i < n;

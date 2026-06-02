@@ -51,6 +51,16 @@ pub enum GatewayError {
     #[error("namespace is read-only")]
     ReadOnlyNamespace,
 
+    /// The backing storage is full — the chunk device pool (or, after
+    /// small-tier spillover, the only remaining tier) could not allocate
+    /// space (ADR-024 capacity thresholds → Full). Distinct from
+    /// [`Self::Upstream`] so the chunk-pool-full case surfaces as a
+    /// clean `507 Insufficient Storage` / POSIX `ENOSPC` instead of the
+    /// opaque `device full → quorum lost → 500` chain that GH #115
+    /// exposed.
+    #[error("insufficient storage: {0}")]
+    InsufficientStorage(String),
+
     /// This node is currently unable to resolve the request and the
     /// caller should retry (potentially against a different node).
     /// ADR-040 §D7 + I-2: emitted by the read path when a composition

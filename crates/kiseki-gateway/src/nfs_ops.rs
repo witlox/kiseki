@@ -584,31 +584,38 @@ impl<G: GatewayOps> NfsContext<G> {
             (buf.clone(), last_len)
         };
 
-        // Choose the composition id:
-        // - First flush (last_len == 0): use the placeholder from the
-        //   fh's first 16 bytes. Preserves Group V #1's cross-protocol
-        //   GET-by-placeholder-UUID semantics — the NFS client received
-        //   that UUID at CREATE time; an S3 client doing
-        //   GET /<bucket>/<uuid> must still find it.
-        // - Subsequent flushes: mint a fresh UUID. `create_at`'s
-        //   idempotency would otherwise drop the new data.
-        let target_id = if last_len == 0 {
-            let mut bytes = [0u8; 16];
-            bytes.copy_from_slice(&fh[..16]);
-            CompositionId(uuid::Uuid::from_bytes(bytes))
-        } else {
-            CompositionId(uuid::Uuid::new_v4())
-        };
-
         let new_len = data.len();
-        let (new_fh, resp) = self.write_with_optional_id(data, Some(target_id)).await?;
+        // #127: a named file takes the NAME path (`create_with_name`):
+        // it binds the name in the LOCAL store AND rides the Create
+        // delta's name field so the hydrator replicates it to every
+        // node. The placeholder-id override is dropped for named files
+        // (the kernel's CREATE-time fh is repointed below), so
+        // cross-protocol addressing is now GET-by-name (like S3), not
+        // GET-by-placeholder-UUID. The rare unnamed/by-handle flush
+        // keeps the placeholder-override path (Group V #1) + the
+        // fresh-id-on-growth idempotency.
+        let name = self.dir_index.name_for(self.namespace_id, fh);
+        let (new_fh, resp) = if name.is_some() {
+            self.write_with_optional_id(data, name.as_deref(), None)
+                .await?
+        } else {
+            let target_id = if last_len == 0 {
+                let mut bytes = [0u8; 16];
+                bytes.copy_from_slice(&fh[..16]);
+                CompositionId(uuid::Uuid::from_bytes(bytes))
+            } else {
+                CompositionId(uuid::Uuid::new_v4())
+            };
+            self.write_with_optional_id(data, None, Some(target_id))
+                .await?
+        };
 
         // Update dir_index to point at the latest composition. Keeps
         // cross-protocol GET-by-name (S3) reading the freshest data;
         // older compositions become orphans and get GC'd by the chunk-
         // store cleaner. This is the explicit "compositions are
         // mutable until close" semantic for NFS-buffered writes.
-        if let Some(name) = self.dir_index.name_for(self.namespace_id, fh) {
+        if let Some(name) = name {
             self.dir_index.insert(
                 self.namespace_id,
                 name,
@@ -653,7 +660,10 @@ impl<G: GatewayOps> NfsContext<G> {
         name: &str,
         data: Vec<u8>,
     ) -> Result<(FileHandle, NfsWriteResponse), GatewayError> {
-        let (fh, resp) = self.write(data).await?;
+        // #127: pass the name so it rides the replicated Create delta
+        // (cross-node name resolution), in addition to the node-local
+        // dir_index cache below.
+        let (fh, resp) = self.write_with_optional_id(data, Some(name), None).await?;
         self.dir_index.insert(
             self.namespace_id,
             name.to_owned(),
@@ -728,7 +738,7 @@ impl<G: GatewayOps> NfsContext<G> {
         &self,
         data: Vec<u8>,
     ) -> Result<(FileHandle, NfsWriteResponse), GatewayError> {
-        self.write_with_optional_id(data, None).await
+        self.write_with_optional_id(data, None, None).await
     }
 
     /// Same as [`Self::write`] but pins the resulting composition to
@@ -738,9 +748,15 @@ impl<G: GatewayOps> NfsContext<G> {
     /// the NFS client's first response gives the caller a UUID that
     /// `comps.get(uuid)` doesn't resolve, so an S3 GET on the same
     /// UUID fails with 404.
+    ///
+    /// `name` (#127): when `Some`, the POSIX name rides the Create
+    /// delta so it replicates to every node's name index (hydrator
+    /// name_inserts) — the same path S3 PUT binds a key through. Pass
+    /// `None` for an unnamed/by-handle write.
     pub async fn write_with_optional_id(
         &self,
         data: Vec<u8>,
+        name: Option<&str>,
         comp_id_override: Option<CompositionId>,
     ) -> Result<(FileHandle, NfsWriteResponse), GatewayError> {
         let resp = self
@@ -750,6 +766,7 @@ impl<G: GatewayOps> NfsContext<G> {
                 namespace_id: self.namespace_id,
                 data,
                 comp_id_override,
+                name: name.map(str::to_owned),
             })
             .await?;
 
@@ -766,72 +783,133 @@ impl<G: GatewayOps> NfsContext<G> {
         // `dir_index`. The index alone doesn't carry type info — we
         // ask the handle registry whether the resolved handle is a
         // directory and pick the right mode + nlink + size shape.
+        // A `dir_index` hit is authoritative for directories, symlinks,
+        // and non-empty regular files. A *size-0 regular* hit is
+        // ambiguous: it's either a genuinely empty file OR a pNFS
+        // placeholder (`create_pending_named`) whose real bytes + name
+        // were committed through the DS COMMIT into the replicated index
+        // and never written back to this stale entry (#127 pNFS half).
+        // Defer those to the replicated lookup (1b) below; only fall back
+        // to the empty placeholder if that misses too.
+        let mut pending_placeholder: Option<(FileHandle, u64)> = None;
         if let Some(entry) = self.dir_index.lookup(self.namespace_id, name) {
             let fileid = u64::from_le_bytes(entry.file_handle[..8].try_into().unwrap_or([0; 8]));
-            let attrs = if self.handles.is_directory(&entry.file_handle) {
-                NfsAttrs {
-                    file_type: FileType::Directory,
-                    size: 4096,
-                    mode: 0o755,
-                    nlink: 2,
+            let is_dir = self.handles.is_directory(&entry.file_handle);
+            // #53: report Symlink so the kernel's GETATTR sees ftype=NF4LNK
+            // and calls READLINK after `ln -s target lnk`.
+            let is_lnk = self.handles.is_symlink(&entry.file_handle);
+            // A size-0 *regular* entry is a pNFS placeholder candidate —
+            // defer it (don't return) so the replicated lookup below can
+            // surface the DS-COMMIT'd bytes + name. Dirs, symlinks, and
+            // non-empty files are authoritative here.
+            if is_dir || is_lnk || entry.size > 0 {
+                let (file_type, size, mode, nlink) = if is_dir {
+                    (FileType::Directory, 4096, 0o755, 2)
+                } else if is_lnk {
+                    (FileType::Symlink, entry.size, 0o777, 1)
+                } else {
+                    (FileType::Regular, entry.size, 0o644, 1)
+                };
+                let attrs = NfsAttrs {
+                    file_type,
+                    size,
+                    mode,
+                    nlink,
                     uid: 0,
                     gid: 0,
                     fileid,
-                }
-            } else if self.handles.is_symlink(&entry.file_handle) {
-                // #53: LOOKUP("lnk") after `ln -s target lnk` resolves
-                // here. Report Symlink so the kernel's subsequent
-                // GETATTR sees ftype=NF4LNK and calls READLINK.
-                NfsAttrs {
-                    file_type: FileType::Symlink,
-                    size: entry.size,
-                    mode: 0o777,
-                    nlink: 1,
-                    uid: 0,
-                    gid: 0,
-                    fileid,
-                }
-            } else {
-                NfsAttrs {
-                    file_type: FileType::Regular,
-                    size: entry.size,
-                    mode: 0o644,
-                    nlink: 1,
-                    uid: 0,
-                    gid: 0,
-                    fileid,
-                }
+                };
+                return Some((entry.file_handle, attrs));
+            }
+            pending_placeholder = Some((entry.file_handle, fileid));
+        }
+
+        // 1b) #127: replicated name index. Resolves a name written on
+        // ANOTHER node (or by this node before a restart) — its binding
+        // isn't in this node's in-memory `dir_index`, but the hydrator
+        // has applied the Create-delta name_insert into the local store,
+        // so `lookup_name` finds it (same store + path S3 GET uses). On
+        // a hit, prime the local dir_index so subsequent ops fast-path
+        // and READDIR surfaces it.
+        if let Ok(Some(comp_id)) = self
+            .gateway
+            .lookup_name(self.tenant_id, self.namespace_id, name)
+            .await
+        {
+            let size = self
+                .gateway
+                .list(self.tenant_id, self.namespace_id)
+                .await
+                .ok()
+                .and_then(|entries| {
+                    entries
+                        .into_iter()
+                        .find(|(cid, _)| *cid == comp_id)
+                        .map(|(_, sz)| sz)
+                })
+                .unwrap_or(0);
+            let fh = self
+                .handles
+                .file_handle(self.namespace_id, self.tenant_id, comp_id);
+            self.dir_index
+                .insert(self.namespace_id, name.to_owned(), fh, comp_id, size);
+            let attrs = NfsAttrs {
+                file_type: FileType::Regular,
+                size,
+                mode: 0o644,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                fileid: u64::from_le_bytes(comp_id.0.as_bytes()[..8].try_into().unwrap_or([0; 8])),
             };
-            return Some((entry.file_handle, attrs));
+            return Some((fh, attrs));
         }
 
         // 2) Phase 15c.3: composition-by-UUID lookup. S3 PUT'd
         // objects are named by their composition UUID; the kernel
         // sends `LOOKUP("<uuid>")` for `dd /mnt/pnfs/<uuid>`. Parse
         // the name as a UUID and consult the gateway list.
-        let uuid = uuid::Uuid::parse_str(name).ok()?;
-        let comp_id = CompositionId(uuid);
-        let entries = self
-            .gateway
-            .list(self.tenant_id, self.namespace_id)
-            .await
-            .ok()?;
-        let (_, size) = entries.iter().find(|(cid, _)| *cid == comp_id).copied()?;
-        // Materialize a file handle for the composition; future
-        // PUTFH/READ requests will resolve through the registry.
-        let fh = self
-            .handles
-            .file_handle(self.namespace_id, self.tenant_id, comp_id);
-        let attrs = NfsAttrs {
-            file_type: FileType::Regular,
-            size,
-            mode: 0o644,
-            nlink: 1,
-            uid: 0,
-            gid: 0,
-            fileid: u64::from_le_bytes(comp_id.0.as_bytes()[..8].try_into().unwrap_or([0; 8])),
-        };
-        Some((fh, attrs))
+        if let Ok(uuid) = uuid::Uuid::parse_str(name) {
+            let comp_id = CompositionId(uuid);
+            if let Ok(entries) = self.gateway.list(self.tenant_id, self.namespace_id).await {
+                if let Some((_, size)) = entries.iter().find(|(cid, _)| *cid == comp_id).copied() {
+                    // Materialize a file handle for the composition; future
+                    // PUTFH/READ requests will resolve through the registry.
+                    let fh = self
+                        .handles
+                        .file_handle(self.namespace_id, self.tenant_id, comp_id);
+                    let attrs = NfsAttrs {
+                        file_type: FileType::Regular,
+                        size,
+                        mode: 0o644,
+                        nlink: 1,
+                        uid: 0,
+                        gid: 0,
+                        fileid: u64::from_le_bytes(
+                            comp_id.0.as_bytes()[..8].try_into().unwrap_or([0; 8]),
+                        ),
+                    };
+                    return Some((fh, attrs));
+                }
+            }
+        }
+
+        // Nothing committed under this name — fall back to the deferred
+        // size-0 placeholder (a genuinely empty `create`d/`touch`ed file).
+        pending_placeholder.map(|(fh, fileid)| {
+            (
+                fh,
+                NfsAttrs {
+                    file_type: FileType::Regular,
+                    size: 0,
+                    mode: 0o644,
+                    nlink: 1,
+                    uid: 0,
+                    gid: 0,
+                    fileid,
+                },
+            )
+        })
     }
 
     /// List directory entries for READDIR.
@@ -858,12 +936,39 @@ impl<G: GatewayOps> NfsContext<G> {
         // composition's UUID would both surface in `ls`.
         let mut named_comp_ids: std::collections::HashSet<CompositionId> =
             std::collections::HashSet::new();
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         for dir_entry in self.dir_index.list(self.namespace_id) {
             named_comp_ids.insert(dir_entry.composition_id);
+            seen_names.insert(dir_entry.name.clone());
             entries.push(ReadDirEntry {
                 fileid: u64::from_le_bytes(dir_entry.file_handle[..8].try_into().unwrap_or([0; 8])),
                 name: dir_entry.name,
             });
+        }
+
+        // #127: replicated named entries — files created on OTHER nodes
+        // (or before a restart) live in the replicated name index, which
+        // the hydrator keeps current locally. Surface them by name so
+        // `ls` is consistent cluster-wide. Dedup against the local
+        // dir_index by name (a locally-written file appears in both).
+        if let Ok(named) = self
+            .gateway
+            .list_names(self.tenant_id, self.namespace_id)
+            .await
+        {
+            for (name, comp_id, _size) in named {
+                if seen_names.contains(&name) {
+                    continue;
+                }
+                named_comp_ids.insert(comp_id);
+                seen_names.insert(name.clone());
+                entries.push(ReadDirEntry {
+                    fileid: u64::from_le_bytes(
+                        comp_id.0.as_bytes()[..8].try_into().unwrap_or([0; 8]),
+                    ),
+                    name,
+                });
+            }
         }
 
         // Phase 15c.3: also enumerate compositions stored in the
@@ -900,20 +1005,24 @@ impl<G: GatewayOps> NfsContext<G> {
     /// the runtime's periodic GC task (see `runtime.rs`) is what
     /// actually frees the device extents once `refcount == 0`.
     pub async fn remove_file(&self, name: &str) -> Result<(), GatewayError> {
-        // Look up before removing so we still know the composition_id
-        // after the dir entry is gone.
-        let Some(entry) = self.dir_index.lookup(self.namespace_id, name) else {
-            return Err(GatewayError::ProtocolError("file not found".into()));
+        // Resolve the composition id: local dir_index fast path, else
+        // the replicated name index (#127 — a file created on ANOTHER
+        // node has no local dir_index entry but is still removable via
+        // its replicated binding). Drop the local dir entry first so the
+        // kernel sees the file gone the instant REMOVE returns.
+        let composition_id = if let Some(entry) = self.dir_index.lookup(self.namespace_id, name) {
+            self.dir_index.remove(self.namespace_id, name);
+            entry.composition_id
+        } else {
+            match self
+                .gateway
+                .lookup_name(self.tenant_id, self.namespace_id, name)
+                .await
+            {
+                Ok(Some(id)) => id,
+                _ => return Err(GatewayError::ProtocolError("file not found".into())),
+            }
         };
-        let composition_id = entry.composition_id;
-
-        // Drop the dir-index binding first — kernel sees the file
-        // gone the instant REMOVE returns. The composition delete
-        // (which decrements chunk refcounts) follows so a partial
-        // failure can't leave a name pointing at a half-deleted
-        // composition.
-        let removed = self.dir_index.remove(self.namespace_id, name);
-        debug_assert!(removed, "lookup succeeded above, remove must too");
 
         // Skip the gateway delete for placeholder/nil compositions —
         // directory entries minted by `mkdir` use `CompositionId::nil`
@@ -948,12 +1057,29 @@ impl<G: GatewayOps> NfsContext<G> {
     }
 
     /// Rename a file within the namespace.
-    pub fn rename_file(&self, old_name: &str, new_name: &str) -> Result<(), GatewayError> {
-        if self.dir_index.rename(self.namespace_id, old_name, new_name) {
-            Ok(())
-        } else {
-            Err(GatewayError::ProtocolError("source file not found".into()))
+    ///
+    /// #127: keeps the replicated name index consistent with the local
+    /// dir_index — without retiring the old name there, a LOOKUP of the
+    /// old name would still resolve via the replicated fallback. The new
+    /// name is served locally by the renamed dir_index entry. NOTE: the
+    /// replicated rebind is leader-local for now (no rename delta yet),
+    /// so cross-node visibility of a rename is a tracked follow-up; the
+    /// common read-after-write path (#127) is unaffected.
+    pub async fn rename_file(&self, old_name: &str, new_name: &str) -> Result<(), GatewayError> {
+        if !self.dir_index.rename(self.namespace_id, old_name, new_name) {
+            return Err(GatewayError::ProtocolError("source file not found".into()));
         }
+        // Retire the old name in the replicated index (name-only — keep
+        // the composition). The new name resolves via the renamed
+        // dir_index entry locally.
+        if let Err(e) = self
+            .gateway
+            .unbind_name(self.tenant_id, self.namespace_id, old_name)
+            .await
+        {
+            tracing::warn!(error = %e, %old_name, "nfs rename: replicated old-name unbind failed");
+        }
+        Ok(())
     }
 
     /// Set file attributes (mode, size). Returns updated attrs.
@@ -1147,6 +1273,9 @@ mod tests {
             read_only: false,
             versioning_enabled: false,
             compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
         });
         let gw = InMemoryGateway::new(
             store,
@@ -1155,6 +1284,60 @@ mod tests {
         );
         let nfs_gw = NfsGateway::new(gw);
         NfsContext::new(nfs_gw, tenant, ns)
+    }
+
+    /// #127 (pNFS half) read-side guard. The kernel pNFS write path leaves
+    /// a size-0 placeholder in `dir_index` (from `create_pending_named` at
+    /// OPEN) while the real bytes + name are committed into the replicated
+    /// store by the DS COMMIT (never written back to that entry). A
+    /// `lookup_by_name` that returned the stale placeholder reported size 0
+    /// → the kernel saw an empty file and never read. The fix defers a
+    /// size-0 regular `dir_index` hit to the replicated name index.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn size0_placeholder_lookup_defers_to_committed_comp() {
+        let ctx = ctx();
+
+        // OPEN(CREATE,"pf.txt"): size-0 placeholder in dir_index, nothing
+        // committed yet. lookup sees a genuinely-empty file.
+        let _ = ctx.create_pending_named("pf.txt").expect("create_pending");
+        let before = ctx
+            .lookup_by_name("pf.txt")
+            .await
+            .expect("placeholder lookup");
+        assert_eq!(before.1.size, 0, "uncommitted file reads as empty");
+        assert_eq!(before.1.file_type, FileType::Regular);
+
+        // Simulate the DS COMMIT: a NAMED composition minted in the store
+        // via the Create-delta name path, WITHOUT touching dir_index —
+        // exactly what op_commit_ds now does (name carried on the layout).
+        let data = vec![b'Z'; 4096];
+        let resp = ctx
+            .gateway
+            .write(crate::nfs::NfsWriteRequest {
+                tenant_id: ctx.tenant_id,
+                namespace_id: ctx.namespace_id,
+                data: data.clone(),
+                comp_id_override: None,
+                name: Some("pf.txt".to_owned()),
+            })
+            .await
+            .expect("named write");
+
+        // lookup_by_name MUST now resolve the committed comp (real size +
+        // its file handle), not the stale size-0 placeholder.
+        let after = ctx
+            .lookup_by_name("pf.txt")
+            .await
+            .expect("committed lookup");
+        assert_eq!(
+            after.1.size,
+            data.len() as u64,
+            "resolves committed bytes, not the size-0 placeholder"
+        );
+        let want_fh = ctx
+            .handles
+            .file_handle(ctx.namespace_id, ctx.tenant_id, resp.composition_id);
+        assert_eq!(after.0, want_fh, "fh points at the committed composition");
     }
 
     /// Three sequential writes to the same fh, each followed by a
@@ -1206,6 +1389,84 @@ mod tests {
         assert_eq!(
             resp.data, expected,
             "read content does not match concatenated writes — flush_writes dropped data (#50)"
+        );
+    }
+
+    /// Build N `NfsContext`s that share ONE composition store (via
+    /// `Arc<InMemoryGateway>`) but each have their own node-local
+    /// `dir_index` — a local model of N cluster nodes. (Shared store
+    /// models the replicated store post-hydration; true delta/hydrator
+    /// replication is verified on the cluster.)
+    fn shared_nodes(n: usize) -> Vec<NfsContext<std::sync::Arc<InMemoryGateway>>> {
+        use std::sync::Arc;
+        let master_key = SystemMasterKey::new([0u8; 32], KeyEpoch(1));
+        let tenant = OrgId(uuid::Uuid::nil());
+        let ns = NamespaceId(uuid::Uuid::from_u128(1));
+        let store = CompositionStore::new();
+        store.add_namespace(kiseki_composition::namespace::Namespace {
+            id: ns,
+            tenant_id: tenant,
+            shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
+            read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
+
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
+        });
+        let gw = Arc::new(InMemoryGateway::new(
+            store,
+            kiseki_chunk::arc_async(ChunkStore::new()),
+            master_key,
+        ));
+        (0..n)
+            .map(|_| NfsContext::new(NfsGateway::new(Arc::clone(&gw)), tenant, ns))
+            .collect()
+    }
+
+    /// #127: NFS names must resolve cluster-wide, not only on the writer
+    /// node. Pre-fix the name lived only in the writer's in-memory
+    /// `dir_index`; a LOOKUP on another node returned nothing even
+    /// though the composition was replicated. The fix rides the name
+    /// into the Create delta (replicated name index) + a read-side
+    /// fallback. Here: write on node A, resolve + read on node B (whose
+    /// dir_index is empty).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cross_node_lookup_and_read_resolve_via_replicated_name_index() {
+        let nodes = shared_nodes(2);
+        let data = b"replicated-bytes-1234".to_vec();
+        nodes[0]
+            .write_named("shared.txt", data.clone())
+            .await
+            .expect("write on node A");
+
+        let (fh, attrs) = nodes[1]
+            .lookup_by_name("shared.txt")
+            .await
+            .expect("#127: cross-node LOOKUP must resolve via the replicated name index");
+        assert_eq!(
+            attrs.size,
+            data.len() as u64,
+            "#127: cross-node GETATTR size wrong (got {})",
+            attrs.size,
+        );
+        let r = nodes[1]
+            .read(&fh, 0, u32::try_from(data.len()).expect("len fits u32"))
+            .await
+            .expect("cross-node read");
+        assert_eq!(r.data, data, "#127: cross-node read returned wrong bytes");
+
+        // READDIR on node B surfaces the name too (not just node A's
+        // dir_index).
+        let names: Vec<String> = nodes[1]
+            .readdir()
+            .await
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "shared.txt"),
+            "#127: cross-node READDIR must list the replicated name; got {names:?}",
         );
     }
 }

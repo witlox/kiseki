@@ -37,25 +37,92 @@ struct ChunkEntry {
     stored_bytes: u64,
 }
 
+/// Storage capacity + dedup statistics for a chunk store.
+///
+/// `device_*` come from the backing [`DeviceBackend`] (for a
+/// `DevicePool` they sum every JBOD member). `logical`/`physical` are
+/// the chunk-level dedup accounting: `logical` is the bytes addressed
+/// by clients (`sum(refcount × payload)`), `physical` is the unique
+/// stored payload bytes (each content-addressed chunk once). The ratio
+/// of the two is the dedup factor.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StorageStats {
+    /// Physical bytes allocated on the backing device(s).
+    pub device_used_bytes: u64,
+    /// Total physical capacity of the backing device(s).
+    pub device_total_bytes: u64,
+    /// Logical bytes addressed by clients (`sum(refcount × payload)`).
+    pub logical_bytes: u64,
+    /// Unique stored payload bytes (each chunk counted once).
+    pub physical_bytes: u64,
+    /// Number of unique chunks held locally.
+    pub chunk_count: u64,
+}
+
+impl StorageStats {
+    /// Dedup ratio = logical / physical (`1.0` = no dedup benefit).
+    #[must_use]
+    pub fn dedup_ratio(&self) -> f64 {
+        if self.physical_bytes == 0 {
+            1.0
+        } else {
+            // Precision loss is acceptable for a display ratio.
+            #[allow(clippy::cast_precision_loss)]
+            let r = self.logical_bytes as f64 / self.physical_bytes as f64;
+            r
+        }
+    }
+
+    /// Free bytes on the backing device(s).
+    #[must_use]
+    pub fn device_free_bytes(&self) -> u64 {
+        self.device_total_bytes
+            .saturating_sub(self.device_used_bytes)
+    }
+}
+
+/// Map a chunk-store pool name to a placement tier (ADR-045 §D3/D4).
+///
+/// The reserved names `fast` / `bulk` / `cold` select a device class;
+/// any other name (including `default`) means "no preference" →
+/// fastest-fit. The pool name rides the existing `write_chunk` /
+/// `PutFragment` seam and propagates to every node, so a tier hint
+/// reaches each node's local placement without changing the EC
+/// durability fan-out.
+#[must_use]
+pub fn tier_for_pool(pool: &str) -> Option<kiseki_block::StorageTier> {
+    match pool {
+        "fast" => Some(kiseki_block::StorageTier::Fast),
+        "bulk" => Some(kiseki_block::StorageTier::Bulk),
+        "cold" => Some(kiseki_block::StorageTier::Cold),
+        _ => None,
+    }
+}
+
 /// Chunk storage operations trait.
 pub trait ChunkOps {
     /// Write a chunk. If the chunk ID already exists (dedup hit),
     /// increments the refcount instead of writing new data (I-C1, I-C2).
-    fn write_chunk(&mut self, envelope: Envelope, pool: &str) -> Result<bool, ChunkError>;
+    ///
+    /// Takes `&self` (GH #137): the persistent store uses interior
+    /// locks fine-grained enough to release the chunk-index mutex
+    /// across the device I/O, so concurrent writers parallelize
+    /// instead of serializing on one exclusive lock.
+    fn write_chunk(&self, envelope: Envelope, pool: &str) -> Result<bool, ChunkError>;
 
     /// Read a chunk by ID. Returns an owned Envelope (supports both
     /// in-memory and persistent backends).
     fn read_chunk(&self, chunk_id: &ChunkId) -> Result<Envelope, ChunkError>;
 
     /// Increment refcount for an existing chunk (dedup).
-    fn increment_refcount(&mut self, chunk_id: &ChunkId) -> Result<u64, ChunkError>;
+    fn increment_refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError>;
 
     /// Atomic dedup-pre-flight: increment the refcount IF the chunk
     /// exists, else return `Ok(None)`. Saves one round-trip on the
     /// gateway dedup path (vs `refcount` + `increment_refcount`).
     /// Default impl falls back to the two-step path; backends that
     /// can do this in a single critical section override it.
-    fn try_increment_if_exists(&mut self, chunk_id: &ChunkId) -> Result<Option<u64>, ChunkError> {
+    fn try_increment_if_exists(&self, chunk_id: &ChunkId) -> Result<Option<u64>, ChunkError> {
         match self.refcount(chunk_id) {
             Ok(_) => self.increment_refcount(chunk_id).map(Some),
             Err(ChunkError::NotFound(_)) => Ok(None),
@@ -63,8 +130,31 @@ pub trait ChunkOps {
         }
     }
 
+    /// Register a `chunk_id` in the dedup index without doing any device
+    /// I/O. Called by the cluster wrapper after a successful
+    /// `write_chunk_ec`: EC fragment writes don't go through
+    /// [`Self::write_chunk`] (they populate the fragments index only),
+    /// so without this hook the dedup index stays empty in EC mode and
+    /// the gateway's `try_increment_if_exists` always misses → every
+    /// PUT re-encrypts + re-fans the same content. On second call for
+    /// the same `chunk_id` this bumps refcount, matching the
+    /// dedup-hit semantics of [`Self::write_chunk`].
+    ///
+    /// Default returns `Err(Io("register_ec_chunk not supported on this
+    /// backend"))` so backends that don't see EC writes don't have to
+    /// implement it.
+    ///
+    /// # Errors
+    /// Backends may return `ChunkError::Io` on refcount overflow or
+    /// meta-store persistence failure.
+    fn register_ec_chunk(&self, _envelope: &Envelope, _pool: &str) -> Result<bool, ChunkError> {
+        Err(ChunkError::Io(
+            "register_ec_chunk not supported on this backend".into(),
+        ))
+    }
+
     /// Decrement refcount. Returns the new refcount.
-    fn decrement_refcount(&mut self, chunk_id: &ChunkId) -> Result<u64, ChunkError>;
+    fn decrement_refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError>;
 
     /// Set a retention hold on a chunk (I-C2b).
     fn set_retention_hold(&mut self, chunk_id: &ChunkId, hold_name: &str)
@@ -84,6 +174,13 @@ pub trait ChunkOps {
     /// Get the refcount for a chunk.
     fn refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError>;
 
+    /// Storage capacity + dedup statistics. Default returns zeroes
+    /// (in-memory / unbounded backends); persistent backends override
+    /// with real device capacity and chunk-level dedup accounting.
+    fn storage_stats(&self) -> StorageStats {
+        StorageStats::default()
+    }
+
     /// Phase 16c step 4: enumerate every chunk currently held
     /// locally. Used by the orphan-fragment scrub to walk the
     /// candidate set. Default empty so existing impls compile;
@@ -99,12 +196,26 @@ pub trait ChunkOps {
     /// returns `Io("not implemented")` so production stores can opt
     /// in piecewise; the in-memory `ChunkStore` overrides it.
     fn write_fragment(
-        &mut self,
+        &self,
         _chunk_id: &ChunkId,
         _fragment_index: u32,
         _bytes: Vec<u8>,
     ) -> Result<(), ChunkError> {
         Err(ChunkError::Io("write_fragment not implemented".into()))
+    }
+
+    /// Write a fragment with a placement-tier hint derived from `pool`
+    /// (ADR-045 §D4). Default ignores the pool and delegates to
+    /// [`write_fragment`](Self::write_fragment); the persistent store
+    /// overrides it to place the fragment on the pool's device class.
+    fn write_fragment_in_pool(
+        &self,
+        chunk_id: &ChunkId,
+        fragment_index: u32,
+        bytes: Vec<u8>,
+        _pool: &str,
+    ) -> Result<(), ChunkError> {
+        self.write_fragment(chunk_id, fragment_index, bytes)
     }
 
     /// Read a fragment by `(chunk_id, fragment_index)`. Returns
@@ -191,17 +302,25 @@ pub trait ChunkOps {
 }
 
 /// In-memory chunk store.
+///
+/// GH #137: to satisfy the `&self` [`ChunkOps`] trait (so writers no
+/// longer need an exclusive lock through the [`SyncBridge`]), the
+/// mutable state lives behind `parking_lot::Mutex`. This store is the
+/// in-memory / test / no-persistence path, not the production perf
+/// path — it stays effectively serial (one mutex per map). The
+/// persistent store is the one that actually parallelizes by
+/// releasing its index lock across device I/O.
 pub struct ChunkStore {
-    chunks: HashMap<ChunkId, ChunkEntry>,
-    pools: HashMap<String, AffinityPool>,
+    chunks: parking_lot::Mutex<HashMap<ChunkId, ChunkEntry>>,
+    pools: parking_lot::Mutex<HashMap<String, AffinityPool>>,
     /// Simulated unavailable chunks for fault injection (ADR-037).
-    unavailable: HashSet<ChunkId>,
+    unavailable: parking_lot::Mutex<HashSet<ChunkId>>,
     /// Phase 16c step 6: per-fragment storage for EC mode. Keyed by
     /// `(chunk_id, fragment_index)` so a 4+2 encoding lays down 6
     /// rows. Distinct from `chunks` (whole-envelope keyed by
     /// `chunk_id`) — the data path picks one or the other based on
     /// `EcStrategy` (Phase 16c step 7).
-    fragments: HashMap<(ChunkId, u32), Vec<u8>>,
+    fragments: parking_lot::Mutex<HashMap<(ChunkId, u32), Vec<u8>>>,
 }
 
 impl ChunkStore {
@@ -209,74 +328,85 @@ impl ChunkStore {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            chunks: HashMap::new(),
-            pools: HashMap::new(),
-            unavailable: HashSet::new(),
-            fragments: HashMap::new(),
+            chunks: parking_lot::Mutex::new(HashMap::new()),
+            pools: parking_lot::Mutex::new(HashMap::new()),
+            unavailable: parking_lot::Mutex::new(HashSet::new()),
+            fragments: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
     /// Mark chunks as unavailable (fault injection for testing).
-    pub fn inject_unavailable(&mut self, chunk_id: ChunkId) {
-        self.unavailable.insert(chunk_id);
+    pub fn inject_unavailable(&self, chunk_id: ChunkId) {
+        self.unavailable.lock().insert(chunk_id);
     }
 
     /// Clear all fault injections.
-    pub fn clear_faults(&mut self) {
-        self.unavailable.clear();
+    pub fn clear_faults(&self) {
+        self.unavailable.lock().clear();
     }
 
     /// Check if a chunk has an injected fault.
     #[must_use]
     pub fn is_unavailable(&self, chunk_id: &ChunkId) -> bool {
-        self.unavailable.contains(chunk_id)
+        self.unavailable.lock().contains(chunk_id)
     }
 
     /// Add an affinity pool.
-    pub fn add_pool(&mut self, pool: AffinityPool) {
-        self.pools.insert(pool.name.clone(), pool);
+    pub fn add_pool(&self, pool: AffinityPool) {
+        self.pools.lock().insert(pool.name.clone(), pool);
     }
 
     /// Total number of stored chunks.
     #[must_use]
     pub fn chunk_count(&self) -> usize {
-        self.chunks.len()
+        self.chunks.lock().len()
     }
 
-    /// Get EC metadata for a chunk (for BDD assertions).
+    /// Get EC metadata for a chunk (for BDD assertions). Returns a
+    /// mapped mutex guard that derefs to `&EcMeta`; the guard holds
+    /// the `chunks` lock for its lifetime.
     #[must_use]
-    pub fn ec_meta(&self, chunk_id: &ChunkId) -> Option<&EcMeta> {
-        self.chunks.get(chunk_id).and_then(|e| e.ec.as_ref())
+    pub fn ec_meta(&self, chunk_id: &ChunkId) -> Option<parking_lot::MappedMutexGuard<'_, EcMeta>> {
+        // `try_map` keeps the guard alive iff the closure returns
+        // `Some`; on `None` it hands the guard back (dropped here).
+        parking_lot::MutexGuard::try_map(self.chunks.lock(), |chunks| {
+            chunks.get_mut(chunk_id).and_then(|e| e.ec.as_mut())
+        })
+        .ok()
     }
 
-    /// Get a mutable pool reference.
-    pub fn pool_mut(&mut self, name: &str) -> Option<&mut AffinityPool> {
-        self.pools.get_mut(name)
+    /// Get a mutable pool reference. Returns a mapped mutex guard that
+    /// derefs to `&mut AffinityPool`.
+    pub fn pool_mut(&self, name: &str) -> Option<parking_lot::MappedMutexGuard<'_, AffinityPool>> {
+        parking_lot::MutexGuard::try_map(self.pools.lock(), |pools| pools.get_mut(name)).ok()
     }
 
-    /// Get a pool reference.
+    /// Get a pool reference. Returns a mapped mutex guard that derefs
+    /// to `&AffinityPool`.
     #[must_use]
-    pub fn pool(&self, name: &str) -> Option<&AffinityPool> {
-        self.pools.get(name)
+    pub fn pool(&self, name: &str) -> Option<parking_lot::MappedMutexGuard<'_, AffinityPool>> {
+        parking_lot::MutexGuard::try_map(self.pools.lock(), |pools| pools.get_mut(name)).ok()
     }
 
-    /// Iterate over all pools. Order is unspecified (`HashMap`).
-    /// Used by the storage-admin RPCs (`ListPools`, `ClusterStatus`).
-    pub fn pools(&self) -> impl Iterator<Item = &AffinityPool> {
-        self.pools.values()
+    /// Snapshot all pools. Order is unspecified (`HashMap`). Used by
+    /// the storage-admin RPCs (`ListPools`, `ClusterStatus`). Returns
+    /// owned clones since the backing map is behind a mutex.
+    #[must_use]
+    pub fn pools(&self) -> Vec<AffinityPool> {
+        self.pools.lock().values().cloned().collect()
     }
 
     /// Find a device by id. Returns the owning pool's name + the
-    /// device, since `PoolDevice::id` is only unique within a pool
-    /// in principle but the storage-admin RPC takes a flat id.
-    /// Linear scan — pool count is small (typically <10).
+    /// device (owned clones), since `PoolDevice::id` is only unique
+    /// within a pool in principle but the storage-admin RPC takes a
+    /// flat id. Linear scan — pool count is small (typically <10).
     #[must_use]
-    pub fn find_device(&self, device_id: &str) -> Option<(&str, &PoolDevice)> {
-        self.pools.values().find_map(|pool| {
+    pub fn find_device(&self, device_id: &str) -> Option<(String, PoolDevice)> {
+        self.pools.lock().values().find_map(|pool| {
             pool.devices
                 .iter()
                 .find(|d| d.id == device_id)
-                .map(|d| (pool.name.as_str(), d))
+                .map(|d| (pool.name.clone(), d.clone()))
         })
     }
 
@@ -285,16 +415,16 @@ impl ChunkStore {
     /// Checks which devices are online in the pool, gathers available
     /// fragments, and reconstructs via EC if needed.
     pub fn read_chunk_ec(&self, chunk_id: &ChunkId) -> Result<Vec<u8>, ChunkError> {
-        let entry = self
-            .chunks
+        let chunks = self.chunks.lock();
+        let entry = chunks
             .get(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
         let Some(ec) = &entry.ec else {
             return Ok(entry.envelope.ciphertext.clone());
         };
 
-        let pool = self
-            .pools
+        let pools = self.pools.lock();
+        let pool = pools
             .get(&entry.pool)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
         let total = ec.data_shards + ec.parity_shards;
@@ -327,20 +457,29 @@ impl Default for ChunkStore {
 }
 
 impl ChunkOps for ChunkStore {
-    #[tracing::instrument(skip(self, envelope), fields(chunk_id = ?envelope.chunk_id, pool, ciphertext_len = envelope.ciphertext.len()))]
-    fn write_chunk(&mut self, envelope: Envelope, pool: &str) -> Result<bool, ChunkError> {
+    // No `#[tracing::instrument]` / per-op `debug!` on this hot path — it
+    // fires per chunk on every PUT. Span machinery + the disabled-callsite
+    // check cost a measurable few % at write rates even at level=warn (no
+    // compile-time level cap is set), and there's no compile-out. Errors
+    // still surface via `warn!`. (S10 deferred the chunk store pending a
+    // flamegraph; this is that follow-up.)
+    fn write_chunk(&self, envelope: Envelope, pool: &str) -> Result<bool, ChunkError> {
         let chunk_id = envelope.chunk_id;
 
         // Dedup: if chunk already exists, just bump refcount.
-        if let Some(entry) = self.chunks.get_mut(&chunk_id) {
+        // Hold `chunks` for the whole op — this in-memory store stays
+        // serial (the persistent store is the one that parallelizes).
+        let mut chunks = self.chunks.lock();
+        if let Some(entry) = chunks.get_mut(&chunk_id) {
             entry.refcount += 1;
-            tracing::debug!(refcount = entry.refcount, "chunk write: dedup hit");
-            return Ok(false); // not a new write
+            return Ok(false); // not a new write (dedup hit)
         }
 
-        // Check pool capacity.
+        // Check pool capacity. Lock order: `chunks` then `pools`,
+        // matching `read_chunk_ec`, so the two never deadlock.
+        let mut pools = self.pools.lock();
         let storage_size;
-        let ec_meta = if let Some(p) = self.pools.get(pool) {
+        let ec_meta = if let Some(p) = pools.get(pool) {
             match p.durability {
                 DurabilityStrategy::ErasureCoding {
                     data_shards,
@@ -380,13 +519,26 @@ impl ChunkOps for ChunkStore {
                     storage_size = envelope.ciphertext.len() as u64 * u64::from(copies);
                     None
                 }
+                DurabilityStrategy::Inline => {
+                    // ADR-024 amendment: `Inline` durability is a
+                    // routing tag declaring "this pool's writes go
+                    // inline-in-Raft-delta". `ChunkStore::write_chunk`
+                    // is the chunk-fabric path; an inline write
+                    // shouldn't reach here. If it does (mis-routing,
+                    // pre-amendment caller), treat it as a single
+                    // copy on the chunk fabric so the write doesn't
+                    // silently disappear — the gateway should be
+                    // calling the inline path instead.
+                    storage_size = envelope.ciphertext.len() as u64;
+                    None
+                }
             }
         } else {
             storage_size = envelope.ciphertext.len() as u64;
             None
         };
 
-        if let Some(p) = self.pools.get_mut(pool) {
+        if let Some(p) = pools.get_mut(pool) {
             if !p.has_capacity(storage_size) {
                 tracing::warn!(
                     storage_size,
@@ -397,8 +549,9 @@ impl ChunkOps for ChunkStore {
             }
             p.used_bytes += storage_size;
         }
+        drop(pools);
 
-        self.chunks.insert(
+        chunks.insert(
             chunk_id,
             ChunkEntry {
                 envelope,
@@ -410,19 +563,21 @@ impl ChunkOps for ChunkStore {
             },
         );
 
-        tracing::debug!(storage_size, "chunk write: success");
         Ok(true) // new write
     }
 
-    #[tracing::instrument(skip(self), fields(chunk_id = ?chunk_id))]
+    // Per-chunk read — the GET fast path (no Raft); per-op span machinery
+    // is the heaviest of the disabled-tracing costs here, so it's removed.
     fn read_chunk(&self, chunk_id: &ChunkId) -> Result<Envelope, ChunkError> {
         // Fault injection (ADR-037 explicit unavailability).
-        if self.unavailable.contains(chunk_id) {
+        if self.unavailable.lock().contains(chunk_id) {
             tracing::warn!("chunk read: device unavailable (fault injected)");
             return Err(ChunkError::DeviceUnavailable(*chunk_id));
         }
-        let entry = self
-            .chunks
+        // Lock order: `chunks` then `pools` (matches `read_chunk_ec`
+        // and `write_chunk`).
+        let chunks = self.chunks.lock();
+        let entry = chunks
             .get(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
 
@@ -437,8 +592,8 @@ impl ChunkOps for ChunkStore {
         // Otherwise rebuild the ciphertext from available fragments via
         // EC decode, and re-wrap in an Envelope that reuses the original
         // auth_tag, nonce, and epoch fields.
-        let pool = self
-            .pools
+        let pools = self.pools.lock();
+        let pool = pools
             .get(&entry.pool)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
         let total = ec.data_shards + ec.parity_shards;
@@ -470,9 +625,9 @@ impl ChunkOps for ChunkStore {
         })
     }
 
-    fn increment_refcount(&mut self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
-        let entry = self
-            .chunks
+    fn increment_refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
+        let mut chunks = self.chunks.lock();
+        let entry = chunks
             .get_mut(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
         entry.refcount += 1;
@@ -483,8 +638,9 @@ impl ChunkOps for ChunkStore {
     /// trips through the `AsyncChunkOps` `SyncBridge` mutex on dedup-
     /// hit writes, the dominant write-path bottleneck observed in
     /// the 2026-05-05 in-process flamegraph.
-    fn try_increment_if_exists(&mut self, chunk_id: &ChunkId) -> Result<Option<u64>, ChunkError> {
-        match self.chunks.get_mut(chunk_id) {
+    fn try_increment_if_exists(&self, chunk_id: &ChunkId) -> Result<Option<u64>, ChunkError> {
+        let mut chunks = self.chunks.lock();
+        match chunks.get_mut(chunk_id) {
             Some(entry) => {
                 entry.refcount += 1;
                 Ok(Some(entry.refcount))
@@ -493,9 +649,9 @@ impl ChunkOps for ChunkStore {
         }
     }
 
-    fn decrement_refcount(&mut self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
-        let entry = self
-            .chunks
+    fn decrement_refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
+        let mut chunks = self.chunks.lock();
+        let entry = chunks
             .get_mut(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
         if entry.refcount == 0 {
@@ -510,8 +666,8 @@ impl ChunkOps for ChunkStore {
         chunk_id: &ChunkId,
         hold_name: &str,
     ) -> Result<(), ChunkError> {
-        let entry = self
-            .chunks
+        let mut chunks = self.chunks.lock();
+        let entry = chunks
             .get_mut(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
         entry.retention_holds.insert(hold_name.to_owned());
@@ -523,8 +679,8 @@ impl ChunkOps for ChunkStore {
         chunk_id: &ChunkId,
         hold_name: &str,
     ) -> Result<(), ChunkError> {
-        let entry = self
-            .chunks
+        let mut chunks = self.chunks.lock();
+        let entry = chunks
             .get_mut(chunk_id)
             .ok_or(ChunkError::NotFound(*chunk_id))?;
         entry.retention_holds.remove(hold_name);
@@ -532,8 +688,8 @@ impl ChunkOps for ChunkStore {
     }
 
     fn gc(&mut self) -> u64 {
-        let to_remove: Vec<ChunkId> = self
-            .chunks
+        let mut chunks = self.chunks.lock();
+        let to_remove: Vec<ChunkId> = chunks
             .iter()
             .filter(|(_, e)| e.refcount == 0 && e.retention_holds.is_empty())
             .map(|(id, _)| *id)
@@ -541,9 +697,10 @@ impl ChunkOps for ChunkStore {
 
         let count = to_remove.len() as u64;
 
+        let mut pools = self.pools.lock();
         for id in &to_remove {
-            if let Some(entry) = self.chunks.remove(id) {
-                if let Some(pool) = self.pools.get_mut(&entry.pool) {
+            if let Some(entry) = chunks.remove(id) {
+                if let Some(pool) = pools.get_mut(&entry.pool) {
                     pool.used_bytes = pool.used_bytes.saturating_sub(entry.stored_bytes);
                 }
             }
@@ -554,22 +711,25 @@ impl ChunkOps for ChunkStore {
 
     fn refcount(&self, chunk_id: &ChunkId) -> Result<u64, ChunkError> {
         self.chunks
+            .lock()
             .get(chunk_id)
             .map(|e| e.refcount)
             .ok_or(ChunkError::NotFound(*chunk_id))
     }
 
     fn list_chunk_ids(&self) -> Vec<ChunkId> {
-        self.chunks.keys().copied().collect()
+        self.chunks.lock().keys().copied().collect()
     }
 
     fn write_fragment(
-        &mut self,
+        &self,
         chunk_id: &ChunkId,
         fragment_index: u32,
         bytes: Vec<u8>,
     ) -> Result<(), ChunkError> {
-        self.fragments.insert((*chunk_id, fragment_index), bytes);
+        self.fragments
+            .lock()
+            .insert((*chunk_id, fragment_index), bytes);
         Ok(())
     }
 
@@ -579,6 +739,7 @@ impl ChunkOps for ChunkStore {
         fragment_index: u32,
     ) -> Result<Vec<u8>, ChunkError> {
         self.fragments
+            .lock()
             .get(&(*chunk_id, fragment_index))
             .cloned()
             .ok_or(ChunkError::NotFound(*chunk_id))
@@ -591,21 +752,22 @@ impl ChunkOps for ChunkStore {
     ) -> Result<bool, ChunkError> {
         Ok(self
             .fragments
+            .lock()
             .remove(&(*chunk_id, fragment_index))
             .is_some())
     }
 
     fn delete_chunk_force(&mut self, chunk_id: &ChunkId) -> Result<bool, ChunkError> {
-        let chunk_removed = self.chunks.remove(chunk_id).is_some();
-        let frag_keys: Vec<_> = self
-            .fragments
+        let chunk_removed = self.chunks.lock().remove(chunk_id).is_some();
+        let mut fragments = self.fragments.lock();
+        let frag_keys: Vec<_> = fragments
             .keys()
             .filter(|(c, _)| c == chunk_id)
             .copied()
             .collect();
         let frag_removed = !frag_keys.is_empty();
         for key in frag_keys {
-            self.fragments.remove(&key);
+            fragments.remove(&key);
         }
         Ok(chunk_removed || frag_removed)
     }
@@ -613,6 +775,7 @@ impl ChunkOps for ChunkStore {
     fn list_fragments(&self, chunk_id: &ChunkId) -> Vec<u32> {
         let target = *chunk_id;
         self.fragments
+            .lock()
             .keys()
             .filter(|(cid, _)| *cid == target)
             .map(|(_, idx)| *idx)
@@ -620,20 +783,21 @@ impl ChunkOps for ChunkStore {
     }
 
     fn snapshot_pools(&self) -> Vec<AffinityPool> {
-        self.pools.values().cloned().collect()
+        self.pools.lock().values().cloned().collect()
     }
 
     fn add_pool_checked(&mut self, pool: AffinityPool) -> Result<(), String> {
-        if self.pools.contains_key(&pool.name) {
+        let mut pools = self.pools.lock();
+        if pools.contains_key(&pool.name) {
             return Err(format!("pool {} already exists", pool.name));
         }
-        self.pools.insert(pool.name.clone(), pool);
+        pools.insert(pool.name.clone(), pool);
         Ok(())
     }
 
     fn add_device(&mut self, pool_name: &str, device: PoolDevice) -> Result<(), String> {
-        let pool = self
-            .pools
+        let mut pools = self.pools.lock();
+        let pool = pools
             .get_mut(pool_name)
             .ok_or_else(|| format!("pool {pool_name} not found"))?;
         if pool.devices.iter().any(|d| d.id == device.id) {
@@ -644,7 +808,8 @@ impl ChunkOps for ChunkStore {
     }
 
     fn remove_device(&mut self, device_id: &str) -> Result<(), String> {
-        for pool in self.pools.values_mut() {
+        let mut pools = self.pools.lock();
+        for pool in pools.values_mut() {
             if let Some(idx) = pool.devices.iter().position(|d| d.id == device_id) {
                 pool.devices.remove(idx);
                 return Ok(());
@@ -658,8 +823,8 @@ impl ChunkOps for ChunkStore {
         pool_name: &str,
         strategy: DurabilityStrategy,
     ) -> Result<(), String> {
-        let pool = self
-            .pools
+        let mut pools = self.pools.lock();
+        let pool = pools
             .get_mut(pool_name)
             .ok_or_else(|| format!("pool {pool_name} not found"))?;
         if pool.used_bytes > 0 {
@@ -694,7 +859,7 @@ mod tests {
     }
 
     fn setup_store() -> ChunkStore {
-        let mut store = ChunkStore::new();
+        let store = ChunkStore::new();
         store.add_pool(
             AffinityPool::new(
                 "fast-nvme",
@@ -708,7 +873,7 @@ mod tests {
 
     #[test]
     fn write_and_read_roundtrip() {
-        let mut store = setup_store();
+        let store = setup_store();
         let env = test_envelope(0x01);
         let chunk_id = env.chunk_id;
 
@@ -723,7 +888,7 @@ mod tests {
 
     #[test]
     fn dedup_increments_refcount() {
-        let mut store = setup_store();
+        let store = setup_store();
         let env1 = test_envelope(0x01);
         let env2 = test_envelope(0x01); // same chunk ID
         let chunk_id = env1.chunk_id;
@@ -747,7 +912,7 @@ mod tests {
     /// future "lazy iterator" rewrite still satisfies the contract.
     #[test]
     fn list_chunk_ids_returns_all_stored_keys() {
-        let mut store = setup_store();
+        let store = setup_store();
         let chunk_a = test_envelope(0x10);
         let chunk_b = test_envelope(0x20);
         let id_a = chunk_a.chunk_id;
@@ -774,7 +939,7 @@ mod tests {
     /// (step 7) is mid-rollout.
     #[test]
     fn fragments_round_trip_independently_of_whole_chunks() {
-        let mut store = setup_store();
+        let store = setup_store();
         let cid = ChunkId([0x42; 32]);
         store
             .write_fragment(&cid, 0, b"frag-zero".to_vec())
@@ -870,7 +1035,7 @@ mod tests {
 
     #[test]
     fn refcount_underflow_rejected() {
-        let mut store = setup_store();
+        let store = setup_store();
         let env = test_envelope(0x01);
         let chunk_id = env.chunk_id;
 
@@ -896,7 +1061,7 @@ mod tests {
     #[test]
     fn write_chunk_returns_false_for_duplicate() {
         // I-C1: dedup — write_chunk returns is_new=false on duplicate.
-        let mut store = setup_store();
+        let store = setup_store();
         let env1 = test_envelope(0x42);
         let env2 = test_envelope(0x42); // same chunk ID
 
@@ -970,7 +1135,7 @@ mod tests {
     // ---------------------------------------------------------------
     #[test]
     fn placement_works_without_affinity_hints() {
-        let mut store = ChunkStore::new();
+        let store = ChunkStore::new();
         store.add_pool(
             AffinityPool::new(
                 "fast-nvme",
@@ -1012,7 +1177,7 @@ mod tests {
     // ---------------------------------------------------------------
     #[test]
     fn dedup_intent_per_rank_skips_dedup() {
-        let mut store = setup_store();
+        let store = setup_store();
 
         // Two envelopes with DIFFERENT chunk IDs (simulating per-rank
         // dedup bypass: each rank derives its own chunk ID).
@@ -1034,7 +1199,7 @@ mod tests {
     // ---------------------------------------------------------------
     #[test]
     fn dedup_intent_shared_ensemble_uses_normal_dedup() {
-        let mut store = setup_store();
+        let store = setup_store();
 
         // Two envelopes with THE SAME chunk ID (simulating shared-ensemble
         // where dedup is used normally).
@@ -1150,7 +1315,7 @@ mod tests {
 
     #[test]
     fn fault_injection_makes_chunk_unavailable() {
-        let mut store = ChunkStore::new();
+        let store = ChunkStore::new();
         store.add_pool(
             AffinityPool::new(
                 "default",
@@ -1181,7 +1346,7 @@ mod tests {
     /// because they only consulted the `unavailable` `HashSet`).
     #[test]
     fn read_chunk_reconstructs_ec_when_devices_offline() {
-        let mut store = ChunkStore::new();
+        let store = ChunkStore::new();
         store.add_pool(
             AffinityPool::new(
                 "ec-pool",

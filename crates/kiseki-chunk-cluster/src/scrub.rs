@@ -959,6 +959,13 @@ mod tests {
 
     #[async_trait]
     impl kiseki_log::traits::LogOps for FakeLog {
+        async fn put_intent_and_fan(
+            &self,
+            _shard_id: kiseki_common::ids::ShardId,
+            _intent: kiseki_log::intent::WriteIntent,
+        ) -> Result<(), kiseki_log::error::LogError> {
+            Err(kiseki_log::error::LogError::Unavailable)
+        }
         async fn append_delta(
             &self,
             _req: kiseki_log::traits::AppendDeltaRequest,

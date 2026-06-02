@@ -249,7 +249,7 @@ async fn given_d3_d5_offline(w: &mut KisekiWorld) {
     let expected_ciphertext = env.ciphertext.clone();
     w.last_chunk_id = Some(chunk_id);
     w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
-    let pool = w.legacy.chunk_store.pool_mut("fast-nvme").unwrap();
+    let mut pool = w.legacy.chunk_store.pool_mut("fast-nvme").unwrap();
     pool.set_device_online("d3", false);
     pool.set_device_online("d5", false);
     match w.legacy.chunk_store.read_chunk_ec(&chunk_id) {
@@ -315,7 +315,7 @@ async fn given_three_offline(w: &mut KisekiWorld) {
     let chunk_id = env.chunk_id;
     w.last_chunk_id = Some(chunk_id);
     w.legacy.chunk_store.write_chunk(env, "fast-nvme").unwrap();
-    let pool = w.legacy.chunk_store.pool_mut("fast-nvme").unwrap();
+    let mut pool = w.legacy.chunk_store.pool_mut("fast-nvme").unwrap();
     pool.set_device_online("d3", false);
     pool.set_device_online("d5", false);
     pool.set_device_online("d6", false);
@@ -339,7 +339,7 @@ async fn then_chunk_lost_error(w: &mut KisekiWorld) {
 
 #[given("device d3 fails")]
 async fn given_d3_fails(w: &mut KisekiWorld) {
-    if let Some(pool) = w.legacy.chunk_store.pool_mut("fast-nvme") {
+    if let Some(mut pool) = w.legacy.chunk_store.pool_mut("fast-nvme") {
         pool.set_device_online("d3", false);
     }
 }
@@ -448,7 +448,7 @@ async fn given_pool_devices(w: &mut KisekiWorld, _pool: String, _n: usize) {
 
 #[when("device d7 is added")]
 async fn when_device_added(w: &mut KisekiWorld) {
-    if let Some(pool) = w.legacy.chunk_store.pool_mut("fast-nvme") {
+    if let Some(mut pool) = w.legacy.chunk_store.pool_mut("fast-nvme") {
         pool.devices.push(kiseki_chunk::pool::PoolDevice {
             id: "d7".into(),
             online: true,

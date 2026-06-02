@@ -121,7 +121,7 @@ fn issue_test_certs() -> TlsBundle {
 }
 
 fn local_bridge(pool: &str) -> Arc<dyn AsyncChunkOps> {
-    let mut store = ChunkStore::new();
+    let store = ChunkStore::new();
     store.add_pool(AffinityPool {
         name: pool.to_owned(),
         device_class: DeviceClass::NvmeSsd,
@@ -129,6 +129,8 @@ fn local_bridge(pool: &str) -> Arc<dyn AsyncChunkOps> {
         devices: vec![],
         capacity_bytes: 1 << 30,
         used_bytes: 0,
+        requires_migration: false,
+        ..Default::default()
     });
     Arc::new(SyncBridge::new(store))
 }

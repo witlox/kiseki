@@ -55,12 +55,20 @@ impl HydratorRegistry {
         log: Arc<dyn LogOps + Send + Sync>,
         metrics: Option<Arc<CompositionMetrics>>,
     ) -> Self {
+        // Poll cadence is tunable via KISEKI_HYDRATOR_POLL_MS (default
+        // 100 ms). Set it very high to effectively pause hydration — used
+        // by the #126/#133 perf bisection to isolate the hydrator's
+        // runtime impact on the write path.
+        let poll_ms = std::env::var("KISEKI_HYDRATOR_POLL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(100);
         Self {
             compositions,
             log,
             metrics,
             active: Mutex::new(HashSet::new()),
-            poll_interval: std::time::Duration::from_millis(100),
+            poll_interval: std::time::Duration::from_millis(poll_ms),
         }
     }
 

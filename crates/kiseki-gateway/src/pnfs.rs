@@ -343,6 +343,12 @@ pub struct ServerLayout {
     pub issued_at_ms: u64,
     /// TTL in ms — eviction at `issued_at_ms + ttl_ms`.
     pub ttl_ms: u64,
+    /// Filename the MDS bound to this composition at OPEN, carried so a
+    /// pNFS DS COMMIT can name the composition it mints (`name: None`
+    /// otherwise leaves the file unresolvable by name — #127 pNFS half).
+    /// Set by `op_layoutget` via [`MdsLayoutManager::set_composition_name`];
+    /// read by the DS COMMIT via [`MdsLayoutManager::composition_name`].
+    pub name: Option<String>,
 }
 
 /// Reasons the MDS may invalidate a layout. Used by Phase 15c LAYOUTRECALL.
@@ -804,6 +810,11 @@ impl MdsLayoutManager {
             stateid,
             issued_at_ms: now_ms,
             ttl_ms: self.config.layout_ttl_ms,
+            // Carried separately by `set_composition_name` after the
+            // caller resolves the filename; a rebuilt (cache-miss)
+            // layout starts nameless and is re-stamped on every
+            // LAYOUTGET, so a transient None here self-heals.
+            name: None,
         };
 
         // Insert + LRU-evict on capacity (I-PN8).
@@ -821,6 +832,31 @@ impl MdsLayoutManager {
             }
         }
         layout
+    }
+
+    /// Stamp the filename the MDS resolved at OPEN onto the cached
+    /// layout for `composition_id`. The pNFS DS COMMIT reads it back via
+    /// [`Self::composition_name`] so the composition it mints carries a
+    /// name (replicated via the Create delta) — without this the kernel
+    /// pNFS write path leaves the file unresolvable by name (#127 pNFS
+    /// half). No-op if the layout isn't cached (evicted before COMMIT).
+    pub fn set_composition_name(&self, composition_id: CompositionId, name: String) {
+        let mut inner = self.inner.lock().lock_or_die("pnfs.inner");
+        if let Some(layout) = inner.cache.get_mut(&composition_id) {
+            layout.name = Some(name);
+        }
+    }
+
+    /// Filename previously stamped via [`Self::set_composition_name`] for
+    /// `composition_id`, if the layout is still cached. Read by the pNFS
+    /// DS COMMIT to name the composition it mints.
+    #[must_use]
+    pub fn composition_name(&self, composition_id: CompositionId) -> Option<String> {
+        let inner = self.inner.lock().lock_or_die("pnfs.inner");
+        inner
+            .cache
+            .get(&composition_id)
+            .and_then(|l| l.name.clone())
     }
 
     /// LAYOUTRETURN. Returns true if state was present.
@@ -1033,6 +1069,49 @@ mod mds_layout_tests {
 
     fn comp(idx: u128) -> CompositionId {
         CompositionId(uuid::Uuid::from_u128(idx))
+    }
+
+    #[test]
+    fn composition_name_round_trips_through_cached_layout() {
+        // #127 (pNFS half): the filename the MDS resolves at OPEN is
+        // stamped onto the cached layout so the DS COMMIT can name the
+        // composition it mints. Verify set/get round-trip + the no-op
+        // semantics the COMMIT relies on (eviction → nameless → file
+        // stays UUID-named rather than panicking).
+        let mgr = MdsLayoutManager::new(fixed_key(), cfg_with_nodes(vec!["n1:2052"]));
+        let c = comp(42);
+
+        // No layout cached yet: read is None, and a stamp is a no-op
+        // (we never resurrect an evicted layout just to hold a name).
+        assert_eq!(mgr.composition_name(c), None);
+        mgr.set_composition_name(c, "ghost.txt".into());
+        assert_eq!(
+            mgr.composition_name(c),
+            None,
+            "stamping an uncached layout must be a no-op"
+        );
+
+        // Issue a layout (caches it). A freshly built layout is nameless
+        // until op_layoutget stamps it.
+        let _ = mgr.layout_get(
+            OrgId(uuid::Uuid::nil()),
+            NamespaceId(uuid::Uuid::from_u128(1)),
+            c,
+            0,
+            1,
+            LayoutIoMode::ReadWrite,
+            1000,
+        );
+        assert_eq!(
+            mgr.composition_name(c),
+            None,
+            "rebuilt layout starts nameless"
+        );
+
+        // Stamp + read back — this is exactly the op_layoutget → DS COMMIT
+        // handoff.
+        mgr.set_composition_name(c, "real.txt".into());
+        assert_eq!(mgr.composition_name(c), Some("real.txt".to_owned()));
     }
 
     #[tokio::test(flavor = "multi_thread")]

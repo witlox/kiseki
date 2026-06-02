@@ -408,6 +408,181 @@ impl ClusterChunkServer {
             .max_decoding_message_size(crate::peer::FABRIC_MAX_MESSAGE_BYTES)
     }
 
+    /// Produce a handle suitable for the TCP-framed fabric listener
+    /// to share with the gRPC adapter. All internal references are
+    /// already `Arc<>` / `Clone` types, so this is a cheap clone of
+    /// handles — the same `local` ops, the same envelope registry,
+    /// the same metrics. A fragment arriving on either transport
+    /// hits the same backend state.
+    ///
+    /// Used at runtime startup to wire one handler into both the
+    /// tonic gRPC service and the TCP-framed listener simultaneously
+    /// (rolling-upgrade posture; ADR-042 §2.2).
+    #[must_use]
+    pub fn clone_for_tcp_framed_handler(&self) -> Self {
+        Self {
+            local: Arc::clone(&self.local),
+            default_pool: self.default_pool.clone(),
+            maintenance: self.maintenance.clone(),
+            chunk_envelope_meta: self.chunk_envelope_meta.clone(),
+            metrics: self.metrics.clone(),
+        }
+    }
+
+    /// `default_pool` accessor — used by the TCP-framed adapter
+    /// when the wire didn't carry a pool hint. The other shared
+    /// state (local ops, envelope registry, metrics) is reached
+    /// through the `handle_*` methods below; this is the one piece
+    /// the codec needs to see before calling the handler.
+    pub(crate) fn default_pool_for_tcp_framed(&self) -> &str {
+        &self.default_pool
+    }
+
+    // ---- shared handlers (used by both gRPC and TCP-framed adapters) ----
+    //
+    // These are the core verb bodies extracted from the gRPC method
+    // impls. Both transport adapters delegate to them so the storage
+    // path is identical regardless of which wire delivered the call.
+    //
+    // Test knobs (FABRIC_SLOW_MS, FABRIC_DENY_INCOMING, maintenance)
+    // are NOT applied here — they live in the gRPC adapter, which is
+    // what the BDD harness drives. When the harness learns TCP-framed
+    // (followup #350), move them into a shared pre-check that runs
+    // before these handlers.
+
+    /// Shared handler for `PutFragment`. Stores the fragment via the
+    /// local chunk store, recording crypto fields on the envelope
+    /// registry and observing the receiver-side phase histograms.
+    ///
+    /// Returns `Ok(true)` when a fresh copy was stored, `Ok(false)`
+    /// on dedup. `Err(ChunkError)` on I/O or capacity failures.
+    ///
+    /// # Errors
+    /// `ChunkError::Io` / `PoolFull` on local-write failure. The
+    /// adapter maps to its wire's status type.
+    pub(crate) async fn handle_put_fragment(
+        &self,
+        fragment_index: u32,
+        pool: String,
+        envelope: kiseki_crypto::envelope::Envelope,
+    ) -> Result<bool, ChunkError> {
+        let decode_started = std::time::Instant::now();
+        let chunk_id = envelope.chunk_id;
+        self.chunk_envelope_meta.record(
+            chunk_id,
+            envelope.auth_tag,
+            envelope.nonce,
+            envelope.system_epoch,
+            envelope.tenant_epoch,
+            envelope.tenant_wrapped_material.clone(),
+        );
+        if let Some(m) = self.metrics.as_ref() {
+            m.observe_put_recv("decode", decode_started.elapsed());
+        }
+
+        let write_started = std::time::Instant::now();
+        let stored = if fragment_index == 0 {
+            self.local.write_chunk(envelope, &pool).await?
+        } else {
+            self.local
+                .write_fragment_in_pool(&chunk_id, fragment_index, envelope.ciphertext, &pool)
+                .await?;
+            // EC fragment writes don't carry refcount semantics; report
+            // stored=true so callers can count this as a successful ack.
+            true
+        };
+        if let Some(m) = self.metrics.as_ref() {
+            m.observe_put_recv("write_chunk", write_started.elapsed());
+        }
+        Ok(stored)
+    }
+
+    /// Shared handler for `GetFragment`. Reads a fragment (EC index
+    /// greater than 0) or whole envelope (index 0). For index 0 it
+    /// tries the EC fragment path first, falling back to the
+    /// whole-envelope path (necessary because the leader picks the
+    /// storage shape).
+    ///
+    /// # Errors
+    /// `ChunkError::NotFound` if no record. Adapter maps to wire status.
+    pub(crate) async fn handle_get_fragment(
+        &self,
+        chunk_id: RustChunkId,
+        fragment_index: u32,
+    ) -> Result<kiseki_crypto::envelope::Envelope, ChunkError> {
+        if fragment_index == 0 {
+            // Try EC fragment path first; fall back to whole-envelope.
+            // Discovered 2026-05-02 — the prior unconditional read_chunk
+            // path returned NotFound for EC chunks (leader never wrote
+            // a whole envelope under EC).
+            if let Ok(bytes) = self.local.read_fragment(&chunk_id, 0).await {
+                return Ok(self.envelope_from_bytes(chunk_id, bytes));
+            }
+            self.local.read_chunk(&chunk_id, None).await
+        } else {
+            let bytes = self.local.read_fragment(&chunk_id, fragment_index).await?;
+            Ok(self.envelope_from_bytes(chunk_id, bytes))
+        }
+    }
+
+    /// Shared handler for `DeleteFragment`. Idempotent — deleting an
+    /// absent fragment returns `Ok(false)` rather than `NotFound`.
+    /// For `fragment_index == 0` decrements the chunk's refcount;
+    /// reports `deleted=true` on a 0-transition.
+    ///
+    /// # Errors
+    /// `ChunkError::Io` on backend failure.
+    pub(crate) async fn handle_delete_fragment(
+        &self,
+        chunk_id: RustChunkId,
+        fragment_index: u32,
+    ) -> Result<bool, ChunkError> {
+        if fragment_index == 0 {
+            // `Ok(0)` (refcount hit zero, this was the last hold) and
+            // `Err(NotFound)` (already gone) are NOT identical outcomes
+            // even though both currently report `deleted=false` on
+            // any-nonzero-refcount and any-NotFound — keep the arms
+            // separate to make the semantics visible at the call site.
+            match self.local.decrement_refcount(&chunk_id).await {
+                Ok(0) => Ok(true),
+                #[allow(clippy::match_same_arms)]
+                Ok(_) => Ok(false),
+                #[allow(clippy::match_same_arms)]
+                Err(ChunkError::NotFound(_)) => Ok(false),
+                Err(e) => Err(e),
+            }
+        } else {
+            self.local.delete_fragment(&chunk_id, fragment_index).await
+        }
+    }
+
+    /// Shared handler for `HasFragment`. Probes whether the peer
+    /// holds a fragment (for the repair scrub).
+    ///
+    /// # Errors
+    /// `ChunkError::Io` on backend failure (other than `NotFound`,
+    /// which is reported as `Ok(false)`).
+    pub(crate) async fn handle_has_fragment(
+        &self,
+        chunk_id: RustChunkId,
+        fragment_index: u32,
+    ) -> Result<bool, ChunkError> {
+        if fragment_index == 0 {
+            // NotFound is not a probe error — it's the "absent" answer.
+            match self.local.refcount(&chunk_id).await {
+                Ok(rc) => Ok(rc > 0),
+                Err(ChunkError::NotFound(_)) => Ok(false),
+                Err(e) => Err(e),
+            }
+        } else {
+            Ok(self
+                .local
+                .list_fragments(&chunk_id)
+                .await
+                .contains(&fragment_index))
+        }
+    }
+
     /// Deposit chunk-level crypto fields for a chunk this node is
     /// going to (or just did) write a local fragment for. The leader
     /// of an EC write fans out `PutFragment` RPCs to peers — those
@@ -537,63 +712,23 @@ impl ClusterChunkService for ClusterChunkServer {
                 ));
             }
         }
-        let decode_started = std::time::Instant::now();
         let req = request.into_inner();
-
         let envelope = req
             .envelope
             .ok_or_else(|| Status::invalid_argument("envelope missing"))?;
         let envelope = proto_envelope_to_rust(envelope)
             .map_err(|e| Status::invalid_argument(format!("bad envelope: {e}")))?;
-
         let pool = req
             .pool_id
             .as_ref()
             .map_or_else(|| self.default_pool.clone(), proto_pool_to_string);
-
-        // Capture chunk-level crypto fields before envelope is moved
-        // into the storage path. Idempotent across fragments — every
-        // fragment of the same chunk carries identical metadata.
-        let chunk_id = envelope.chunk_id;
-        self.chunk_envelope_meta.record(
-            chunk_id,
-            envelope.auth_tag,
-            envelope.nonce,
-            envelope.system_epoch,
-            envelope.tenant_epoch,
-            envelope.tenant_wrapped_material.clone(),
-        );
-        if let Some(m) = self.metrics.as_ref() {
-            m.observe_put_recv("decode", decode_started.elapsed());
-        }
-
-        // Phase 16d step 2: route by fragment_index. index=0 keeps
-        // the legacy whole-envelope path (Replication-N + dedup).
-        // index>0 is an EC shard; store via write_fragment so the
-        // bytes are addressed by (chunk_id, fragment_index).
-        let write_started = std::time::Instant::now();
-        if req.fragment_index == 0 {
-            let stored = self
-                .local
-                .write_chunk(envelope, &pool)
-                .await
-                .map_err(|e| chunk_err_to_status(&e))?;
-            if let Some(m) = self.metrics.as_ref() {
-                m.observe_put_recv("write_chunk", write_started.elapsed());
-            }
-            Ok(Response::new(pb::PutFragmentResponse { stored }))
-        } else {
-            self.local
-                .write_fragment(&chunk_id, req.fragment_index, envelope.ciphertext)
-                .await
-                .map_err(|e| chunk_err_to_status(&e))?;
-            if let Some(m) = self.metrics.as_ref() {
-                m.observe_put_recv("write_chunk", write_started.elapsed());
-            }
-            // EC fragment writes don't carry refcount semantics; report
-            // stored=true so callers can count this as a successful ack.
-            Ok(Response::new(pb::PutFragmentResponse { stored: true }))
-        }
+        // Delegate to the shared handler — same logic the TCP-framed
+        // adapter calls. Storage path is now transport-agnostic.
+        let stored = self
+            .handle_put_fragment(req.fragment_index, pool, envelope)
+            .await
+            .map_err(|e| chunk_err_to_status(&e))?;
+        Ok(Response::new(pb::PutFragmentResponse { stored }))
     }
 
     async fn get_fragment(
@@ -602,49 +737,13 @@ impl ClusterChunkService for ClusterChunkServer {
     ) -> Result<Response<pb::GetFragmentResponse>, Status> {
         let req = request.into_inner();
         let chunk_id = proto_chunk_id_to_rust(req.chunk_id.as_ref())?;
-
-        if req.fragment_index == 0 {
-            // index=0 has two storage shapes depending on the mode the
-            // leader used: Replication-N stores the WHOLE envelope at
-            // chunk_id (via write_chunk), EC stores ONE shard at
-            // (chunk_id, 0) (via write_fragment). The server doesn't
-            // know which mode the leader used, so try the fragment
-            // path first and fall back to the whole-envelope path. If
-            // the fragment exists, return it as a synthetic envelope
-            // (the EC decoder reads only `ciphertext`; the auth_tag /
-            // nonce / epoch fields are leader-side state and irrelevant
-            // for fragment reconstruction).
-            //
-            // Discovered 2026-05-02 — the prior unconditional
-            // read_chunk path returned NotFound for EC chunks (leader
-            // never wrote a whole envelope under EC) which surfaced
-            // as `chunk lost: insufficient fragments for reconstruction`
-            // on cross-node reads.
-            if let Ok(bytes) = self.local.read_fragment(&chunk_id, 0).await {
-                let env = self.envelope_from_bytes(chunk_id, bytes);
-                return Ok(Response::new(pb::GetFragmentResponse {
-                    envelope: Some(rust_envelope_to_proto(&env)),
-                }));
-            }
-            let env = self
-                .local
-                .read_chunk(&chunk_id, None)
-                .await
-                .map_err(|e| chunk_err_to_status(&e))?;
-            Ok(Response::new(pb::GetFragmentResponse {
-                envelope: Some(rust_envelope_to_proto(&env)),
-            }))
-        } else {
-            let bytes = self
-                .local
-                .read_fragment(&chunk_id, req.fragment_index)
-                .await
-                .map_err(|e| chunk_err_to_status(&e))?;
-            let env = self.envelope_from_bytes(chunk_id, bytes);
-            Ok(Response::new(pb::GetFragmentResponse {
-                envelope: Some(rust_envelope_to_proto(&env)),
-            }))
-        }
+        let env = self
+            .handle_get_fragment(chunk_id, req.fragment_index)
+            .await
+            .map_err(|e| chunk_err_to_status(&e))?;
+        Ok(Response::new(pb::GetFragmentResponse {
+            envelope: Some(rust_envelope_to_proto(&env)),
+        }))
     }
 
     async fn delete_fragment(
@@ -653,30 +752,11 @@ impl ClusterChunkService for ClusterChunkServer {
     ) -> Result<Response<pb::DeleteFragmentResponse>, Status> {
         let req = request.into_inner();
         let chunk_id = proto_chunk_id_to_rust(req.chunk_id.as_ref())?;
-
-        if req.fragment_index == 0 {
-            // Whole-envelope path: same as 16a — drop refcount,
-            // report deleted=true on a 0-transition.
-            match self.local.decrement_refcount(&chunk_id).await {
-                Ok(0) => Ok(Response::new(pb::DeleteFragmentResponse { deleted: true })),
-                Ok(_) => Ok(Response::new(pb::DeleteFragmentResponse { deleted: false })),
-                Err(ChunkError::NotFound(_)) => {
-                    Ok(Response::new(pb::DeleteFragmentResponse { deleted: false }))
-                }
-                Err(e) => Err(chunk_err_to_status(&e)),
-            }
-        } else {
-            // EC fragment: idempotent delete via the per-fragment
-            // store. No refcount semantics for individual fragments.
-            let was_present = self
-                .local
-                .delete_fragment(&chunk_id, req.fragment_index)
-                .await
-                .map_err(|e| chunk_err_to_status(&e))?;
-            Ok(Response::new(pb::DeleteFragmentResponse {
-                deleted: was_present,
-            }))
-        }
+        let deleted = self
+            .handle_delete_fragment(chunk_id, req.fragment_index)
+            .await
+            .map_err(|e| chunk_err_to_status(&e))?;
+        Ok(Response::new(pb::DeleteFragmentResponse { deleted }))
     }
 
     async fn has_fragment(
@@ -685,19 +765,10 @@ impl ClusterChunkService for ClusterChunkServer {
     ) -> Result<Response<pb::HasFragmentResponse>, Status> {
         let req = request.into_inner();
         let chunk_id = proto_chunk_id_to_rust(req.chunk_id.as_ref())?;
-
-        let present = if req.fragment_index == 0 {
-            match self.local.refcount(&chunk_id).await {
-                Ok(rc) => rc > 0,
-                Err(ChunkError::NotFound(_)) => false,
-                Err(e) => return Err(chunk_err_to_status(&e)),
-            }
-        } else {
-            self.local
-                .list_fragments(&chunk_id)
-                .await
-                .contains(&req.fragment_index)
-        };
+        let present = self
+            .handle_has_fragment(chunk_id, req.fragment_index)
+            .await
+            .map_err(|e| chunk_err_to_status(&e))?;
         Ok(Response::new(pb::HasFragmentResponse {
             present,
             stored_age_ms: 0,
@@ -844,7 +915,7 @@ fn rust_org_to_proto(o: RustOrgId) -> pb::OrgId {
 fn chunk_err_to_status(e: &ChunkError) -> Status {
     let msg = e.to_string();
     match e {
-        ChunkError::NotFound(_) => Status::not_found(msg),
+        ChunkError::NotFound(_) | ChunkError::SlabNotFound(_) => Status::not_found(msg),
         ChunkError::Corrupted(_) | ChunkError::DeviceUnavailable(_) | ChunkError::ChunkLost => {
             Status::data_loss(msg)
         }
@@ -947,7 +1018,7 @@ mod tests {
     }
 
     fn local_bridge(pool: &str) -> Arc<dyn AsyncChunkOps> {
-        let mut store = ChunkStore::new();
+        let store = ChunkStore::new();
         store.add_pool(AffinityPool {
             name: pool.to_owned(),
             device_class: DeviceClass::NvmeSsd,
@@ -955,6 +1026,8 @@ mod tests {
             devices: vec![],
             capacity_bytes: 1 << 30,
             used_bytes: 0,
+            requires_migration: false,
+            ..Default::default()
         });
         Arc::new(SyncBridge::new(store))
     }
