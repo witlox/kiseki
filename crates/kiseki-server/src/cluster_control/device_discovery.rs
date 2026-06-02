@@ -264,42 +264,27 @@ pub fn discover_with_proc_mounts(
         });
     }
 
-    // ADR-049 D1 step 3: always include data_dir as a fallback
+    // ADR-049 D1 step 3: ALWAYS include data_dir as a fallback
     // entry so `DeviceMatcher::DataDir` always has a target. Tagged
-    // `data-dir-default` unless the operator overrode it.
+    // `data-dir-default` unless the operator overrode it. Earlier
+    // versions tried to dedup against /proc/mounts entries, but the
+    // parent-mount comparison matched `/` for every tempdir-rooted
+    // path, leaving CI without the fallback entry that the resolver
+    // contract requires.
     if let Some(dir) = data_dir {
-        // Only add the entry if data_dir wasn't already discovered
-        // via /proc/mounts (its mount point might be `/` or another
-        // path that already appears).
-        let already_present = devices.iter().any(|d| {
-            // Compare by canonical path: data_dir may be under a
-            // mount point we already added.
-            let dir_str = dir.to_string_lossy();
-            let entry_str = d.mount_path.to_string_lossy();
-            dir_str.starts_with(entry_str.as_ref())
+        let (total_bytes, free_bytes) = fs_stats(dir);
+        let media_class = detect_media_type(dir);
+        let tag = tags
+            .tag_for(dir)
+            .or_else(|| Some("data-dir-default".to_owned()));
+        devices.push(DeviceEntry {
+            mount_path: dir.to_path_buf(),
+            media_class,
+            total_bytes,
+            free_bytes,
+            tag,
+            exclusive: false,
         });
-        if !already_present {
-            // ADR-049 D1 step 3 says "always include" — sandboxed CI
-            // runners (tmpfs / non-statvfs-friendly mounts) report
-            // `total_bytes=0`. Drop the entry only if statvfs errors
-            // entirely; a zero-byte report still gets the entry so
-            // `DeviceMatcher::DataDir` policies retain a target. The
-            // resolver's BestEffort fallback can pick this up even
-            // when capacity is unknown.
-            let (total_bytes, free_bytes) = fs_stats(dir);
-            let media_class = detect_media_type(dir);
-            let tag = tags
-                .tag_for(dir)
-                .or_else(|| Some("data-dir-default".to_owned()));
-            devices.push(DeviceEntry {
-                mount_path: dir.to_path_buf(),
-                media_class,
-                total_bytes,
-                free_bytes,
-                tag,
-                exclusive: false,
-            });
-        }
     }
 
     NodeDeviceInventory {
