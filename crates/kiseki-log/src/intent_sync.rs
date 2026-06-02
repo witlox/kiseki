@@ -146,10 +146,14 @@ impl WireIntent {
 /// degrades to `ParseError` (a non-ack). Response encoding is wrapped so an
 /// encode fault also degrades to `ParseError` rather than escaping as a panic.
 #[must_use]
-pub fn build_intent_dispatcher(store: Arc<dyn IntentStore>) -> ShardDispatch {
+pub fn build_intent_dispatcher(
+    store: Arc<dyn IntentStore>,
+    recv_coalescer: Option<Arc<crate::intent_recv_coalescer::IntentRecvCoalescer>>,
+) -> ShardDispatch {
     Arc::new(
         move |tag: &str, payload: &[u8]| -> BoxFuture<'_, DispatchOutcome> {
             let store = Arc::clone(&store);
+            let recv_coalescer = recv_coalescer.as_ref().map(Arc::clone);
             let tag = tag.to_owned();
             let payload = payload.to_vec();
             Box::pin(async move {
@@ -221,25 +225,33 @@ pub fn build_intent_dispatcher(store: Arc<dyn IntentStore>) -> ShardDispatch {
                             }
                         }
                         let n = intents.len();
-                        // ADR-047 hot-path timer (aux.store_put) — local fjall
-                        // IntentStore write on the peer. Now wraps the whole
-                        // batch commit, mirroring `put_batch`'s one-WAL-sync
-                        // shape on the producer side.
+                        // Lever 1 (2026-06-02): receiver-side coalescer
+                        // when configured. The coalescer aggregates this
+                        // RPC with concurrent RPCs from other producers
+                        // into ONE fjall put_batch per coalesce window.
+                        // Falls back to direct `store.put_batch` when no
+                        // coalescer is configured (test paths /
+                        // not-yet-wired call sites).
+                        //
+                        // ADR-047 hot-path timer (aux.store_put) — under
+                        // the coalescer the span includes the receiver-
+                        // side wait. Pair with the
+                        // `kiseki_intent_recv_coalesce_wait_seconds`
+                        // histogram to split wait vs commit.
                         let put_res = kiseki_tracing::hot_span!("aux.store_put", {
-                            store.put_batch(intents)
+                            match recv_coalescer {
+                                Some(c) => c.submit(intents).await,
+                                None => store
+                                    .put_batch(intents)
+                                    .map(|outcomes| outcomes.iter().map(|_| true).collect()),
+                            }
                         });
                         match put_res {
-                            // Recorded OR Duplicate both mean the intent is
-                            // durable on this replica — credit the ack
-                            // either way (idempotent re-fan must still
-                            // count, ADR-047 §5 / O3). The reply is one bool
-                            // per input intent in input order.
-                            Ok(outcomes) => {
-                                let acks: Vec<bool> = outcomes.iter().map(|_| true).collect();
+                            Ok(acks) => {
                                 debug_assert_eq!(
                                     acks.len(),
                                     n,
-                                    "put_batch must return one outcome per input"
+                                    "ack vec must have one entry per input intent"
                                 );
                                 kiseki_tracing::hot_span!("aux.encode_response", {
                                     encode_ok(&acks)
@@ -540,7 +552,7 @@ mod tests {
         let i2 = rich_intent(seq(2, 0, 1), None);
         store.put(i1.clone()).unwrap();
         store.put(i2.clone()).unwrap();
-        let dispatch = build_intent_dispatcher(store);
+        let dispatch = build_intent_dispatcher(store, None);
 
         let outcome = dispatch(INTENT_GATHER_PENDING_TAG, &[]).await;
         let DispatchOutcome::Ok(bytes) = outcome else {
@@ -570,7 +582,7 @@ mod tests {
     #[tokio::test]
     async fn dispatcher_intent_put_stores_fanned_intent() {
         let store: Arc<dyn IntentStore> = Arc::new(InMemIntentStore::new());
-        let dispatch = build_intent_dispatcher(Arc::clone(&store));
+        let dispatch = build_intent_dispatcher(Arc::clone(&store), None);
 
         let one = rich_intent(seq(7, 3, 2), Some([0xa1u8; 16]));
         let two = rich_intent(seq(7, 4, 2), Some([0xa2u8; 16]));
@@ -605,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn dispatcher_intent_put_bad_payload_is_parse_error() {
         let store: Arc<dyn IntentStore> = Arc::new(InMemIntentStore::new());
-        let dispatch = build_intent_dispatcher(Arc::clone(&store));
+        let dispatch = build_intent_dispatcher(Arc::clone(&store), None);
         let outcome = dispatch(INTENT_PUT_TAG, &[0xff, 0x00, 0x13, 0x37]).await;
         assert!(matches!(outcome, DispatchOutcome::ParseError));
         assert_eq!(store.pending_len().unwrap(), 0, "nothing recorded");
@@ -616,7 +628,7 @@ mod tests {
     #[tokio::test]
     async fn dispatcher_unknown_tag_falls_through() {
         let store = Arc::new(InMemIntentStore::new());
-        let dispatch = build_intent_dispatcher(store);
+        let dispatch = build_intent_dispatcher(store, None);
         let outcome = dispatch("not_an_intent_tag", &[]).await;
         assert!(matches!(outcome, DispatchOutcome::UnknownTag));
     }
