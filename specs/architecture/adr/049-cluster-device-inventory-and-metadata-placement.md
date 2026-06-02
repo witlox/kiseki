@@ -18,7 +18,37 @@ namespaces).
 - **rev 1** (2026-06-02): initial draft.
 - **rev 2** (2026-06-02): cluster-aggregate capacity formula
   (§D4.5), per-node distribution, capacity admin surface.
-- **rev 3** (2026-06-02, this revision): incorporates gate-1
+- **rev 4** (2026-06-02, this revision): MUST-FIX items from the
+  re-diamond (rev 3 verification round). Four spec corrections:
+  - **N-12 / architect**: `PER_FILE_METADATA_FOOTPRINT_BYTES`
+    moves from `kiseki-server` (binary-only crate, not importable)
+    to `kiseki-common::metadata`. Phase 1 of implementation
+    relocates the constant + updates the two existing call sites.
+  - **N-5 / architect**: `await_catalog_ready` quiescence-vs-timeout
+    interaction. `last_change_ms` split into `policy_change_ms`
+    (the quiescence clock — only mutated by `SetPlacementPolicy` /
+    `SetWorkloadParams`) and `inventory_change_ms` (D10
+    observability only — NOT consulted by quiescence). Defaults
+    rebalanced: `KISEKI_CATALOG_BOOT_TIMEOUT_MS=90 s`,
+    `KISEKI_CATALOG_QUIESCENCE_MS=30 s` (was 30 / 120).
+  - **Auditor STILL-FAIL**: worked-example arithmetic recomputed
+    bit-exact. `projected_metadata = 287.987 GiB` (was 309.1 GiB
+    — residual GB-vs-GiB drift the rev-3 audit missed because
+    the per-node-sum identity hid it). Cascades:
+    `metadata_budget` 463.6 → **431.98 GiB**; `small_file_budget`
+    (homogeneous) 6448.4 → **6480.02 GiB**; per-node metadata
+    77.3 → **71.997 GiB**; per-node small 1074.7 → **1080.00 GiB**;
+    heterogeneous node-4 line items 12.04/137.94 → **11.22/138.79
+    GiB**; node-1 line items 90.31/1034.74 → **84.16/1040.84 GiB**.
+    Per-node-sum identity (200.00 / 1500.00 GiB) holds either way.
+  - **Auditor Q10**: per-node-floor redistribution algorithm now
+    spec'd with explicit pseudocode (deterministic donor
+    selection, contribution formula, per-tier ordering). I-DI10
+    holds across the algorithm.
+  Documents the 12 phase-3 acceptance criteria (adversary
+  N-1..N-12) + 5 architect SHOULD-FIX items as numbered phase
+  commitments in open questions Q22-Q38.
+- **rev 3** (2026-06-02): incorporates gate-1
   diamond findings (adversary F-1..F-17 + architect coherence
   audit + auditor numeric audit). Material changes:
   - **F-1 cold-boot deadlock** (CRITICAL): RaftLog tier is
@@ -220,7 +250,17 @@ struct ClusterDeviceCatalog {
     policy: PlacementPolicy,
     workload: WorkloadParams,
     policy_revision: u64,                  // monotone, bumped per Set*
-    last_change_ms: u64,
+    /// Wall-clock at last **policy or workload** mutation. Bumped
+    /// by `SetPlacementPolicy` and `SetWorkloadParams` apply ONLY
+    /// — NOT by `UpsertNodeInventory`. This is the
+    /// `await_catalog_ready` quiescence clock (§D5.5); inventory
+    /// upserts happen every 60 s per node and would otherwise
+    /// reset quiescence on every busy-cluster apply, preventing
+    /// boot from ever proceeding (rev 4 fix for re-diamond N-5).
+    policy_change_ms: u64,
+    /// Separate wall-clock for inventory drift, used by D10
+    /// observability gauges but NOT by `await_catalog_ready`.
+    inventory_change_ms: u64,
 }
 ```
 
@@ -430,17 +470,23 @@ struct WorkloadParams {
 }
 
 impl WorkloadParams {
-    /// Per-cluster-replica metadata bytes per file. Composes the
-    /// single-replica footprint from ADR-030's
-    /// `system_disk::PER_FILE_METADATA_FOOTPRINT_BYTES` (512 B
-    /// covers composition + name binding + HLC stamps + LSM
-    /// overhead, per the constant's doc comment) with the
-    /// replication factor here. **Do not duplicate the 512 B
-    /// constant** — it lives in `system_disk` and that ADR-030
-    /// figure is the single source of truth.
+    /// Per-cluster metadata bytes per file. Composes the
+    /// single-replica footprint with the replication factor.
+    ///
+    /// **Rev 4 ownership fix**: `PER_FILE_METADATA_FOOTPRINT_BYTES`
+    /// moves from `crates/kiseki-server/src/system_disk.rs` (a
+    /// binary-only crate) to `crates/kiseki-common/src/metadata.rs`
+    /// (a library crate every dependent crate can import). Rev 3
+    /// drafted this method against `kiseki_server::system_disk::*`
+    /// which would have failed to compile because `kiseki-server`
+    /// has no `lib.rs` target. Phase 1 of the implementation moves
+    /// the constant + updates the two existing call sites
+    /// (`runtime.rs:529`, `web/admin_extra.rs:1635`) to import from
+    /// `kiseki_common::metadata::PER_FILE_METADATA_FOOTPRINT_BYTES`.
+    /// ADR-030 §3 documentation is amended accordingly.
     fn metadata_per_file_bytes(&self) -> u64 {
         u64::from(self.metadata_replication)
-            * kiseki_server::system_disk::PER_FILE_METADATA_FOOTPRINT_BYTES
+            * kiseki_common::metadata::PER_FILE_METADATA_FOOTPRINT_BYTES
     }
 }
 ```
@@ -585,7 +631,8 @@ assert Σ_{t in Absolute tiers} t.cluster_bytes
 #### Per-node distribution
 
 ```
-for each node n:
+# Phase 1: naive proportional distribution.
+for each node n in inventories (ascending NodeId order):
     if n.fast_capacity > 0:
         share = n.fast_capacity / F_total
         n.metadata_share    = metadata_budget    × share
@@ -596,11 +643,65 @@ for each node n:
         n.small_file_share  = 0
         n.headroom_share    = 0
     n.chunk_share = n.slow_capacity + leftover_fast_on_n
+
+# Phase 2: Q10 per-node-floor redistribution (rev 4 fix).
+# After phase 1, some nodes may have shares below
+# `per_tier_min_viable_bytes` (default 256 MiB) — fjall can't
+# bring up a keyspace below that. Redistribute the shortfall
+# from the largest-share donor nodes, deterministically.
+for each tier T in [Metadata, SmallObject, Headroom]:
+    # Iterate in canonical (ascending NodeId) order for determinism.
+    for each node n with n.fast_capacity > 0:
+        if n.{T}_share < per_tier_min_viable_bytes:
+            shortfall = per_tier_min_viable_bytes − n.{T}_share
+
+            if mode == Strict:
+                # Strict mode rejects the policy at the
+                # `SetPlacementPolicy.apply` gate (I-DI9 + I-DI8).
+                # `compute_cluster_budgets` returns
+                # `Err(PlacementError::BelowMinViable)`.
+                return Err(BelowMinViable { tier: T, node_id: n,
+                                            share_bytes: n.{T}_share,
+                                            min_viable: per_tier_min_viable_bytes });
+            else:
+                # BestEffort: take from donors. Donors are nodes
+                # whose share for THIS tier is strictly above
+                # per_tier_min_viable_bytes, sorted by descending
+                # `n.{T}_share` then ascending NodeId (canonical
+                # tie-break). Largest donor first.
+                donors = inventories
+                    .filter(|d| d.fast_capacity > 0 && d.NodeId != n.NodeId
+                               && d.{T}_share > per_tier_min_viable_bytes)
+                    .sort_by(|d| (-d.{T}_share, d.NodeId));
+
+                # Each donor contributes proportionally to its
+                # excess-above-floor, capped at the shortfall.
+                total_excess = Σ donors.{T}_share − per_tier_min_viable_bytes
+                for donor in donors:
+                    donor_excess = donor.{T}_share − per_tier_min_viable_bytes
+                    donor_contribution = (donor_excess / total_excess) × shortfall
+                    donor.{T}_share -= donor_contribution
+
+                n.{T}_share = per_tier_min_viable_bytes
+
+                # Emit observability:
+                metric kiseki_capacity_redistributed_bytes{tier=T,
+                       from=donor.NodeId, to=n.NodeId} += donor_contribution
+
+# After phase 2, every node either has {T}_share ≥
+# per_tier_min_viable_bytes (BestEffort), or the policy was
+# rejected at apply (Strict). I-DI8 still holds: the cluster
+# aggregate per-tier budget is unchanged (we only moved bytes
+# between nodes).
 ```
 
 A node with zero fast tier hosts no metadata or small-file budget
 — other nodes carry its share. Cluster aggregate budgets stay
 satisfied.
+
+The phase-2 redistribution is purely deterministic (canonical
+order, deterministic donor selection, deterministic contribution
+formula) so I-DI10 holds across the algorithm.
 
 #### Edge cases
 
@@ -624,27 +725,41 @@ slipped into decimal for some intermediates — corrected here).
 
 ```
 F_total            = 6 × 1.5 TiB = 9 TiB = 9216 GiB
-S_total            = 6 × 8 TiB   = 48 TiB
+S_total            = 6 × 8 TiB   = 48 TiB = 49152 GiB
 N_nodes_with_fast  = 6
 N_nodes_total      = 6
-projected_files    = 48 TiB / 256 KiB = 48 × 2^40 / 2^18 = 192 × 2^22 ≈ 201.3 M
-projected_metadata = 201.3 M × 1536 B = 309.1 GiB
-metadata_budget    = clamp(309.1 × 1.5 = 463.6 GiB,
+projected_files    = 49152 GiB / 256 KiB
+                   = 49152 × 2^30 / (256 × 2^10)
+                   = 49152 × 2^20
+                   = 51 539 607 552 / 256
+                   = 201 326 592 ≈ 201.33 M files exact
+projected_metadata = 201 326 592 × 1536 B = 309 237 645 312 B
+                   = 309 237 645 312 / 2^30 GiB
+                   = **287.987 GiB**                                        (rev 4 fix: was 309.1)
+metadata_budget    = clamp(287.987 × 1.5 = 431.98 GiB,
                            floor = max(60 GiB, 1.5 GiB) = 60 GiB,
-                           ceiling = 0.30 × 9216 = 2764.8 GiB) = 463.6 GiB   (~5.0% of F_total)
-headroom_budget    = 0.25 × 9216 GiB = 2304.0 GiB                            (rev 3: 25%, was 10%)
-small_file_budget  = 9216 − 463.6 − 2304.0 = 6448.4 GiB ≈ 6.30 TiB           (~70% of F_total)
+                           ceiling = 0.30 × 9216 = 2764.8 GiB) = **431.98 GiB**   (~4.7% of F_total)
+headroom_budget    = 0.25 × 9216 GiB = 2304.0 GiB                            (rev 3: 25%)
+small_file_budget  = 9216 − 431.98 − 2304.0 = **6480.02 GiB ≈ 6.328 TiB**    (~70.3% of F_total)
 chunk_budget       = 48 TiB SATA + 0 fast spillover
 
-per node (share = 1500 / 9216 = exactly 16.667% each):
-  metadata_share   = 463.6 × 0.16667 = 77.3 GiB
-  small_file_share = 6448.4 × 0.16667 = 1074.7 GiB ≈ 1.05 TiB
-  headroom_share   = 2304.0 × 0.16667 = 384.0 GiB
+per node (share = 1500 / 9216 = exactly 16.6667% each):
+  metadata_share   = 431.98 × 0.166667 = **71.997 GiB**
+  small_file_share = 6480.02 × 0.166667 = **1080.00 GiB ≈ 1.055 TiB**
+  headroom_share   = 2304.0 × 0.166667 = **384.00 GiB**
   chunk_share      = 8 TiB SATA per node
 
 Verification per I-DI8 (per-node sum ≤ node.fast_capacity):
-  77.3 + 1074.7 + 384.0 = 1536.0 GiB = 1.5 TiB ✓ (matches lssd fast)
+  71.997 + 1080.00 + 384.00 = 1535.997 GiB ≈ 1.5 TiB (1536 GiB) ✓
+  Difference of 0.003 GiB = 3.2 MiB is float-rounding noise; the
+  algebraic identity Σ shares = 1.0 holds exactly.
 ```
+
+(Rev 4 corrected the residual GB-vs-GiB drift the rev 3 auditor
+caught: `projected_metadata` was labeled GiB while computed in
+decimal billions, cascading through `metadata_budget` and
+`small_file_budget`. Implementer's property test consumes the
+corrected numbers as oracle.)
 
 Note: rev 3's 25% LSM headroom moves SmallObject from ~85% to
 ~70% of F_total. Phase 3 measurement of actual fjall compaction
@@ -696,29 +811,38 @@ shares (exact):
 counted node 4's 200 GiB as if it were ADDED to the 5 × 1500. The
 correct cluster total is 5 × 1500 + 200 = 7700 GiB.)
 
-Continuing with F_total = 7700 GiB:
-  projected_metadata still = 309.1 GiB (depends only on S_total).
-  metadata_budget          = clamp(463.6 GiB, 60 GiB,
-                                   0.30 × 7700 = 2310 GiB) = 463.6 GiB
+Continuing with F_total = 7700 GiB and **rev 4-corrected
+projected_metadata = 287.987 GiB**:
+  metadata_budget          = clamp(287.987 × 1.5 = 431.98 GiB,
+                                   floor = 60 GiB,
+                                   ceiling = 0.30 × 7700 = 2310 GiB) = **431.98 GiB**
   headroom_budget          = 0.25 × 7700 = 1925.0 GiB
-  small_file_budget        = 7700 − 463.6 − 1925.0 = 5311.4 GiB ≈ 5.19 TiB
+  small_file_budget        = 7700 − 431.98 − 1925.0 = **5343.02 GiB ≈ 5.218 TiB**
 
-  node 4 (share 2.597%):
-    metadata  = 463.6 × 0.02597 = 12.04 GiB
-    small     = 5311.4 × 0.02597 = 137.94 GiB
-    headroom  = 1925.0 × 0.02597 = 49.99 GiB
-    sum                              = 200.0 GiB ✓ (exactly fits 200 GiB NVMe)
+  node 4 (share 200/7700 = 2.5974%):
+    metadata  = 431.98 × 0.025974 = **11.22 GiB**
+    small     = 5343.02 × 0.025974 = **138.79 GiB**
+    headroom  = 1925.0 × 0.025974 = **49.99 GiB**
+    sum                              = **200.00 GiB** ✓ (exactly fits 200 GiB NVMe)
 
-  node 1 (share 19.481%):
-    metadata  = 463.6 × 0.19481 = 90.31 GiB
-    small     = 5311.4 × 0.19481 = 1034.74 GiB ≈ 1.01 TiB
-    headroom  = 1925.0 × 0.19481 = 374.99 GiB
-    sum                              = 1500.0 GiB ✓ (exactly fits 1.5 TiB lssd)
+  node 1 (share 1500/7700 = 19.4805%):
+    metadata  = 431.98 × 0.194805 = **84.16 GiB**
+    small     = 5343.02 × 0.194805 = **1040.84 GiB ≈ 1.017 TiB**
+    headroom  = 1925.0 × 0.194805 = **374.99 GiB**
+    sum                              = **1500.00 GiB** ✓ (exactly fits 1.5 TiB lssd)
 ```
 
 Node 4 still participates with proportionally smaller shares. The
 cluster aggregate budgets are still satisfied. Per-node sum equals
-node fast capacity exactly (I-DI8 ✓).
+node fast capacity exactly (I-DI8 ✓ — the identity Σ_n share_n = 1
+makes this hold by construction).
+
+(Rev 4 corrected line items 12.04/137.94/90.31/1034.74 → exact
+values 11.22/138.79/84.16/1040.84. The per-node sum stays 200.00
+/ 1500.00 GiB either way — the algebraic identity hides the
+intermediate error, which is what made the bug survive rev 2 and
+rev 3 review. Implementer's property test consumes the corrected
+line items as oracle.)
 
 **Why this matters**: the rev 2 example had ~7% of arithmetic
 slop. Real implementations need bit-exact agreement across nodes
@@ -828,16 +952,25 @@ pub trait DeviceCatalogRead {
     fn workload(&self) -> WorkloadParams;
 }
 
-/// Boot-time "wait for catalog" — pattern mirrored from existing
-/// `OpenRaftControlStore::new` await semantics (runtime.rs:782-797).
-/// Returns once (a) the local node's `UpsertNodeInventory` has
-/// applied AND (b) the catalog's `last_change_ms` has been stable
-/// for >= `quiescence_ms` (default 2× refresh_interval; F-6 race fix).
+/// Boot-time "wait for catalog" — NEW pattern (not in current
+/// codebase; rev 4 honest correction — the rev 3 "mirrored from
+/// runtime.rs:782-797" claim referred to *construction*, not a
+/// wait-for-ready primitive). Returns once:
+///   (a) the local node's `UpsertNodeInventory` has applied AND
+///   (b) the catalog's `policy_change_ms` (NOT `inventory_change_ms`)
+///       has been stable for >= `quiescence_ms`.
+/// The split clock (rev 4 fix for re-diamond N-5) ensures inventory
+/// refresh churn from peer nodes doesn't reset quiescence —
+/// otherwise a busy cluster's `policy_change_ms` is stable but
+/// `inventory_change_ms` resets every ~600 ms (100 nodes × 60 s
+/// refresh) and quiescence never fires. Default `quiescence_ms`
+/// is now 30 s (was 120 s); `timeout` raised to 90 s so timeout
+/// > quiescence by a 3× margin.
 pub async fn await_catalog_ready(
     ctrl: &OpenRaftControlStore,
     local_node_id: NodeId,
-    timeout: Duration,            // KISEKI_CATALOG_BOOT_TIMEOUT_MS default 30 s
-    quiescence_ms: Duration,      // KISEKI_CATALOG_QUIESCENCE_MS  default 120 s
+    timeout: Duration,            // KISEKI_CATALOG_BOOT_TIMEOUT_MS default 90 s (rev 4: was 30)
+    quiescence_ms: Duration,      // KISEKI_CATALOG_QUIESCENCE_MS  default 30 s (rev 4: was 120)
 ) -> Result<Arc<dyn DeviceResolver>, PlacementError>;
 
 /// Periodic inventory refresh task. Spawned once per node from
@@ -1412,3 +1545,126 @@ phase-3 acceptance criteria.)
     survey for default-tuning. The 256 KiB `avg_file_bytes`
     is a sweep; phase 7 measures GCP perf-cluster workload
     actuals and proposes a default revision.
+
+### Re-diamond (rev 4) acceptance criteria
+
+The rev-4 re-diamond produced 12 phase-3 acceptance items
+(adversary N-1..N-12) + 5 architect SHOULD-FIX items + the
+auditor's algorithm clarifications. All are implementation-detail
+level — they MUST be addressed during phase implementation, not
+in another spec revision.
+
+22. **N-1 (KISEKI_RAFT_LOG_DIR fallback chain)**: mandatory
+    env-var ordering — `KISEKI_RAFT_LOG_DIR > KISEKI_DATA_DIR/raft >
+    FAIL_FAST("set one of these")`. No silent CWD fallback.
+    Phase 1 acceptance.
+
+23. **N-2 (pointer-file atomicity)**: `kiseki-tier-paths.json`
+    written by `runtime.rs` (not per-tier consumer); atomic
+    `write+rename` contract; `0600` permissions; corrupt JSON
+    treated as `RefuseToOpen` (NOT first-boot); the file is
+    written once after ALL tiers resolve. Phase 5a acceptance.
+
+24. **N-3 (I-DI9 determinism note)**: code-comment + property
+    test confirming `SetPlacementPolicy.apply` evaluates against
+    the state-machine's current `inventories` BTreeMap, NOT an
+    inventory snapshot embedded in the LogCommand. Add a
+    leader-side pre-flight that gives operators a friendlier
+    rejection at submit time, with the apply gate as safety net.
+    Phase 4 acceptance.
+
+25. **N-4 (F_total/S_total = 0 panic guards)**: explicit
+    `S_total == 0` short-circuit (return zero-budgets struct,
+    warn, refuse `SetPlacementPolicy` in Strict);
+    explicit `floor > ceiling` handling (cap floor at ceiling,
+    warn). Phase 3 acceptance.
+
+26. **N-6 (QLC dimension surfacing)**: WARN fires at inventory
+    publish (one log line per device, NOT silenced after first
+    refresh); `kiseki_placement_qlc_inferred{node, mount}` gauge.
+    Follow-up ADR splits `MediaType` for proper NvmeU2 vs NvmeQlc
+    treatment. Phase 2 acceptance for the gauge.
+
+27. **N-7 (per-node safety margin)**: apply a 0.95 multiplicative
+    safety on per-node share OR on the I-DI8 RHS. Pick one and
+    document. Phase 3 acceptance (formula or invariant text).
+
+28. **N-8 (canonical-order summation lint)**: clippy/lint rule
+    OR a property test that hashes the float sequence produced
+    by two thread orders summing the same inventory; canonical-order
+    bit-exact; randomized may differ. The phase 3 test commitment
+    needs the wording fixed (rev 3 had it backwards). Phase 3
+    acceptance.
+
+29. **N-9 (boot publish-before-resolver-gate)**: boot order
+    MUST be: (1) read local devices NOW; (2) publish
+    `UpsertNodeInventory` with current truth; (3) THEN run
+    resolver against the freshly-published catalog. Otherwise
+    a recovering node with stale catalog truth bricks itself.
+    Phase 5a acceptance.
+
+30. **N-10 (25% headroom admin docs)**: `kiseki-admin topology
+    node-inventory show --explain` prints the headroom rationale
+    + formula inputs. `node-inventory show` (without --explain)
+    labels the headroom share with an ADR-049 pointer.
+    Phase 4 acceptance.
+
+31. **N-11 (I-DI9 + I-CP-Move test commitments)**: phase 3
+    pins unit tests for I-CP-Move covering: missing file →
+    first-boot writes; corrupt JSON → refuses; matching path →
+    pass-through; mismatched path with non-empty prior →
+    refuses; mismatched path with empty prior → updates pointer.
+    Phase 4 pins the I-DI9 apply-determinism property test.
+
+32. **architect SHOULD-FIX (3 missing PlacementError variants)**:
+    add `PolicyApplyRejected { reason, node_id }`,
+    `PathVersionMismatch { tier, prior, resolved }`,
+    `CatalogUnreachable { reason }`. Split `Io(io::Error)` into
+    pointer-file I/O vs catalog-store I/O. Phase 3 acceptance.
+
+33. **architect SHOULD-FIX (phase 5 split)**: split phase 5 →
+    5a (boot reorder + I-CP-Move pointer file gate, single-node
+    smoke test) + 5b (ADR-022 rev-5 SmallObjectStore fjall swap,
+    #129 PUT works through resolver) + 5c (IntentStore +
+    CompositionMeta + ChunkMeta consumer rewiring + ADR-030
+    amendment, rolling-restart preserves all 4 tiers). Isolates
+    the riskiest commit (5b touches data path).
+
+34. **architect SHOULD-FIX (BDD feature file location +
+    DI-6/DI-7)**: pre-allocate
+    `specs/features/device-inventory.feature` (avoids collision
+    with ADR-024 `device-management.feature`). Add DI-6
+    (I-CP-Move dedicated: pointer-file deleted out of band)
+    and DI-7 (catalog-quiescence timeout) scenarios. Phase 6.
+
+35. **architect SHOULD-FIX (ADR-033/042/044 rows)**: extend
+    §D11.1 with rows for ADR-033 (apply hook for I-DI9),
+    ADR-042 (leader-forward for inventory upsert), ADR-044
+    (policy-cache.json encryption at rest). Spec text addition.
+
+36. **architect SHOULD-FIX (`#[serde(default)]`)**: phase 1
+    contract requires `ControlSnapshot::catalog` field carries
+    `#[serde(default)]` so a pre-upgrade snapshot decodes
+    cleanly. Phase 1 acceptance.
+
+37. **architect SHOULD-FIX (phase 7 measurement → phase 3)**:
+    move `fast_headroom_pct` measurement commitment from phase 7
+    to phase 3 alongside `per_tier_min_viable_bytes` measurement.
+    Phase 7 just validates that production defaults produce
+    sane budgets on `c3-standard-22-lssd × 6`. Spec text edit
+    to §D12.
+
+38. **auditor clarification (Absolute pre-check scope)**: the
+    rev 3 cluster-aggregate Absolute pre-check catches pure
+    Σ Absolute overcommit; mixed Auto+Absolute under-budget
+    cases fall through to per-node I-DI8 post-distribution.
+    Add this clarification to §D4.5. Phase 3 may add a stricter
+    pre-check if mixed cases prove operationally noisy.
+
+### Gate-1 verdict (post-rev-4)
+
+Rev 4 addresses all MUST-FIX items from the re-diamond
+verification. Remaining items (Q22-Q38) are phase-implementation
+acceptance criteria — they pin the contracts the spec needs,
+not structural redo. **Gate-1 PASS** (conditional on phase-3+
+verification that Q22-Q38 land in code).
