@@ -127,6 +127,34 @@ pub trait IntentStore: Send + Sync {
     /// Backing-store I/O or codec failure (durable impls only).
     fn put(&self, intent: WriteIntent) -> Result<PutOutcome, IntentError>;
 
+    /// Batched variant of [`put`] — the producer's intent-fan coalescer
+    /// submits up to `KISEKI_INTENT_FAN_BATCH_MAX` intents per call so the
+    /// durable backing store amortises one mutex acquisition + one batch
+    /// commit + one WAL sync across the whole batch instead of N independent
+    /// `put` calls. The default fallback walks `put` per element for
+    /// foundational/test impls that do not need batching.
+    ///
+    /// Returns one [`PutOutcome`] per input intent, in input order
+    /// (idempotent-duplicates remain visible per-element). On error the
+    /// whole batch fails — callers may retry the unrecorded tail (the
+    /// receiver's coalescer ack-distribution treats an error as a non-ack
+    /// for every PUT in the batch).
+    ///
+    /// W12 (2026-06-02): the 2026-06-02 GCP W11 A/B showed the producer-side
+    /// `intent_put` fan at 22 k RPC/s × 158 ms = 3 500 in-flight per cluster.
+    /// Each receiver paid one fjall WAL sync per PUT; batching N intents
+    /// into one commit collapses that to one sync per N PUTs.
+    ///
+    /// # Errors
+    /// Backing-store I/O or codec failure (durable impls only).
+    fn put_batch(&self, intents: Vec<WriteIntent>) -> Result<Vec<PutOutcome>, IntentError> {
+        let mut out = Vec::with_capacity(intents.len());
+        for intent in intents {
+            out.push(self.put(intent)?);
+        }
+        Ok(out)
+    }
+
     /// Pending (un-incorporated) intents, ascending by perspective seq — the
     /// order the async committer applies them (ADR-047 §3).
     ///
@@ -225,6 +253,26 @@ impl IntentStore for InMemIntentStore {
         }
         g.by_seq.insert(intent.perspective_seq, intent);
         Ok(PutOutcome::Recorded)
+    }
+
+    fn put_batch(&self, intents: Vec<WriteIntent>) -> Result<Vec<PutOutcome>, IntentError> {
+        if intents.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut g = self.inner.lock().lock_or_die("intent_store.inner");
+        let mut out = Vec::with_capacity(intents.len());
+        for intent in intents {
+            if let Some(key) = intent.idempotency_key {
+                if let Some(&existing) = g.by_key.get(&key) {
+                    out.push(PutOutcome::Duplicate(existing));
+                    continue;
+                }
+                g.by_key.insert(key, intent.perspective_seq);
+            }
+            g.by_seq.insert(intent.perspective_seq, intent);
+            out.push(PutOutcome::Recorded);
+        }
+        Ok(out)
     }
 
     fn pending(&self) -> Result<Vec<WriteIntent>, IntentError> {
@@ -508,6 +556,17 @@ struct PendingIndex {
     by_idem: HashMap<IdempotencyKey, PerspectiveSeq>,
 }
 
+/// Per-element state for the [`FjallIntentStore::put_batch`] middle pass.
+/// Kept as a module-private struct (not a tuple) so the type signature
+/// stays inside the `type_complexity` clippy budget.
+struct FjallBatchedRecord {
+    seq: PerspectiveSeq,
+    idem: Option<IdempotencyKey>,
+    seq_key: [u8; SEQ_KEY_LEN],
+    value: Vec<u8>,
+    intent: WriteIntent,
+}
+
 /// Durable, fjall-backed [`IntentStore`] (ADR-047 phase 2).
 ///
 /// Single-node durable store — NO quorum replication (that lands in a
@@ -698,6 +757,83 @@ impl IntentStore for FjallIntentStore {
         }
         idx.by_seq.insert(seq, intent);
         Ok(PutOutcome::Recorded)
+    }
+
+    fn put_batch(&self, intents: Vec<WriteIntent>) -> Result<Vec<PutOutcome>, IntentError> {
+        // W12 (2026-06-02): batched durable record. The producer's intent-fan
+        // coalescer (and the receiver's `intent_put` handler) submit up to
+        // KISEKI_INTENT_FAN_BATCH_MAX intents per call so the durable backing
+        // store amortises one `mutations` mutex + one fjall batch + one WAL
+        // sync across the whole batch, and the in-memory mirror updates in
+        // one lock acquisition.
+        if intents.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _guard = self
+            .mutations
+            .lock()
+            .lock_or_die("intent_store.fjall.mutations");
+
+        // First pass under the index lock: classify Recorded vs Duplicate
+        // using the in-memory idem mirror (no fjall reads). The mirror
+        // reflects committed state; under the held `mutations` mutex no
+        // concurrent writer can race in between.
+        let mut outcomes: Vec<PutOutcome> = Vec::with_capacity(intents.len());
+        let mut to_record: Vec<FjallBatchedRecord> = Vec::with_capacity(intents.len());
+        {
+            let idx = self
+                .pending_index
+                .lock()
+                .lock_or_die("intent_store.fjall.pending_index");
+            for intent in intents {
+                if let Some(key) = intent.idempotency_key {
+                    if let Some(&existing) = idx.by_idem.get(&key) {
+                        outcomes.push(PutOutcome::Duplicate(existing));
+                        continue;
+                    }
+                }
+                let seq = intent.perspective_seq;
+                let idem = intent.idempotency_key;
+                let seq_key = encode_seq_key(seq);
+                let value = encode_value(&intent);
+                outcomes.push(PutOutcome::Recorded);
+                to_record.push(FjallBatchedRecord {
+                    seq,
+                    idem,
+                    seq_key,
+                    value,
+                    intent,
+                });
+            }
+        }
+
+        if to_record.is_empty() {
+            return Ok(outcomes);
+        }
+
+        // Second pass: one batch carrying every Recorded intent + dedup
+        // pointer. fjall commits the whole batch atomically.
+        let mut batch = self.batch_for_write();
+        for r in &to_record {
+            batch.insert(&self.intents_ks, r.seq_key.to_vec(), r.value.clone());
+            if let Some(key) = r.idem {
+                batch.insert(&self.idem_ks, key.to_vec(), r.seq_key.to_vec());
+            }
+        }
+        batch.commit()?;
+
+        // Third pass: durable commit landed — update the mirror once.
+        let mut idx = self
+            .pending_index
+            .lock()
+            .lock_or_die("intent_store.fjall.pending_index");
+        for r in to_record {
+            if let Some(key) = r.idem {
+                idx.by_idem.insert(key, r.seq);
+            }
+            idx.by_seq.insert(r.seq, r.intent);
+        }
+        Ok(outcomes)
     }
 
     fn pending(&self) -> Result<Vec<WriteIntent>, IntentError> {

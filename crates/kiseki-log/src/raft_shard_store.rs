@@ -19,9 +19,7 @@ use kiseki_common::ids::{ChunkId, NodeId, OrgId, SequenceNumber, ShardId};
 use crate::delta::Delta;
 use crate::error::LogError;
 use crate::intent::{FjallIntentStore, InMemIntentStore, IntentStore, WriteIntent};
-use crate::intent_sync::{
-    build_intent_dispatcher, TransportIntentGatherer, WireIntent, INTENT_PUT_TAG,
-};
+use crate::intent_sync::{build_intent_dispatcher, TransportIntentGatherer};
 use crate::raft::state_machine::ClusterChunkStateEntry;
 use crate::raft::OpenRaftLogStore;
 use crate::raft_intent_sink::RaftLogIncorporationSink;
@@ -29,7 +27,6 @@ use crate::shard::{ShardConfig, ShardInfo, ShardState};
 use crate::shard_committer::{PeerIntentGatherer, ShardCommitter};
 use crate::traits::{AppendChunkAndDeltaRequest, AppendDeltaRequest, LogOps, ReadDeltasRequest};
 use kiseki_common::locks::LockOrDie;
-use kiseki_raft::tcp_transport::rpc_call;
 
 /// Default min durable copies for an acked decoupled write when
 /// `KISEKI_MIN_ACKS` is unset — mirrors the chunk D-5 default (2-of-N).
@@ -135,7 +132,20 @@ pub struct RaftShardStore {
     /// `with_transport_metrics`, the lazy listener init wires them
     /// in via `RaftRpcListener::with_metrics(...)`.
     transport_metrics: Mutex<Option<Arc<kiseki_raft::transport_metrics::RaftTransportMetrics>>>,
+    /// W12 (2026-06-02): per-shard intent-fan coalescer (producer-side).
+    /// Spawned in `create_shard` for every shard whose intent store opened
+    /// durably (the F-P5b-rpc-1 obligation). `put_intent_and_fan` routes
+    /// through this so up to `KISEKI_INTENT_FAN_BATCH_MAX` PUTs share one
+    /// local `put_batch` + one `intent_put` RPC per peer, amortising the
+    /// fjall WAL sync and dropping the cluster-wide fan RPC volume by 4-8×.
+    intent_fan_coalescers: IntentFanCoalescerMap,
 }
+
+/// W12 (2026-06-02): per-shard handle map for the intent-fan coalescer.
+/// Aliased so the field declaration on [`RaftShardStore`] stays inside the
+/// `type_complexity` clippy budget.
+type IntentFanCoalescerMap =
+    Mutex<HashMap<ShardId, crate::intent_fan_coalescer::IntentFanCoalescer>>;
 
 impl RaftShardStore {
     /// Create a new (empty) Raft shard store.
@@ -195,6 +205,7 @@ impl RaftShardStore {
             inline_store: None,
             listener_registry: Mutex::new(None),
             transport_metrics: Mutex::new(None),
+            intent_fan_coalescers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -362,7 +373,7 @@ impl RaftShardStore {
     /// Durably records `intent` on a quorum so the gateway can fast-ack a write
     /// BEFORE the synchronous Raft round. Writes the LOCAL per-shard
     /// [`IntentStore`] (one durable copy) and fans the intent to the shard's
-    /// voter peers via [`INTENT_PUT_TAG`]; returns `Ok` ONLY once total durable
+    /// voter peers via the W12 intent-fan coalescer; returns `Ok` ONLY once total durable
     /// copies (`1 local + remote acks`) reach `self.min_acks`. Otherwise `Err`
     /// — the caller MUST NOT ack (an acked write is guaranteed on `≥ min_acks`
     /// replicas, I-L2/I-CS1).
@@ -395,11 +406,10 @@ impl RaftShardStore {
         shard_id: ShardId,
         intent: WriteIntent,
     ) -> Result<(), LogError> {
-        use futures::StreamExt;
-
         // ADR-047 hot-path timer (pif.total) — covers the whole body,
         // including the non-durable refuse path so a degraded shard's
-        // refusal time is observable.
+        // refusal time is observable. Post-W12 this measures the
+        // submitter's wall time: submission + coalesce wait + flush wall.
         kiseki_tracing::hot_timer_guard!(_ht_pif_total = "pif.total");
 
         // Non-durable guard FIRST: refuse before any write so an in-memory
@@ -417,111 +427,20 @@ impl RaftShardStore {
             return Err(LogError::Unavailable);
         }
 
-        let store = self
-            .intent_store(shard_id)
-            .ok_or(LogError::ShardNotFound(shard_id))?;
-
-        // Local put first — one durable copy. A local failure is fatal: with
-        // the local copy missing we can never reach min_acks safely.
-        // ADR-047 hot-path timer (pif.local_put) — local fjall WAL
-        // write; one of the two non-RTT critical-path costs on this
-        // function alongside leader_first_hop.
-        let local_put_res =
-            kiseki_tracing::hot_span!("pif.local_put", { store.put(intent.clone()) });
-        local_put_res.map_err(|e| {
-            tracing::warn!(shard_id = %shard_id.0, error = %e, "put_intent_and_fan: local intent store write failed");
-            LogError::Unavailable
-        })?;
-        let mut acks: usize = 1;
-
-        // Fast path: a single-copy quorum (1-node cluster / min_acks=1) is
-        // satisfied by the local write alone — no fan needed. (If this node is
-        // also the leader the local copy already covers fan-includes-leader.)
-        if acks >= self.min_acks {
-            return Ok(());
+        // W12 (2026-06-02): route through the per-shard intent-fan
+        // coalescer. The coalescer owns the local `put_batch` + the fan,
+        // amortising both across up to `KISEKI_INTENT_FAN_BATCH_MAX`
+        // concurrent submissions. The submitter just sends + awaits a
+        // oneshot.
+        let coalescer = {
+            self.intent_fan_coalescers
+                .lock()
+                .lock_or_die("raft_shard_store.intent_fan_coalescers")
+                .get(&shard_id)
+                .cloned()
         }
-
-        // Voter peers (minus self), each resolved to an addr. Reuse the same
-        // resolver the recovery gather uses so the fan targets the voter set.
-        // ADR-047 hot-path timer (pif.resolve_peers) — DashMap reads +
-        // current-leader lookup. Usually sub-microsecond locally; on
-        // contended large clusters the lookup-with-dashmap-shard-lock
-        // can surface.
-        let (peers, leader_id) = kiseki_tracing::hot_span!("pif.resolve_peers", {
-            let peers = self.resolve_voter_peers(shard_id).unwrap_or_default();
-            // MF-3: identify the leader. If the leader is a remote voter, fan it
-            // FIRST (must-include), then top up with the rest. If this node IS the
-            // leader, the local put already holds it. If unknown, no special order
-            // — the recovery backstop covers it.
-            let leader_id = self
-                .get_shard(shard_id)
-                .ok()
-                .and_then(|s| s.current_leader_id());
-            (peers, leader_id)
-        });
-        let wire = WireIntent::from(&intent);
-
-        let local = self.node_id;
-        let leader_is_local = leader_id == Some(local);
-
-        // Leader-first: when the leader is a remote voter, fan it before the
-        // parallel top-up so it always holds the intent even when other peers
-        // would otherwise satisfy min_acks first (the no-election-orphan fix).
-        if !leader_is_local {
-            if let Some(lid) = leader_id {
-                if let Some((node_id, addr)) = peers.iter().find(|(n, _)| n.0 == lid).cloned() {
-                    // ADR-047 hot-path timer (pif.leader_first_hop) —
-                    // THE single cross-node RTT the gateway pays
-                    // before the parallel top-up starts. Per the
-                    // escalation A-1 finding this is the candidate
-                    // for being the under-measured ~5 ms on GCP.
-                    let acked = kiseki_tracing::hot_span!("pif.leader_first_hop", {
-                        fan_one_intent(node_id, addr, shard_id, wire.clone()).await
-                    });
-                    if acked {
-                        acks += 1;
-                        if acks >= self.min_acks {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Fan the remaining voter peers (excluding the leader already fanned) in
-        // PARALLEL; stop as soon as the durable copies reach min_acks.
-        // ADR-047 hot-path timer (pif.parallel_topup) — wraps the
-        // fan-out construction + the await-loop. A `?`-early return
-        // from inside (no such path here today) would still drop the
-        // guard cleanly.
-        kiseki_tracing::hot_timer_guard!(_ht_pif_topup = "pif.parallel_topup");
-        let mut fan = futures::stream::FuturesUnordered::new();
-        for (node_id, addr) in peers {
-            // Skip the leader if we already fanned it above.
-            if !leader_is_local && leader_id == Some(node_id.0) {
-                continue;
-            }
-            fan.push(fan_one_intent(node_id, addr, shard_id, wire.clone()));
-        }
-        while let Some(acked) = fan.next().await {
-            if acked {
-                acks += 1;
-                if acks >= self.min_acks {
-                    // Quorum reached — return as soon as enough peers ack
-                    // (the remaining fan futures are dropped/cancelled).
-                    return Ok(());
-                }
-            }
-        }
-
-        // Shortfall: durable copies < min_acks. The caller MUST NOT ack.
-        tracing::warn!(
-            shard_id = %shard_id.0,
-            acks,
-            min_acks = self.min_acks,
-            "put_intent_and_fan: quorum shortfall — refusing to ack",
-        );
-        Err(LogError::QuorumLost(shard_id))
+        .ok_or(LogError::ShardNotFound(shard_id))?;
+        coalescer.submit(intent).await
     }
 
     /// Stop every spawned per-shard committer task cleanly: signal shutdown on
@@ -599,6 +518,12 @@ impl RaftShardStore {
         self.durable_intent_shards
             .lock()
             .lock_or_die("raft_shard_store.durable_intent_shards")
+            .remove(&shard_id);
+        // W12: drop the coalescer handle — closes the mpsc channel, the
+        // background task observes the closure and exits cleanly.
+        self.intent_fan_coalescers
+            .lock()
+            .lock_or_die("raft_shard_store.intent_fan_coalescers")
             .remove(&shard_id);
         self.shards
             .lock()
@@ -793,8 +718,63 @@ impl RaftShardStore {
         // on becoming leader), and self-prunes the local intent store on every
         // node (leader or follower) against the applied max_incorporated_seq.
         if intent_store_durable {
-            self.spawn_supervisor(shard_id, &store, intent_store);
+            self.spawn_supervisor(shard_id, &store, Arc::clone(&intent_store));
+            // W12 (2026-06-02): producer-side intent-fan coalescer. Same
+            // F-P5b-rpc-1 gate as the supervisor — only durable intent
+            // stores get batching (a non-durable store refuses
+            // `put_intent_and_fan` outright in the public API).
+            self.spawn_intent_fan_coalescer(shard_id, &store, intent_store);
         }
+    }
+
+    /// W12 (2026-06-02): spawn the per-shard intent-fan coalescer task on
+    /// the Raft runtime. The submission handle lives in
+    /// `self.intent_fan_coalescers` for `put_intent_and_fan` to look up
+    /// per call.
+    ///
+    /// The resolver closure re-reads voter membership + current leader on
+    /// every batch flush so a recent membership change or leadership move
+    /// is honoured without restart.
+    fn spawn_intent_fan_coalescer(
+        &self,
+        shard_id: ShardId,
+        store: &Arc<OpenRaftLogStore>,
+        intent_store: Arc<dyn IntentStore>,
+    ) {
+        let resolver_store = Arc::clone(store);
+        let resolver_peers = self.peers.clone();
+        let local = self.node_id;
+        let resolver: crate::intent_fan_coalescer::PeerLeaderResolver = Arc::new(move || {
+            let peers: Vec<(NodeId, String)> = resolver_store
+                .voter_ids()
+                .into_iter()
+                .filter(|id| *id != local)
+                .filter_map(|id| {
+                    resolver_peers
+                        .get(&id)
+                        .map(|addr| (NodeId(id), addr.clone()))
+                })
+                .collect();
+            let leader_id = resolver_store.current_leader_id();
+            (peers, leader_id)
+        });
+        let coalescer = crate::intent_fan_coalescer::spawn(
+            self.rt.handle(),
+            crate::intent_fan_coalescer::CoalescerConfig {
+                shard_id,
+                local_node: NodeId(self.node_id),
+                store: intent_store,
+                resolver,
+                min_acks: self.min_acks,
+                cap_max: crate::intent_fan_coalescer::batch_max_from_env(),
+                cap_timeout: crate::intent_fan_coalescer::batch_timeout_from_env(),
+                peer_rpc_timeout: INTENT_FAN_PEER_TIMEOUT,
+            },
+        );
+        self.intent_fan_coalescers
+            .lock()
+            .lock_or_die("raft_shard_store.intent_fan_coalescers")
+            .insert(shard_id, coalescer);
     }
 
     /// Spawn the per-shard committer **supervisor** (ADR-047 `LeaderSink`, MF-2 +
@@ -1651,30 +1631,6 @@ impl LogOps for RaftShardStore {
     ) -> Result<(), LogError> {
         let store = self.get_shard(shard_id)?;
         store.advance_watermark(consumer, position).await
-    }
-}
-
-/// One `intent_put` fan call (ADR-047 `LeaderSink`): durably record `wire` on
-/// peer `(node_id, addr)`, returning `true` on a durable ack. A bounded timeout
-/// keeps a slow/dead peer from stalling the producer's fast-ack; a non-`Ok`
-/// reply or timeout is a non-ack (`false`), never fabricated.
-async fn fan_one_intent(
-    node_id: NodeId,
-    addr: String,
-    shard_id: ShardId,
-    wire: WireIntent,
-) -> bool {
-    let call = rpc_call::<_, ()>(&addr, shard_id, INTENT_PUT_TAG, None, &wire);
-    match tokio::time::timeout(INTENT_FAN_PEER_TIMEOUT, call).await {
-        Ok(Ok(())) => true,
-        Ok(Err(e)) => {
-            tracing::debug!(node = node_id.0, addr = %addr, error = %e, "intent_put fan: peer non-ack");
-            false
-        }
-        Err(_) => {
-            tracing::debug!(node = node_id.0, addr = %addr, "intent_put fan: peer timed out");
-            false
-        }
     }
 }
 

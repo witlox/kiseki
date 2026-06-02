@@ -663,6 +663,9 @@ impl KisekiMetrics {
         let log = std::sync::Arc::new(
             kiseki_log::LogMetrics::register(&registry).expect("log metrics register"),
         );
+        // W12 (2026-06-02): intent-fan coalescing histograms — batch_size +
+        // coalesce_wait. Free functions, no struct returned.
+        kiseki_log::intent_metrics::register(&registry).expect("intent_metrics register");
 
         let keymanager = std::sync::Arc::new(
             kiseki_keymanager::KeyManagerMetrics::register(&registry)
