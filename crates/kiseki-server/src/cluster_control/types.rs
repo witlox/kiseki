@@ -35,6 +35,16 @@ pub enum ControlResponse {
         /// The new shard's id.
         new_shard_id: ShardId,
     },
+    /// ADR-049 I-DI9: `SetPlacementPolicy` / `SetWorkloadParams`
+    /// apply was REJECTED by the apply-time gate (per-node budget
+    /// would violate I-DI8 or cluster-aggregate Absolute exceeds
+    /// `F_total − headroom`). The catalog state is unchanged.
+    /// `reason` carries the structured `PlacementError` Display so
+    /// admin RPC surfaces it verbatim to the operator.
+    PolicyRejected {
+        /// Why the apply was rejected.
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for ControlResponse {
@@ -47,6 +57,7 @@ impl std::fmt::Display for ControlResponse {
             Self::SplitRecorded { new_shard_id } => {
                 write!(f, "SplitRecorded(new={:?})", new_shard_id.0)
             }
+            Self::PolicyRejected { reason } => write!(f, "PolicyRejected({reason})"),
         }
     }
 }

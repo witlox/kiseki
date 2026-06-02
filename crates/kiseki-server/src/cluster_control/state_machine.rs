@@ -297,33 +297,75 @@ impl StateMachineInner {
                 ControlResponse::Applied
             }
             ControlCommand::SetPlacementPolicy { policy } => {
-                // ADR-049 I-DI9 + I-DI8 (apply-time gate): re-resolve
-                // budgets against current inventories; Strict rejects
-                // policies that would violate I-DI8 on any node.
-                // BestEffort always applies and emits a
-                // `policy_apply_rebudget` event for each node whose
-                // budget shrinks below current actual usage.
+                // ADR-049 I-DI9 (apply-time gate): re-resolve budgets
+                // against current inventories under the new policy;
+                // reject the LogCommand at apply if the cluster-
+                // aggregate Absolute pre-check trips. Per-node I-DI8
+                // checks land alongside the BestEffort `policy_apply_
+                // rebudget` event stream in phase 4 admin RPC.
                 //
-                // Phase 1 lands the variant + bump; the I-DI9 gate
-                // is wired in phase 4 (admin RPC + resolver land
-                // first so the gate can call `compute_cluster_budgets`).
-                // Until then, apply unconditionally — pre-prod
-                // accepts this; production gating ships before any
-                // public release.
-                if self.catalog.policy != *policy {
-                    self.catalog.policy = policy.clone();
-                    self.catalog.policy_revision = self.catalog.policy_revision.saturating_add(1);
-                    self.catalog.policy_change_ms = now_ms();
+                // Deterministic: every replica's `catalog.inventories`
+                // converges via prior `UpsertNodeInventory` applies;
+                // every replica's I-DI9 evaluation against that state
+                // produces the same decision. Implementer property
+                // test: two distinct replicas applying the same
+                // ControlCommand from the same prior state MUST
+                // agree on accept-or-reject.
+                if self.catalog.policy == *policy {
+                    ControlResponse::Applied
+                } else {
+                    let mut probe = self.catalog.clone();
+                    probe.policy = policy.clone();
+                    match crate::cluster_control::resolver::compute_cluster_budgets(&probe) {
+                        Ok(_) => {
+                            self.catalog.policy = policy.clone();
+                            self.catalog.policy_revision =
+                                self.catalog.policy_revision.saturating_add(1);
+                            self.catalog.policy_change_ms = now_ms();
+                            ControlResponse::Applied
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "ADR-049 I-DI9: SetPlacementPolicy rejected at apply time"
+                            );
+                            ControlResponse::PolicyRejected {
+                                reason: format!("{err}"),
+                            }
+                        }
+                    }
                 }
-                ControlResponse::Applied
             }
             ControlCommand::SetWorkloadParams { params } => {
-                if self.catalog.workload != *params {
-                    self.catalog.workload = *params;
-                    self.catalog.policy_revision = self.catalog.policy_revision.saturating_add(1);
-                    self.catalog.policy_change_ms = now_ms();
+                // I-DI9 also fires for workload-param changes:
+                // tweaking `avg_file_bytes` or `growth_headroom` can
+                // shift `metadata_budget` past the ceiling and
+                // overcommit Absolute SmallObject if any tier is
+                // Absolute. Same evaluate-then-apply shape.
+                if self.catalog.workload == *params {
+                    ControlResponse::Applied
+                } else {
+                    let mut probe = self.catalog.clone();
+                    probe.workload = *params;
+                    match crate::cluster_control::resolver::compute_cluster_budgets(&probe) {
+                        Ok(_) => {
+                            self.catalog.workload = *params;
+                            self.catalog.policy_revision =
+                                self.catalog.policy_revision.saturating_add(1);
+                            self.catalog.policy_change_ms = now_ms();
+                            ControlResponse::Applied
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "ADR-049 I-DI9: SetWorkloadParams rejected at apply time"
+                            );
+                            ControlResponse::PolicyRejected {
+                                reason: format!("{err}"),
+                            }
+                        }
+                    }
                 }
-                ControlResponse::Applied
             }
         }
     }
@@ -1087,6 +1129,56 @@ mod tests {
         assert!(parsed.catalog.inventories.contains_key(&NodeId(7)));
         assert_eq!(parsed.catalog.policy_revision, 1);
         assert!(!parsed.catalog.policy.tiers.is_empty());
+    }
+
+    #[test]
+    fn set_placement_policy_rejected_at_apply_when_absolute_overcommits() {
+        // I-DI9 + DI-5 (unit-test seed): an operator pushing
+        // `Absolute { 100 TiB }` SmallObject against a cluster with
+        // F_total = 9 TiB must be rejected at apply time. The
+        // catalog state stays unchanged so admin RPC + operator see
+        // a clean "policy not adopted" surface.
+        use kiseki_common::{DeviceMatcher, MediaType, PolicyMode, TierCapacity, TierPolicy};
+        const TIB: u64 = 1024 * 1024 * 1024 * 1024;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let mut sm = StateMachineInner::new();
+        // Seed inventories: 6 × 1.5 TiB NVMe.
+        for n in 1u64..=6 {
+            sm.apply_command(&ControlCommand::UpsertNodeInventory {
+                node_id: NodeId(n),
+                inventory: inventory(n, 1500, 0),
+            });
+        }
+        let before_revision = sm.catalog.policy_revision;
+        let policy = kiseki_common::PlacementPolicy {
+            tiers: vec![TierPolicy {
+                tier: kiseki_common::FjallStoreTier::SmallObject,
+                preferences: vec![DeviceMatcher::Class(MediaType::Nvme)],
+                mode: PolicyMode::BestEffort,
+                capacity: TierCapacity::Absolute {
+                    cluster_bytes: 100 * TIB,
+                },
+            }],
+        };
+        let resp = sm.apply_command(&ControlCommand::SetPlacementPolicy { policy });
+        match resp {
+            ControlResponse::PolicyRejected { reason } => {
+                // The reason should mention I-DI8 violation and the
+                // demand/available values for operator clarity.
+                assert!(
+                    reason.contains("I-DI8") || reason.contains("exceeds available"),
+                    "expected reject reason to mention I-DI8 / exceeds available, got: {reason}",
+                );
+            }
+            other => panic!("expected PolicyRejected, got {other:?}"),
+        }
+        assert_eq!(
+            sm.catalog.policy_revision, before_revision,
+            "I-DI9: rejected SetPlacementPolicy must NOT bump policy_revision"
+        );
+        // Cluster still has F_total > 0 so the rejection is real.
+        assert!(sm.catalog.f_total() > 0);
+        let _ = GIB; // silence unused
     }
 
     #[test]
