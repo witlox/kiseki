@@ -139,15 +139,6 @@ pub struct RaftShardStore {
     /// local `put_batch` + one `intent_put` RPC per peer, amortising the
     /// fjall WAL sync and dropping the cluster-wide fan RPC volume by 4-8×.
     intent_fan_coalescers: IntentFanCoalescerMap,
-    /// Lever 1 (2026-06-02): per-shard receiver-side `intent_put` fan
-    /// coalescer. Spawned alongside the producer-side fan coalescer
-    /// for every shard whose intent store opened durably. Mirrors the
-    /// W12 producer-side design on the RECEIVER: aggregates incoming
-    /// `intent_put` RPCs from multiple producers into one fjall
-    /// `put_batch` per coalesce window, since receiver-side concurrency
-    /// is naturally much higher than any one producer's per-shard
-    /// concurrency.
-    intent_recv_coalescers: IntentRecvCoalescerMap,
 }
 
 /// W12 (2026-06-02): per-shard handle map for the intent-fan coalescer.
@@ -155,12 +146,6 @@ pub struct RaftShardStore {
 /// `type_complexity` clippy budget.
 type IntentFanCoalescerMap =
     Mutex<HashMap<ShardId, crate::intent_fan_coalescer::IntentFanCoalescer>>;
-
-/// Lever 1 (2026-06-02): per-shard handle map for the receiver-side
-/// `intent_put` coalescer. Aliased for the same reason as
-/// [`IntentFanCoalescerMap`].
-type IntentRecvCoalescerMap =
-    Mutex<HashMap<ShardId, crate::intent_recv_coalescer::IntentRecvCoalescer>>;
 
 impl RaftShardStore {
     /// Create a new (empty) Raft shard store.
@@ -221,7 +206,6 @@ impl RaftShardStore {
             listener_registry: Mutex::new(None),
             transport_metrics: Mutex::new(None),
             intent_fan_coalescers: Mutex::new(HashMap::new()),
-            intent_recv_coalescers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -541,11 +525,6 @@ impl RaftShardStore {
             .lock()
             .lock_or_die("raft_shard_store.intent_fan_coalescers")
             .remove(&shard_id);
-        // Lever 1: same teardown for the receiver-side coalescer.
-        self.intent_recv_coalescers
-            .lock()
-            .lock_or_die("raft_shard_store.intent_recv_coalescers")
-            .remove(&shard_id);
         self.shards
             .lock()
             .lock_or_die("raft_shard_store.shards")
@@ -572,7 +551,6 @@ impl RaftShardStore {
     ///
     /// Panics if the Raft instance fails to construct (out of memory
     /// or unrecoverable openraft config error — both fatal at boot).
-    #[allow(clippy::too_many_lines)] // boot-time per-shard wiring is genuinely many steps
     pub fn create_shard(
         &self,
         shard_id: ShardId,
@@ -709,33 +687,6 @@ impl RaftShardStore {
                 .insert(shard_id);
         }
 
-        // Lever 1 (2026-06-02): spawn the per-shard receiver-side
-        // intent_put coalescer on the Raft runtime. The dispatcher we
-        // hand to the listener routes inbound `intent_put` RPCs
-        // through it so multiple producers' RPCs share one fjall
-        // put_batch per coalesce window. Only spawned for durable
-        // intent stores — a non-durable shard refuses
-        // put_intent_and_fan upstream anyway and would never receive a
-        // production intent_put fan.
-        let recv_coalescer = if intent_store_durable {
-            let coalescer = crate::intent_recv_coalescer::spawn(
-                self.rt.handle(),
-                crate::intent_recv_coalescer::RecvConfig {
-                    shard_id,
-                    store: Arc::clone(&intent_store),
-                    cap_max: crate::intent_recv_coalescer::recv_batch_max_from_env(),
-                    cap_timeout: crate::intent_recv_coalescer::recv_batch_timeout_from_env(),
-                },
-            );
-            self.intent_recv_coalescers
-                .lock()
-                .lock_or_die("raft_shard_store.intent_recv_coalescers")
-                .insert(shard_id, coalescer.clone());
-            Some(Arc::new(coalescer))
-        } else {
-            None
-        };
-
         // Register this shard's Raft handle with the listener so
         // inbound multiplexed RPCs route here.
         if let Some(reg) = registry {
@@ -746,10 +697,7 @@ impl RaftShardStore {
             // fanned `intent_put`). The listener consults it only after the
             // Raft dispatcher returns `UnknownTag`, so the consensus path is
             // untouched.
-            reg.register_aux(
-                shard_id,
-                build_intent_dispatcher(Arc::clone(&intent_store), recv_coalescer.clone()),
-            );
+            reg.register_aux(shard_id, build_intent_dispatcher(Arc::clone(&intent_store)));
             tracing::info!(shard_id = %shard_id.0, "shard registered with Raft RPC listener");
         }
 
