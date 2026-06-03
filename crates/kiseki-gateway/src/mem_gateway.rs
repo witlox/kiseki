@@ -3001,15 +3001,28 @@ impl InMemoryGateway {
                     GatewayError::Upstream(e.to_string())
                 }
             })?;
-            let comp = comps
-                .get(comp_id)
-                .expect("composition was just created above; must be present");
-            let params = (
-                comp.shard_id,
-                comp.tenant_id,
-                comp.namespace_id,
-                comp.chunks.clone(),
-            );
+            // The four params for the Raft delta are knowable without
+            // re-reading the composition we just wrote: shard_id and
+            // tenant_id come from the namespace metadata snapshot we
+            // already cached at the top of `write_impl`
+            // (`ns_for_pool`), namespace_id and chunks are in scope.
+            // The previous impl did `comps.get(comp_id)` here — 7.9%
+            // of single-thread 4 KiB PUT time on the
+            // 2026-06-03 flamegraph for a value we already have.
+            //
+            // Fallback: on the rare path where ns_for_pool was None
+            // (namespace was registered between the top of write_impl
+            // and now), re-read; this branch is a one-time cost on
+            // the first PUT to a freshly-created namespace.
+            let (shard_id, tenant_id) = if let Some(ref ns) = ns_for_pool {
+                (ns.shard_id, ns.tenant_id)
+            } else {
+                let comp = comps
+                    .get(comp_id)
+                    .expect("composition was just created above; must be present");
+                (comp.shard_id, comp.tenant_id)
+            };
+            let params = (shard_id, tenant_id, req.namespace_id, chunk_ids.clone());
             let log = comps.log();
             (comp_id, log, params)
         }; // Lock dropped here — before Raft consensus.
