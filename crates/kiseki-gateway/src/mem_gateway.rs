@@ -2515,10 +2515,16 @@ impl InMemoryGateway {
                     replicated: ns.size_band_pools.replicated.clone(),
                     ec: ns.size_band_pools.ec.clone(),
                 });
-        let pool_snapshot = self.chunks.snapshot_pools().await;
+        // Hot path: snapshot_pools_arc returns an Arc<Vec<_>> from a
+        // cached ArcSwap, avoiding the per-PUT clone of every pool
+        // entry. The Vec contents (durability, devices, name, etc.)
+        // are refreshed only on admin mutations; `used_bytes` may be
+        // stale by some amount but the capacity gate is non-load-
+        // bearing here — see PersistentChunkStore::refresh_pools_snapshot.
+        let pool_snapshot = self.chunks.snapshot_pools_arc().await;
         let total_data_size = req.data.len() as u64;
         let selected_pool = kiseki_chunk::select_pool_for_write(
-            &pool_snapshot,
+            pool_snapshot.as_slice(),
             total_data_size,
             tier_policy_for_select.as_ref(),
             preferred_class,

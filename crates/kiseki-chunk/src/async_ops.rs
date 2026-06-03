@@ -203,6 +203,15 @@ pub trait AsyncChunkOps: Send + Sync {
         Vec::new()
     }
 
+    /// Hot-path variant for the chunk-write code path. See
+    /// [`crate::store::ChunkOps::snapshot_pools_arc`] for the rationale.
+    /// Default impl wraps `snapshot_pools().await`; concrete stores
+    /// that cache the snapshot internally override to avoid the
+    /// per-call Vec clone.
+    async fn snapshot_pools_arc(&self) -> std::sync::Arc<Vec<crate::pool::AffinityPool>> {
+        std::sync::Arc::new(self.snapshot_pools().await)
+    }
+
     /// Find a single device by id across every pool. Returns the
     /// pool name + device. Used by `GetDevice`.
     /// Default impl scans `snapshot_pools()`.
@@ -439,6 +448,10 @@ impl<T: ChunkOps + Send + Sync + 'static> AsyncChunkOps for SyncBridge<T> {
 
     async fn snapshot_pools(&self) -> Vec<crate::pool::AffinityPool> {
         self.inner.read().snapshot_pools()
+    }
+
+    async fn snapshot_pools_arc(&self) -> std::sync::Arc<Vec<crate::pool::AffinityPool>> {
+        self.inner.read().snapshot_pools_arc()
     }
 
     async fn add_pool(&self, pool: crate::pool::AffinityPool) -> Result<(), String> {

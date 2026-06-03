@@ -100,6 +100,16 @@ pub struct PersistentChunkStore {
     /// small `pools.json` file (rewritten only on rare admin
     /// mutations, not on the chunk write path).
     pools: DashMap<String, AffinityPool>,
+    /// Cached snapshot of `pools` for the chunk-write hot path. The
+    /// gateway's `select_pool_for_write` runs on every PUT and needs
+    /// a `&[AffinityPool]`; the previous implementation cloned every
+    /// DashMap entry per op (~5% of single-thread PUT time at 4 KiB
+    /// in the 2026-06-03 flamegraph). The ArcSwap holds an
+    /// `Arc<Vec<AffinityPool>>` that's rebuilt only on admin
+    /// mutations (`add_pool`, `add_device`, `remove_device`,
+    /// `set_pool_durability`, `set_pool_threshold`) — reads on the
+    /// hot path are a single atomic load + Arc bump.
+    pools_snapshot: arc_swap::ArcSwap<Vec<AffinityPool>>,
     /// Device backend for chunk data storage.
     device: std::sync::Arc<dyn DeviceBackend>,
     /// Fjall-backed metadata WAL. Writes are O(1) per record (one
@@ -203,6 +213,7 @@ impl PersistentChunkStore {
             chunks: Mutex::new(HashMap::new()),
             fragments: Mutex::new(HashMap::new()),
             pools: DashMap::new(),
+            pools_snapshot: arc_swap::ArcSwap::from_pointee(Vec::new()),
             device: std::sync::Arc::new(device),
             meta,
             pools_path,
@@ -236,16 +247,43 @@ impl PersistentChunkStore {
             frag_map.insert((id, record.fragment_index), FragmentEntry { extent });
         }
 
+        // Seed the cached snapshot from the just-hydrated DashMap so
+        // the first write_chunk doesn't see an empty pool list.
+        let initial_snapshot: Vec<AffinityPool> = pools.iter().map(|e| e.value().clone()).collect();
         Ok(Self {
             chunks: Mutex::new(chunk_map),
             fragments: Mutex::new(frag_map),
             pools,
+            pools_snapshot: arc_swap::ArcSwap::from_pointee(initial_snapshot),
             device: std::sync::Arc::new(device),
             meta,
             pools_path,
             write_phase_metric: std::sync::RwLock::new(None),
             sync_per_write: std::sync::atomic::AtomicBool::new(true),
         })
+    }
+
+    /// Rebuild the cached `pools_snapshot` from the DashMap. Call
+    /// after every mutation that adds/removes/modifies a pool entry.
+    /// Cheap (single Vec allocation + N pool clones; N≈10) compared
+    /// to the per-PUT cost the cache is replacing.
+    ///
+    /// **Deliberately NOT called from the chunk-write hot path.**
+    /// `write_chunk` updates `used_bytes` on the DashMap entry per
+    /// PUT for admin observability (Prometheus
+    /// `kiseki_chunk_pool_used_bytes` gauge); refreshing the snapshot
+    /// per PUT would defeat the cache. The snapshot's `used_bytes`
+    /// is therefore stale between admin mutations — acceptable
+    /// because (a) pools are TB-scale and per-PUT byte skew is tiny,
+    /// and (b) capacity backpressure runs via the dedicated
+    /// soft/hard-limit threshold checks (ADR-024 amendment), not via
+    /// `select_pool_for_write`'s `has_capacity()` gate. The gate's
+    /// only role is to drop the "no capacity anywhere" pool from the
+    /// candidate set — a state operators long since responded to via
+    /// emergency-reduction.
+    fn refresh_pools_snapshot(&self) {
+        let snapshot: Vec<AffinityPool> = self.pools.iter().map(|e| e.value().clone()).collect();
+        self.pools_snapshot.store(std::sync::Arc::new(snapshot));
     }
 
     /// Build a chunk store around a pre-opened device backend.
@@ -297,10 +335,13 @@ impl PersistentChunkStore {
             frag_map.insert((id, record.fragment_index), FragmentEntry { extent });
         }
 
+        let initial_snapshot: Vec<AffinityPool> =
+            pools.iter().map(|e| e.value().clone()).collect();
         Ok(Self {
             chunks: Mutex::new(chunk_map),
             fragments: Mutex::new(frag_map),
             pools,
+            pools_snapshot: arc_swap::ArcSwap::from_pointee(initial_snapshot),
             device,
             meta,
             pools_path,
@@ -404,6 +445,7 @@ impl PersistentChunkStore {
     /// subsequent admin write will rewrite the JSON).
     pub fn add_pool(&self, pool: AffinityPool) {
         self.pools.insert(pool.name.clone(), pool);
+        self.refresh_pools_snapshot();
         if let Err(e) = save_pools(&self.pools_path, &self.pools) {
             tracing::warn!(error = %e, "persist pools.json failed");
         }
@@ -1124,7 +1166,14 @@ impl ChunkOps for PersistentChunkStore {
     }
 
     fn snapshot_pools(&self) -> Vec<crate::pool::AffinityPool> {
-        self.pools.iter().map(|e| e.value().clone()).collect()
+        // Read from the cached ArcSwap rather than re-walking the
+        // DashMap on every call. Hot path: gateway::write_impl runs
+        // this once per PUT.
+        (**self.pools_snapshot.load()).clone()
+    }
+
+    fn snapshot_pools_arc(&self) -> std::sync::Arc<Vec<crate::pool::AffinityPool>> {
+        self.pools_snapshot.load_full()
     }
 
     fn add_pool_checked(&mut self, pool: crate::pool::AffinityPool) -> Result<(), String> {
@@ -1133,6 +1182,7 @@ impl ChunkOps for PersistentChunkStore {
         }
         let name = pool.name.clone();
         self.pools.insert(name, pool);
+        self.refresh_pools_snapshot();
         if let Err(e) = save_pools(&self.pools_path, &self.pools) {
             tracing::warn!(error = %e, "persist pools.json failed (add_pool_checked)");
         }
@@ -1154,6 +1204,7 @@ impl ChunkOps for PersistentChunkStore {
             }
             pool.devices.push(device);
         }
+        self.refresh_pools_snapshot();
         if let Err(e) = save_pools(&self.pools_path, &self.pools) {
             tracing::warn!(error = %e, "persist pools.json failed (add_device)");
         }
@@ -1172,6 +1223,7 @@ impl ChunkOps for PersistentChunkStore {
         if !found {
             return Err(format!("device {device_id} not found"));
         }
+        self.refresh_pools_snapshot();
         if let Err(e) = save_pools(&self.pools_path, &self.pools) {
             tracing::warn!(error = %e, "persist pools.json failed (remove_device)");
         }
@@ -1197,6 +1249,7 @@ impl ChunkOps for PersistentChunkStore {
             }
             pool.durability = strategy;
         }
+        self.refresh_pools_snapshot();
         if let Err(e) = save_pools(&self.pools_path, &self.pools) {
             tracing::warn!(error = %e, "persist pools.json failed (set_pool_durability)");
         }
