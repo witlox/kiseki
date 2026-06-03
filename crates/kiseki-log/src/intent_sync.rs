@@ -84,6 +84,11 @@ pub(crate) struct WireIntent {
     /// The client idempotency key, if any.
     idem: Option<[u8; 16]>,
     /// `append_chunk_and_delta_request_to_proto(&wi.append).encode_to_vec()`.
+    /// `#[serde(with = "serde_bytes")]` triggers postcard's
+    /// `serialize_bytes` / `deserialize_bytes` fast path (length-prefix +
+    /// memcpy) instead of `SerializeSeq::serialize_element` per byte —
+    /// see GH #194 for the flamegraph evidence.
+    #[serde(with = "serde_bytes")]
     append_proto: Vec<u8>,
 }
 

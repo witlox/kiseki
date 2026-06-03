@@ -497,7 +497,9 @@ impl ShardSmInner {
         // small_store.get(&chunk_id.0).
         if !item.inline_payloads.is_empty() {
             if let Some(ref store) = self.inline_store {
-                for (chunk_id, bytes) in &item.inline_payloads {
+                for entry in &item.inline_payloads {
+                    let chunk_id = &entry.chunk_id;
+                    let bytes = &entry.payload;
                     if let Err(e) = store.put(chunk_id, bytes) {
                         tracing::warn!(
                             chunk_id = ?chunk_id,
@@ -709,7 +711,9 @@ impl ShardSmInner {
                 // via `small_store.get(&chunk_id.0)`.
                 if !inline_payloads.is_empty() {
                     if let Some(ref store) = self.inline_store {
-                        for (chunk_id, bytes) in inline_payloads {
+                        for entry in inline_payloads {
+                            let chunk_id = &entry.chunk_id;
+                            let bytes = &entry.payload;
                             if let Err(e) = store.put(chunk_id, bytes) {
                                 tracing::warn!(
                                     chunk_id = ?chunk_id,
@@ -1200,8 +1204,8 @@ mod tests {
             has_inline_data: false,
             new_chunks: vec![],
             inline_payloads: vec![
-                (chunk_a, vec![0xDE, 0xAD, 0xBE, 0xEF]),
-                (chunk_b, vec![0xCA, 0xFE]),
+                (chunk_a, vec![0xDE, 0xAD, 0xBE, 0xEF]).into(),
+                (chunk_b, vec![0xCA, 0xFE]).into(),
             ],
         };
         let _ = inner.apply_command(&cmd, 1);

@@ -31,7 +31,9 @@ pub enum LogCommand {
         hashed_key: [u8; 32],
         /// Chunk reference IDs.
         chunk_refs: Vec<[u8; 32]>,
-        /// Encrypted payload.
+        /// Encrypted payload. `serde_bytes` skips per-byte serde
+        /// dispatch — see GH #194.
+        #[serde(with = "serde_bytes")]
         payload: Vec<u8>,
         /// Has inline data.
         has_inline_data: bool,
@@ -58,7 +60,9 @@ pub enum LogCommand {
         hashed_key: [u8; 32],
         /// Chunk reference IDs (delta side).
         chunk_refs: Vec<[u8; 32]>,
-        /// Encrypted payload (delta side).
+        /// Encrypted payload (delta side). `serde_bytes` skips per-byte
+        /// serde dispatch — see GH #194.
+        #[serde(with = "serde_bytes")]
         payload: Vec<u8>,
         /// Has inline data (delta side).
         has_inline_data: bool,
@@ -75,7 +79,11 @@ pub enum LogCommand {
         /// for non-inline writes — pre-prod wipe-and-redeploy
         /// clears persisted history of the legacy
         /// `has_inline_data` offload path.
-        inline_payloads: Vec<([u8; 32], Vec<u8>)>,
+        ///
+        /// Wrapped in [`InlinePayloadEntry`] so the inner `payload`
+        /// can pick up `serde_bytes` (GH #194); per-byte dispatch
+        /// here is dominant for inline-path writes.
+        inline_payloads: Vec<InlinePayloadEntry>,
     },
     /// Increment the refcount of an existing `cluster_chunk_state`
     /// entry. Used when a second composition references an already-
@@ -167,7 +175,9 @@ pub enum LogCommand {
         hashed_key: [u8; 32],
         /// Chunk reference IDs (delta side).
         chunk_refs: Vec<[u8; 32]>,
-        /// Encrypted payload (delta side).
+        /// Encrypted payload (delta side). `serde_bytes` fast path
+        /// — see GH #194.
+        #[serde(with = "serde_bytes")]
         payload: Vec<u8>,
         /// Has inline data (delta side).
         has_inline_data: bool,
@@ -179,7 +189,7 @@ pub enum LogCommand {
         perspective_seq: kiseki_common::time::HybridLogicalClock,
         /// #129 — inline small-file payloads (see
         /// [`Self::ChunkAndDelta::inline_payloads`]).
-        inline_payloads: Vec<([u8; 32], Vec<u8>)>,
+        inline_payloads: Vec<InlinePayloadEntry>,
     },
     /// ADR-047 PART 8 §U — batched async-committed intents.
     ///
@@ -216,7 +226,9 @@ pub struct IncorporateItem {
     pub hashed_key: [u8; 32],
     /// Chunk reference IDs (delta side).
     pub chunk_refs: Vec<[u8; 32]>,
-    /// Encrypted payload (delta side).
+    /// Encrypted payload (delta side). `serde_bytes` fast path —
+    /// see GH #194.
+    #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
     /// Has inline data (delta side).
     pub has_inline_data: bool,
@@ -226,7 +238,37 @@ pub struct IncorporateItem {
     pub perspective_seq: kiseki_common::time::HybridLogicalClock,
     /// #129 — inline small-file payloads (see
     /// [`LogCommand::ChunkAndDelta::inline_payloads`]).
-    pub inline_payloads: Vec<([u8; 32], Vec<u8>)>,
+    pub inline_payloads: Vec<InlinePayloadEntry>,
+}
+
+/// Carrier for a single inline small-file payload. Exists as a
+/// dedicated struct (rather than a `([u8; 32], Vec<u8>)` tuple) so
+/// the bytes field can pick up `#[serde(with = "serde_bytes")]` —
+/// the inner `Vec<u8>` used to walk through `SerializeSeq` per byte
+/// and dominated PUT CPU (GH #194). Wire-format change: the tuple
+/// form serialized as `(chunk_id, length, bytes)` via two seq writes;
+/// the struct form serializes as `(chunk_id, bytes)` with a
+/// length-prefix + memcpy for `bytes`. Pre-prod wipe-and-redeploy
+/// at cutover (`feedback_no_backcompat`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InlinePayloadEntry {
+    /// Content-addressed chunk identifier (32 bytes).
+    pub chunk_id: [u8; 32],
+    /// Inline-stored envelope bytes (the small-file payload).
+    #[serde(with = "serde_bytes")]
+    pub payload: Vec<u8>,
+}
+
+impl From<([u8; 32], Vec<u8>)> for InlinePayloadEntry {
+    fn from((chunk_id, payload): ([u8; 32], Vec<u8>)) -> Self {
+        Self { chunk_id, payload }
+    }
+}
+
+impl From<InlinePayloadEntry> for ([u8; 32], Vec<u8>) {
+    fn from(e: InlinePayloadEntry) -> Self {
+        (e.chunk_id, e.payload)
+    }
 }
 
 /// New `cluster_chunk_state` entry to be created as part of a

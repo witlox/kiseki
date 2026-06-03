@@ -593,7 +593,15 @@ impl OpenRaftLogStore {
             payload: req.payload,
             has_inline_data: req.has_inline_data,
             new_chunks,
-            inline_payloads,
+            inline_payloads: inline_payloads
+                .into_iter()
+                .map(
+                    |(chunk_id, payload)| crate::raft_store::InlinePayloadEntry {
+                        chunk_id,
+                        payload,
+                    },
+                )
+                .collect(),
         };
 
         let resp = self.raft.client_write(cmd).await.map_err(|e| {
@@ -689,7 +697,7 @@ impl OpenRaftLogStore {
             payload: req.payload,
             has_inline_data: req.has_inline_data,
             new_chunks,
-            inline_payloads,
+            inline_payloads: inline_payloads.into_iter().map(Into::into).collect(),
         };
 
         let resp = self
