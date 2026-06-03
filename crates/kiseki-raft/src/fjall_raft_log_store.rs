@@ -10,10 +10,12 @@
 
 use std::fmt::Debug;
 use std::io;
+use std::num::NonZeroUsize;
 use std::ops::RangeBounds;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use lru::LruCache;
 use openraft::alias::{LogIdOf, VoteOf};
 use openraft::entry::RaftEntry;
 use openraft::storage::{IOFlushed, RaftLogReader, RaftLogStorage};
@@ -22,14 +24,44 @@ use serde::{de::DeserializeOwned, Serialize};
 
 use crate::fjall_log_store::FjallLogStore;
 
+/// Default LRU capacity for the in-memory log entry cache (GH #199).
+///
+/// Sized so that under W12-batched intent fan (~100 intents per
+/// `IncorporateIntents` Raft entry) at the target 300 ops/s, the
+/// last ~10 seconds of entries stay resident — well beyond the
+/// typical apply lag.
+const DEFAULT_ENTRY_CACHE_CAP: usize = 4096;
+
 /// Persistent Raft log store backed by fjall.
 ///
 /// Stores log entries in the `raft_log` keyspace and metadata
 /// (`vote`, `committed`, `last_purged`) in the `raft_meta` keyspace.
 /// Thread-safe via `Arc` — `Clone` shares the underlying database.
+///
+/// ## GH #199: in-memory entry LRU
+///
+/// `entry_cache` holds the most-recent N (default 4096) entries as
+/// already-deserialized `Arc<C::Entry>`, populated on `append` (the
+/// leader has the typed entry in hand before we ever serialize it).
+/// Reads on the apply / replication paths look up the cache first,
+/// falling back to fjall + postcard decode only on miss. The cache
+/// is invalidated on `truncate_after` / `purge`.
+///
+/// The values are wrapped in `Arc` so cache populate (`append` and
+/// `try_get_log_entries` miss-fill) is a refcount bump, not a deep
+/// copy of the ~4 KiB inline-payload-carrying entry. The read path
+/// still has to materialize a fresh `C::Entry` for openraft's
+/// `Vec<C::Entry>` return — one deep clone per returned entry —
+/// but that's unavoidable as long as openraft's API takes entries
+/// by value.
+///
+/// The cache is shared across clones via `Arc<Mutex<_>>`. The mutex
+/// is held for a single hash lookup per get-or-insert; contention is
+/// bounded.
 #[derive(Clone)]
 pub struct FjallRaftLogStore<C: RaftTypeConfig> {
     inner: Arc<FjallLogStore>,
+    entry_cache: Arc<Mutex<LruCache<u64, Arc<C::Entry>>>>,
     _phantom: std::marker::PhantomData<C>,
 }
 
@@ -40,10 +72,7 @@ impl<C: RaftTypeConfig> FjallRaftLogStore<C> {
     /// name with no extension.
     pub fn open(path: &Path) -> io::Result<Self> {
         let inner = FjallLogStore::open(path)?;
-        Ok(Self {
-            inner: Arc::new(inner),
-            _phantom: std::marker::PhantomData,
-        })
+        Ok(Self::with_inner(Arc::new(inner)))
     }
 
     /// #151 (W6) — Open with group-commit fsync coalescing on. See
@@ -55,10 +84,17 @@ impl<C: RaftTypeConfig> FjallRaftLogStore<C> {
         max_batch: usize,
     ) -> io::Result<Self> {
         let inner = FjallLogStore::open(path)?.with_fsync_coalescing(window_us, max_batch);
-        Ok(Self {
-            inner: Arc::new(inner),
+        Ok(Self::with_inner(Arc::new(inner)))
+    }
+
+    fn with_inner(inner: Arc<FjallLogStore>) -> Self {
+        let cap = NonZeroUsize::new(DEFAULT_ENTRY_CACHE_CAP)
+            .unwrap_or_else(|| NonZeroUsize::new(1).expect("1 is non-zero"));
+        Self {
+            inner,
+            entry_cache: Arc::new(Mutex::new(LruCache::new(cap))),
             _phantom: std::marker::PhantomData,
-        })
+        }
     }
 
     /// Check whether this store has any persisted state (log entries
@@ -88,8 +124,68 @@ where
             std::ops::Bound::Excluded(&e) => e.saturating_sub(1),
             std::ops::Bound::Unbounded => u64::MAX,
         };
+
+        // GH #199: try the deserialized-entry cache first. The
+        // common case on the leader is a tight contiguous range
+        // (the apply path requests entries by log index right
+        // after they were appended); if every index in the range
+        // is resident, we never touch fjall + postcard.
+        //
+        // Cache hit-then-miss in the middle of a range is the
+        // tricky case — for simplicity we fall back to the fjall
+        // range scan on ANY miss, but populate the cache with the
+        // results on the way back so the next adjacent read is
+        // fully cached. This trades a small redundancy on miss
+        // for a simpler invariant on hit.
+        let want = end.saturating_add(1).saturating_sub(start);
+        if want > 0 && want <= u64::try_from(DEFAULT_ENTRY_CACHE_CAP).unwrap_or(u64::MAX) {
+            // On all-hit we collect `Arc`s under the mutex (cheap
+            // refcount bumps) and release the mutex before doing the
+            // deep clones for openraft's return type. Keeps mutex
+            // hold-time bounded by hash-lookup × N.
+            let arcs: Option<Vec<Arc<C::Entry>>> = {
+                let mut cache = self
+                    .entry_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut out = Vec::with_capacity(usize::try_from(want).unwrap_or(0));
+                let mut all_hit = true;
+                for i in start..=end {
+                    if let Some(arc) = cache.get(&i) {
+                        out.push(Arc::clone(arc));
+                    } else {
+                        all_hit = false;
+                        break;
+                    }
+                }
+                if all_hit {
+                    Some(out)
+                } else {
+                    None
+                }
+            };
+            if let Some(arcs) = arcs {
+                return Ok(arcs.iter().map(|a| (**a).clone()).collect());
+            }
+        }
+
+        // Cache miss (or range too large to bother). Read through
+        // fjall + postcard, then populate the cache so the next
+        // adjacent read is hot. Building the result list by cloning
+        // each entry once before moving the original into the cache
+        // avoids the double-clone the original implementation paid.
         let entries: Vec<(u64, C::Entry)> = self.inner.range(start, end)?;
-        Ok(entries.into_iter().map(|(_, e)| e).collect())
+        let result: Vec<C::Entry> = entries.iter().map(|(_, e)| e.clone()).collect();
+        {
+            let mut cache = self
+                .entry_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (idx, entry) in entries {
+                cache.put(idx, Arc::new(entry));
+            }
+        }
+        Ok(result)
     }
 
     async fn read_vote(&mut self) -> Result<Option<VoteOf<C>>, io::Error> {
@@ -146,8 +242,33 @@ where
         // `inner.append` per entry, burning N fsyncs per replication
         // payload — the dominant cost in the multi-node PUT ceiling
         // (1% of GET on GCP compact 2026-05-17).
+        //
+        // GH #199 — collect entries into a `Vec` once so we can both
+        // hand them to `append_batch` AND populate the in-memory LRU
+        // cache. The leader-side apply path that runs right after
+        // this append will hit the cache instead of re-reading +
+        // re-decoding from fjall.
+        //
+        // Cache values are `Arc<C::Entry>`. Population is a single
+        // `Arc::new` per entry — no deep clone — so the cost on a
+        // 100-entry W12 batch is bounded by allocator pressure
+        // rather than ~400 KB of memcpy per batch. The first
+        // implementation built an `indexed: Vec<(u64, C::Entry)>`
+        // and clone-walked it, which was visible as ~14 % regression
+        // on the local 3-node profile run.
+        let entries: Vec<C::Entry> = entries.into_iter().collect();
         self.inner
-            .append_batch(entries.into_iter().map(|e| (e.index(), e)))?;
+            .append_batch(entries.iter().map(|e| (e.index(), e)))?;
+        {
+            let mut cache = self
+                .entry_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for entry in entries {
+                let idx = entry.index();
+                cache.put(idx, Arc::new(entry));
+            }
+        }
         // #151 (W6) — when the coalescer is on, `append_batch` only
         // appended to the WAL with `PersistMode::Buffer` (no device
         // sync yet). The durability barrier — and thus the
@@ -170,6 +291,13 @@ where
             // Truncate everything — remove all entries.
             self.inner.truncate_before(u64::MAX)?;
         }
+        // GH #199: invalidate the LRU. Truncate-after is rare (only
+        // happens on leader change / log conflict) so the brute-force
+        // clear is fine — the next reads will repopulate the cache.
+        self.entry_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         Ok(())
     }
 
@@ -177,6 +305,24 @@ where
         // Remove entries up to and including log_id.index().
         self.inner.truncate_before(log_id.index() + 1)?;
         self.inner.set_meta("last_purged", &log_id)?;
+        // GH #199: drop the purged prefix from the LRU. We don't have
+        // a range-pop on `lru`, so iterate and remove. Purge is even
+        // rarer than truncate_after (driven by snapshot policy, every
+        // 1000 entries by default), so the linear scan is fine.
+        {
+            let mut cache = self
+                .entry_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let purged_through = log_id.index();
+            let to_drop: Vec<u64> = cache
+                .iter()
+                .filter_map(|(idx, _)| (*idx <= purged_through).then_some(*idx))
+                .collect();
+            for idx in to_drop {
+                cache.pop(&idx);
+            }
+        }
         Ok(())
     }
 

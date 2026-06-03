@@ -2477,6 +2477,7 @@ dependencies = [
  "fjall",
  "futures",
  "kiseki-common",
+ "lru 0.16.4",
  "openraft",
  "parking_lot 0.12.5",
  "postcard",
