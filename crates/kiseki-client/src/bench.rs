@@ -80,6 +80,18 @@ pub struct BenchConfig {
     /// first-touch from this client would create a single-shard
     /// namespace which defeats the perf measurement.
     pub namespace_id: Option<NamespaceId>,
+    /// When `Some(url)`, the bench POSTs `/admin/topology/namespaces`
+    /// before driving load — provisioning the bench namespace +
+    /// requested shard count + waiting for the gateway's per-namespace
+    /// registry to converge. Lets local docker-compose runs do native
+    /// benches without running `setup-shards.sh` by hand. `None`
+    /// preserves the GCP runbook contract: operator provisions
+    /// externally; bench just measures.
+    pub admin_endpoint: Option<String>,
+    /// Shard count for the provision step. Ignored when
+    /// `admin_endpoint` is `None`. Defaults to 3 (one shard per node
+    /// in the typical 3-node compose).
+    pub bench_shards: u64,
 }
 
 /// Deterministic bench tenant + namespace. Distinct from the system
@@ -223,6 +235,77 @@ fn make_payload(size: usize, seed: u64) -> Vec<u8> {
     buf
 }
 
+/// Best-effort provision the bench namespace via the admin HTTP API.
+/// `POST /admin/topology/namespaces` is idempotent: 201 on first
+/// create, 409 "already exists" on re-runs — both are success. Any
+/// other failure mode (admin endpoint unreachable, single-node
+/// "cluster control not wired", network error) returns `Err` so the
+/// caller can surface it before driving load.
+async fn provision_bench_namespace(
+    admin_endpoint: &str,
+    tenant_id: OrgId,
+    namespace_id: NamespaceId,
+    shards: u64,
+) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+    let host_port = admin_endpoint
+        .strip_prefix("http://")
+        .or_else(|| admin_endpoint.strip_prefix("https://"))
+        .and_then(|rest| rest.split('/').next())
+        .ok_or("invalid admin endpoint URL (expected http[s]://host:port)")?;
+    let body = format!(
+        "{{\"namespace_id\":\"{}\",\"tenant_id\":\"{}\",\"shards\":{}}}",
+        namespace_id.0, tenant_id.0, shards
+    );
+    let req = format!(
+        "POST /admin/topology/namespaces HTTP/1.1\r\n\
+         Host: {host_port}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len(),
+    );
+    let mut stream = TcpStream::connect(host_port)
+        .map_err(|e| format!("admin connect failed ({host_port}): {e}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(15))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| format!("admin write failed: {e}"))?;
+    let mut buf = Vec::new();
+    stream
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("admin read failed: {e}"))?;
+    let head = String::from_utf8_lossy(&buf);
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .ok_or_else(|| {
+            format!(
+                "admin reply has no HTTP status: {}",
+                &head[..head.len().min(120)]
+            )
+        })?;
+    match status {
+        200 | 201 => Ok(()),
+        409 => Ok(()), // already exists — fine
+        _ => Err(format!(
+            "POST /admin/topology/namespaces returned {status}: {}",
+            head.lines()
+                .last()
+                .unwrap_or("")
+                .chars()
+                .take(200)
+                .collect::<String>()
+        )),
+    }
+}
+
 /// Run the benchmark and emit a report on stdout. Returns the report
 /// so callers can inspect it programmatically.
 ///
@@ -231,6 +314,18 @@ fn make_payload(size: usize, seed: u64) -> Vec<u8> {
 /// unsupported, the connection fails, or the warmup PUTs fail.
 #[allow(clippy::too_many_lines)] // workload loop + stats wiring is intrinsically long
 pub async fn run(cfg: BenchConfig) -> Result<BenchReport, String> {
+    let (tenant_id, namespace_id) = resolve_bench_ids(&cfg);
+    // Best-effort: provision the bench namespace before driving load.
+    // Only when --admin-endpoint is set; GCP runbook expects external
+    // provisioning via setup-shards.sh and leaves this unset.
+    if let Some(admin) = cfg.admin_endpoint.as_deref() {
+        provision_bench_namespace(admin, tenant_id, namespace_id, cfg.bench_shards).await?;
+        // The control-plane apply hook hydrates each gateway's
+        // per-namespace registry asynchronously after the admin POST
+        // returns. Probe-and-wait so the first warmup PUT lands on a
+        // gateway that knows the namespace.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
     let driver = build_driver(&cfg).await?;
 
     // Warmup keys for GetHeavy / Mixed. Each object gets DISTINCT,
