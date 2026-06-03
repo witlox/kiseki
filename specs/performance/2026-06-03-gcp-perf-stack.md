@@ -81,17 +81,56 @@ and the lsm_tree write/read path dominate**. The CPU optimisations the recent
 stack landed (#194-#201) have moved the bottleneck off the deserialise path and
 onto the durable-storage path, which is the desired shape.
 
-### Open levers visible at this scale
+### Scoring against `targets.md` (default profile)
 
-1. **`ViewStore::get_view` 62.75 %** — a per-PUT view lookup. Caching candidate
-   (per-tenant, short TTL). Tracked separately if it pans out.
-2. **`tcp_transport::decode_request_body` 75.80 %** — Raft inter-node RPC
-   wire decode. Different decode site than #199 targeted (#199 was log-store
-   read; this is wire-receive). Same fix shape might apply but on a different
-   type.
-3. **Composition store sync write** (#200) — still a tracked follow-up;
-   contention with the IntentStore writer is visible in the fjall worker pool
-   traces.
+Per the `targets.md` status legend (`✓` within 20 % below target, `≈`
+within 50 %, `✗` far below):
+
+| Shape | Measured | Target (idealised) | % | Status |
+|---|---:|---:|---:|---|
+| 4 KiB GET op/s (3-client agg) | 433 000 | 600 000 | 72 % | **≈** (very near ✓) — in band on an idealised target |
+| 4 KiB PUT op/s (3-client agg) | 10 297 | 360 000 | 2.9 % | **✗** — far below |
+| PUT/GET ratio | 2.4 % | 60 % (ADR-042 §14 TCP-framed) | — | architectural asymmetry not the issue; PUT is the gap |
+
+The targets are derived from ADR-042 §14 (TCP-framed: 60 k op/s PUT,
+100 k op/s GET per node) scaled by 6 nodes, with no Raft commit cost
+subtracted — i.e. an idealised ceiling. The 60 % PUT/GET write-asymmetry
+matches VAST's marketed ratio; GET landing at 72 % of that ceiling is
+solid, well inside ADR-042's `≈` band and approaching the 80 % ✓
+threshold. PUT at 2.9 % is the single gap and matches the roadmap's
+"commit-bound: one Raft round per write" framing.
+
+Competitive view (`competitive-targets.md`, same hardware): GET at
+433 k is 2–4× ahead of Lustre / Ceph / VAST for 4 KiB reads; PUT at
+10.3 k is on-par-to-2×-ahead of Ceph 4 KiB writes (5–20 k, also
+commit-/journal-bound) and 3–15× behind Lustre R-1 (30–80 k) and
+VAST (50–150 k).
+
+### Levers visible for PUT (in priority order by gap-closing potential)
+
+The flamegraph tells the same story `roadmap.md` does: PUT spends its
+CPU in the leader's durable-write path, not in serde, not in
+encrypt/HKDF, not in framing.
+
+| # | Lever | Flamegraph evidence | Status | Expected lift |
+|---|---|---|---|---|
+| **1** | **W1 batched Raft commit** (#126) — amortise one fsync round across many concurrent PUTs | `fjall::WriteBatch::commit` 76.5 %, `Memtable::insert` 70.7 %, `flush::worker::run` 66.6 % — the LSM commit fence is the dominant ancestor of `IntentStore::put_batch` 88.9 %. Every PUT pays its own commit round. | **Landed, gated off** (per `project_w1_write_coalescing_landed`; `KISEKI_WRITE_COALESCE=on`). Capability gate deferred. | Order of magnitude. This is the lever that closes the 35× gap; nothing else competes. |
+| **2** | **#200 composition coalescer** — group composition-store writes the same way W1 groups Raft writes | Composition is on eventual-durability but per-request `Memtable::insert` cost is visible in the fjall worker pool traces under `flush::worker::run`. | **Open, deferred** — held back to measure W1 in isolation. | Substantive after W1 lands; same shape (cross-request batching of the second LSM in the hot path). |
+| **3** | **`tcp_transport::decode_request_body` (postcard, 75.8 %)** — Raft inter-node RPC wire-receive decode | Distinct site from #199 (which was the log-store *read* decode). This is the leader receiving AppendEntries from peers, plus per-node receiving the produce side of the fan. Same fix-shape as #195 (`serde_bytes` on `Vec<u8>` fields) but on the wire-receive type, not the stored type. | **Not started**, fix-shape is well-understood from #195. | CPU win, no protocol change. Probably 5–15 % PUT lift in isolation; less once W1 lands and commit dominates less. |
+| **4** | **`ViewStore::get_view` (62.8 %)** — per-PUT view lookup | Read-only on the hot path; tenant-scoped so caching is straightforward. | **Not started.** | CPU win, single-digit % PUT lift. Cheap to land. |
+| **5** | **Encrypt/HKDF path** | Not on this flamegraph above noise — #155 + #157 already wrung this out. | — | None expected from re-visiting. |
+
+**Order of operations**: 1 is the headline. Without it, 2–4 are
+rearranging the deck chairs on the commit-bound ship — the workload
+will hit fjall commit before it benefits from a serde or
+view-lookup win. With W1 on, the bottleneck migrates and 2–4
+become measurable in isolation.
+
+The 2026-06-03 stack (#194/#195/#197/#198/#201) was deliberately
+in the "CPU off serde" phase — necessary scaffolding so that when
+W1 turns on, the freed commit-fence headroom isn't immediately
+re-consumed by serde. With them landed, W1 gate-on is the next
+A/B.
 
 ## Comparison vs prior snapshots
 
