@@ -153,7 +153,11 @@ parking_lot = "0.12"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }
 
 # --- Observability ---
-tracing = "0.1"
+# `release_max_level_info` makes `tracing::debug!` and `tracing::trace!`
+# compile to a literal no-op in release builds — no callsite cache,
+# no field formatting, no level check. Tier 2/3 builds that need
+# verbose tracing can override with `--features tracing/max_level_debug`.
+tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 tracing-opentelemetry = "0.32"
 opentelemetry = "0.31"
