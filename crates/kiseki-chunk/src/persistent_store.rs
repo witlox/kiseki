@@ -103,8 +103,8 @@ pub struct PersistentChunkStore {
     /// Cached snapshot of `pools` for the chunk-write hot path. The
     /// gateway's `select_pool_for_write` runs on every PUT and needs
     /// a `&[AffinityPool]`; the previous implementation cloned every
-    /// DashMap entry per op (~5% of single-thread PUT time at 4 KiB
-    /// in the 2026-06-03 flamegraph). The ArcSwap holds an
+    /// `DashMap` entry per op (~5% of single-thread PUT time at 4 KiB
+    /// in the 2026-06-03 flamegraph). The `ArcSwap` holds an
     /// `Arc<Vec<AffinityPool>>` that's rebuilt only on admin
     /// mutations (`add_pool`, `add_device`, `remove_device`,
     /// `set_pool_durability`, `set_pool_threshold`) — reads on the
@@ -263,13 +263,13 @@ impl PersistentChunkStore {
         })
     }
 
-    /// Rebuild the cached `pools_snapshot` from the DashMap. Call
+    /// Rebuild the cached `pools_snapshot` from the `DashMap`. Call
     /// after every mutation that adds/removes/modifies a pool entry.
-    /// Cheap (single Vec allocation + N pool clones; N≈10) compared
+    /// Cheap (single `Vec` allocation + N pool clones; N≈10) compared
     /// to the per-PUT cost the cache is replacing.
     ///
     /// **Deliberately NOT called from the chunk-write hot path.**
-    /// `write_chunk` updates `used_bytes` on the DashMap entry per
+    /// `write_chunk` updates `used_bytes` on the `DashMap` entry per
     /// PUT for admin observability (Prometheus
     /// `kiseki_chunk_pool_used_bytes` gauge); refreshing the snapshot
     /// per PUT would defeat the cache. The snapshot's `used_bytes`
@@ -335,8 +335,7 @@ impl PersistentChunkStore {
             frag_map.insert((id, record.fragment_index), FragmentEntry { extent });
         }
 
-        let initial_snapshot: Vec<AffinityPool> =
-            pools.iter().map(|e| e.value().clone()).collect();
+        let initial_snapshot: Vec<AffinityPool> = pools.iter().map(|e| e.value().clone()).collect();
         Ok(Self {
             chunks: Mutex::new(chunk_map),
             fragments: Mutex::new(frag_map),

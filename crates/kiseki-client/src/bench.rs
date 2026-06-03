@@ -241,7 +241,7 @@ fn make_payload(size: usize, seed: u64) -> Vec<u8> {
 /// other failure mode (admin endpoint unreachable, single-node
 /// "cluster control not wired", network error) returns `Err` so the
 /// caller can surface it before driving load.
-async fn provision_bench_namespace(
+fn provision_bench_namespace(
     admin_endpoint: &str,
     tenant_id: OrgId,
     namespace_id: NamespaceId,
@@ -292,8 +292,8 @@ async fn provision_bench_namespace(
             )
         })?;
     match status {
-        200 | 201 => Ok(()),
-        409 => Ok(()), // already exists — fine
+        // 200/201 = created, 409 = already exists — both are success.
+        200 | 201 | 409 => Ok(()),
         _ => Err(format!(
             "POST /admin/topology/namespaces returned {status}: {}",
             head.lines()
@@ -319,7 +319,7 @@ pub async fn run(cfg: BenchConfig) -> Result<BenchReport, String> {
     // Only when --admin-endpoint is set; GCP runbook expects external
     // provisioning via setup-shards.sh and leaves this unset.
     if let Some(admin) = cfg.admin_endpoint.as_deref() {
-        provision_bench_namespace(admin, tenant_id, namespace_id, cfg.bench_shards).await?;
+        provision_bench_namespace(admin, tenant_id, namespace_id, cfg.bench_shards)?;
         // The control-plane apply hook hydrates each gateway's
         // per-namespace registry asynchronously after the admin POST
         // returns. Probe-and-wait so the first warmup PUT lands on a
@@ -834,6 +834,8 @@ mod tests {
             json: false,
             tenant_id: None,
             namespace_id: None,
+            admin_endpoint: None,
+            bench_shards: 1,
         };
         let Err(err) = build_driver(&cfg).await else {
             panic!("ftp:// must be rejected");
@@ -861,6 +863,8 @@ mod tests {
             json: false,
             tenant_id: None,
             namespace_id: None,
+            admin_endpoint: None,
+            bench_shards: 1,
         };
         let Err(err) = build_driver(&cfg).await else {
             panic!("port 1 is reserved — no listener can answer");
