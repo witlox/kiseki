@@ -137,6 +137,12 @@ openraft = { version = "0.10.0-alpha.17", features = ["serde", "type-alias"] }
 # postcard provides deterministic encoding; lru is the hot-tail cache.
 redb = "4"
 postcard = { version = "1", features = ["alloc", "use-std"] }
+# serde_bytes: trigger postcard's serialize_bytes / deserialize_bytes
+# fast paths (length-prefix + memcpy) for Vec<u8> fields on the
+# Raft + IntentSync wire types. Without it, postcard goes through
+# SerializeSeq::serialize_element per byte (~12% of PUT CPU on the
+# 2026-06-03 3-node flamegraph; GH #194).
+serde_bytes = "0.11"
 lru = "0.16"
 # Non-poisoning RwLock for the composition write-behind overlay
 # (ADR-040 rev 3). std::sync::RwLock would force unwrap on every

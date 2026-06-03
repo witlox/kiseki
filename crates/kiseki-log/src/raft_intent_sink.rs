@@ -114,7 +114,7 @@ impl<A: IntentLogAppender> IncorporationSink for RaftLogIncorporationSink<A> {
                     .append
                     .inline_payloads
                     .iter()
-                    .map(|(c, b)| (c.0, b.clone()))
+                    .map(|(c, b)| (c.0, b.clone()).into())
                     .collect(),
             })
             .collect();
