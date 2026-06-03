@@ -15,6 +15,26 @@ namespaces).
 
 ## Revision history
 
+- **rev 5** (2026-06-02, this revision): fast-tier mount aggregation
+  is an **OS-layer LVM concern**, NOT a kiseki concern. The setup
+  script provisions each catalog-resolved fast-tier mount
+  (`fast-small`, `fast-meta`) as an ext4 filesystem on a striped LV
+  spanning N physical NVMe (default N=1 — a degenerate single-disk
+  stripe LV — so capacity expansion has the same shape regardless of
+  starting disk count). Adding capacity is the standard online LVM
+  dance — `pvcreate` → `vgextend` → `lvextend` → `resize2fs` — with
+  zero kiseki involvement: the mount path stays the same, the
+  pointer file stays the same, fjall picks up the bigger
+  `statvfs()` result on next compaction. **I-CP-Move is rescoped**
+  to "mount-path change" (operator policy edits / disk replacement);
+  it explicitly does NOT fire for capacity expansion. The §D8
+  migrate CLI is correspondingly rescoped: it moves a tier between
+  mount paths (rare), not "add capacity" (common, handled at the
+  OS layer). New §D8.2 documents the LVM layout convention; §D11.1
+  notes the boundary explicitly. No code changes — resolver +
+  pointer file + capacity formula all consume `statvfs()` totals
+  which already reflect LVM-aggregated capacity. Chunk-pool axis
+  unchanged (raw block, no FS, no LVM — `KISEKI_RAW_DEVICES`).
 - **rev 1** (2026-06-02): initial draft.
 - **rev 2** (2026-06-02): cluster-aggregate capacity formula
   (§D4.5), per-node distribution, capacity admin surface.
@@ -1105,13 +1125,20 @@ The HTTP surface mirrors:
 
 ### D8. Reshape / migration story
 
-When the policy changes, existing fjall store contents must move.
+`kiseki-admin storage migrate` is a **mount-path-change** primitive
+— it moves a tier from one mount point to another mount point
+(operator policy edit; disk replacement; relocation onto a freshly-
+provisioned VG). It is **NOT** the tool for capacity expansion —
+that's an OS-layer LVM operation (see §D8.2).
+
 v1 approach (operator-driven):
 
-1. Operator sets new policy via admin RPC.
+1. Operator sets new policy via admin RPC, OR provisions a new
+   mount point and updates `KISEKI_DEVICE_TAGS`.
 2. Each affected node logs: "policy says SmallObject should live on
-   `/mnt/nvme1` but I'm currently on `/mnt/sata0` — drain via:
-   `kiseki-admin storage migrate --tier=small-object --node=N`".
+   `/mnt/fast-small-vg2` but I'm currently on `/mnt/fast-small-vg1`
+   — drain via: `kiseki-admin storage migrate --tier=small-object
+   --node=N`".
 3. Migration is a separate explicit command that:
    - Quiesces writes to the tier (sets it read-only via a state
      machine bit).
@@ -1129,6 +1156,10 @@ until v1 ships.
 If a node is **added** to the cluster, it picks up the current
 policy from the catalog at boot and opens its fjall stores at the
 correct paths from day one. No migration needed.
+
+If **capacity** on an existing mount is exhausted, the operator
+performs an online LVM extension on that mount — no kiseki
+involvement, no migrate, no pointer-file update. See §D8.2.
 
 ### D8.1. Path-move semantics (rev 3 — F-3 / I-CP-Move)
 
@@ -1185,6 +1216,105 @@ prior resolved path recorded in `kiseki-tier-paths.json`. Enforced
 in `runtime.rs` boot sequence by reading the pointer file BEFORE
 calling each fjall consumer's open. ADR-040 I-CP1's hydrator
 contract is preserved by this gate.
+
+**I-CP-Move scope (rev 5 clarification):** the guard fires only
+when the *mount path itself* changes — i.e. when `prior_path` and
+`resolved_path` differ as strings. **It does NOT fire for
+capacity-expansion operations on the same mount** (see §D8.2):
+`vgextend` + `lvextend` + `resize2fs` grow the backing storage
+under `/mnt/<name>/` without changing the path, the pointer file,
+or the fjall keyspace location. The guard distinguishes:
+
+- "operator moved SmallObject from `/mnt/old-vg` to `/mnt/new-vg`" →
+  I-CP-Move trips; migrate required.
+- "operator added 4 NVMe to `/mnt/fast-small`'s VG and resized the
+  LV" → mount path unchanged; pointer unchanged; I-CP-Move silent;
+  fjall sees the bigger `statvfs()` on next compaction.
+
+### D8.2. Fast-tier mount aggregation (rev 5 — LVM convention)
+
+The per-tier mount the resolver picks (e.g. `/mnt/fast-small`,
+`/mnt/fast-meta`) is **always backed by an LVM logical volume**,
+even on single-disk deployments. The setup script provisions:
+
+```
+N × physical NVMe  →  N × LVM PVs  →  one VG per fast tier  →
+                  →  one striped LV per fast tier (-i N -I 64k)  →
+                  →  ext4 mount at /mnt/<tier>
+```
+
+Default `N=1` per tier (a degenerate single-disk-stripe LV) so
+small deployments still pay the LVM tax (negligible — ~1-2 µs per
+I/O for the dm-stripe target) but inherit the same capacity-
+expansion shape as large deployments: there is no "first disk"
+special case.
+
+**Why LVM and not raw fjall-on-block:** fjall is FS-bound — its
+SST files, manifest, and WAL go through `std::fs`. A raw-block
+fjall would require a fjall fork with a custom storage backend
+(out of scope). For the per-tier workloads (small KV ops on
+metadata, KB-sized objects on SmallObject), the FS / LVM
+overhead is negligible — LSM compaction dominates. Raw block
+remains the right shape for the chunk pool (large opaque blobs,
+offset/length addressing, `KISEKI_RAW_DEVICES` — §D11.1 axis,
+unchanged by this revision).
+
+**Capacity expansion runbook** (online, no service restart):
+
+```bash
+# Operator attaches 3 new local NVMe to a node:
+pvcreate /dev/nvme7n1 /dev/nvme8n1 /dev/nvme9n1
+vgextend kiseki_small /dev/nvme7n1 /dev/nvme8n1 /dev/nvme9n1
+lvextend -l +100%FREE /dev/kiseki_small/data
+resize2fs /dev/kiseki_small/data
+# Done. fjall's statvfs reports the new total; the §D4.5 formula
+# re-balances on next `compute_cluster_budgets` invocation
+# (every InventoryReport apply tick); the resolver re-picks the
+# same mount; pointer file unchanged; I-CP-Move silent.
+```
+
+**Why striped LVs (`-i N -I 64k`):** uniform 64 KiB stripe across
+all PVs in the VG. SmallObject and the three metadata keyspaces
+all benefit from disk-level parallelism on LSM compaction and
+WAL fsync. The stripe width is chosen at LV-create time; growing
+the LV onto new PVs uses linear segments by default (writes after
+extension hit the new PVs only). For full re-striping after a
+large extension, the operator runs `lvconvert --type striped
+--stripes N` offline — that IS a path-affecting operation and
+goes through `kiseki-admin storage migrate` (back to a fresh LV).
+
+**Per-tier sizing convention:**
+
+| Tier            | LVM VG          | LV name | LV mount        |
+|-----------------|-----------------|---------|-----------------|
+| SmallObject     | `kiseki_small`  | `data`  | `/mnt/fast-small` |
+| All 3 metadata  | `kiseki_meta`   | `data`  | `/mnt/fast-meta`  |
+
+The three metadata tiers share one mount (`/mnt/fast-meta`) and
+one LV — they're co-located on the same backing storage but in
+distinct fjall keyspaces under `/mnt/fast-meta/kiseki/intent-store/`,
+`/mnt/fast-meta/kiseki/composition-meta/`, `/mnt/fast-meta/kiseki/
+chunk-meta/`. This matches how their write workloads scale (all
+three KB-sized KV) and how their tail latency couples (all three
+share the same fsync queue + LSM compaction reserve).
+
+**Resolver consequence:** the resolver's per-tier preference list
+(e.g. `Tag("fast-small") → Class(Nvme) → Class(Ssd) → DataDir`)
+matches against `DeviceEntry` records discovered from `/proc/
+mounts`. An LVM-backed mount appears as one `DeviceEntry` — the
+resolver does not see (or care about) the underlying PVs. The
+`DeviceEntry.media_class` is read from the slowest PV's
+rotational flag (conservative — a mixed VG reports `Hdd` even
+if it includes one SSD). Operator hygiene: don't mix media
+classes inside a single VG.
+
+**§D4.5 formula consequence:** `f_total` sums each node's fast-
+tier mount capacity from `statvfs()`. LVM-aggregated mounts
+report their total LV size — so a `vgextend + lvextend +
+resize2fs` flow automatically grows `f_total` on next
+`InventoryReporter` tick (60 s default). No formula change; no
+catalog schema change; no apply-time re-budget required beyond
+the existing inventory-refresh cadence.
 
 ### D9. Invariants
 
@@ -1333,7 +1463,7 @@ doesn't re-derive the wrong answer.
 | **ADR-016 (backup/DR)** | The catalog state machine is included in `ControlSnapshot` (serde_json), so backup catches it for free. **Bound**: snapshot size grows ~1 KiB per node. For clusters > 1000 nodes, switch the catalog encoding to postcard or per-tenant sharding (follow-up). | No code change in v1. |
 | **ADR-022 (fjall keyspace pattern)** | Every catalog-resolved store uses the rev-2/3/4 fjall pattern (memtable + WAL + `PersistMode`). The §D2.5 RaftLog bootstrap path also uses fjall. | rev-5 of ADR-022 (small-object swap) consumes the resolver. Phase 5. |
 | **ADR-024 (device management + capacity)** | Two type lattices for media: `MediaType` (system_disk) and `DeviceClass` (chunk pool). Q13 resolution: `MediaType` is the coarse owner; `DeviceClass` is a refinement tag on `DeviceEntry.device_class: Option<DeviceClass>`. Resolver only consults `MediaType`. Mapping table in Q13. | Phase 3 implementation refactors `DeviceClass` to carry an upcast to `MediaType`. |
-| **ADR-029 (raw block allocator)** | Chunk fragments stay on `KISEKI_RAW_DEVICES`. ADR-049 §D4 chunk tier's `Remainder` capacity is **informational** (reports the unused fast leftover); actual chunk allocation is bounded by raw-device sizes, not by this number. §D4 row clarified. | No change to ADR-029. |
+| **ADR-029 (raw block allocator)** | Chunk fragments stay on `KISEKI_RAW_DEVICES` — raw block, no FS, no LVM. The fast-tier mounts that the resolver picks (`/mnt/fast-small`, `/mnt/fast-meta`) ride a parallel OS-layer LVM axis (§D8.2) that ADR-029 never sees: the script peels the trailing N NVMe off `${raw_devices}` for FS provisioning before the chunk store sees the list. ADR-049 §D4 chunk tier's `Remainder` capacity is **informational** (reports the unused fast leftover); actual chunk allocation is bounded by raw-device sizes, not by this number. | No change to ADR-029. The chunk axis and the fast-tier-FS axis are orthogonal. |
 | **ADR-030 (small-file placement)** | `small_file_budget_bytes` was a per-shard input from `NodeMetadataCapacity` reporting (ADR-030 §3 / I-L9). ADR-049 §D4.5 now OWNS this number. ADR-030's I-L9 inline_threshold formula consumes the resolver output verbatim. ADR-030 needs a §"Rev 4 amendment" noting the source change. | ADR-030 amendment ships with ADR-049 phase 5 wiring. |
 | **ADR-040 (persistent metadata stores)** | CompositionMeta path now resolver-routed. Without I-CP-Move (§D8.1), a path change between boots violates ADR-040 I-CP1. **Resolved by I-CP-Move + path-version pointer file.** | Phase 5 wires the pointer file before each fjall open. |
 | **ADR-041 (Raft transport multiplexing)** | The control-plane group registers via the multiplexed listener (`registry_for_ctrl` at runtime.rs:783-794). Catalog reads/writes ride the existing control-plane plumbing. | No change. |

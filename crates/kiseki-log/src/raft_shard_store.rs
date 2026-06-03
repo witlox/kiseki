@@ -123,6 +123,14 @@ pub struct RaftShardStore {
     /// without nesting, and for Raft RPC server + bootstrap.
     rt: tokio::runtime::Runtime,
     data_dir: Option<PathBuf>,
+    /// ADR-049 phase 5a continued: per-tier-resolved base for
+    /// per-shard `IntentStore` keyspaces. When set, `create_shard`
+    /// opens the `FjallIntentStore` at
+    /// `intent_store_base/<shard_id>/intents/` instead of
+    /// `data_dir/<shard_id>/intents/`. Defaults to `None` (legacy
+    /// `data_dir`-relative path) so single-host / dev / CI deployments
+    /// keep working without operator setup.
+    intent_store_base: Option<PathBuf>,
     inline_store: Option<Arc<dyn kiseki_common::inline_store::InlineStore>>,
     /// Per-node Raft RPC listener registry handle. `None` until the
     /// first `create_shard` with `Some(raft_addr)` lazily binds the
@@ -202,6 +210,7 @@ impl RaftShardStore {
             peers,
             rt,
             data_dir,
+            intent_store_base: None,
             inline_store: None,
             listener_registry: Mutex::new(None),
             transport_metrics: Mutex::new(None),
@@ -231,6 +240,21 @@ impl RaftShardStore {
         store: Arc<dyn kiseki_common::inline_store::InlineStore>,
     ) -> Self {
         self.inline_store = Some(store);
+        self
+    }
+
+    /// ADR-049 phase 5a continued: override the base directory under
+    /// which per-shard `FjallIntentStore` keyspaces open. Each shard
+    /// will be created at `base/<shard_id>/intents/` instead of the
+    /// pre-ADR-049 `data_dir/<shard_id>/intents/`.
+    ///
+    /// Set by `runtime.rs` from `BootTierPaths::intent_store_base()`
+    /// — falls back to `data_dir` when the pointer file doesn't
+    /// supply an `IntentStore` tier (first boot, single-host dev).
+    /// MUST be called before the first `create_shard`.
+    #[must_use]
+    pub fn with_intent_store_base(mut self, base: PathBuf) -> Self {
+        self.intent_store_base = Some(base);
         self
     }
 
@@ -659,7 +683,21 @@ impl RaftShardStore {
         let (intent_store, intent_store_durable): (Arc<dyn IntentStore>, bool) =
             match &self.data_dir {
                 Some(dir) => {
-                    let path = dir.join(shard_id.0.to_string()).join("intents");
+                    // ADR-049 phase 5a continued: prefer the
+                    // pointer-resolved intent-store base when set
+                    // via `with_intent_store_base` — that's the
+                    // fast-tier mount the resolver picked. Falls
+                    // back to `data_dir`-relative when no override
+                    // exists (first boot / dev / CI).
+                    let base = self.intent_store_base.as_ref().unwrap_or(dir);
+                    let path = base.join(shard_id.0.to_string()).join("intents");
+                    if let Some(parent) = path.parent() {
+                        // Ensure the parent exists; the resolved
+                        // mount may not have the kiseki/intent-store
+                        // subdir created yet on first boot at that
+                        // mount.
+                        let _ = std::fs::create_dir_all(parent);
+                    }
                     let store = FjallIntentStore::open(&path).unwrap_or_else(|e| {
                         panic!(
                             "durable IntentStore open failed for shard {} at {}: {} \
