@@ -60,9 +60,12 @@ variable "profile" {
   description = <<-EOT
     Cluster profile — selects the shape *and* which benchmark suite the ctrl runs:
 
-      "default"   — broad coverage. 6 × c3-standard-22 storage with 4 × local NVMe each
-                    (1.5 TB / node), 3 × c3-standard-22 client. 6 nodes ≥ EC-4+2 minimum,
-                    pure-NVMe device pool, Tier_1 50 Gbps. Runs perf-suite.sh.
+      "default"   — broad coverage. 6 × c3-standard-22 storage with 4 × local NVMe each:
+                    2 NVMe as raw chunk pool (0.75 TB), 1 NVMe → LVM `kiseki_small`/data
+                    LV → /mnt/fast-small (SmallObjectStore), 1 NVMe → LVM `kiseki_meta`/
+                    data LV → /mnt/fast-meta (3 metadata fjall keyspaces). 3 × c3-
+                    standard-22 client. 6 nodes ≥ EC-4+2 minimum, Tier_1 50 Gbps. Runs
+                    perf-suite.sh. Capacity expansion is online OS LVM (ADR-049 §D8.2).
       "transport" — protocol/NIC ceiling. 3 × c3-standard-88 storage with 8 × local NVMe
                     each (3 TB / node), 3 × c3-standard-44 client. Tier_1 100 Gbps, disks
                     deliberately faster than the wire so any cap is gateway/grpc, not I/O.
@@ -101,14 +104,20 @@ locals {
       storage_scratch    = 0                     # lssd: SSDs are bundled, not scratch
       storage_nvme_count = 4                     # device path count for raw_devices
       storage_tier_1     = false                 # c3-standard-22-lssd (22 vCPU) is below Tier_1 floor; 6×23 Gbps aggregate
-      client_count       = 3
-      client_machine     = "c3-standard-22"
-      client_cache_gb    = 200
-      client_tier_1      = false # c3-standard-22 (22 vCPU) is below the Tier_1 floor
-      client_gpu         = false
-      client_image       = "rocky-linux-cloud/rocky-linux-9"
-      client_setup       = "setup-perf-client.sh"
-      bench_suite        = "perf-suite.sh"
+      # ADR-049 §D8.2: peel N + M trailing NVMe off `raw_devices` to back
+      # /mnt/fast-small (N) and /mnt/fast-meta (M). Remaining NVMe → chunks.
+      # Total: 4 = 2 chunk + 1 small + 1 meta. Capacity-expansion is online
+      # `vgextend + lvextend + resize2fs`, no kiseki migrate.
+      fast_small_disks = 1
+      fast_meta_disks  = 1
+      client_count     = 3
+      client_machine   = "c3-standard-22"
+      client_cache_gb  = 200
+      client_tier_1    = false # c3-standard-22 (22 vCPU) is below the Tier_1 floor
+      client_gpu       = false
+      client_image     = "rocky-linux-cloud/rocky-linux-9"
+      client_setup     = "setup-perf-client.sh"
+      bench_suite      = "perf-suite.sh"
     }
     transport = {
       label              = "transport"
@@ -117,14 +126,18 @@ locals {
       storage_scratch    = 0
       storage_nvme_count = 16 # c3-standard-88-lssd bundles 16 partitions
       storage_tier_1     = true
-      client_count       = 3
-      client_machine     = "c3-standard-44"
-      client_cache_gb    = 100
-      client_tier_1      = true
-      client_gpu         = false
-      client_image       = "rocky-linux-cloud/rocky-linux-9"
-      client_setup       = "setup-perf-client.sh"
-      bench_suite        = "perf-suite-transport.sh"
+      # 16 NVMe → 10 chunk + 4 small + 2 meta (more small-files headroom
+      # for the protocol-ceiling bench; metadata is small KV, 2 PVs is plenty).
+      fast_small_disks = 4
+      fast_meta_disks  = 2
+      client_count     = 3
+      client_machine   = "c3-standard-44"
+      client_cache_gb  = 100
+      client_tier_1    = true
+      client_gpu       = false
+      client_image     = "rocky-linux-cloud/rocky-linux-9"
+      client_setup     = "setup-perf-client.sh"
+      bench_suite      = "perf-suite-transport.sh"
     }
     gpu = {
       label              = "gpu"
@@ -133,11 +146,14 @@ locals {
       storage_scratch    = 0
       storage_nvme_count = 8 # c3-standard-44-lssd bundles 8 partitions
       storage_tier_1     = true
-      client_count       = 2
-      client_machine     = "a2-highgpu-1g"
-      client_cache_gb    = 1000
-      client_tier_1      = false # a2-highgpu-1g (12 vCPU) is below the Tier_1 floor
-      client_gpu         = true
+      # 8 NVMe → 5 chunk + 2 small + 1 meta.
+      fast_small_disks = 2
+      fast_meta_disks  = 1
+      client_count     = 2
+      client_machine   = "a2-highgpu-1g"
+      client_cache_gb  = 1000
+      client_tier_1    = false # a2-highgpu-1g (12 vCPU) is below the Tier_1 floor
+      client_gpu       = true
       # Google's Deep Learning VM image: Debian 11 + CUDA 12.3 + nvidia drivers preinstalled.
       client_image = "deeplearning-platform-release/common-cu123-debian-11"
       client_setup = "setup-gpu-client.sh"
@@ -150,14 +166,17 @@ locals {
       storage_scratch    = 0
       storage_nvme_count = 8 # c3-standard-44-lssd bundles 8 partitions
       storage_tier_1     = true
-      client_count       = 2
-      client_machine     = "c3-standard-44"
-      client_cache_gb    = 100
-      client_tier_1      = true
-      client_gpu         = false
-      client_image       = "rocky-linux-cloud/rocky-linux-9"
-      client_setup       = "setup-perf-client.sh"
-      bench_suite        = "perf-suite.sh" # full protocol matrix (S3 + NFSv4 + pNFS + FUSE)
+      # 8 NVMe → 5 chunk + 2 small + 1 meta.
+      fast_small_disks = 2
+      fast_meta_disks  = 1
+      client_count     = 2
+      client_machine   = "c3-standard-44"
+      client_cache_gb  = 100
+      client_tier_1    = true
+      client_gpu       = false
+      client_image     = "rocky-linux-cloud/rocky-linux-9"
+      client_setup     = "setup-perf-client.sh"
+      bench_suite      = "perf-suite.sh" # full protocol matrix (S3 + NFSv4 + pNFS + FUSE)
     }
   }
 
@@ -279,15 +298,17 @@ resource "google_compute_instance" "storage" {
   }
 
   metadata_startup_script = templatefile("${path.module}/scripts/setup-raw-storage.sh", {
-    node_id         = count.index + 1
-    node_ip         = local.storage_ips[count.index]
-    all_peers       = local.all_peers
-    raft_port       = local.raft_port
-    raw_devices     = local.raw_devices
-    device_class    = "nvme"
-    meta_dir        = "/var/lib/kiseki"
-    release_tag     = var.release_tag
-    binary_url_base = local.binary_url_base
+    node_id          = count.index + 1
+    node_ip          = local.storage_ips[count.index]
+    all_peers        = local.all_peers
+    raft_port        = local.raft_port
+    raw_devices      = local.raw_devices
+    device_class     = "nvme"
+    meta_dir         = "/var/lib/kiseki"
+    fast_small_disks = local.p.fast_small_disks
+    fast_meta_disks  = local.p.fast_meta_disks
+    release_tag      = var.release_tag
+    binary_url_base  = local.binary_url_base
   })
 }
 

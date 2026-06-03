@@ -1,0 +1,56 @@
+# ADR-049 local-test overlay for the 3-node compose.
+#
+# Adds two bind-mounted "fast tier" mounts per node so the runtime
+# resolver picks them up via KISEKI_DEVICE_TAGS:
+#
+#   /mnt/fast-small ← tag "fast-small" → SmallObjectStore
+#   /mnt/fast-meta  ← tag "fast-meta"  → IntentStore + CompositionMeta + ChunkMeta
+#
+# The /data dir stays the bootstrap path (RaftLog tier + pointer file).
+#
+# Bind targets live under /tmp/kiseki-test — on Arch / most Linux,
+# /tmp is tmpfs so this is RAM-fast, but the bind-mount target survives
+# container restart, so the I-CP-Move smoke test (restart with prior
+# keyspace + tampered pointer) actually works.
+#
+# Usage:
+#   mkdir -p /tmp/kiseki-test/node{1,2,3}-{data,small,meta}
+#   docker compose \
+#     -f docker-compose.3node.yml \
+#     -f docker-compose.3node.adr049.yml \
+#     up --build -d
+#
+#   ./scripts/verify-adr049-local.sh
+#
+#   docker compose -f docker-compose.3node.yml -f docker-compose.3node.adr049.yml down
+#   rm -rf /tmp/kiseki-test
+
+services:
+  kiseki-node1:
+    environment:
+      KISEKI_DEVICE_TAGS: "/data=data-dir-default,/mnt/fast-small=fast-small,/mnt/fast-meta=fast-meta"
+    volumes:
+      - /tmp/kiseki-test/node1-data:/data
+      - /tmp/kiseki-test/node1-small:/mnt/fast-small
+      - /tmp/kiseki-test/node1-meta:/mnt/fast-meta
+
+  kiseki-node2:
+    environment:
+      KISEKI_DEVICE_TAGS: "/data=data-dir-default,/mnt/fast-small=fast-small,/mnt/fast-meta=fast-meta"
+    volumes:
+      - /tmp/kiseki-test/node2-data:/data
+      - /tmp/kiseki-test/node2-small:/mnt/fast-small
+      - /tmp/kiseki-test/node2-meta:/mnt/fast-meta
+
+  kiseki-node3:
+    environment:
+      KISEKI_DEVICE_TAGS: "/data=data-dir-default,/mnt/fast-small=fast-small,/mnt/fast-meta=fast-meta"
+    volumes:
+      - /tmp/kiseki-test/node3-data:/data
+      - /tmp/kiseki-test/node3-small:/mnt/fast-small
+      - /tmp/kiseki-test/node3-meta:/mnt/fast-meta
+
+# Empty volumes block to override the named volumes from the base file
+# (we use bind mounts instead). The named volumes from the base file
+# are unused once this overlay is applied.
+volumes: {}

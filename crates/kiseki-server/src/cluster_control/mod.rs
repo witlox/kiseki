@@ -51,6 +51,13 @@ pub mod tier_paths;
 // in one call.
 pub mod phase5_boot;
 
+// ADR-049 phase 5a continued (runtime read): bridge the
+// `kiseki-tier-paths.json` pointer to the four fjall keyspace opens
+// in runtime.rs (`SmallObject`, `IntentStore`, `CompositionMeta`,
+// `ChunkMeta`). First boot falls back to `<data_dir>/<convention>`;
+// Nth boot uses the resolved mount the prior boot recorded.
+pub mod boot_paths;
+
 pub use commands::ControlCommand;
 pub use metrics::ClusterControlMetrics;
 // Re-exports kept for the follow-up subtask that switches admin

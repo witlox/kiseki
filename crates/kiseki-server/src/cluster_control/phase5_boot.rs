@@ -213,6 +213,74 @@ pub async fn run(inputs: Phase5BootInputs<'_>) -> Result<ResolvedBoot, Phase5Boo
     })
 }
 
+/// First-boot local resolution — writes the pointer file BEFORE the
+/// fjall stores open, using only the local inventory + the built-in
+/// default placement policy.
+///
+/// Why this exists: [`run`] requires the control-plane Raft to be up
+/// (to submit `UpsertNodeInventory`). The fjall stores open earlier
+/// in the boot path than that. Without `first_boot_local_resolve`,
+/// the very first boot would open every fjall keyspace at
+/// `<data_dir>/<convention>` (e.g. the boot disk), then [`run`]
+/// would write a pointer pointing at `/mnt/fast-foo/…`, and the
+/// I-CP-Move guard would trip on the *second* boot because the prior
+/// fjall keyspaces would all be at `<data_dir>` while the resolver
+/// wants `/mnt/fast-foo`.
+///
+/// What it does:
+///   1. If the pointer file already exists, return Ok(()) — Nth boot
+///      uses the recorded paths (caller already has them loaded).
+///   2. Otherwise discover local devices, resolve all four catalog
+///      tiers against the local inventory + built-in default policy,
+///      and write the pointer file. The mounts a single node picks
+///      are stable regardless of cluster size (resolver consults only
+///      its own inventory's tags + classes), so the per-tier paths
+///      are correct even before consensus is up.
+///
+/// Cluster-wide budgets are NOT computed here — they require every
+/// node's inventory. Per-node `BudgetBytes` is enforced at write
+/// time by the gateway, not at fjall-open time. The pointer file
+/// records only the *paths*, which are policy-stable.
+pub fn first_boot_local_resolve(
+    node_id: NodeId,
+    data_dir: &Path,
+    tags: &DeviceTagMap,
+) -> Result<bool, Phase5BootError> {
+    // Idempotent: respect prior pointer if it exists.
+    if tier_paths::load(data_dir)?.is_some() {
+        return Ok(false);
+    }
+
+    let inventory = discover_local_inventory(node_id, Some(data_dir), tags, now_ms());
+
+    // Local-only "cluster": this node carries the whole catalog. The
+    // resolver picks paths from `inventory`'s device list per tier
+    // policy preferences; budgets are placeholders (sized to this
+    // node's share) and not consulted by the path-resolution step.
+    let mut catalog = kiseki_common::ClusterDeviceCatalog::default();
+    catalog.inventories.insert(node_id, inventory.clone());
+    catalog.policy = kiseki_common::PlacementPolicy::built_in_default();
+
+    let cluster = compute_cluster_budgets(&catalog)
+        .map_err(|e| Phase5BootError::BudgetCompute(format!("{e}")))?;
+    let resolved_tiers = resolve_all(&inventory, &cluster, &catalog.policy)
+        .map_err(|e| Phase5BootError::Resolve(format!("{e}")))?;
+
+    let resolved = TierPaths::from_resolved(
+        resolved_tiers
+            .iter()
+            .map(|r| (r.tier, r.chosen_mount.clone())),
+    );
+
+    tier_paths::save(data_dir, &resolved)?;
+    tracing::info!(
+        node_id = node_id.0,
+        data_dir = %data_dir.display(),
+        "ADR-049 first-boot local resolve: wrote pointer file using built-in default policy"
+    );
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

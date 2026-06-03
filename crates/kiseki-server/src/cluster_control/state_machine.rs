@@ -1059,10 +1059,27 @@ mod tests {
 
     #[test]
     fn set_placement_policy_bumps_revision_and_quiescence_clock() {
+        // The initial catalog policy is `PlacementPolicy::built_in_default()`
+        // (auto-populated via `ClusterDeviceCatalog::default()`), so setting
+        // built_in_default is a no-op (idempotent). To force a real change
+        // we use a custom single-tier policy.
+        use kiseki_common::{DeviceMatcher, MediaType, PolicyMode, TierCapacity, TierPolicy};
         let mut sm = StateMachineInner::new();
         let before_rev = sm.catalog.policy_revision;
+        let custom_policy = kiseki_common::PlacementPolicy {
+            tiers: vec![TierPolicy {
+                tier: kiseki_common::FjallStoreTier::SmallObject,
+                preferences: vec![DeviceMatcher::Class(MediaType::Ssd)],
+                mode: PolicyMode::BestEffort,
+                capacity: TierCapacity::Auto {
+                    target_pct: 50,
+                    floor_bytes: 1024 * 1024 * 1024,
+                    ceiling_bytes: None,
+                },
+            }],
+        };
         let resp = sm.apply_command(&ControlCommand::SetPlacementPolicy {
-            policy: kiseki_common::PlacementPolicy::built_in_default(),
+            policy: custom_policy,
         });
         assert_eq!(resp, ControlResponse::Applied);
         assert_eq!(sm.catalog.policy_revision, before_rev + 1);
@@ -1105,6 +1122,12 @@ mod tests {
         // ADR-049 phase 1 wire test: snapshot includes catalog,
         // install repopulates it. Q36 acceptance: future field
         // additions are forward-compatible via #[serde(default)].
+        //
+        // Note: initial catalog policy is `built_in_default` (auto via
+        // `ClusterDeviceCatalog::default()`), so setting `built_in_default`
+        // would be a no-op. We use a tiny custom policy that *differs*
+        // from the default so the revision bump is observable.
+        use kiseki_common::{DeviceMatcher, MediaType, PolicyMode, TierCapacity, TierPolicy};
         let mut sm = StateMachineInner::new();
         sm.apply_command(&ControlCommand::CreateNamespace {
             namespace_id: ns(),
@@ -1115,8 +1138,20 @@ mod tests {
             node_id: NodeId(7),
             inventory: inventory(7, 1500, 8000),
         });
+        let custom_policy = kiseki_common::PlacementPolicy {
+            tiers: vec![TierPolicy {
+                tier: kiseki_common::FjallStoreTier::SmallObject,
+                preferences: vec![DeviceMatcher::Class(MediaType::Ssd)],
+                mode: PolicyMode::BestEffort,
+                capacity: TierCapacity::Auto {
+                    target_pct: 50,
+                    floor_bytes: 1024 * 1024 * 1024,
+                    ceiling_bytes: None,
+                },
+            }],
+        };
         sm.apply_command(&ControlCommand::SetPlacementPolicy {
-            policy: kiseki_common::PlacementPolicy::built_in_default(),
+            policy: custom_policy,
         });
         let snap = ControlSnapshot {
             namespaces: sm.namespaces.clone(),
@@ -1128,7 +1163,7 @@ mod tests {
         assert_eq!(parsed.catalog.inventories.len(), 1);
         assert!(parsed.catalog.inventories.contains_key(&NodeId(7)));
         assert_eq!(parsed.catalog.policy_revision, 1);
-        assert!(!parsed.catalog.policy.tiers.is_empty());
+        assert_eq!(parsed.catalog.policy.tiers.len(), 1);
     }
 
     #[test]
@@ -1186,12 +1221,24 @@ mod tests {
         // Q36 acceptance: a pre-upgrade snapshot (no `catalog`
         // field in the JSON) MUST decode cleanly via
         // #[serde(default)] -> ClusterDeviceCatalog::default().
+        //
+        // After ADR-049 phase 5a continued, `ClusterDeviceCatalog::default()`
+        // populates `policy` from `PlacementPolicy::built_in_default()` so
+        // a fresh cluster has sensible defaults without an operator
+        // `SetPlacementPolicy` apply. The pre-upgrade decode therefore
+        // yields the full default policy, NOT an empty one.
         let pre_upgrade_json = r#"{"namespaces": {}}"#;
         let parsed: ControlSnapshot =
             serde_json::from_str(pre_upgrade_json).expect("forward-compat decode");
         assert!(parsed.namespaces.is_empty());
         assert!(parsed.catalog.inventories.is_empty());
         assert_eq!(parsed.catalog.policy_revision, 0);
-        assert!(parsed.catalog.policy.tiers.is_empty());
+        // Default policy covers every catalog-resolved tier.
+        for tier in kiseki_common::FjallStoreTier::catalog_resolved() {
+            assert!(
+                parsed.catalog.policy.for_tier(tier).is_some(),
+                "default policy must cover {tier:?}"
+            );
+        }
     }
 }
