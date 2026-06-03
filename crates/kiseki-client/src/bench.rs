@@ -59,6 +59,13 @@ pub struct BenchConfig {
     pub shape: Shape,
     /// In-flight ops.
     pub concurrency: usize,
+    /// Number of TCP connections in the client pool. Workers round-robin
+    /// across the pool. Defaults to 1 — the realistic shape for a single
+    /// FUSE / NFS-as-client / S3-keepalive process running concurrency
+    /// in-flight requests over one connection. Raise it to model a
+    /// load-generator that fans concurrent ops across multiple sockets
+    /// (older bench shape: `connections = concurrency`).
+    pub connections: usize,
     /// Per-object payload size in bytes.
     pub object_size: usize,
     /// Wall-clock cap.
@@ -182,10 +189,10 @@ async fn build_driver(cfg: &BenchConfig) -> Result<Arc<dyn Driver>, String> {
             let (tenant_id, namespace_id) = resolve_bench_ids(cfg);
             match cfg.binding {
                 NativeBinding::Tcp => {
-                    return native::build_tcp(addr, cfg.concurrency, tenant_id, namespace_id).await
+                    return native::build_tcp(addr, cfg.connections, tenant_id, namespace_id).await
                 }
                 NativeBinding::Grpc => {
-                    return native::build_grpc(addr, cfg.concurrency, tenant_id, namespace_id).await
+                    return native::build_grpc(addr, cfg.connections, tenant_id, namespace_id).await
                 }
             }
         }
@@ -828,6 +835,7 @@ mod tests {
             binding: NativeBinding::Tcp,
             shape: Shape::PutHeavy,
             concurrency: 1,
+            connections: 1,
             object_size: 1024,
             duration: Duration::from_secs(1),
             warmup_objects: 0,
@@ -857,6 +865,7 @@ mod tests {
             binding: NativeBinding::Tcp,
             shape: Shape::PutHeavy,
             concurrency: 1,
+            connections: 1,
             object_size: 1024,
             duration: Duration::from_secs(1),
             warmup_objects: 0,

@@ -920,6 +920,7 @@ fn handle_bench(args: &[String]) {
     let mut shape = Shape::PutHeavy;
     let mut binding = NativeBinding::Tcp;
     let mut concurrency: usize = 16;
+    let mut connections: usize = 1;
     let mut object_size: usize = 65_536;
     let mut duration_secs: u64 = 30;
     let mut warmup_objects: usize = 256;
@@ -964,6 +965,13 @@ fn handle_bench(args: &[String]) {
                     .get(i + 1)
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(concurrency);
+                i += 2;
+            }
+            "--connections" => {
+                connections = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(connections);
                 i += 2;
             }
             "--object-size" => {
@@ -1036,6 +1044,11 @@ OPTIONS:
     --shape <s>               put-heavy | get-heavy | mixed     (default: put-heavy)
     --binding <b>             tcp | grpc       (default: tcp; only for kiseki://)
     --concurrency <N>         in-flight ops    (default: 16)
+    --connections <N>         TCP connections in client pool (default: 1)
+                              The realistic single-process FUSE/NFS
+                              shape. Set to `<N>` = `<concurrency>` to
+                              model a load-generator that fans across
+                              sockets (older bench default).
     --object-size <bytes>     payload size     (default: 65536)
     --duration-secs <N>       wall-clock cap   (default: 30)
     --warmup-objects <N>      pre-populate for GET shapes (default: 256)
@@ -1099,6 +1112,7 @@ NAMESPACE PROVISIONING:
         binding,
         shape,
         concurrency,
+        connections,
         object_size,
         duration: std::time::Duration::from_secs(duration_secs),
         warmup_objects,
