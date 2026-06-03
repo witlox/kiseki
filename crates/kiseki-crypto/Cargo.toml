@@ -19,6 +19,14 @@ compression = ["flate2"]
 [dependencies]
 kiseki-common = { workspace = true }
 aws-lc-rs = { workspace = true }
+# Content-addressed dedup hash (ADR-044 rev-2, 2026-06-03). BLAKE3 is
+# the default for `derive_chunk_id`; SHA-256 stays selectable via
+# KISEKI_CHUNK_HASH=sha256 for FIPS-only deployments where BLAKE3 is
+# not on the approved primitive list. Single-thread BLAKE3 is ~6× the
+# AWS-LC SHA-256 NI path on x86-64 (measured on flamegraph: SHA-256
+# was 21% of single-thread 4 KiB PUT time on the in-process-persistent
+# floor pre-swap).
+blake3 = "1.5"
 libc = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 zeroize = { workspace = true }
