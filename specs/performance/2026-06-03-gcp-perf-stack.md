@@ -106,31 +106,63 @@ Competitive view (`competitive-targets.md`, same hardware): GET at
 commit-/journal-bound) and 3–15× behind Lustre R-1 (30–80 k) and
 VAST (50–150 k).
 
-### Levers visible for PUT (in priority order by gap-closing potential)
+### Levers visible for PUT — corrected ranking
 
-The flamegraph tells the same story `roadmap.md` does: PUT spends its
-CPU in the leader's durable-write path, not in serde, not in
-encrypt/HKDF, not in framing.
+**Correction (2026-06-03):** an earlier draft of this section listed
+"W1 batched Raft commit" as the headline lever. That was wrong: W1
+(ADR-046) was built then **REVERTED on 2026-05-29 (commit `3fd8cc8`)**
+after the local A/B showed flat throughput (254 vs 264 op/s). Root
+cause of the flat: **openraft already auto-batches concurrent
+`client_write`s** into one AppendEntries (`max_payload_entries: 300`)
+— W1 amortised exactly what openraft amortises. ADR-046 is retained
+as a rejected-decision record. There is no `KISEKI_WRITE_COALESCE`
+env var to turn on; the code is not in main.
 
-| # | Lever | Flamegraph evidence | Status | Expected lift |
-|---|---|---|---|---|
-| **1** | **W1 batched Raft commit** (#126) — amortise one fsync round across many concurrent PUTs | `fjall::WriteBatch::commit` 76.5 %, `Memtable::insert` 70.7 %, `flush::worker::run` 66.6 % — the LSM commit fence is the dominant ancestor of `IntentStore::put_batch` 88.9 %. Every PUT pays its own commit round. | **Landed, gated off** (per `project_w1_write_coalescing_landed`; `KISEKI_WRITE_COALESCE=on`). Capability gate deferred. | Order of magnitude. This is the lever that closes the 35× gap; nothing else competes. |
-| **2** | **#200 composition coalescer** — group composition-store writes the same way W1 groups Raft writes | Composition is on eventual-durability but per-request `Memtable::insert` cost is visible in the fjall worker pool traces under `flush::worker::run`. | **Open, deferred** — held back to measure W1 in isolation. | Substantive after W1 lands; same shape (cross-request batching of the second LSM in the hot path). |
-| **3** | **`tcp_transport::decode_request_body` (postcard, 75.8 %)** — Raft inter-node RPC wire-receive decode | Distinct site from #199 (which was the log-store *read* decode). This is the leader receiving AppendEntries from peers, plus per-node receiving the produce side of the fan. Same fix-shape as #195 (`serde_bytes` on `Vec<u8>` fields) but on the wire-receive type, not the stored type. | **Not started**, fix-shape is well-understood from #195. | CPU win, no protocol change. Probably 5–15 % PUT lift in isolation; less once W1 lands and commit dominates less. |
-| **4** | **`ViewStore::get_view` (62.8 %)** — per-PUT view lookup | Read-only on the hot path; tenant-scoped so caching is straightforward. | **Not started.** | CPU win, single-digit % PUT lift. Cheap to land. |
-| **5** | **Encrypt/HKDF path** | Not on this flamegraph above noise — #155 + #157 already wrung this out. | — | None expected from re-visiting. |
+The honest story per `docs/performance/roadmap.md` +
+`project_perf_roadmap_commit_bound`:
 
-**Order of operations**: 1 is the headline. Without it, 2–4 are
-rearranging the deck chairs on the commit-bound ship — the workload
-will hit fjall commit before it benefits from a serde or
-view-lookup win. With W1 on, the bottleneck migrates and 2–4
-become measurable in isolation.
+- **On loopback, the replicated round pipelines cleanly to ~13 k op/s
+  on a single shard**. The earlier "stacked off-CPU wait in the
+  commit pipeline" theory was disproven by direct probes; an earlier
+  "40 ms stall" was traced to a probe artefact (tonic 0.14.5
+  `serve_with_incoming` ignores `tcp_nodelay`; prod path is
+  `serve_with_shutdown` which has nodelay default-on and is not
+  Nagle-stalled).
+- **On real GCP, the 250 op/s / 50–100 ms forwarded tier is NOT
+  reproduced on loopback.** The mechanism on real-node hardware is
+  not yet pinned. The roadmap's next step is **per-step timing in
+  the loaded server on real GCP** (tokio-console or instrumented
+  spans), NOT another flamegraph — a flamegraph won't show an
+  off-CPU wait.
 
-The 2026-06-03 stack (#194/#195/#197/#198/#201) was deliberately
-in the "CPU off serde" phase — necessary scaffolding so that when
-W1 turns on, the freed commit-fence headroom isn't immediately
-re-consumed by serde. With them landed, W1 gate-on is the next
-A/B.
+Two concrete code sites the prior investigation surfaced (still
+applicable, not blocked on theory):
+
+| Site | Evidence | Expected lift |
+|---|---|---|
+| **`tcp_framed/connection.rs` serve_connection loop** — `read → dispatch (await full round) → write → next`. `request_id` is carried on the wire but **not used for multiplexing**, so per-connection concurrency = 1 and cluster concurrency = number of client TCP connections. | Identified during the W1 investigation; ranked above W1 in the corrected analysis. | Substantial: every additional in-flight PUT on a single client connection becomes possible. |
+| **`tcp_transport::decode_request_body` (postcard, 75.8 % of flamegraph samples)** — Raft inter-node RPC wire-receive decode. Distinct site from #199 (log-store *read* decode); same fix-shape as #195 (`serde_bytes` on `Vec<u8>` fields). | This flamegraph. | CPU win, 5–15 % PUT lift in isolation. |
+
+Two diagnostic-shaped follow-ups (the roadmap's actual next probes):
+
+| Probe | What it answers |
+|---|---|
+| **tokio-console / per-step timing on a loaded real-GCP server** | Where the GCP-only 50–100 ms forwarded-tier latency actually waits. Not visible on a flamegraph (off-CPU). |
+| **Same direct-pipeline probe shape on real GCP nodes** | Whether the GCP latency is mechanism or measurement — does the loopback "13 k op/s scales cleanly" result reproduce, or is it real-NIC / co-location / kernel-stack specific? |
+
+Two CPU follow-ups, lower priority:
+
+| # | Lever | Status |
+|---|---|---|
+| **3** | `tcp_transport::decode_request_body` `serde_bytes` swap (same shape as #195) | Not started; well-understood fix. |
+| **4** | `ViewStore::get_view` (62.8 %) per-tenant cache | Not started; cheap to land. |
+
+**The 2026-06-03 CPU stack (#194/#195/#197/#198/#201) was real work**
+— it took CPU off serde and surfaced the actual structure of the
+hot path on the flamegraph. But it does NOT close the GCP PUT gap on
+its own; the gap is not a CPU shortage at the leader, it's a
+real-hardware latency mechanism that needs a representative probe
+to identify. **Next A/B is not a code lever — it's a measurement.**
 
 ## Comparison vs prior snapshots
 
