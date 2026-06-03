@@ -238,6 +238,12 @@ def start_cluster(compose_file: str = "docker-compose.3node.yml") -> ClusterInfo
     down here to free the host ports. `stop_cluster` will restore
     it on teardown so the next test using `kiseki_server` doesn't
     hit `Connection refused`.
+
+    Extra compose overlays can be appended via
+    ``KISEKI_E2E_COMPOSE_OVERLAYS`` (``:`` -separated list, applied
+    in order — typical use: layer ``docker-compose.3node.adr049.yml``
+    on top to exercise the ADR-049 tier-paths split with bind-mounted
+    fast-small / fast-meta tmpfs mounts).
     """
     root = _workspace_root()
     # Snapshot single-node state BEFORE we tear it down so we know
@@ -249,8 +255,15 @@ def start_cluster(compose_file: str = "docker-compose.3node.yml") -> ClusterInfo
         cwd=root,
         capture_output=True,
     )
+    compose_args = ["docker", "compose", "-f", compose_file]
+    overlays = os.environ.get("KISEKI_E2E_COMPOSE_OVERLAYS", "").strip()
+    if overlays:
+        for overlay in overlays.split(":"):
+            overlay = overlay.strip()
+            if overlay:
+                compose_args.extend(["-f", overlay])
     result = subprocess.run(
-        ["docker", "compose", "-f", compose_file, "up", "-d"],
+        compose_args + ["up", "-d"],
         cwd=root,
         capture_output=True,
         text=True,
@@ -323,6 +336,15 @@ def stop_cluster(info: ClusterInfo) -> None:
     # CI sets this so the workflow's upload-artifact step has something to
     # capture when a multi-node test fails — otherwise `docker ps -a` after
     # teardown is empty and the failure has no server-side context.
+    # Mirror the overlay set start_cluster used so `down -v` removes
+    # all the services / networks / named volumes from BOTH files.
+    compose_args = ["docker", "compose", "-f", info.compose_file]
+    overlays = os.environ.get("KISEKI_E2E_COMPOSE_OVERLAYS", "").strip()
+    if overlays:
+        for overlay in overlays.split(":"):
+            overlay = overlay.strip()
+            if overlay:
+                compose_args.extend(["-f", overlay])
     log_dir = os.environ.get("KISEKI_E2E_LOG_DUMP_DIR")
     if log_dir:
         try:
@@ -331,8 +353,7 @@ def stop_cluster(info: ClusterInfo) -> None:
             log_path = os.path.join(log_dir, f"{stem}.log")
             with open(log_path, "wb") as fh:
                 subprocess.run(
-                    ["docker", "compose", "-f", info.compose_file,
-                     "logs", "--no-color", "--tail=2000"],
+                    compose_args + ["logs", "--no-color", "--tail=2000"],
                     cwd=root,
                     stdout=fh,
                     stderr=subprocess.STDOUT,
@@ -341,7 +362,7 @@ def stop_cluster(info: ClusterInfo) -> None:
         except OSError:
             pass  # log dumping is best-effort
     subprocess.run(
-        ["docker", "compose", "-f", info.compose_file, "down", "-v"],
+        compose_args + ["down", "-v"],
         cwd=root,
         capture_output=True,
         check=False,
