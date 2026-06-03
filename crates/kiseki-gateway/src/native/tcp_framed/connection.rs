@@ -5,19 +5,24 @@
 //! 1. Caller (the listener) hands us an already-handshaked stream
 //!    (rustls or plaintext) plus the [`TcpFramedPrincipal`] minted
 //!    from the validated peer cert.
-//! 2. We loop: read `[length be u32][body]`, decode the V3 frame via
-//!    [`decode_request_frame`], dispatch the verb via
-//!    [`super::dispatch::dispatch_verb`], encode the result via
-//!    [`encode_response_frame`], write back.
-//! 3. Loop ends on read EOF, write error, or unrecoverable wire-level
-//!    error (oversize, version mismatch).
+//! 2. We split the stream into read + write halves, wrap the write
+//!    half in an `AsyncMutex` so concurrent dispatch tasks can write
+//!    their responses without interleaving frames.
+//! 3. We read `[length be u32][body]` in the read loop; each frame is
+//!    `tokio::spawn`'d into its own dispatch task that decodes the V3
+//!    frame, dispatches the verb via [`super::dispatch::dispatch_verb`],
+//!    and writes the response under the shared write-half mutex.
+//! 4. Loop ends on read EOF or unrecoverable wire-level read error
+//!    (oversize length, malformed length prefix); in-flight dispatch
+//!    tasks finish on their own.
 //!
-//! Concurrency: `request_id` multiplex within one connection is
-//! deferred to slice 4 (client-side). v1 server processes frames
-//! sequentially per-connection; the client may pipeline (multiple
-//! outstanding requests on one connection) since the server preserves
-//! `request_id` in the response envelope. Cross-connection concurrency
-//! comes from the listener spawning one task per accepted connection.
+//! Concurrency: per-connection in-flight is unbounded by this layer.
+//! The client demultiplexes responses by `request_id` in the response
+//! envelope (the reader loop on the client maintains a `request_id` →
+//! oneshot map). Same shape the chunk-cluster fabric peer server uses
+//! (see `crates/kiseki-chunk-cluster/src/peer/tcp_framed/server.rs`).
+//! Cross-connection concurrency comes from the listener spawning one
+//! task per accepted connection.
 
 use std::sync::Arc;
 
@@ -26,6 +31,7 @@ use kiseki_proto::native_contract::wire_tcp_framed::{
     WireDecodeError, WireStatus,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::native::server::ServerImpl;
 
@@ -65,17 +71,20 @@ pub enum ConnectionError {
 /// mismatch) are converted to response frames sent back over the
 /// wire, NOT propagated up here.
 pub async fn serve_connection<S>(
-    stream: &mut S,
+    stream: S,
     server: Arc<ServerImpl>,
     principal: TcpFramedPrincipal,
 ) -> Result<(), ConnectionError>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let (mut read_half, write_half) = tokio::io::split(stream);
+    let write_half = Arc::new(AsyncMutex::new(write_half));
+
     let mut len_buf = [0u8; 4];
     loop {
         // Length prefix — if read returns 0 bytes, peer closed cleanly.
-        match stream.read_exact(&mut len_buf).await {
+        match read_half.read_exact(&mut len_buf).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e.into()),
@@ -89,47 +98,62 @@ where
                 // drain. Send a wire-level error response (request_id
                 // 0 — we never decoded a frame header) then close.
                 let payload = format!("frame oversize: {length_be} > cap").into_bytes();
-                let _ = write_response(stream, WireStatus::ProtocolError, 0, &payload, &[]).await;
+                let mut guard = write_half.lock().await;
+                let _ =
+                    write_response(&mut *guard, WireStatus::ProtocolError, 0, &payload, &[]).await;
                 return Err(e.into());
             }
         };
 
         let mut body = vec![0u8; body_len];
-        stream.read_exact(&mut body).await?;
+        read_half.read_exact(&mut body).await?;
 
-        // Decode V3 frame header — borrowed view over `body`.
-        // `meta` is the postcard-encoded request metadata; `bulk`
-        // is the raw bulk bytes (empty for non-bulk verbs). No copy
-        // of either is needed at this layer; dispatch sees borrowed
-        // slices.
-        let (request_id, verb_tag, req_meta_off, req_bulk_off) = match decode_request_frame(&body) {
-            Ok(view) => {
-                // Capture offsets so we can re-slice `body` for
-                // the dispatch call (the borrow checker won't
-                // let us hold `view` across the await — it
-                // borrows `body` and `body` is moved into the
-                // dispatch path).
-                let verb = view.verb_tag.to_string();
-                let meta_start = body.len() - view.meta.len() - view.bulk.len();
-                let bulk_start = body.len() - view.bulk.len();
-                (view.request_id, verb, meta_start, bulk_start)
-            }
-            Err(e) => {
-                let payload = format!("frame decode failed: {e}").into_bytes();
-                write_response(stream, WireStatus::ProtocolError, 0, &payload, &[]).await?;
-                continue;
-            }
-        };
+        // Spawn a dispatch task per frame so concurrent in-flight
+        // requests on this connection run in parallel. The read
+        // loop returns immediately to read the next length prefix;
+        // the dispatch task owns the body buffer and writes its
+        // response under the shared write-half mutex.
+        let server = Arc::clone(&server);
+        let principal = principal.clone();
+        let write_half = Arc::clone(&write_half);
+        tokio::spawn(async move {
+            // Decode V3 frame header — borrowed view over `body`.
+            // `meta` is the postcard-encoded request metadata; `bulk`
+            // is the raw bulk bytes (empty for non-bulk verbs).
+            let (request_id, verb_tag, req_meta_off, req_bulk_off) =
+                match decode_request_frame(&body) {
+                    Ok(view) => {
+                        let verb = view.verb_tag.to_string();
+                        let meta_start = body.len() - view.meta.len() - view.bulk.len();
+                        let bulk_start = body.len() - view.bulk.len();
+                        (view.request_id, verb, meta_start, bulk_start)
+                    }
+                    Err(e) => {
+                        let payload = format!("frame decode failed: {e}").into_bytes();
+                        let mut guard = write_half.lock().await;
+                        let _ = write_response(
+                            &mut *guard,
+                            WireStatus::ProtocolError,
+                            0,
+                            &payload,
+                            &[],
+                        )
+                        .await;
+                        return;
+                    }
+                };
 
-        let (status, resp_meta, resp_bulk) = dispatch_verb(
-            &server,
-            &principal,
-            &verb_tag,
-            &body[req_meta_off..req_bulk_off],
-            &body[req_bulk_off..],
-        )
-        .await;
-        write_response(stream, status, request_id, &resp_meta, &resp_bulk).await?;
+            let (status, resp_meta, resp_bulk) = dispatch_verb(
+                &server,
+                &principal,
+                &verb_tag,
+                &body[req_meta_off..req_bulk_off],
+                &body[req_bulk_off..],
+            )
+            .await;
+            let mut guard = write_half.lock().await;
+            let _ = write_response(&mut *guard, status, request_id, &resp_meta, &resp_bulk).await;
+        });
     }
 }
 
@@ -341,12 +365,10 @@ mod tests {
         let server = make_server().await;
         let principal = TcpFramedPrincipal::new("", ConnectionId(1));
 
-        let (mut client_side, mut server_side) = duplex(64 * 1024);
+        let (mut client_side, server_side) = duplex(64 * 1024);
 
         let server_task =
-            tokio::spawn(
-                async move { serve_connection(&mut server_side, server, principal).await },
-            );
+            tokio::spawn(async move { serve_connection(server_side, server, principal).await });
 
         let tenant = OrgId(uuid::Uuid::from_bytes([1; 16]));
         let ns = NamespaceId(uuid::Uuid::from_bytes([2; 16]));
@@ -385,11 +407,9 @@ mod tests {
         let server = make_server().await;
         let principal = TcpFramedPrincipal::new("", ConnectionId(1));
 
-        let (mut client_side, mut server_side) = duplex(64 * 1024);
+        let (mut client_side, server_side) = duplex(64 * 1024);
         let server_task =
-            tokio::spawn(
-                async move { serve_connection(&mut server_side, server, principal).await },
-            );
+            tokio::spawn(async move { serve_connection(server_side, server, principal).await });
 
         let tenant = OrgId(uuid::Uuid::from_bytes([1; 16]));
         let ns = NamespaceId(uuid::Uuid::from_bytes([2; 16]));
@@ -423,11 +443,9 @@ mod tests {
     async fn malformed_frame_keeps_connection_alive() {
         let server = make_server().await;
         let principal = TcpFramedPrincipal::new("", ConnectionId(1));
-        let (mut client_side, mut server_side) = duplex(64 * 1024);
+        let (mut client_side, server_side) = duplex(64 * 1024);
         let server_task =
-            tokio::spawn(
-                async move { serve_connection(&mut server_side, server, principal).await },
-            );
+            tokio::spawn(async move { serve_connection(server_side, server, principal).await });
 
         // Send a frame with valid length but corrupt postcard payload.
         let bad_payload: Vec<u8> = vec![NATIVE_TCP_FRAMED_VERSION_V3, 0xFF, 0xFF, 0xFF];
@@ -466,11 +484,9 @@ mod tests {
     async fn oversize_length_prefix_terminates_connection() {
         let server = make_server().await;
         let principal = TcpFramedPrincipal::new("", ConnectionId(1));
-        let (mut client_side, mut server_side) = duplex(64 * 1024);
+        let (mut client_side, server_side) = duplex(64 * 1024);
         let server_task =
-            tokio::spawn(
-                async move { serve_connection(&mut server_side, server, principal).await },
-            );
+            tokio::spawn(async move { serve_connection(server_side, server, principal).await });
 
         // Length way above the cap.
         let evil_len = u32::MAX;

@@ -200,10 +200,10 @@ async fn handle_one_connection(
         tracing::warn!(error = %e, "TCP-framed: TCP_NODELAY on accepted socket failed; perf may regress");
     }
     if let Some(acc) = acceptor {
-        let mut tls = acc.accept(tcp_stream).await?;
+        let tls = acc.accept(tcp_stream).await?;
         // Extract canonical SAN from the validated peer cert.
         let principal = principal_from_tls(&tls, conn_id)?;
-        match serve_connection(&mut tls, server, principal).await {
+        match serve_connection(tls, server, principal).await {
             Ok(()) => Ok(()),
             Err(super::connection::ConnectionError::Io(e)) => Err(e),
             Err(e) => Err(io::Error::other(e.to_string())),
@@ -214,8 +214,7 @@ async fn handle_one_connection(
         // gRPC binding's plaintext fallback).
         let dev = CanonicalSanUri::default_for_dev();
         let principal = TcpFramedPrincipal::new(dev.as_str(), conn_id);
-        let mut s = tcp_stream;
-        match serve_connection(&mut s, server, principal).await {
+        match serve_connection(tcp_stream, server, principal).await {
             Ok(()) => Ok(()),
             Err(super::connection::ConnectionError::Io(e)) => Err(e),
             Err(e) => Err(io::Error::other(e.to_string())),
