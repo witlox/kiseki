@@ -21,6 +21,10 @@ use crate::keys::{SystemMasterKey, TenantKek};
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Envelope {
     /// Encrypted data (without tag — tag is separate for clarity).
+    /// `serde_bytes` triggers postcard's length-prefix + memcpy fast
+    /// path so the ~4 KiB inline-PUT ciphertext doesn't walk through
+    /// `SerializeSeq::serialize_element` per byte (GH #196).
+    #[serde(with = "serde_bytes")]
     pub ciphertext: Vec<u8>,
     /// AEAD authentication tag (16 bytes).
     pub auth_tag: [u8; GCM_TAG_LEN],

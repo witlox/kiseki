@@ -1938,7 +1938,8 @@ impl GatewayOps for InMemoryGateway {
                                 usize::try_from(offset_in_slab).unwrap_or(usize::MAX);
                             let end = offset_usize.saturating_add(length as usize);
                             if end <= slab.data.len() {
-                                serde_json::from_slice::<envelope::Envelope>(
+                                // GH #196: postcard (matches the encode site)
+                                postcard::from_bytes::<envelope::Envelope>(
                                     &slab.data[offset_usize..end],
                                 )
                                 .ok()
@@ -1974,7 +1975,7 @@ impl GatewayOps for InMemoryGateway {
                     .get(&chunk_id.0)
                     .ok()
                     .flatten()
-                    .and_then(|d| serde_json::from_slice::<envelope::Envelope>(&d).ok())
+                    .and_then(|d| postcard::from_bytes::<envelope::Envelope>(&d).ok())
             } else {
                 None
             };
@@ -2789,7 +2790,13 @@ impl InMemoryGateway {
                 piece_len <= shard_inline_threshold
             };
             if pieces_len == 1 && inline_eligible && self.small_store.is_some() {
-                let env_bytes = serde_json::to_vec(&env).map_err(|e| {
+                // GH #196: postcard, not JSON. The inline path's
+                // `env_bytes` rides into SmallObjectStore AND fans
+                // out via the Raft delta; JSON used to inflate each
+                // ciphertext byte to ~4 chars + comma through
+                // `itoa::write` (~8% of node1 CPU on the 2026-06-03
+                // flamegraph). postcard is length-prefix + memcpy.
+                let env_bytes = postcard::to_stdvec(&env).map_err(|e| {
                     tracing::warn!(?chunk_id, error = %e, "gateway write: inline encode failed");
                     GatewayError::Upstream(e.to_string())
                 })?;

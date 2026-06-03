@@ -22,7 +22,6 @@ native = [
     "dep:kiseki-proto",
     "dep:tonic",
     "dep:prost",
-    "dep:postcard",
     "dep:tokio-stream",
     "dep:x509-parser",
 ]
@@ -53,7 +52,7 @@ kiseki-tracing = { workspace = true }
 kiseki-proto = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
-postcard = { workspace = true, optional = true }
+postcard = { workspace = true }
 tokio-stream = { version = "0.1", optional = true }
 x509-parser = { workspace = true, optional = true }
 aws-lc-rs = { workspace = true }
