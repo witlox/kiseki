@@ -156,6 +156,23 @@ struct ParsedMount {
     source: String,
     mount_point: PathBuf,
     fstype: String,
+    /// Comma-separated mount options as read from /proc/mounts.
+    /// Used to filter read-only mounts (kiseki needs writable storage).
+    options: String,
+}
+
+impl ParsedMount {
+    /// True when the mount was mounted read-only (`ro` flag in the
+    /// options string). The kernel's `/proc/mounts` always lists the
+    /// effective read-only state, even when the underlying device is
+    /// writable — so this catches both `mount -o ro` and read-only
+    /// filesystem images (Arch Linux's `/usr`, Snap containers,
+    /// squashfs roots, etc.).
+    fn is_readonly(&self) -> bool {
+        self.options
+            .split(',')
+            .any(|opt| opt == "ro" || opt.starts_with("ro,"))
+    }
 }
 
 /// Parse `/proc/mounts` content into structured rows. Pure function
@@ -172,6 +189,7 @@ fn parse_mounts(content: &str) -> Vec<ParsedMount> {
             source: parts[0].to_owned(),
             mount_point: PathBuf::from(parts[1]),
             fstype: parts[2].to_owned(),
+            options: parts.get(3).copied().unwrap_or("").to_owned(),
         });
     }
     out
@@ -198,6 +216,14 @@ fn filter_real_storage(mounts: Vec<ParsedMount>, tags: &DeviceTagMap) -> Vec<Par
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
     mounts
         .into_iter()
+        .filter(|m| {
+            // Read-only mounts are unusable as backing storage — fjall
+            // would error `ReadOnlyFilesystem` on open. Drop them
+            // unconditionally (no operator override: if you want fjall
+            // on a ro mount, that's a config error). Catches Arch's
+            // `/usr` partition, squashfs/snap mounts, etc.
+            !m.is_readonly()
+        })
         .filter(|m| {
             // Operator tag overrides the fstype filter. Untagged tmpfs
             // is still excluded.
@@ -528,6 +554,35 @@ tmpfs {} tmpfs rw 0 0
         let tagged = filter_real_storage(mounts, &DeviceTagMap::parse(&tag_input));
         assert_eq!(tagged.len(), 1);
         assert_eq!(tagged[0].mount_point, fast_small);
+    }
+
+    #[test]
+    fn filter_real_storage_drops_readonly_mounts() {
+        // Arch Linux mounts /usr as a separate ext4 partition on the
+        // root block device, READ-ONLY. Before the ro-filter the
+        // resolver would pick `/usr` for SmallObject via Class(Nvme),
+        // then fjall would error ReadOnlyFilesystem on open. After:
+        // ro mounts are excluded so the resolver falls to DataDir.
+        let tmp = tempfile::tempdir().unwrap();
+        let usr = tmp.path().join("usr");
+        let var = tmp.path().join("var");
+        std::fs::create_dir_all(&usr).unwrap();
+        std::fs::create_dir_all(&var).unwrap();
+        let proc_content = format!(
+            "\
+/dev/nvme0n1p2 {} ext4 ro,nosuid,nodev,relatime 0 0
+/dev/nvme0n1p3 {} ext4 rw,nosuid,nodev,relatime 0 0
+",
+            usr.display(),
+            var.display(),
+        );
+        let mounts = parse_mounts(&proc_content);
+        // Sanity: parse_mounts captured the options column.
+        assert!(mounts[0].is_readonly(), "ro mount must be flagged");
+        assert!(!mounts[1].is_readonly(), "rw mount must not be flagged");
+        let real = filter_real_storage(mounts, &DeviceTagMap::parse(""));
+        assert_eq!(real.len(), 1, "ro mount must be dropped");
+        assert_eq!(real[0].mount_point, var);
     }
 
     #[test]
