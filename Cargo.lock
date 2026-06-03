@@ -2287,6 +2287,7 @@ dependencies = [
  "libc",
  "proptest",
  "serde",
+ "serde_bytes",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

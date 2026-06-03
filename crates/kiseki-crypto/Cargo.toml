@@ -29,6 +29,7 @@ aws-lc-rs = { workspace = true }
 blake3 = "1.5"
 libc = { workspace = true }
 serde = { version = "1", features = ["derive"] }
+serde_bytes = { workspace = true }
 zeroize = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
