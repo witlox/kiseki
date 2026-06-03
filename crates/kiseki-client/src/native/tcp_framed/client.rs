@@ -584,10 +584,10 @@ mod tests {
             signing,
         ));
 
-        let (client_side, mut server_side) = duplex(64 * 1024);
+        let (client_side, server_side) = duplex(64 * 1024);
         let principal = TcpFramedPrincipal::new("", ConnectionId(1));
         let server_task = tokio::spawn(async move {
-            let _ = server_serve(&mut server_side, server, principal).await;
+            let _ = server_serve(server_side, server, principal).await;
         });
 
         let client = TcpFramedClient::from_stream(client_side);
