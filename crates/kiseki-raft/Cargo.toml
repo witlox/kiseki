@@ -17,6 +17,11 @@ arc-swap = "1.7"
 async-trait = { workspace = true }
 dashmap = "6"
 futures = "0.3"
+# In-memory LRU cache for FjallRaftLogStore (GH #199). Holds
+# already-deserialized Entry<C> so the leader-side double-decode
+# (read for replication + read for apply) doesn't pay postcard
+# twice on hot recent entries.
+lru = { workspace = true }
 openraft = { workspace = true }
 prometheus = { workspace = true }
 # Persistent Raft log store (ADR-022 rev-2 successor): fjall replaces
