@@ -156,6 +156,23 @@ struct ParsedMount {
     source: String,
     mount_point: PathBuf,
     fstype: String,
+    /// Comma-separated mount options as read from /proc/mounts.
+    /// Used to filter read-only mounts (kiseki needs writable storage).
+    options: String,
+}
+
+impl ParsedMount {
+    /// True when the mount was mounted read-only (`ro` flag in the
+    /// options string). The kernel's `/proc/mounts` always lists the
+    /// effective read-only state, even when the underlying device is
+    /// writable — so this catches both `mount -o ro` and read-only
+    /// filesystem images (Arch Linux's `/usr`, Snap containers,
+    /// squashfs roots, etc.).
+    fn is_readonly(&self) -> bool {
+        self.options
+            .split(',')
+            .any(|opt| opt == "ro" || opt.starts_with("ro,"))
+    }
 }
 
 /// Parse `/proc/mounts` content into structured rows. Pure function
@@ -172,27 +189,63 @@ fn parse_mounts(content: &str) -> Vec<ParsedMount> {
             source: parts[0].to_owned(),
             mount_point: PathBuf::from(parts[1]),
             fstype: parts[2].to_owned(),
+            options: parts.get(3).copied().unwrap_or("").to_owned(),
         });
     }
     out
 }
 
 /// Filter parsed mounts down to "real backing storage":
-///   - fstype not in [`EXCLUDED_FSTYPES`]
-///   - mount point not under [`EXCLUDED_PATH_PREFIXES`]
-///   - source starts with `/dev/` (a real block device) — `bind`
-///     mounts and `none` sources are skipped
+///   - fstype not in [`EXCLUDED_FSTYPES`] (overridable: operator-tagged
+///     paths bypass this filter — operators tag mounts intentionally,
+///     so a tagged tmpfs is a deliberate fast-volatile cache, not noise)
+///   - source starts with `/dev/` OR the path is operator-tagged
+///     (docker bind mounts have non-`/dev` sources but are real backing
+///     storage when the operator says so)
+///   - mount point is an actual directory (drops bind-mounted *files*
+///     like docker's `/etc/resolv.conf` on `/dev/sdX` — fjall opens
+///     directories, so a file-mount is unusable)
+///   - mount point not under [`EXCLUDED_PATH_PREFIXES`] (no exception:
+///     even an operator-tagged `/proc/...` is a config error)
 ///
 /// Deduplicates by `mount_point` (keeps the first occurrence, which
 /// matches kernel's "most recent wins" ordering when /proc/mounts
 /// is re-read after a `mount -o remount`).
-fn filter_real_storage(mounts: Vec<ParsedMount>) -> Vec<ParsedMount> {
+fn filter_real_storage(mounts: Vec<ParsedMount>, tags: &DeviceTagMap) -> Vec<ParsedMount> {
     let excluded_fstypes: HashSet<&str> = EXCLUDED_FSTYPES.iter().copied().collect();
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
     mounts
         .into_iter()
-        .filter(|m| !excluded_fstypes.contains(m.fstype.as_str()))
-        .filter(|m| m.source.starts_with("/dev/"))
+        .filter(|m| {
+            // Read-only mounts are unusable as backing storage — fjall
+            // would error `ReadOnlyFilesystem` on open. Drop them
+            // unconditionally (no operator override: if you want fjall
+            // on a ro mount, that's a config error). Catches Arch's
+            // `/usr` partition, squashfs/snap mounts, etc.
+            !m.is_readonly()
+        })
+        .filter(|m| {
+            // Operator tag overrides the fstype filter. Untagged tmpfs
+            // is still excluded.
+            tags.tag_for(&m.mount_point).is_some() || !excluded_fstypes.contains(m.fstype.as_str())
+        })
+        .filter(|m| {
+            // Operator tag overrides the source filter (docker bind mounts).
+            tags.tag_for(&m.mount_point).is_some() || m.source.starts_with("/dev/")
+        })
+        .filter(|m| {
+            // Bind-mounted *files* (e.g. /etc/resolv.conf in docker)
+            // appear in /proc/mounts on a real `/dev/X` source but their
+            // `mount_point` is a file, not a directory. fjall would
+            // `mkdir_all` the parent and then NotADirectory on open.
+            // Drop unconditionally — no operator override; if you
+            // intend a fjall keyspace on a file, that's a bug.
+            //
+            // `is_dir()` returns false for non-existent paths too,
+            // which is the right behaviour: a stale /proc/mounts entry
+            // for a removed mount point is not a viable storage device.
+            m.mount_point.is_dir()
+        })
         .filter(|m| {
             let p = m.mount_point.to_string_lossy();
             !EXCLUDED_PATH_PREFIXES
@@ -242,7 +295,7 @@ pub fn discover_with_proc_mounts(
     refreshed_ms: u64,
     proc_mounts_content: &str,
 ) -> NodeDeviceInventory {
-    let real_mounts = filter_real_storage(parse_mounts(proc_mounts_content));
+    let real_mounts = filter_real_storage(parse_mounts(proc_mounts_content), tags);
     let mut devices: Vec<DeviceEntry> = Vec::with_capacity(real_mounts.len() + 1);
 
     for m in real_mounts {
@@ -400,53 +453,162 @@ tmpfs /run tmpfs rw,nosuid,nodev,size=10M 0 0
         assert_eq!(mounts[2].mount_point, PathBuf::from("/mnt/nvme0"));
     }
 
+    /// Use a tempdir + `/` (always a directory) to satisfy the
+    /// `mount_point.is_dir()` check added in rev 5+. The filter doesn't
+    /// stat the source — only the mount point — so we can keep
+    /// synthetic device sources while pointing the mount at real dirs.
     #[test]
     fn filter_real_storage_drops_kernel_and_runtime_fstypes() {
-        let mounts = parse_mounts(
+        let tmp = tempfile::tempdir().unwrap();
+        let nvme = tmp.path().join("nvme0");
+        let sata = tmp.path().join("sata0");
+        std::fs::create_dir_all(&nvme).unwrap();
+        std::fs::create_dir_all(&sata).unwrap();
+        let proc_content = format!(
             "\
 proc /proc proc rw 0 0
 sysfs /sys sysfs rw 0 0
 tmpfs /run tmpfs rw 0 0
-/dev/nvme0n1p1 /mnt/nvme0 ext4 rw 0 0
+/dev/nvme0n1p1 {} ext4 rw 0 0
 /dev/sda1 / ext4 rw 0 0
-/dev/sdb1 /mnt/sata0 xfs rw 0 0
+/dev/sdb1 {} xfs rw 0 0
 overlay /var/lib/docker/overlay2/abc/merged overlay rw 0 0
 ",
+            nvme.display(),
+            sata.display(),
         );
-        let real = filter_real_storage(mounts);
+        let mounts = parse_mounts(&proc_content);
+        let tags = DeviceTagMap::parse("");
+        let real = filter_real_storage(mounts, &tags);
         // Should keep nvme0, /, and sata0; drop proc/sysfs/tmpfs/overlay.
         assert_eq!(real.len(), 3);
         let paths: Vec<_> = real.iter().map(|m| &m.mount_point).collect();
-        assert!(paths.contains(&&PathBuf::from("/mnt/nvme0")));
+        assert!(paths.contains(&&nvme));
         assert!(paths.contains(&&PathBuf::from("/")));
-        assert!(paths.contains(&&PathBuf::from("/mnt/sata0")));
+        assert!(paths.contains(&&sata));
     }
 
     #[test]
     fn filter_real_storage_skips_excluded_path_prefixes() {
-        let mounts = parse_mounts(
+        let tmp = tempfile::tempdir().unwrap();
+        let nvme = tmp.path().join("nvme0");
+        std::fs::create_dir_all(&nvme).unwrap();
+        let proc_content = format!(
             "\
 /dev/snap0 /snap/foo ext4 rw 0 0
-/dev/nvme0n1p1 /mnt/nvme0 ext4 rw 0 0
+/dev/nvme0n1p1 {} ext4 rw 0 0
 ",
+            nvme.display(),
         );
-        let real = filter_real_storage(mounts);
+        let mounts = parse_mounts(&proc_content);
+        let tags = DeviceTagMap::parse("");
+        let real = filter_real_storage(mounts, &tags);
         assert_eq!(real.len(), 1);
-        assert_eq!(real[0].mount_point, PathBuf::from("/mnt/nvme0"));
+        assert_eq!(real[0].mount_point, nvme);
     }
 
     #[test]
     fn filter_real_storage_deduplicates_by_mount_point() {
         // A remount creates a second /proc/mounts entry for the same
         // path; keep the first.
-        let mounts = parse_mounts(
+        let tmp = tempfile::tempdir().unwrap();
+        let foo = tmp.path().join("foo");
+        std::fs::create_dir_all(&foo).unwrap();
+        let proc_content = format!(
             "\
-/dev/sda1 /mnt/foo ext4 rw,defaults 0 0
-/dev/sda1 /mnt/foo ext4 rw,remount,noatime 0 0
+/dev/sda1 {} ext4 rw,defaults 0 0
+/dev/sda1 {} ext4 rw,remount,noatime 0 0
 ",
+            foo.display(),
+            foo.display(),
         );
-        let real = filter_real_storage(mounts);
+        let mounts = parse_mounts(&proc_content);
+        let tags = DeviceTagMap::parse("");
+        let real = filter_real_storage(mounts, &tags);
         assert_eq!(real.len(), 1);
+    }
+
+    #[test]
+    fn filter_real_storage_operator_tag_overrides_tmpfs_exclusion() {
+        // ADR-049 phase 5a+ regression: docker bind-mounts /tmp paths
+        // appear as tmpfs (inherited from host /tmp). When the operator
+        // explicitly tags such a mount via KISEKI_DEVICE_TAGS, it MUST
+        // be included in the inventory so policies that target the tag
+        // can match. Without this, docker-compose ADR-049 tests fall
+        // through to Class(Nvme) and silently pick `/etc/resolv.conf`.
+        let tmp = tempfile::tempdir().unwrap();
+        let fast_small = tmp.path().join("fast-small");
+        std::fs::create_dir_all(&fast_small).unwrap();
+        let proc_content = format!(
+            "\
+tmpfs {} tmpfs rw 0 0
+",
+            fast_small.display(),
+        );
+        let mounts = parse_mounts(&proc_content);
+        // Without a tag: tmpfs filter drops it.
+        let untagged = filter_real_storage(mounts.clone(), &DeviceTagMap::parse(""));
+        assert!(untagged.is_empty(), "untagged tmpfs must be dropped");
+        // With a tag: operator override keeps it.
+        let tag_input = format!("{}=fast-small", fast_small.display());
+        let tagged = filter_real_storage(mounts, &DeviceTagMap::parse(&tag_input));
+        assert_eq!(tagged.len(), 1);
+        assert_eq!(tagged[0].mount_point, fast_small);
+    }
+
+    #[test]
+    fn filter_real_storage_drops_readonly_mounts() {
+        // Arch Linux mounts /usr as a separate ext4 partition on the
+        // root block device, READ-ONLY. Before the ro-filter the
+        // resolver would pick `/usr` for SmallObject via Class(Nvme),
+        // then fjall would error ReadOnlyFilesystem on open. After:
+        // ro mounts are excluded so the resolver falls to DataDir.
+        let tmp = tempfile::tempdir().unwrap();
+        let usr = tmp.path().join("usr");
+        let var = tmp.path().join("var");
+        std::fs::create_dir_all(&usr).unwrap();
+        std::fs::create_dir_all(&var).unwrap();
+        let proc_content = format!(
+            "\
+/dev/nvme0n1p2 {} ext4 ro,nosuid,nodev,relatime 0 0
+/dev/nvme0n1p3 {} ext4 rw,nosuid,nodev,relatime 0 0
+",
+            usr.display(),
+            var.display(),
+        );
+        let mounts = parse_mounts(&proc_content);
+        // Sanity: parse_mounts captured the options column.
+        assert!(mounts[0].is_readonly(), "ro mount must be flagged");
+        assert!(!mounts[1].is_readonly(), "rw mount must not be flagged");
+        let real = filter_real_storage(mounts, &DeviceTagMap::parse(""));
+        assert_eq!(real.len(), 1, "ro mount must be dropped");
+        assert_eq!(real[0].mount_point, var);
+    }
+
+    #[test]
+    fn filter_real_storage_drops_bind_mounted_files() {
+        // Docker bind-mounts /etc/resolv.conf, /etc/hostname, /etc/hosts
+        // as individual files on the host's root block device. They appear
+        // in /proc/mounts as `/dev/nvmeXnY /etc/resolv.conf ext4 ...`
+        // but `mount_point.is_dir()` is false (it's a file). fjall would
+        // error NotADirectory on open. Drop them at the filter.
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let file_mount = tmp.path().join("file");
+        std::fs::write(&file_mount, b"i am a file").unwrap();
+        let proc_content = format!(
+            "\
+/dev/nvme0n1p2 {} ext4 rw 0 0
+/dev/nvme0n1p2 {} ext4 rw 0 0
+",
+            file_mount.display(),
+            real_dir.display(),
+        );
+        let mounts = parse_mounts(&proc_content);
+        let real = filter_real_storage(mounts, &DeviceTagMap::parse(""));
+        assert_eq!(real.len(), 1);
+        assert_eq!(real[0].mount_point, real_dir);
     }
 
     #[test]

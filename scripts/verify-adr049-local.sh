@@ -20,6 +20,19 @@ set -uo pipefail
 TEST_ROOT=/tmp/kiseki-test
 NODES=(node1 node2 node3)
 
+# Container names — docker compose project is the repo dir basename
+# ("kiseki") so the pattern is kiseki-kiseki-node{1,2,3}-1.
+declare -A CONTAINER=(
+  [node1]=kiseki-kiseki-node1-1
+  [node2]=kiseki-kiseki-node2-1
+  [node3]=kiseki-kiseki-node3-1
+)
+
+# kiseki writes pointer file + fjall data as root with 0600 / 0700,
+# so the verify checks all go through `docker exec` rather than
+# the host bind paths (the host user can't read root-owned tmpfs).
+exec_in() { docker exec "${CONTAINER[$1]}" "${@:2}"; }
+
 # Maps node → host S3 port (from docker-compose.3node.yml port maps)
 declare -A S3_PORT=(
   [node1]=9000
@@ -69,11 +82,10 @@ wait_for_cluster() {
 verify_pointer_files_exist() {
   step "T1: pointer file written"
   for n in "${NODES[@]}"; do
-    local pointer="${TEST_ROOT}/${n}-data/kiseki-tier-paths.json"
-    if [ ! -f "$pointer" ]; then
-      fail "${n}: pointer file missing at ${pointer}"
+    if ! exec_in "$n" test -f /data/kiseki-tier-paths.json; then
+      fail "${n}: pointer file missing at /data/kiseki-tier-paths.json"
     fi
-    ok "${n}: ${pointer} exists"
+    ok "${n}: /data/kiseki-tier-paths.json exists"
   done
 }
 
@@ -81,37 +93,20 @@ verify_pointer_files_exist() {
 verify_pointer_paths() {
   step "T2: pointer paths point at /mnt/fast-{small,meta}/kiseki/<tier>"
   for n in "${NODES[@]}"; do
-    local pointer="${TEST_ROOT}/${n}-data/kiseki-tier-paths.json"
-    if ! command -v jq >/dev/null 2>&1; then
-      yellow "  jq not installed — falling back to grep"
-      grep -q '/mnt/fast-small/kiseki/small-object' "$pointer" \
-        || fail "${n}: small_object not on /mnt/fast-small"
-      grep -q '/mnt/fast-meta/kiseki/intent-store' "$pointer" \
-        || fail "${n}: intent_store not on /mnt/fast-meta"
-      grep -q '/mnt/fast-meta/kiseki/composition-meta' "$pointer" \
-        || fail "${n}: composition_meta not on /mnt/fast-meta"
-      grep -q '/mnt/fast-meta/kiseki/chunk-meta' "$pointer" \
-        || fail "${n}: chunk_meta not on /mnt/fast-meta"
-      ok "${n}: all 4 tiers on /mnt/fast-* (grep check)"
-      continue
-    fi
-    local small intent compo chunk
-    small=$(jq -r '.paths.small_object'      "$pointer")
-    intent=$(jq -r '.paths.intent_store'     "$pointer")
-    compo=$(jq -r '.paths.composition_meta'  "$pointer")
-    chunk=$(jq -r '.paths.chunk_meta'        "$pointer")
-    [[ "$small" == "/mnt/fast-small/kiseki/small-object" ]] \
-      || fail "${n}: small_object=${small} expected /mnt/fast-small/kiseki/small-object"
-    [[ "$intent" == "/mnt/fast-meta/kiseki/intent-store" ]] \
-      || fail "${n}: intent_store=${intent} expected /mnt/fast-meta/kiseki/intent-store"
-    [[ "$compo" == "/mnt/fast-meta/kiseki/composition-meta" ]] \
-      || fail "${n}: composition_meta=${compo} expected /mnt/fast-meta/kiseki/composition-meta"
-    [[ "$chunk" == "/mnt/fast-meta/kiseki/chunk-meta" ]] \
-      || fail "${n}: chunk_meta=${chunk} expected /mnt/fast-meta/kiseki/chunk-meta"
-    ok "${n}: small_object → ${small}"
-    ok "${n}: intent_store → ${intent}"
-    ok "${n}: composition_meta → ${compo}"
-    ok "${n}: chunk_meta → ${chunk}"
+    local pointer_json
+    pointer_json=$(exec_in "$n" cat /data/kiseki-tier-paths.json)
+    for expected in \
+        '/mnt/fast-small/kiseki/small-object' \
+        '/mnt/fast-meta/kiseki/intent-store' \
+        '/mnt/fast-meta/kiseki/composition-meta' \
+        '/mnt/fast-meta/kiseki/chunk-meta'; do
+      if ! grep -q "$expected" <<< "$pointer_json"; then
+        red "  $n: pointer file content:"
+        echo "$pointer_json" | sed 's/^/    /'
+        fail "${n}: expected path ${expected} not in pointer"
+      fi
+    done
+    ok "${n}: all 4 tiers on /mnt/fast-{small,meta}"
   done
 }
 
@@ -120,25 +115,28 @@ verify_pointer_paths() {
 verify_keyspace_dirs() {
   step "T3: fjall keyspaces exist on /mnt/fast-{small,meta}"
   for n in "${NODES[@]}"; do
-    local small="${TEST_ROOT}/${n}-small/kiseki/small-object"
-    local meta_compo="${TEST_ROOT}/${n}-meta/kiseki/composition-meta"
-    local meta_chunk="${TEST_ROOT}/${n}-meta/kiseki/chunk-meta"
-    [ -d "$small" ]      || fail "${n}: SmallObjectStore dir missing at ${small}"
-    [ -d "$meta_compo" ] || fail "${n}: CompositionMeta dir missing at ${meta_compo}"
-    [ -d "$meta_chunk" ] || fail "${n}: ChunkMeta dir missing at ${meta_chunk}"
+    for path in \
+        /mnt/fast-small/kiseki/small-object \
+        /mnt/fast-meta/kiseki/composition-meta \
+        /mnt/fast-meta/kiseki/chunk-meta; do
+      if ! exec_in "$n" test -d "$path"; then
+        fail "${n}: fjall keyspace dir missing at ${path}"
+      fi
+    done
     ok "${n}: small-object/, composition-meta/, chunk-meta/ all present"
-    # Also verify the FALLBACK paths are EMPTY — if these have content
-    # the runtime is still opening at data_dir-relative paths (the bug
-    # this whole feature fixes).
-    if [ -d "${TEST_ROOT}/${n}-data/small/objects" ] && \
-       [ -n "$(ls -A "${TEST_ROOT}/${n}-data/small/objects" 2>/dev/null)" ]; then
-      fail "${n}: fallback /data/small/objects is non-empty — runtime opened at fallback"
+    # Verify the FALLBACK paths are EMPTY — if these have content the
+    # runtime is still opening at data_dir-relative paths (the bug this
+    # whole feature fixes).
+    local count
+    count=$(exec_in "$n" sh -c 'ls /data/small/objects 2>/dev/null | wc -l')
+    if [ "${count:-0}" -gt 0 ]; then
+      fail "${n}: fallback /data/small/objects non-empty (${count} entries) — runtime opened at fallback"
     fi
-    if [ -d "${TEST_ROOT}/${n}-data/metadata/compositions" ] && \
-       [ -n "$(ls -A "${TEST_ROOT}/${n}-data/metadata/compositions" 2>/dev/null)" ]; then
-      fail "${n}: fallback /data/metadata/compositions is non-empty — runtime opened at fallback"
+    count=$(exec_in "$n" sh -c 'ls /data/metadata/compositions 2>/dev/null | wc -l')
+    if [ "${count:-0}" -gt 0 ]; then
+      fail "${n}: fallback /data/metadata/compositions non-empty — runtime opened at fallback"
     fi
-    ok "${n}: fallback paths empty (resolver is wiring through)"
+    ok "${n}: fallback paths empty (resolver wired through)"
   done
 }
 
@@ -146,51 +144,59 @@ verify_keyspace_dirs() {
 verify_small_put_lands_in_fast_small() {
   step "T4: S3 PUT lands under /mnt/fast-small/kiseki/small-object"
   local bucket="adr049smoke"
-  local key="hello.txt"
+  local key="hello-$(date +%s).txt"
   local payload="hello adr-049"
-  # Use node1's S3 endpoint
   local s3="http://127.0.0.1:${S3_PORT[node1]}"
-  # Snapshot small-object dir sizes BEFORE
-  local before_size_n1
-  before_size_n1=$(du -sb "${TEST_ROOT}/node1-small/kiseki/small-object" 2>/dev/null | awk '{print $1}')
-  before_size_n1=${before_size_n1:-0}
-  # Create bucket + PUT
-  curl -s -X PUT "${s3}/${bucket}" -o /dev/null -w '%{http_code}\n' | grep -qE '^(200|409)$' \
-    || fail "S3 bucket create failed"
-  echo "${payload}" | curl -s -X PUT --data-binary @- "${s3}/${bucket}/${key}" -o /dev/null -w '%{http_code}\n' \
-    | grep -qE '^(200|201|204)$' \
-    || fail "S3 PUT failed"
-  # Allow the gateway to flush
-  sleep 2
-  # Snapshot AFTER on ALL nodes (chunk may have been routed to any node)
+  # fjall preallocates a 64 MiB journal so `du` can't detect a small
+  # write. Track the mtime of the journal file instead — a PUT advances
+  # it. (POSIX `stat -c %Y` returns seconds since epoch.)
+  declare -A before
+  for n in "${NODES[@]}"; do
+    before[$n]=$(exec_in "$n" sh -c 'stat -c %Y /mnt/fast-small/kiseki/small-object/0.jnl 2>/dev/null' || echo 0)
+    before[$n]=${before[$n]:-0}
+  done
+  # Create bucket (409 = already exists is fine on a re-run)
+  local bucket_code
+  bucket_code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${s3}/${bucket}")
+  case "$bucket_code" in
+    200|409) ;;
+    *) fail "S3 bucket create returned ${bucket_code}" ;;
+  esac
+  local put_code
+  put_code=$(echo "${payload}" | curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary @- "${s3}/${bucket}/${key}")
+  case "$put_code" in
+    200|201|204) ;;
+    *) fail "S3 PUT returned ${put_code}" ;;
+  esac
+  # Allow the gateway + raft + fjall flush
+  sleep 3
   local grew=0
   for n in "${NODES[@]}"; do
-    local before=0 after=0
-    [ "$n" = "node1" ] && before=$before_size_n1
-    after=$(du -sb "${TEST_ROOT}/${n}-small/kiseki/small-object" 2>/dev/null | awk '{print $1}')
+    local after
+    after=$(exec_in "$n" sh -c 'stat -c %Y /mnt/fast-small/kiseki/small-object/0.jnl 2>/dev/null' || echo 0)
     after=${after:-0}
-    if [ "$after" -gt "$before" ]; then
+    if [ "$after" -gt "${before[$n]}" ]; then
       grew=$((grew + 1))
-      ok "${n}: small-object/ grew ${before} → ${after} bytes"
+      ok "${n}: small-object journal mtime advanced ${before[$n]} → ${after}"
     fi
   done
   if [ "$grew" -eq 0 ]; then
-    fail "no node's small-object/ grew — PUT did not land on fast-small"
+    fail "no node's small-object journal advanced — inline PUT did not write fast-small"
   fi
-  ok "${grew} node(s) recorded the inline payload under /mnt/fast-small"
+  ok "${grew} node(s) wrote to /mnt/fast-small/kiseki/small-object"
 }
 
 # T5: tamper with the pointer, restart node, expect I-CP-Move trip
 verify_icp_move_guard() {
   step "T5: I-CP-Move guard trips on tampered pointer"
-  local pointer="${TEST_ROOT}/node1-data/kiseki-tier-paths.json"
   # Bring node1 down cleanly
   docker compose -f docker-compose.3node.yml -f docker-compose.3node.adr049.yml \
     stop kiseki-node1 >/dev/null 2>&1
-  # Tamper: rewrite pointer so small_object claims a different mount
-  # while the actual keyspace still lives on /mnt/fast-small. Boot must
-  # refuse rather than silently switching.
-  cat > "$pointer" <<EOF
+  # Tamper: rewrite pointer so small_object claims a different mount.
+  # We use docker run with the bind volume so the write happens as root
+  # (the host user can't write 0600 root-owned files).
+  docker run --rm -v /tmp/kiseki-test/node1-data:/data alpine:latest sh -c '
+    cat > /data/kiseki-tier-paths.json <<EOF
 {
   "paths": {
     "small_object":     "/mnt/fast-different/kiseki/small-object",
@@ -200,11 +206,13 @@ verify_icp_move_guard() {
   }
 }
 EOF
+    chmod 0600 /data/kiseki-tier-paths.json
+  '
   ok "tampered pointer written (small_object now claims /mnt/fast-different)"
-  # Restart node1 in foreground-ish mode and capture exit
+  # Restart node1 — it should refuse to start
   docker compose -f docker-compose.3node.yml -f docker-compose.3node.adr049.yml \
     start kiseki-node1 >/dev/null 2>&1
-  # Wait for logs to contain the error OR the node to come up healthy
+  # Wait for logs to contain the error
   local saw_error=0
   for _ in $(seq 1 30); do
     if docker compose -f docker-compose.3node.yml -f docker-compose.3node.adr049.yml \
@@ -222,9 +230,10 @@ EOF
       logs --tail=80 kiseki-node1 2>&1 | sed 's/^/    /'
     fail "I-CP-Move was expected to trip; it didn't"
   fi
-  # Restore the pointer + restart so the cluster is healthy on exit
+  # Restore: delete the pointer file so first-boot resolve regenerates it
   yellow "  restoring pointer + restarting node1"
-  rm -f "$pointer"
+  docker run --rm -v /tmp/kiseki-test/node1-data:/data alpine:latest \
+    rm -f /data/kiseki-tier-paths.json
   docker compose -f docker-compose.3node.yml -f docker-compose.3node.adr049.yml \
     restart kiseki-node1 >/dev/null 2>&1
 }

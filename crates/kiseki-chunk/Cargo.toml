@@ -46,6 +46,11 @@ serde_json = "1"
 # concurrent reads kill the previous `Mutex<HashMap>` contention
 # without paying for an LSM on a 10-entry config table.
 dashmap = "6"
+# ArcSwap on the pool snapshot (the input to `select_pool_for_write`).
+# Pools mutate via admin RPC (rare); reads happen per-PUT (frequent).
+# arc-swap lets the hot write path do a single atomic load instead of
+# cloning every pool entry out of the DashMap on every op.
+arc-swap = "1.7"
 # fjall WAL for chunk + fragment meta (ADR-022 rev-4). Replaces the
 # `save_meta` / `save_frag_meta` JSON-rewrite-the-world calls that
 # capped per-PUT cost at O(N) in store size. Same backend the
