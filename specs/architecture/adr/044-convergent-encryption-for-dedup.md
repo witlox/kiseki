@@ -1,16 +1,39 @@
 # ADR-044: Convergent encryption for content-addressed dedup
 
-**Status:** Accepted (adversary-reviewed 2026-05-27; findings addressed below)
+**Status:** Accepted (adversary-reviewed 2026-05-27; findings addressed below;
+rev-2 hash-algorithm amendment 2026-06-03)
 **Date:** 2026-05-27
 **Relates to:** ADR-002 (two-layer encryption), ADR-003 (HKDF DEK derivation), ADR-017 (dedup + refcount), GH #102
 
+## Revision history
+
+- **rev 2** (2026-06-03): **BLAKE3 becomes the default `chunk_id` hash**;
+  SHA-256 + HMAC-SHA256 is still selectable via `KISEKI_CHUNK_HASH=sha256`
+  for FIPS-only deployments. Both produce 32-byte outputs so `ChunkId([u8;32])`
+  is unchanged. Trigger: SHA-256 was 21 % of single-thread 4 KiB PUT
+  time on the in-process-persistent flamegraph (2026-06-03 dev box);
+  BLAKE3's vectorised single-stream path drops this to roughly 1 %.
+  Tenant-isolated mode swaps `HMAC-SHA256` for `blake3::keyed_hash`, with
+  the 32-byte key derived via BLAKE3's KDF mode
+  (`blake3::derive_key("kiseki 2026-06-03 tenant chunk-id v1", tenant_hmac_key)`)
+  so any-length tenant key material maps to the required 32-byte key
+  cleanly and with domain separation from other uses of the tenant key.
+  Pre-prod schema churn: clusters that wrote chunks under SHA-256 cannot
+  dedupe against new BLAKE3-keyed writes — wipe-and-redeploy at cutover.
+  Production deployments stay on whichever algorithm they were
+  initialised with.
+- **rev 1** (2026-05-27): initial decision — convergent encryption to
+  fix GH #102 torn-chunk reads on EC.
+
 ## Context
 
-Kiseki deduplicates chunks by content address: `chunk_id = HMAC-SHA256(plaintext)`
-(`DedupPolicy::CrossTenant`) or `HMAC-SHA256(tenant_hmac_key, plaintext)`
-(`DedupPolicy::TenantIsolated`) — `crates/kiseki-crypto/src/chunk_id.rs`. Two
-writes of identical content therefore produce the **same `chunk_id`**, which is
-the intended dedup signal (refcount instead of re-store, ADR-017).
+Kiseki deduplicates chunks by content address: `chunk_id = H(plaintext)`
+(`DedupPolicy::CrossTenant`) or `keyed_H(tenant_hmac_key, plaintext)`
+(`DedupPolicy::TenantIsolated`) — `crates/kiseki-crypto/src/chunk_id.rs`. `H`
+is BLAKE3 by default, SHA-256 + HMAC-SHA256 when `KISEKI_CHUNK_HASH=sha256`
+(rev-2 amendment 2026-06-03). Two writes of identical content therefore
+produce the **same `chunk_id`**, which is the intended dedup signal
+(refcount instead of re-store, ADR-017).
 
 Chunks are encrypted with AES-256-GCM. The DEK is derived per chunk:
 `dek = HKDF-SHA256(master[epoch], salt=chunk_id, info="kiseki-chunk-dek-v1")`

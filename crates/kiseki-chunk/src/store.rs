@@ -268,6 +268,16 @@ pub trait ChunkOps {
         Vec::new()
     }
 
+    /// Hot-path-friendly variant of [`snapshot_pools`]: returns the
+    /// shared cached snapshot as an `Arc<Vec<_>>` so the gateway's
+    /// per-PUT `select_pool_for_write` call doesn't pay the per-entry
+    /// clone cost. Default impl falls back to wrapping
+    /// `snapshot_pools()`; `PersistentChunkStore` overrides to return
+    /// its cached `ArcSwap` payload directly.
+    fn snapshot_pools_arc(&self) -> std::sync::Arc<Vec<AffinityPool>> {
+        std::sync::Arc::new(self.snapshot_pools())
+    }
+
     /// ADR-025 W5 — `CreatePool`. Returns `Err(human-readable
     /// reason)` on duplicate name. Default returns `Err`; pool-
     /// aware stores override.

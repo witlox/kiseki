@@ -926,6 +926,8 @@ fn handle_bench(args: &[String]) {
     let mut json = false;
     let mut tenant_id_override: Option<kiseki_common::ids::OrgId> = None;
     let mut namespace_id_override: Option<kiseki_common::ids::NamespaceId> = None;
+    let mut admin_endpoint: Option<String> = None;
+    let mut bench_shards: u64 = 3;
 
     let mut i = 0;
     while i < args.len() {
@@ -1011,6 +1013,17 @@ fn handle_bench(args: &[String]) {
                 }
                 i += 2;
             }
+            "--admin-endpoint" => {
+                admin_endpoint = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "--bench-shards" => {
+                bench_shards = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(bench_shards);
+                i += 2;
+            }
             "--help" | "-h" => {
                 println!(
                     "\
@@ -1031,21 +1044,40 @@ OPTIONS:
                               (default: UUIDv5(NAMESPACE_DNS, \"kiseki-bench-tenant\"))
     --namespace <uuid>        override the bench namespace_id
                               (default: UUIDv5(NAMESPACE_DNS, \"kiseki-bench\"))
+    --admin-endpoint <url>    when set, POST /admin/topology/namespaces
+                              before driving load so the bench namespace
+                              + per-shard Raft groups are provisioned.
+                              Idempotent (409 = already-exists treated
+                              as success). Unset → operator must
+                              provision externally (the GCP runbook).
+    --bench-shards <N>        shard count for --admin-endpoint provision
+                              (default: 3)
 
 NAMESPACE PROVISIONING:
     Per ADR-033 §1, multi-shard fanout is a property of the namespace's
     NamespaceShardMap, set when the namespace is created. The bench
     targets a dedicated perf-tenant + perf-namespace (NOT the system
     \"default\" bucket) so it doesn't compete with casual S3 traffic.
-    The operator must create the perf-namespace with the desired shard
-    count BEFORE running bench, e.g.:
+
+    Two ways to provision:
+
+    A) GCP runbook (external setup-shards.sh, fine-grained control):
 
         kiseki-admin --endpoint http://leader:9090 \\
-            namespace-create-sharded \\
-            --namespace-id <uuid> --tenant-id <uuid> --shards <N>
+            topology namespace-create <namespace-uuid> \\
+            --tenant <tenant-uuid> --shards <N>
 
-    First-touch creates the namespace with N=1 (sequential-safe);
-    that's fine for correctness but defeats fan-out measurement.
+    B) Local docker-compose convenience (bench tool handles it):
+
+        kiseki-client bench \\
+            --endpoint kiseki://127.0.0.1:9103 \\
+            --admin-endpoint http://127.0.0.1:9090 \\
+            --bench-shards 3 \\
+            --shape put-heavy --object-size 4096
+
+    Without --admin-endpoint AND without external provisioning, the
+    first PUT lands on `compositions.create → NamespaceNotFound`
+    (registry not hydrated) and the bench reports 0 ops.
 "
                 );
                 return;
@@ -1073,6 +1105,8 @@ NAMESPACE PROVISIONING:
         json,
         tenant_id: tenant_id_override,
         namespace_id: namespace_id_override,
+        admin_endpoint,
+        bench_shards,
     };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
