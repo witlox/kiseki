@@ -34,6 +34,12 @@ prometheus = { workspace = true }
 fjall = "3.1"
 parking_lot = { workspace = true }
 serde = { version = "1", features = ["derive"] }
+# serde_bytes: skip postcard's per-byte SeqAccess loop on the
+# wire-receive decode of inter-node Raft RPC payloads. The wire
+# format (length-prefix + raw bytes) is identical to bare Vec<u8>;
+# the win is purely in the deserializer (one visit_byte_buf vs
+# N visit_u8 calls). Site: `decode_request_body` payload field.
+serde_bytes = { workspace = true }
 thiserror = { workspace = true }
 postcard = { workspace = true }
 tokio = { workspace = true }

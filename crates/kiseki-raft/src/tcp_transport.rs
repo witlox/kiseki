@@ -309,16 +309,23 @@ fn encode_request_body<P: Serialize>(
 
 /// Decode a request frame body. Returns `None` if the version byte is
 /// reserved or unknown — caller responds with `ParseError`.
+//
+// 75.8 % of the flamegraph for inter-node Raft RPC dispatch was in
+// the per-byte SeqAccess loop deserializing `Vec<u8>`. Decoding the
+// payload field as `serde_bytes::ByteBuf` calls postcard's
+// `deserialize_byte_buf`, which copies the full byte slice in one
+// shot. Wire format is identical (length-prefix + raw bytes), so
+// the encode side is unchanged.
 fn decode_request_body(body: &[u8]) -> Option<(ShardId, String, Vec<u8>)> {
     let version = *body.first()?;
     if version != RAFT_TRANSPORT_VERSION_V2 || RESERVED_VERSION_BYTES.contains(&version) {
         return None;
     }
     let outer_bytes = &body[1..];
-    let (id_bytes, tag, payload_bytes): ([u8; 16], String, Vec<u8>) =
+    let (id_bytes, tag, payload_bytes): ([u8; 16], String, serde_bytes::ByteBuf) =
         postcard::from_bytes(outer_bytes).ok()?;
     let shard_id = ShardId(uuid::Uuid::from_bytes(id_bytes));
-    Some((shard_id, tag, payload_bytes))
+    Some((shard_id, tag, payload_bytes.into_vec()))
 }
 
 /// Build a response frame body: `[status_byte][body bytes]`. Empty

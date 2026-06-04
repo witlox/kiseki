@@ -2485,6 +2485,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde",
+ "serde_bytes",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
