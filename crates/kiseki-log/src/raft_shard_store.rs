@@ -36,7 +36,27 @@ const DEFAULT_MIN_ACKS: usize = 2;
 /// The supervisor polls leadership + drains (leader) or self-prunes (follower)
 /// each tick; short enough that an idle shard's single pending intent is
 /// incorporated within ~one hydrator cadence.
-const COMMITTER_INTERVAL: Duration = Duration::from_millis(50);
+///
+/// Default 50 ms is latency-conservative; throughput-bound workloads (high
+/// PUT op/s where Phase-2 `IncorporateIntents` per-batch overhead is the
+/// binding cost) can raise this via `KISEKI_COMMITTER_INTERVAL_MS` to let
+/// bigger batches accumulate (each batch amortises ~33 ms of Raft round
+/// across up to `DRAIN_BATCH_CAP = 1 000` entries). The trade-off is a
+/// longer Phase-2 incorporation tail — clients are already ack'd at
+/// Phase 1 so this does NOT affect PUT ack latency; it only delays the
+/// committed-state visibility for cross-path reads (#207 / #208 probe
+/// surfaced 85-entry batches at the 50 ms tick under sustained load,
+/// 8.5 % of cap — bigger ticks → larger batches → lower per-PUT Phase-2
+/// cost at higher throughput).
+const COMMITTER_INTERVAL_DEFAULT_MS: u64 = 50;
+
+fn committer_interval() -> Duration {
+    let ms = std::env::var("KISEKI_COMMITTER_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(COMMITTER_INTERVAL_DEFAULT_MS);
+    Duration::from_millis(ms)
+}
 
 /// Per-peer timeout for the `intent_put` fan — bounded like the chunk
 /// fan-out so a single slow/dead peer cannot stall the producer's fast-ack.
@@ -901,7 +921,7 @@ impl RaftShardStore {
                         gatherer,
                         leadership_store,
                         prune_store,
-                        COMMITTER_INTERVAL,
+                        committer_interval(),
                         shutdown_rx,
                     )
                     .await;
