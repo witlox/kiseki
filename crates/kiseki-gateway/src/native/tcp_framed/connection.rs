@@ -19,10 +19,21 @@
 //! Concurrency: per-connection in-flight is unbounded by this layer.
 //! The client demultiplexes responses by `request_id` in the response
 //! envelope (the reader loop on the client maintains a `request_id` →
-//! oneshot map). Same shape the chunk-cluster fabric peer server uses
-//! (see `crates/kiseki-chunk-cluster/src/peer/tcp_framed/server.rs`).
-//! Cross-connection concurrency comes from the listener spawning one
-//! task per accepted connection.
+//! oneshot map).
+//!
+//! **Writer model.** Earlier (slice-4) revisions wrapped the write half
+//! in `Arc<AsyncMutex<WriteHalf>>` and let each dispatch task lock it
+//! before writing its response. Under N concurrent in-flight requests
+//! on one connection, that mutex serialised all N dispatch completions
+//! — measured on GCP 2026-06-04 as a ~6 ms tail between the gateway's
+//! work completing and the client receiving the response. The current
+//! shape replaces the mutex with an **mpsc channel + a single dedicated
+//! writer task**: dispatch tasks send a `(status, request_id, meta,
+//! bulk)` tuple into the channel and immediately return; the writer
+//! task drains the channel, writing each frame in arrival order under
+//! no contention. Per-frame ordering on the wire is preserved (the
+//! writer is a single task), and `request_id` correlation lets the
+//! client demultiplex regardless of completion order.
 
 use std::sync::Arc;
 
@@ -31,7 +42,23 @@ use kiseki_proto::native_contract::wire_tcp_framed::{
     WireDecodeError, WireStatus,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc;
+
+/// One response frame queued by a dispatch task for the writer task to
+/// emit. Owned-data so the dispatch task can drop its frame buffer
+/// immediately after submission.
+struct ResponseFrame {
+    status: WireStatus,
+    request_id: u64,
+    meta: Vec<u8>,
+    bulk: Vec<u8>,
+}
+
+/// Per-connection response channel depth. Larger than typical
+/// in-flight count so a brief writer-stall doesn't backpressure
+/// dispatch. Each slot holds a small struct (no payload copies for the
+/// hot 4 KiB-bulk case — the bulk vec is moved through).
+const RESPONSE_CHANNEL_CAP: usize = 256;
 
 use crate::native::server::ServerImpl;
 
@@ -78,16 +105,43 @@ pub async fn serve_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (mut read_half, write_half) = tokio::io::split(stream);
-    let write_half = Arc::new(AsyncMutex::new(write_half));
+    let (mut read_half, mut write_half) = tokio::io::split(stream);
+    let (tx, mut rx) = mpsc::channel::<ResponseFrame>(RESPONSE_CHANNEL_CAP);
+
+    // Dedicated writer task — drains the response channel and writes
+    // each frame to the wire in arrival order. One writer, no mutex
+    // contention on the write side regardless of how many dispatch
+    // tasks complete simultaneously. Per-frame ordering on the wire
+    // is preserved (the writer is single-threaded); `request_id`
+    // correlation lets the client demultiplex.
+    let writer_handle = tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            if write_response(
+                &mut write_half,
+                frame.status,
+                frame.request_id,
+                &frame.meta,
+                &frame.bulk,
+            )
+            .await
+            .is_err()
+            {
+                // Peer write failed — connection is broken. Drop
+                // remaining queued responses; their dispatch tasks
+                // already completed their work, the wire just can't
+                // carry the answers.
+                break;
+            }
+        }
+    });
 
     let mut len_buf = [0u8; 4];
-    loop {
+    let result: Result<(), ConnectionError> = loop {
         // Length prefix — if read returns 0 bytes, peer closed cleanly.
         match read_half.read_exact(&mut len_buf).await {
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(e) => return Err(e.into()),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break Ok(()),
+            Err(e) => break Err(e.into()),
         }
         let length_be = u32::from_be_bytes(len_buf);
         let body_len = match validate_frame_length(length_be) {
@@ -98,24 +152,31 @@ where
                 // drain. Send a wire-level error response (request_id
                 // 0 — we never decoded a frame header) then close.
                 let payload = format!("frame oversize: {length_be} > cap").into_bytes();
-                let mut guard = write_half.lock().await;
-                let _ =
-                    write_response(&mut *guard, WireStatus::ProtocolError, 0, &payload, &[]).await;
-                return Err(e.into());
+                let _ = tx
+                    .send(ResponseFrame {
+                        status: WireStatus::ProtocolError,
+                        request_id: 0,
+                        meta: payload,
+                        bulk: Vec::new(),
+                    })
+                    .await;
+                break Err(e.into());
             }
         };
 
         let mut body = vec![0u8; body_len];
-        read_half.read_exact(&mut body).await?;
+        if let Err(e) = read_half.read_exact(&mut body).await {
+            break Err(e.into());
+        }
 
         // Spawn a dispatch task per frame so concurrent in-flight
         // requests on this connection run in parallel. The read
         // loop returns immediately to read the next length prefix;
-        // the dispatch task owns the body buffer and writes its
-        // response under the shared write-half mutex.
+        // the dispatch task owns the body buffer and pushes its
+        // response into the channel for the writer task to emit.
         let server = Arc::clone(&server);
         let principal = principal.clone();
-        let write_half = Arc::clone(&write_half);
+        let tx = tx.clone();
         tokio::spawn(async move {
             // Decode V3 frame header — borrowed view over `body`.
             // `meta` is the postcard-encoded request metadata; `bulk`
@@ -130,15 +191,14 @@ where
                     }
                     Err(e) => {
                         let payload = format!("frame decode failed: {e}").into_bytes();
-                        let mut guard = write_half.lock().await;
-                        let _ = write_response(
-                            &mut *guard,
-                            WireStatus::ProtocolError,
-                            0,
-                            &payload,
-                            &[],
-                        )
-                        .await;
+                        let _ = tx
+                            .send(ResponseFrame {
+                                status: WireStatus::ProtocolError,
+                                request_id: 0,
+                                meta: payload,
+                                bulk: Vec::new(),
+                            })
+                            .await;
                         return;
                     }
                 };
@@ -151,10 +211,25 @@ where
                 &body[req_bulk_off..],
             )
             .await;
-            let mut guard = write_half.lock().await;
-            let _ = write_response(&mut *guard, status, request_id, &resp_meta, &resp_bulk).await;
+            let _ = tx
+                .send(ResponseFrame {
+                    status,
+                    request_id,
+                    meta: resp_meta,
+                    bulk: resp_bulk,
+                })
+                .await;
         });
-    }
+    };
+
+    // Closing our `tx` here lets the writer task exit when in-flight
+    // dispatches finish (each holds a `tx` clone; once they all
+    // complete, the channel closes and the writer's `rx.recv()`
+    // returns `None`). The writer drains remaining queued responses
+    // before exiting.
+    drop(tx);
+    let _ = writer_handle.await;
+    result
 }
 
 /// Write a V3 response frame to the wire via **3-iovec vectored
