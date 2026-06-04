@@ -155,6 +155,46 @@ pub struct RaftShardStore {
 type IntentFanCoalescerMap =
     Mutex<HashMap<ShardId, crate::intent_fan_coalescer::IntentFanCoalescer>>;
 
+/// Optional DIAGNOSTIC group-commit for the durable intent store, gated by
+/// `KISEKI_INTENT_FLUSH_INTERVAL_MS`. The intent store is the lone per-PUT
+/// *synchronous* fsync — the chunk (runtime.rs), composition, and Raft-log
+/// stores all relax to a ~100 ms periodic flush. When the env is set we
+/// relax inline fsync and spawn the periodic flusher that
+/// [`FjallIntentStore::flush`]'s doc already anticipated, so the write-path
+/// fsync tax can be A/B-measured.
+///
+/// CAVEAT: relaxing inline fsync opens a ≤interval loss window AT ACK,
+/// trading the ADR-047 C1 no-loss-at-ack contract — this is an experiment
+/// knob, NOT a ship default (a shipped form needs the gateway
+/// `fsync_pending` hook the chunk store uses). Unset ⇒ per-write fsync.
+fn maybe_spawn_intent_flusher(store: &Arc<FjallIntentStore>) {
+    let Some(ms) = std::env::var("KISEKI_INTENT_FLUSH_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+    else {
+        return;
+    };
+    store.set_sync_per_write(false);
+    let flush_store = Arc::clone(store);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(ms));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let s = Arc::clone(&flush_store);
+            if tokio::task::spawn_blocking(move || s.flush())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .is_none()
+            {
+                tracing::warn!("intent store group-commit flush failed; retry next tick");
+            }
+        }
+    });
+}
+
 impl RaftShardStore {
     /// Create a new (empty) Raft shard store.
     ///
@@ -698,7 +738,7 @@ impl RaftShardStore {
                         // mount.
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    let store = FjallIntentStore::open(&path).unwrap_or_else(|e| {
+                    let store = Arc::new(FjallIntentStore::open(&path).unwrap_or_else(|e| {
                         panic!(
                             "durable IntentStore open failed for shard {} at {}: {} \
                              (ADR-047 F-P5b-rpc-1: cannot host a shard whose intent \
@@ -707,8 +747,12 @@ impl RaftShardStore {
                             path.display(),
                             e,
                         )
-                    });
-                    (Arc::new(store), true)
+                    }));
+                    // Optional DIAGNOSTIC group-commit (`KISEKI_INTENT_FLUSH_INTERVAL_MS`)
+                    // — see `maybe_spawn_intent_flusher`. Unset ⇒ per-write fsync (safe).
+                    maybe_spawn_intent_flusher(&store);
+                    let store: Arc<dyn IntentStore> = store;
+                    (store, true)
                 }
                 // `data_dir = None` (in-memory test cluster) is volatile, so it is
                 // NOT durable for decoupled-ack purposes.
