@@ -1250,6 +1250,80 @@ mod tests {
         assert_eq!(s.pending_len().unwrap(), 3);
     }
 
+    /// Local A/B for the intent-store write path. Three scenarios over a
+    /// fresh `FjallIntentStore`, N intents each:
+    ///   A. solo `put()`  — one fjall commit (fsync) per intent
+    ///   B. `put_batch(B)` — one fjall commit (fsync) per B intents (S3)
+    ///   C. solo `put()` with `sync_per_write=false` — no per-write fsync
+    /// A vs C isolates the fsync cost; A vs B is exactly S3's lever (fewer
+    /// fsyncs via fuller batches). This is the bottleneck the S2 finding
+    /// identified — fjall serializes every commit on one journal mutex with
+    /// the fsync under it — so the only way up is fewer fsyncs per intent.
+    /// Prints throughput; run with `-- --ignored --nocapture`.
+    #[test]
+    #[ignore = "slow: local fjall commit-throughput A/B (fsync-bound), run explicitly"]
+    fn bench_fjall_commit_throughput_solo_vs_batched() {
+        use std::time::Instant;
+        const N: u32 = 3000;
+        const BATCH: usize = 64;
+
+        // A: solo put() — N fsyncs.
+        let dir_a = tempfile::tempdir().unwrap();
+        let store_a = FjallIntentStore::open(&dir_a.path().join("a")).unwrap();
+        let started = Instant::now();
+        for i in 0..N {
+            store_a.put(intent(seq(1, i, 1), None)).unwrap();
+        }
+        let solo = started.elapsed();
+
+        // B: put_batch(BATCH) — N/BATCH fsyncs (S3).
+        let dir_b = tempfile::tempdir().unwrap();
+        let store_b = FjallIntentStore::open(&dir_b.path().join("b")).unwrap();
+        let started = Instant::now();
+        let mut next = 0u32;
+        while next < N {
+            let mut batch = Vec::with_capacity(BATCH);
+            for _ in 0..BATCH {
+                if next >= N {
+                    break;
+                }
+                batch.push(intent(seq(2, next, 1), None));
+                next += 1;
+            }
+            store_b.put_batch(batch).unwrap();
+        }
+        let batched = started.elapsed();
+
+        // C: solo put() with buffered durability — no per-write fsync.
+        let dir_c = tempfile::tempdir().unwrap();
+        let store_c = FjallIntentStore::open(&dir_c.path().join("c")).unwrap();
+        store_c.set_sync_per_write(false);
+        let started = Instant::now();
+        for i in 0..N {
+            store_c.put(intent(seq(3, i, 1), None)).unwrap();
+        }
+        let buffered = started.elapsed();
+
+        let ops = |dur: std::time::Duration| f64::from(N) / dur.as_secs_f64();
+        eprintln!("\n=== FjallIntentStore commit-throughput A/B (N={N}, sync_per_write=true unless noted) ===");
+        eprintln!(
+            "A solo put()        {solo:>10.2?}  {:>9.0} intents/s  ({N} fsyncs)",
+            ops(solo)
+        );
+        eprintln!(
+            "B put_batch({BATCH})     {batched:>10.2?}  {:>9.0} intents/s  ({} fsyncs)  -> {:.1}x vs A",
+            ops(batched),
+            (N as usize).div_ceil(BATCH),
+            ops(batched) / ops(solo)
+        );
+        eprintln!(
+            "C solo, no-fsync    {buffered:>10.2?}  {:>9.0} intents/s  (0 fsyncs)   -> {:.1}x vs A (= the fsync tax)",
+            ops(buffered),
+            ops(buffered) / ops(solo)
+        );
+        eprintln!("S3 mechanism = move from A toward B by filling batches; the fsync floor (A) is what S1 alone cannot lift.\n");
+    }
+
     #[test]
     fn fjall_prune_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
