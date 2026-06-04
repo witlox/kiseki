@@ -52,3 +52,11 @@ uuid = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `criterion` drives the decode_request_body Vec<u8> vs ByteBuf A/B
+# in `benches/decode_request_body.rs`. Default features off — keeps
+# the bench compile cheap on dev boxes.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "decode_request_body"
+harness = false
