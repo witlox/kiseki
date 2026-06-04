@@ -1,0 +1,877 @@
+# HELP kiseki_chunk_read_bytes_total Chunk bytes read
+# TYPE kiseki_chunk_read_bytes_total counter
+kiseki_chunk_read_bytes_total 0
+# HELP kiseki_chunk_write_bytes_total Chunk bytes written
+# TYPE kiseki_chunk_write_bytes_total counter
+kiseki_chunk_write_bytes_total 2116853760
+# HELP kiseki_cluster_control_apply_hook_duration_seconds Per-replica apply hook duration by op.
+# TYPE kiseki_cluster_control_apply_hook_duration_seconds histogram
+kiseki_cluster_control_apply_hook_duration_seconds_bucket{op="create_namespace",le="0.0001"} 0
+kiseki_cluster_control_apply_hook_duration_seconds_bucket{op="create_namespace",le="0.0005"} 0
+kiseki_cluster_control_apply_hook_duration_seconds_bucket{op="create_namespace",le="0.001"} 0
+kiseki_cluster_control_apply_hook_duration_seconds_bucket{op="create_namespace",le="0.005"} 0
+kiseki_cluster_control_apply_hook_duration_seconds_bucket{op="create_namespace",le="0.01"} 0
+kiseki_cluster_control_apply_hook_duration_seconds_bucket{op="create_namespace",le="0.025"} 0
+kiseki_cluster_control_apply_hook_duration_seconds_bucket{op="create_namespace",le="0.05"} 0
+kiseki_cluster_control_apply_hook_duration_seconds_bucket{op="create_namespace",le="0.1"} 0
+kiseki_cluster_control_apply_hook_duration_seconds_bucket{op="create_namespace",le="0.25"} 1
+kiseki_cluster_control_apply_hook_duration_seconds_bucket{op="create_namespace",le="0.5"} 1
+kiseki_cluster_control_apply_hook_duration_seconds_bucket{op="create_namespace",le="1"} 1
+kiseki_cluster_control_apply_hook_duration_seconds_bucket{op="create_namespace",le="+Inf"} 1
+kiseki_cluster_control_apply_hook_duration_seconds_sum{op="create_namespace"} 0.160814501
+kiseki_cluster_control_apply_hook_duration_seconds_count{op="create_namespace"} 1
+# HELP kiseki_cluster_control_apply_total State-machine apply count by op (per-replica).
+# TYPE kiseki_cluster_control_apply_total counter
+kiseki_cluster_control_apply_total{op="create_namespace"} 1
+# HELP kiseki_cluster_control_namespaces Namespaces currently tracked in this replica's control-plane state machine.
+# TYPE kiseki_cluster_control_namespaces gauge
+kiseki_cluster_control_namespaces 1
+# HELP kiseki_cluster_control_submit_duration_seconds Control-plane Raft submit latency (replication + apply) by op.
+# TYPE kiseki_cluster_control_submit_duration_seconds histogram
+kiseki_cluster_control_submit_duration_seconds_bucket{op="create_namespace",le="0.001"} 0
+kiseki_cluster_control_submit_duration_seconds_bucket{op="create_namespace",le="0.005"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="create_namespace",le="0.01"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="create_namespace",le="0.025"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="create_namespace",le="0.05"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="create_namespace",le="0.1"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="create_namespace",le="0.25"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="create_namespace",le="0.5"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="create_namespace",le="1"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="create_namespace",le="2.5"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="create_namespace",le="5"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="create_namespace",le="+Inf"} 1
+kiseki_cluster_control_submit_duration_seconds_sum{op="create_namespace"} 0.003968824
+kiseki_cluster_control_submit_duration_seconds_count{op="create_namespace"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="upsert_node_inventory",le="0.001"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="upsert_node_inventory",le="0.005"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="upsert_node_inventory",le="0.01"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="upsert_node_inventory",le="0.025"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="upsert_node_inventory",le="0.05"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="upsert_node_inventory",le="0.1"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="upsert_node_inventory",le="0.25"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="upsert_node_inventory",le="0.5"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="upsert_node_inventory",le="1"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="upsert_node_inventory",le="2.5"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="upsert_node_inventory",le="5"} 1
+kiseki_cluster_control_submit_duration_seconds_bucket{op="upsert_node_inventory",le="+Inf"} 1
+kiseki_cluster_control_submit_duration_seconds_sum{op="upsert_node_inventory"} 0.000034391
+kiseki_cluster_control_submit_duration_seconds_count{op="upsert_node_inventory"} 1
+# HELP kiseki_cluster_control_submit_total Control-plane Raft submit count by op and outcome.
+# TYPE kiseki_cluster_control_submit_total counter
+kiseki_cluster_control_submit_total{op="create_namespace",outcome="ok"} 1
+kiseki_cluster_control_submit_total{op="upsert_node_inventory",outcome="forward"} 1
+# HELP kiseki_composition_count Live composition records in the persistent store.
+# TYPE kiseki_composition_count gauge
+kiseki_composition_count 1154067
+# HELP kiseki_composition_hydrator_apply_duration_seconds Duration of one apply_hydration_batch (atomic backend commit).
+# TYPE kiseki_composition_hydrator_apply_duration_seconds histogram
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.001"} 1
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.005"} 1
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.01"} 1
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.025"} 1
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.05"} 1
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.1"} 1
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.25"} 1
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.5"} 1
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="1"} 1
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="2.5"} 1
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="5"} 1
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="10"} 1
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="+Inf"} 1
+kiseki_composition_hydrator_apply_duration_seconds_sum{shard="00000000-0000-0000-0000-000000000001"} 0.000619441
+kiseki_composition_hydrator_apply_duration_seconds_count{shard="00000000-0000-0000-0000-000000000001"} 1
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.001"} 16
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.005"} 20
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.01"} 23
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.025"} 103
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.05"} 187
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.1"} 187
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.25"} 196
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.5"} 198
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="1"} 198
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="2.5"} 198
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="5"} 198
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="10"} 198
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="+Inf"} 198
+kiseki_composition_hydrator_apply_duration_seconds_sum{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5"} 6.209932178999999
+kiseki_composition_hydrator_apply_duration_seconds_count{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5"} 198
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.001"} 16
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.005"} 50
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.01"} 57
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.025"} 141
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.05"} 222
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.1"} 226
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.25"} 230
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.5"} 231
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="1"} 231
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="2.5"} 231
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="5"} 231
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="10"} 231
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="+Inf"} 231
+kiseki_composition_hydrator_apply_duration_seconds_sum{shard="558a43d0-a465-4fb1-a82a-359d04624e9e"} 5.376107206000001
+kiseki_composition_hydrator_apply_duration_seconds_count{shard="558a43d0-a465-4fb1-a82a-359d04624e9e"} 231
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.001"} 16
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.005"} 23
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.01"} 28
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.025"} 77
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.05"} 187
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.1"} 188
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.25"} 197
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.5"} 198
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="1"} 198
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="2.5"} 198
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="5"} 198
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="10"} 198
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="+Inf"} 198
+kiseki_composition_hydrator_apply_duration_seconds_sum{shard="562ee637-47a6-4aa6-91f1-514b60189963"} 6.525076815000001
+kiseki_composition_hydrator_apply_duration_seconds_count{shard="562ee637-47a6-4aa6-91f1-514b60189963"} 198
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.001"} 16
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.005"} 30
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.01"} 33
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.025"} 105
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.05"} 186
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.1"} 189
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.25"} 192
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.5"} 192
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="1"} 192
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="2.5"} 192
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="5"} 192
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="10"} 192
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="+Inf"} 192
+kiseki_composition_hydrator_apply_duration_seconds_sum{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4"} 4.511217261000001
+kiseki_composition_hydrator_apply_duration_seconds_count{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4"} 192
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.001"} 15
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.005"} 115
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.01"} 171
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.025"} 244
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.05"} 318
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.1"} 325
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.25"} 328
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.5"} 330
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="1"} 330
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="2.5"} 330
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="5"} 330
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="10"} 330
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="+Inf"} 330
+kiseki_composition_hydrator_apply_duration_seconds_sum{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb"} 6.066060893000001
+kiseki_composition_hydrator_apply_duration_seconds_count{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb"} 330
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.001"} 21
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.005"} 44
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.01"} 50
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.025"} 131
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.05"} 213
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.1"} 217
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.25"} 222
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.5"} 224
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="1"} 224
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="2.5"} 224
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="5"} 224
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="10"} 224
+kiseki_composition_hydrator_apply_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="+Inf"} 224
+kiseki_composition_hydrator_apply_duration_seconds_sum{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad"} 5.743633074999999
+kiseki_composition_hydrator_apply_duration_seconds_count{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad"} 224
+# HELP kiseki_composition_hydrator_last_applied_seq Highest delta sequence applied per shard (durable from meta).
+# TYPE kiseki_composition_hydrator_last_applied_seq gauge
+kiseki_composition_hydrator_last_applied_seq{shard="00000000-0000-0000-0000-000000000001"} 1
+kiseki_composition_hydrator_last_applied_seq{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5"} 176078
+kiseki_composition_hydrator_last_applied_seq{shard="558a43d0-a465-4fb1-a82a-359d04624e9e"} 181839
+kiseki_composition_hydrator_last_applied_seq{shard="562ee637-47a6-4aa6-91f1-514b60189963"} 174350
+kiseki_composition_hydrator_last_applied_seq{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4"} 162361
+kiseki_composition_hydrator_last_applied_seq{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb"} 185382
+kiseki_composition_hydrator_last_applied_seq{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad"} 180797
+# HELP kiseki_composition_hydrator_stalled 1 when the hydrator is halted; 0 otherwise. Latches; operator clears.
+# TYPE kiseki_composition_hydrator_stalled gauge
+kiseki_composition_hydrator_stalled 0
+# HELP kiseki_composition_store_commit_errors_total Composition-store commit/persist failures (disk full, fsync error).
+# TYPE kiseki_composition_store_commit_errors_total counter
+kiseki_composition_store_commit_errors_total 0
+# HELP kiseki_composition_store_commits_total Total successful composition-store commits (periodic flusher + hydrator).
+# TYPE kiseki_composition_store_commits_total counter
+kiseki_composition_store_commits_total 0
+# HELP kiseki_composition_store_size_bytes On-disk footprint of the composition store directory in bytes (refreshed every 30s).
+# TYPE kiseki_composition_store_size_bytes gauge
+kiseki_composition_store_size_bytes 556402290
+# HELP kiseki_control_alias_total Total namespace aliases created.
+# TYPE kiseki_control_alias_total counter
+kiseki_control_alias_total 0
+# HELP kiseki_control_namespaces Active namespaces in the local NamespaceShardMapStore.
+# TYPE kiseki_control_namespaces gauge
+kiseki_control_namespaces 0
+# HELP kiseki_crypto_shred_total Crypto-shred operations performed
+# TYPE kiseki_crypto_shred_total counter
+kiseki_crypto_shred_total 0
+# HELP kiseki_fabric_peers_up Healthy fabric peer count (last-call success).
+# TYPE kiseki_fabric_peers_up gauge
+kiseki_fabric_peers_up 0
+# HELP kiseki_fabric_quorum_lost_total Writes that failed to reach the configured min_acks.
+# TYPE kiseki_fabric_quorum_lost_total counter
+kiseki_fabric_quorum_lost_total 0
+# HELP kiseki_gateway_put_phase_duration_seconds Gateway PUT phase latency: encrypt, chunk_write, composition_record
+# TYPE kiseki_gateway_put_phase_duration_seconds histogram
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_fan_inner",le="0.0001"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_fan_inner",le="0.0005"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_fan_inner",le="0.001"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_fan_inner",le="0.005"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_fan_inner",le="0.01"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_fan_inner",le="0.025"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_fan_inner",le="0.05"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_fan_inner",le="0.1"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_fan_inner",le="0.25"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_fan_inner",le="0.5"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_fan_inner",le="1"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_fan_inner",le="2.5"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_fan_inner",le="5"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_fan_inner",le="+Inf"} 516810
+kiseki_gateway_put_phase_duration_seconds_sum{phase="chunk_fan_inner"} 0.03468935100001553
+kiseki_gateway_put_phase_duration_seconds_count{phase="chunk_fan_inner"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_write",le="0.0001"} 0
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_write",le="0.0005"} 0
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_write",le="0.001"} 84
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_write",le="0.005"} 471408
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_write",le="0.01"} 507877
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_write",le="0.025"} 510858
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_write",le="0.05"} 511788
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_write",le="0.1"} 512882
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_write",le="0.25"} 516101
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_write",le="0.5"} 516761
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_write",le="1"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_write",le="2.5"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_write",le="5"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="chunk_write",le="+Inf"} 516810
+kiseki_gateway_put_phase_duration_seconds_sum{phase="chunk_write"} 2450.4789503889747
+kiseki_gateway_put_phase_duration_seconds_count{phase="chunk_write"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="composition_record",le="0.0001"} 0
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="composition_record",le="0.0005"} 0
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="composition_record",le="0.001"} 32
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="composition_record",le="0.005"} 462422
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="composition_record",le="0.01"} 502178
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="composition_record",le="0.025"} 510396
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="composition_record",le="0.05"} 511457
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="composition_record",le="0.1"} 512689
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="composition_record",le="0.25"} 516061
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="composition_record",le="0.5"} 516752
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="composition_record",le="1"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="composition_record",le="2.5"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="composition_record",le="5"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="composition_record",le="+Inf"} 516810
+kiseki_gateway_put_phase_duration_seconds_sum{phase="composition_record"} 2595.9101936209695
+kiseki_gateway_put_phase_duration_seconds_count{phase="composition_record"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="encrypt",le="0.0001"} 516784
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="encrypt",le="0.0005"} 516807
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="encrypt",le="0.001"} 516809
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="encrypt",le="0.005"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="encrypt",le="0.01"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="encrypt",le="0.025"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="encrypt",le="0.05"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="encrypt",le="0.1"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="encrypt",le="0.25"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="encrypt",le="0.5"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="encrypt",le="1"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="encrypt",le="2.5"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="encrypt",le="5"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="encrypt",le="+Inf"} 516810
+kiseki_gateway_put_phase_duration_seconds_sum{phase="encrypt"} 3.781448267000031
+kiseki_gateway_put_phase_duration_seconds_count{phase="encrypt"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="intent_fan_inner",le="0.0001"} 0
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="intent_fan_inner",le="0.0005"} 0
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="intent_fan_inner",le="0.001"} 86
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="intent_fan_inner",le="0.005"} 471440
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="intent_fan_inner",le="0.01"} 507879
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="intent_fan_inner",le="0.025"} 510858
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="intent_fan_inner",le="0.05"} 511788
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="intent_fan_inner",le="0.1"} 512882
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="intent_fan_inner",le="0.25"} 516101
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="intent_fan_inner",le="0.5"} 516761
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="intent_fan_inner",le="1"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="intent_fan_inner",le="2.5"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="intent_fan_inner",le="5"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="intent_fan_inner",le="+Inf"} 516810
+kiseki_gateway_put_phase_duration_seconds_sum{phase="intent_fan_inner"} 2450.0592353119587
+kiseki_gateway_put_phase_duration_seconds_count{phase="intent_fan_inner"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="parallel_fan_wall",le="0.0001"} 0
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="parallel_fan_wall",le="0.0005"} 0
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="parallel_fan_wall",le="0.001"} 84
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="parallel_fan_wall",le="0.005"} 471408
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="parallel_fan_wall",le="0.01"} 507877
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="parallel_fan_wall",le="0.025"} 510858
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="parallel_fan_wall",le="0.05"} 511788
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="parallel_fan_wall",le="0.1"} 512882
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="parallel_fan_wall",le="0.25"} 516101
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="parallel_fan_wall",le="0.5"} 516761
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="parallel_fan_wall",le="1"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="parallel_fan_wall",le="2.5"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="parallel_fan_wall",le="5"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="parallel_fan_wall",le="+Inf"} 516810
+kiseki_gateway_put_phase_duration_seconds_sum{phase="parallel_fan_wall"} 2450.4789503889747
+kiseki_gateway_put_phase_duration_seconds_count{phase="parallel_fan_wall"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="raft_commit",le="0.0001"} 0
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="raft_commit",le="0.0005"} 0
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="raft_commit",le="0.001"} 84
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="raft_commit",le="0.005"} 471408
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="raft_commit",le="0.01"} 507877
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="raft_commit",le="0.025"} 510858
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="raft_commit",le="0.05"} 511788
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="raft_commit",le="0.1"} 512882
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="raft_commit",le="0.25"} 516101
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="raft_commit",le="0.5"} 516761
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="raft_commit",le="1"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="raft_commit",le="2.5"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="raft_commit",le="5"} 516810
+kiseki_gateway_put_phase_duration_seconds_bucket{phase="raft_commit",le="+Inf"} 516810
+kiseki_gateway_put_phase_duration_seconds_sum{phase="raft_commit"} 2450.4789503889747
+kiseki_gateway_put_phase_duration_seconds_count{phase="raft_commit"} 516810
+# HELP kiseki_gateway_read_retry_exhausted_total Reads that exhausted the retry budget without resolving.
+# TYPE kiseki_gateway_read_retry_exhausted_total counter
+kiseki_gateway_read_retry_exhausted_total 0
+# HELP kiseki_gateway_read_retry_total Reads that exited the retry loop with a hit.
+# TYPE kiseki_gateway_read_retry_total counter
+kiseki_gateway_read_retry_total 0
+# HELP kiseki_gateway_workflow_ref_writes_total S3 PUTs by x-kiseki-workflow-ref validation outcome (ADR-021 / I-WA1)
+# TYPE kiseki_gateway_workflow_ref_writes_total counter
+kiseki_gateway_workflow_ref_writes_total{result="absent"} 516810
+# HELP kiseki_intent_coalesce_wait_seconds Per-intent wait inside the producer-side coalescer, from submission to flush (W12). The throughput-vs-tail-latency tuning knob — KISEKI_INTENT_FAN_BATCH_TIMEOUT_US is the upper bound.
+# TYPE kiseki_intent_coalesce_wait_seconds histogram
+kiseki_intent_coalesce_wait_seconds_bucket{le="0.000001"} 69
+kiseki_intent_coalesce_wait_seconds_bucket{le="0.000005"} 991
+kiseki_intent_coalesce_wait_seconds_bucket{le="0.00001"} 1520
+kiseki_intent_coalesce_wait_seconds_bucket{le="0.00005"} 4656
+kiseki_intent_coalesce_wait_seconds_bucket{le="0.0001"} 9010
+kiseki_intent_coalesce_wait_seconds_bucket{le="0.00025"} 26933
+kiseki_intent_coalesce_wait_seconds_bucket{le="0.0005"} 64698
+kiseki_intent_coalesce_wait_seconds_bucket{le="0.001"} 226825
+kiseki_intent_coalesce_wait_seconds_bucket{le="0.0025"} 516047
+kiseki_intent_coalesce_wait_seconds_bucket{le="0.005"} 516785
+kiseki_intent_coalesce_wait_seconds_bucket{le="0.01"} 516792
+kiseki_intent_coalesce_wait_seconds_bucket{le="+Inf"} 516810
+kiseki_intent_coalesce_wait_seconds_sum 559.2189255520024
+kiseki_intent_coalesce_wait_seconds_count 516810
+# HELP kiseki_intent_put_batch_size Number of intents per fanned intent_put RPC (W12 producer-side coalescing). Pairs with kiseki_raft_transport_rpc_duration_seconds{op="intent_put"} so the per-RPC mean stays interpretable after batching.
+# TYPE kiseki_intent_put_batch_size histogram
+kiseki_intent_put_batch_size_bucket{le="1"} 278471
+kiseki_intent_put_batch_size_bucket{le="2"} 430874
+kiseki_intent_put_batch_size_bucket{le="4"} 507279
+kiseki_intent_put_batch_size_bucket{le="8"} 514043
+kiseki_intent_put_batch_size_bucket{le="16"} 514049
+kiseki_intent_put_batch_size_bucket{le="32"} 514049
+kiseki_intent_put_batch_size_bucket{le="64"} 514049
+kiseki_intent_put_batch_size_bucket{le="128"} 514049
+kiseki_intent_put_batch_size_bucket{le="+Inf"} 514049
+kiseki_intent_put_batch_size_sum 867003
+kiseki_intent_put_batch_size_count 514049
+# HELP kiseki_key_rotation_total Key rotations performed
+# TYPE kiseki_key_rotation_total counter
+kiseki_key_rotation_total 0
+# HELP kiseki_keymanager_current_epoch Latest key epoch known to this node.
+# TYPE kiseki_keymanager_current_epoch gauge
+kiseki_keymanager_current_epoch 0
+# HELP kiseki_keymanager_epoch_count Number of epochs tracked in this node's local state.
+# TYPE kiseki_keymanager_epoch_count gauge
+kiseki_keymanager_epoch_count 0
+# HELP kiseki_keymanager_migration_complete_total Total epoch-migration-complete events.
+# TYPE kiseki_keymanager_migration_complete_total counter
+kiseki_keymanager_migration_complete_total 0
+# HELP kiseki_keymanager_rotation_total Total successful key rotations on this node.
+# TYPE kiseki_keymanager_rotation_total counter
+kiseki_keymanager_rotation_total 0
+# HELP kiseki_log_append_duration_seconds Per-shard delta-append latency (ADR-032).
+# TYPE kiseki_log_append_duration_seconds histogram
+kiseki_log_append_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.0001"} 0
+kiseki_log_append_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.0005"} 0
+kiseki_log_append_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.001"} 0
+kiseki_log_append_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.005"} 1
+kiseki_log_append_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.01"} 1
+kiseki_log_append_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.025"} 1
+kiseki_log_append_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.05"} 1
+kiseki_log_append_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.1"} 1
+kiseki_log_append_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.25"} 1
+kiseki_log_append_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.5"} 1
+kiseki_log_append_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="1"} 1
+kiseki_log_append_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="2.5"} 1
+kiseki_log_append_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="+Inf"} 1
+kiseki_log_append_duration_seconds_sum{shard="00000000-0000-0000-0000-000000000001"} 0.002856974
+kiseki_log_append_duration_seconds_count{shard="00000000-0000-0000-0000-000000000001"} 1
+# HELP kiseki_log_append_total Per-shard delta-append count by outcome (ADR-032).
+# TYPE kiseki_log_append_total counter
+kiseki_log_append_total{outcome="ok",shard="00000000-0000-0000-0000-000000000001"} 1
+# HELP kiseki_log_compaction_removed_total Total deltas removed by compaction (cumulative across shards).
+# TYPE kiseki_log_compaction_removed_total counter
+kiseki_log_compaction_removed_total 0
+# HELP kiseki_log_read_duration_seconds Per-shard delta-read latency.
+# TYPE kiseki_log_read_duration_seconds histogram
+kiseki_log_read_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.0001"} 9484
+kiseki_log_read_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.0005"} 9494
+kiseki_log_read_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.001"} 9494
+kiseki_log_read_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.005"} 9494
+kiseki_log_read_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.01"} 9494
+kiseki_log_read_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.025"} 9494
+kiseki_log_read_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.05"} 9494
+kiseki_log_read_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.1"} 9494
+kiseki_log_read_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.25"} 9494
+kiseki_log_read_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="0.5"} 9494
+kiseki_log_read_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="1"} 9494
+kiseki_log_read_duration_seconds_bucket{shard="00000000-0000-0000-0000-000000000001",le="+Inf"} 9494
+kiseki_log_read_duration_seconds_sum{shard="00000000-0000-0000-0000-000000000001"} 0.10203914199999983
+kiseki_log_read_duration_seconds_count{shard="00000000-0000-0000-0000-000000000001"} 9494
+kiseki_log_read_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.0001"} 741
+kiseki_log_read_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.0005"} 741
+kiseki_log_read_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.001"} 741
+kiseki_log_read_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.005"} 742
+kiseki_log_read_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.01"} 742
+kiseki_log_read_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.025"} 742
+kiseki_log_read_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.05"} 743
+kiseki_log_read_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.1"} 744
+kiseki_log_read_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.25"} 746
+kiseki_log_read_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.5"} 748
+kiseki_log_read_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="1"} 817
+kiseki_log_read_duration_seconds_bucket{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="+Inf"} 923
+kiseki_log_read_duration_seconds_sum{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5"} 280.52578325600007
+kiseki_log_read_duration_seconds_count{shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5"} 923
+kiseki_log_read_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.0001"} 708
+kiseki_log_read_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.0005"} 709
+kiseki_log_read_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.001"} 709
+kiseki_log_read_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.005"} 710
+kiseki_log_read_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.01"} 711
+kiseki_log_read_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.025"} 714
+kiseki_log_read_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.05"} 717
+kiseki_log_read_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.1"} 721
+kiseki_log_read_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.25"} 736
+kiseki_log_read_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.5"} 744
+kiseki_log_read_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="1"} 814
+kiseki_log_read_duration_seconds_bucket{shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="+Inf"} 923
+kiseki_log_read_duration_seconds_sum{shard="558a43d0-a465-4fb1-a82a-359d04624e9e"} 280.754945333
+kiseki_log_read_duration_seconds_count{shard="558a43d0-a465-4fb1-a82a-359d04624e9e"} 923
+kiseki_log_read_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.0001"} 696
+kiseki_log_read_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.0005"} 697
+kiseki_log_read_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.001"} 697
+kiseki_log_read_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.005"} 698
+kiseki_log_read_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.01"} 698
+kiseki_log_read_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.025"} 698
+kiseki_log_read_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.05"} 698
+kiseki_log_read_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.1"} 698
+kiseki_log_read_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.25"} 699
+kiseki_log_read_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.5"} 700
+kiseki_log_read_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="1"} 766
+kiseki_log_read_duration_seconds_bucket{shard="562ee637-47a6-4aa6-91f1-514b60189963",le="+Inf"} 881
+kiseki_log_read_duration_seconds_sum{shard="562ee637-47a6-4aa6-91f1-514b60189963"} 284.20697986000005
+kiseki_log_read_duration_seconds_count{shard="562ee637-47a6-4aa6-91f1-514b60189963"} 881
+kiseki_log_read_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.0001"} 850
+kiseki_log_read_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.0005"} 855
+kiseki_log_read_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.001"} 855
+kiseki_log_read_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.005"} 855
+kiseki_log_read_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.01"} 855
+kiseki_log_read_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.025"} 855
+kiseki_log_read_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.05"} 858
+kiseki_log_read_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.1"} 858
+kiseki_log_read_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.25"} 863
+kiseki_log_read_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.5"} 870
+kiseki_log_read_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="1"} 919
+kiseki_log_read_duration_seconds_bucket{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="+Inf"} 1031
+kiseki_log_read_duration_seconds_sum{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4"} 270.48606752100005
+kiseki_log_read_duration_seconds_count{shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4"} 1031
+kiseki_log_read_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.0001"} 674
+kiseki_log_read_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.0005"} 674
+kiseki_log_read_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.001"} 675
+kiseki_log_read_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.005"} 678
+kiseki_log_read_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.01"} 679
+kiseki_log_read_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.025"} 683
+kiseki_log_read_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.05"} 701
+kiseki_log_read_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.1"} 727
+kiseki_log_read_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.25"} 775
+kiseki_log_read_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.5"} 807
+kiseki_log_read_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="1"} 888
+kiseki_log_read_duration_seconds_bucket{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="+Inf"} 990
+kiseki_log_read_duration_seconds_sum{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb"} 273.08148449500004
+kiseki_log_read_duration_seconds_count{shard="d40a4cb5-1198-460b-a56b-5b013459ecdb"} 990
+kiseki_log_read_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.0001"} 673
+kiseki_log_read_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.0005"} 673
+kiseki_log_read_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.001"} 674
+kiseki_log_read_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.005"} 676
+kiseki_log_read_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.01"} 676
+kiseki_log_read_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.025"} 677
+kiseki_log_read_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.05"} 681
+kiseki_log_read_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.1"} 685
+kiseki_log_read_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.25"} 691
+kiseki_log_read_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.5"} 699
+kiseki_log_read_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="1"} 770
+kiseki_log_read_duration_seconds_bucket{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="+Inf"} 882
+kiseki_log_read_duration_seconds_sum{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad"} 284.0868158099999
+kiseki_log_read_duration_seconds_count{shard="d7348816-ddba-40c2-93ec-7c9c3b773cad"} 882
+# HELP kiseki_log_read_total Per-shard delta-read count by outcome.
+# TYPE kiseki_log_read_total counter
+kiseki_log_read_total{outcome="ok",shard="00000000-0000-0000-0000-000000000001"} 9494
+kiseki_log_read_total{outcome="ok",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5"} 923
+kiseki_log_read_total{outcome="ok",shard="558a43d0-a465-4fb1-a82a-359d04624e9e"} 923
+kiseki_log_read_total{outcome="ok",shard="562ee637-47a6-4aa6-91f1-514b60189963"} 881
+kiseki_log_read_total{outcome="ok",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4"} 1031
+kiseki_log_read_total{outcome="ok",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb"} 990
+kiseki_log_read_total{outcome="ok",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad"} 882
+# HELP kiseki_node_metadata_capacity_bytes Per-node metadata-role device capacity (kind = total | used | soft_limit | hard_limit | small_file_budget)
+# TYPE kiseki_node_metadata_capacity_bytes gauge
+kiseki_node_metadata_capacity_bytes{kind="hard_limit"} 40056164352
+kiseki_node_metadata_capacity_bytes{kind="small_file_budget"} 14565650432
+kiseki_node_metadata_capacity_bytes{kind="soft_limit"} 26704109568
+kiseki_node_metadata_capacity_bytes{kind="total"} 53408219136
+kiseki_node_metadata_capacity_bytes{kind="used"} 12138459136
+# HELP kiseki_node_metadata_media_type Media type of this node's metadata-role device (one-hot)
+# TYPE kiseki_node_metadata_media_type gauge
+kiseki_node_metadata_media_type{kind="hdd"} 0
+kiseki_node_metadata_media_type{kind="nvme"} 1
+kiseki_node_metadata_media_type{kind="ssd"} 0
+kiseki_node_metadata_media_type{kind="unknown"} 0
+# HELP kiseki_pool_device_capacity_bytes Per-device capacity (kind = total | used | free)
+# TYPE kiseki_pool_device_capacity_bytes gauge
+kiseki_pool_device_capacity_bytes{device_id="065ea5b5-1492-4787-a933-a1a43d23ab35",kind="free",pool="data"} 402628603904
+kiseki_pool_device_capacity_bytes{device_id="065ea5b5-1492-4787-a933-a1a43d23ab35",kind="total",pool="data"} 402628603904
+kiseki_pool_device_capacity_bytes{device_id="065ea5b5-1492-4787-a933-a1a43d23ab35",kind="used",pool="data"} 0
+kiseki_pool_device_capacity_bytes{device_id="16b3ec85-a016-4b2b-892c-3091f461367d",kind="free",pool="data"} 402628603904
+kiseki_pool_device_capacity_bytes{device_id="16b3ec85-a016-4b2b-892c-3091f461367d",kind="total",pool="data"} 402628603904
+kiseki_pool_device_capacity_bytes{device_id="16b3ec85-a016-4b2b-892c-3091f461367d",kind="used",pool="data"} 0
+# HELP kiseki_raft_entries_total Total Raft entries applied
+# TYPE kiseki_raft_entries_total counter
+kiseki_raft_entries_total 0
+# HELP kiseki_raft_transport_active_connections Current accepted-connection count on this Raft RPC listener.
+# TYPE kiseki_raft_transport_active_connections gauge
+kiseki_raft_transport_active_connections 163
+# HELP kiseki_raft_transport_listener_restarts_total Listener supervisor restarts (ADR-041 gate-1 F-H3). Should stay 0 in steady state.
+# TYPE kiseki_raft_transport_listener_restarts_total counter
+kiseki_raft_transport_listener_restarts_total 0
+# HELP kiseki_raft_transport_registry_size Active shard count registered with this Raft RPC listener.
+# TYPE kiseki_raft_transport_registry_size gauge
+kiseki_raft_transport_registry_size 8
+# HELP kiseki_raft_transport_rpc_duration_seconds Multiplexed Raft RPC server-side latency by shard and op.
+# TYPE kiseki_raft_transport_rpc_duration_seconds histogram
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.0001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.0005"} 68
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.001"} 272
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.005"} 377
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.01"} 389
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.025"} 391
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.05"} 392
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.1"} 420
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.25"} 426
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.5"} 436
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="1"} 987
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="+Inf"} 1166
+kiseki_raft_transport_rpc_duration_seconds_sum{op="append_entries",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5"} 762.2952898190022
+kiseki_raft_transport_rpc_duration_seconds_count{op="append_entries",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5"} 1166
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.0001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.0005"} 90
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.001"} 303
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.005"} 406
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.01"} 415
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.025"} 416
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.05"} 418
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.1"} 448
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.25"} 471
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.5"} 486
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="1"} 1101
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="+Inf"} 1213
+kiseki_raft_transport_rpc_duration_seconds_sum{op="append_entries",shard="558a43d0-a465-4fb1-a82a-359d04624e9e"} 757.1182214410005
+kiseki_raft_transport_rpc_duration_seconds_count{op="append_entries",shard="558a43d0-a465-4fb1-a82a-359d04624e9e"} 1213
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.0001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.0005"} 66
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.001"} 246
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.005"} 325
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.01"} 332
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.025"} 333
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.05"} 334
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.1"} 362
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.25"} 368
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.5"} 376
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="1"} 893
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="+Inf"} 1061
+kiseki_raft_transport_rpc_duration_seconds_sum{op="append_entries",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4"} 755.6281708920004
+kiseki_raft_transport_rpc_duration_seconds_count{op="append_entries",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4"} 1061
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.0001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.0005"} 200
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.001"} 527
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.005"} 647
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.01"} 655
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.025"} 658
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.05"} 658
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.1"} 693
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.25"} 832
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.5"} 904
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="1"} 1478
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="+Inf"} 1628
+kiseki_raft_transport_rpc_duration_seconds_sum{op="append_entries",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb"} 757.4060999530003
+kiseki_raft_transport_rpc_duration_seconds_count{op="append_entries",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb"} 1628
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.0001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.0005"} 93
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.001"} 327
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.005"} 450
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.01"} 459
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.025"} 463
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.05"} 465
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.1"} 495
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.25"} 525
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.5"} 558
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="1"} 1197
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="append_entries",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="+Inf"} 1292
+kiseki_raft_transport_rpc_duration_seconds_sum{op="append_entries",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad"} 762.517964329
+kiseki_raft_transport_rpc_duration_seconds_count{op="append_entries",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad"} 1292
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.0001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.0005"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.005"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.01"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.025"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.05"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.1"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.25"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.5"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="1"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="+Inf"} 1
+kiseki_raft_transport_rpc_duration_seconds_sum{op="intent_gather_pending",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5"} 0.000013721
+kiseki_raft_transport_rpc_duration_seconds_count{op="intent_gather_pending",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.0001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.0005"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.005"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.01"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.025"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.05"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.1"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.25"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.5"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="1"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="+Inf"} 1
+kiseki_raft_transport_rpc_duration_seconds_sum{op="intent_gather_pending",shard="558a43d0-a465-4fb1-a82a-359d04624e9e"} 0.000011532
+kiseki_raft_transport_rpc_duration_seconds_count{op="intent_gather_pending",shard="558a43d0-a465-4fb1-a82a-359d04624e9e"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.0001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.0005"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.005"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.01"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.025"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.05"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.1"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.25"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.5"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="1"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="+Inf"} 1
+kiseki_raft_transport_rpc_duration_seconds_sum{op="intent_gather_pending",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4"} 0.000025289
+kiseki_raft_transport_rpc_duration_seconds_count{op="intent_gather_pending",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.0001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.0005"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.005"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.01"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.025"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.05"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.1"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.25"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.5"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="1"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="+Inf"} 1
+kiseki_raft_transport_rpc_duration_seconds_sum{op="intent_gather_pending",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb"} 0.000053853
+kiseki_raft_transport_rpc_duration_seconds_count{op="intent_gather_pending",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.0001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.0005"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.005"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.01"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.025"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.05"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.1"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.25"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.5"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="1"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_gather_pending",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="+Inf"} 1
+kiseki_raft_transport_rpc_duration_seconds_sum{op="intent_gather_pending",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad"} 0.000016845
+kiseki_raft_transport_rpc_duration_seconds_count{op="intent_gather_pending",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.0001"} 0
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.0005"} 6559
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.001"} 15123
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.005"} 18307
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.01"} 18386
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.025"} 18428
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.05"} 18474
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.1"} 18499
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.25"} 32908
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.5"} 48340
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="1"} 51218
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="+Inf"} 51566
+kiseki_raft_transport_rpc_duration_seconds_sum{op="intent_put",shard="558a43d0-a465-4fb1-a82a-359d04624e9e"} 11462.983896428941
+kiseki_raft_transport_rpc_duration_seconds_count{op="intent_put",shard="558a43d0-a465-4fb1-a82a-359d04624e9e"} 51566
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.0001"} 0
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.0005"} 12535
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.001"} 26429
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.005"} 36843
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.01"} 37359
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.025"} 37567
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.05"} 37636
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.1"} 37699
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.25"} 66573
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="562ee637-47a6-4aa6-91f1-514b60189963",le="0.5"} 97435
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="562ee637-47a6-4aa6-91f1-514b60189963",le="1"} 103088
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="562ee637-47a6-4aa6-91f1-514b60189963",le="+Inf"} 103815
+kiseki_raft_transport_rpc_duration_seconds_sum{op="intent_put",shard="562ee637-47a6-4aa6-91f1-514b60189963"} 22947.664056329737
+kiseki_raft_transport_rpc_duration_seconds_count{op="intent_put",shard="562ee637-47a6-4aa6-91f1-514b60189963"} 103815
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.0001"} 0
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.0005"} 6885
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.001"} 15838
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.005"} 18888
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.01"} 18988
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.025"} 19043
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.05"} 19083
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.1"} 19107
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.25"} 33279
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.5"} 48817
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="1"} 51591
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="intent_put",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="+Inf"} 51925
+kiseki_raft_transport_rpc_duration_seconds_sum{op="intent_put",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad"} 11267.678142213908
+kiseki_raft_transport_rpc_duration_seconds_count{op="intent_put",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad"} 51925
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.0001"} 0
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.0005"} 0
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.005"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.01"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.025"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.05"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.1"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.25"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="0.5"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="1"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5",le="+Inf"} 1
+kiseki_raft_transport_rpc_duration_seconds_sum{op="vote",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5"} 0.000918633
+kiseki_raft_transport_rpc_duration_seconds_count{op="vote",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.0001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.0005"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.005"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.01"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.025"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.05"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.1"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.25"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="0.5"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="1"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="558a43d0-a465-4fb1-a82a-359d04624e9e",le="+Inf"} 2
+kiseki_raft_transport_rpc_duration_seconds_sum{op="vote",shard="558a43d0-a465-4fb1-a82a-359d04624e9e"} 0.001511732
+kiseki_raft_transport_rpc_duration_seconds_count{op="vote",shard="558a43d0-a465-4fb1-a82a-359d04624e9e"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.0001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.0005"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.005"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.01"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.025"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.05"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.1"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.25"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="0.5"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="1"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4",le="+Inf"} 2
+kiseki_raft_transport_rpc_duration_seconds_sum{op="vote",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4"} 0.001288926
+kiseki_raft_transport_rpc_duration_seconds_count{op="vote",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.0001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.0005"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.005"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.01"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.025"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.05"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.1"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.25"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="0.5"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="1"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb",le="+Inf"} 2
+kiseki_raft_transport_rpc_duration_seconds_sum{op="vote",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb"} 0.001209317
+kiseki_raft_transport_rpc_duration_seconds_count{op="vote",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb"} 2
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.0001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.0005"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.001"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.005"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.01"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.025"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.05"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.1"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.25"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="0.5"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="1"} 1
+kiseki_raft_transport_rpc_duration_seconds_bucket{op="vote",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad",le="+Inf"} 1
+kiseki_raft_transport_rpc_duration_seconds_sum{op="vote",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad"} 0.000019351
+kiseki_raft_transport_rpc_duration_seconds_count{op="vote",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad"} 1
+# HELP kiseki_raft_transport_rpc_total Multiplexed Raft RPC count by shard, op, and outcome.
+# TYPE kiseki_raft_transport_rpc_total counter
+kiseki_raft_transport_rpc_total{op="append_entries",outcome="ok",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5"} 1166
+kiseki_raft_transport_rpc_total{op="append_entries",outcome="ok",shard="558a43d0-a465-4fb1-a82a-359d04624e9e"} 1213
+kiseki_raft_transport_rpc_total{op="append_entries",outcome="ok",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4"} 1061
+kiseki_raft_transport_rpc_total{op="append_entries",outcome="ok",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb"} 1628
+kiseki_raft_transport_rpc_total{op="append_entries",outcome="ok",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad"} 1292
+kiseki_raft_transport_rpc_total{op="intent_gather_pending",outcome="ok",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5"} 1
+kiseki_raft_transport_rpc_total{op="intent_gather_pending",outcome="ok",shard="558a43d0-a465-4fb1-a82a-359d04624e9e"} 1
+kiseki_raft_transport_rpc_total{op="intent_gather_pending",outcome="ok",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4"} 1
+kiseki_raft_transport_rpc_total{op="intent_gather_pending",outcome="ok",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb"} 1
+kiseki_raft_transport_rpc_total{op="intent_gather_pending",outcome="ok",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad"} 1
+kiseki_raft_transport_rpc_total{op="intent_put",outcome="ok",shard="558a43d0-a465-4fb1-a82a-359d04624e9e"} 51566
+kiseki_raft_transport_rpc_total{op="intent_put",outcome="ok",shard="562ee637-47a6-4aa6-91f1-514b60189963"} 103815
+kiseki_raft_transport_rpc_total{op="intent_put",outcome="ok",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad"} 51925
+kiseki_raft_transport_rpc_total{op="vote",outcome="ok",shard="4e5acd05-73e5-4cfc-90fc-cd9eb27687c5"} 1
+kiseki_raft_transport_rpc_total{op="vote",outcome="ok",shard="558a43d0-a465-4fb1-a82a-359d04624e9e"} 1
+kiseki_raft_transport_rpc_total{op="vote",outcome="ok",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4"} 1
+kiseki_raft_transport_rpc_total{op="vote",outcome="ok",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb"} 1
+kiseki_raft_transport_rpc_total{op="vote",outcome="unknown_shard",shard="558a43d0-a465-4fb1-a82a-359d04624e9e"} 1
+kiseki_raft_transport_rpc_total{op="vote",outcome="unknown_shard",shard="bf411e37-e10e-4ccc-a035-2592f45ec1f4"} 1
+kiseki_raft_transport_rpc_total{op="vote",outcome="unknown_shard",shard="d40a4cb5-1198-460b-a56b-5b013459ecdb"} 1
+kiseki_raft_transport_rpc_total{op="vote",outcome="unknown_shard",shard="d7348816-ddba-40c2-93ec-7c9c3b773cad"} 1
+# HELP kiseki_raft_transport_unknown_shard_total Inbound RPCs targeted at a shard_id not in the registry. Sustained values indicate stale peer caches (ADR-034 grace period not refreshing).
+# TYPE kiseki_raft_transport_unknown_shard_total counter
+kiseki_raft_transport_unknown_shard_total 4
+# HELP kiseki_storage_chunk_count Unique chunk count held locally
+# TYPE kiseki_storage_chunk_count gauge
+kiseki_storage_chunk_count 0
+# HELP kiseki_storage_device_total_bytes Chunk-store device pool total capacity (this node)
+# TYPE kiseki_storage_device_total_bytes gauge
+kiseki_storage_device_total_bytes 805257207808
+# HELP kiseki_storage_device_used_bytes Chunk-store device pool bytes used (this node)
+# TYPE kiseki_storage_device_used_bytes gauge
+kiseki_storage_device_used_bytes 0
+# HELP kiseki_storage_logical_bytes Logical bytes addressed by clients (sum refcount × payload)
+# TYPE kiseki_storage_logical_bytes gauge
+kiseki_storage_logical_bytes 0
+# HELP kiseki_storage_meta_bytes Metadata tier on-disk bytes (system disk, ADR-030 last-resort tier)
+# TYPE kiseki_storage_meta_bytes gauge
+kiseki_storage_meta_bytes 548864
+# HELP kiseki_storage_physical_bytes Unique stored payload bytes (each chunk once)
+# TYPE kiseki_storage_physical_bytes gauge
+kiseki_storage_physical_bytes 0
+# HELP kiseki_storage_small_bytes Small-object inline tier on-disk bytes (system disk, ADR-030)
+# TYPE kiseki_storage_small_bytes gauge
+kiseki_storage_small_bytes 0
+# HELP kiseki_storage_tier_bulk_total_bytes Bulk-tier (SSD) total
+# TYPE kiseki_storage_tier_bulk_total_bytes gauge
+kiseki_storage_tier_bulk_total_bytes 0
+# HELP kiseki_storage_tier_bulk_used_bytes Bulk-tier (SSD) used
+# TYPE kiseki_storage_tier_bulk_used_bytes gauge
+kiseki_storage_tier_bulk_used_bytes 0
+# HELP kiseki_storage_tier_cold_total_bytes Cold-tier (HDD) total
+# TYPE kiseki_storage_tier_cold_total_bytes gauge
+kiseki_storage_tier_cold_total_bytes 0
+# HELP kiseki_storage_tier_cold_used_bytes Cold-tier (HDD) used
+# TYPE kiseki_storage_tier_cold_used_bytes gauge
+kiseki_storage_tier_cold_used_bytes 0
+# HELP kiseki_storage_tier_fast_total_bytes Fast-tier (NVMe) total
+# TYPE kiseki_storage_tier_fast_total_bytes gauge
+kiseki_storage_tier_fast_total_bytes 805257207808
+# HELP kiseki_storage_tier_fast_used_bytes Fast-tier (NVMe) used
+# TYPE kiseki_storage_tier_fast_used_bytes gauge
+kiseki_storage_tier_fast_used_bytes 0
+# HELP kiseki_transport_connections_active Active transport connections
+# TYPE kiseki_transport_connections_active gauge
+kiseki_transport_connections_active 0
+# HELP kiseki_transport_connections_idle Idle transport connections
+# TYPE kiseki_transport_connections_idle gauge
+kiseki_transport_connections_idle 0
+# HELP kiseki_view_objects Distinct objects across all views on this node.
+# TYPE kiseki_view_objects gauge
+kiseki_view_objects 0
+# HELP kiseki_view_total_versions Total object versions across all views on this node.
+# TYPE kiseki_view_total_versions gauge
+kiseki_view_total_versions 0
+# HELP kiseki_view_versions_added_total Total versions added across all views.
+# TYPE kiseki_view_versions_added_total counter
+kiseki_view_versions_added_total 0
+# HELP kiseki_view_versions_deleted_total Total versions deleted across all views.
+# TYPE kiseki_view_versions_deleted_total counter
+kiseki_view_versions_deleted_total 0
