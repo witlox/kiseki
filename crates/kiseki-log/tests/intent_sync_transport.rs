@@ -156,7 +156,30 @@ fn spawn_node(node_id: u64, addr: &str) -> RaftShardStore {
         ShardConfig::default(),
         Some(addr),
     );
+    // The Raft RPC listener lazy-inits on the store's Raft runtime —
+    // under parallel suite load that spawn can lag past the test's
+    // first gather, which then sees connection-refused and returns a
+    // PARTIAL result (the `two_peers_keyed_distinctly` flake: local
+    // 2026-06-10 + CI main-push post-#233). Block until the listener
+    // actually accepts before handing the node to the test.
+    wait_listening(addr);
     store
+}
+
+/// Probe-connect until `addr` accepts (10 ms backoff, 5 s cap). A
+/// successful connect is dropped immediately — the listener treats a
+/// zero-byte connection as a benign disconnect.
+fn wait_listening(addr: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match std::net::TcpStream::connect(addr) {
+            Ok(_) => return,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => panic!("listener at {addr} never came up: {e}"),
+        }
+    }
 }
 
 /// gather_pending round-trip: node B holds rich intents; node A's gatherer
