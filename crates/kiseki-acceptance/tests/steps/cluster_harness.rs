@@ -600,7 +600,23 @@ fn spawn_with_env(
         // GH #115: refresh the capacity/dedup gauges every 2s (default
         // 30s) so the capacity-observability scenario can assert shortly
         // after writing without a long sleep.
-        .env("KISEKI_CAPACITY_REFRESH_INTERVAL_S", "2");
+        .env("KISEKI_CAPACITY_REFRESH_INTERVAL_S", "2")
+        // GH #223 / P3a (error-taxonomy 41b23b5): pin the watermark-
+        // advance round effectively OFF (24 h) for harnessed clusters.
+        // The cluster is a process-level singleton shared by every
+        // @multi-node scenario; with the default 5 s cadence,
+        // unrelated suite traffic on the bootstrap shard advances the
+        // delta-log GC boundary past 1 and the @shard-mgmt split/
+        // merge lifecycle scenarios then hit the (deliberate, spec'd)
+        // DeltaLogPruned refusal non-deterministically. Pinning the
+        // cadence keeps the lifecycle scenarios on an unpruned shard
+        // — what they pin — while the refusal contract itself is
+        // pinned explicitly by the "SplitShard … refused …
+        // DeltaLogPruned" scenario via the advance-watermark test
+        // knob, and by kiseki-log unit/integration tests at the
+        // LogError level (merge.rs, auto_split.rs,
+        // openraft_integration.rs).
+        .env("KISEKI_WATERMARK_ADVANCE_INTERVAL_MS", "86400000");
     if let Some(bytes) = chunk_device_bytes {
         // GH #115 ENOSPC scenario: cap the file-backed chunk device so
         // a handful of PUTs fills it and the gateway returns a clean 507.

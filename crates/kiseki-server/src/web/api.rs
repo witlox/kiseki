@@ -202,6 +202,8 @@ pub fn ui_router(state: UiState, auth: AuthConfig) -> Router {
         //   POST /admin/test/fabric/deny-incoming/{0|1}  — refuse all incoming PutFragment
         //   DELETE /admin/test/chunk/{id}/fragment/{idx} — drop a single
         //                                                  local fragment file
+        //   POST /admin/test/shard/{id}/advance-watermark/{pos} — drive the
+        //                                                  replicated AdvanceWatermark (P3a)
         .route(
             "/admin/test/fabric/slow-ms/{ms}",
             post(admin_test_fabric_slow),
@@ -213,6 +215,10 @@ pub fn ui_router(state: UiState, auth: AuthConfig) -> Router {
         .route(
             "/admin/test/chunk/{chunk_id}/fragment/{fragment_index}",
             axum::routing::delete(admin_test_drop_fragment),
+        )
+        .route(
+            "/admin/test/shard/{shard_id}/advance-watermark/{position}",
+            post(admin_test_advance_watermark),
         )
         .merge(super::admin_extra::admin_extra_routes())
         .layer(axum::middleware::from_fn_with_state(
@@ -782,6 +788,7 @@ async fn admin_inspect_composition(
     State(state): State<UiState>,
     axum::extract::Path(comp_id_str): axum::extract::Path<String>,
 ) -> impl IntoResponse {
+    use kiseki_composition::CompositionOps as _;
     let Ok(uuid) = uuid::Uuid::parse_str(&comp_id_str) else {
         return (
             axum::http::StatusCode::BAD_REQUEST,
@@ -795,8 +802,17 @@ async fn admin_inspect_composition(
             axum::Json(serde_json::json!({"error": "composition store not initialized"})),
         );
     };
-    match store.with_storage_locked(|s| s.get(comp_id)) {
-        Ok(Some(comp)) => (
+    // P4 (#226) read-coherence on the inspection path: rows created
+    // at ack on async surfaces live in the CompositionStore's
+    // volatile overlay (`pending`) until the hydrator materializes
+    // them durably. Reading via raw storage (`with_storage_locked`)
+    // is overlay-blind BY DESIGN (the hydrator depends on that), so
+    // it 404s a fresh async object on the very node that acked the
+    // PUT. Inspection must see what the data path serves — the
+    // overlay-aware `CompositionOps::get` (ADR-047 §F-3 / I-CS2
+    // bounded-stale visibility contract).
+    match store.get(comp_id) {
+        Ok(comp) => (
             axum::http::StatusCode::OK,
             axum::Json(serde_json::json!({
                 "node_id": state.node_info.node_id,
@@ -810,7 +826,7 @@ async fn admin_inspect_composition(
                 "chunk_ids": comp.chunks.iter().map(hex_chunk_id).collect::<Vec<_>>(),
             })),
         ),
-        _ => (
+        Err(_) => (
             axum::http::StatusCode::NOT_FOUND,
             axum::Json(serde_json::json!({
                 "node_id": state.node_info.node_id,
@@ -980,6 +996,61 @@ async fn admin_test_drop_fragment(
     )
 }
 
+/// `POST /admin/test/shard/{shard_id}/advance-watermark/{position}` —
+/// drive the shard's replicated `AdvanceWatermark` command (P3a)
+/// directly, advancing the `hydrator` consumer to `position`.
+///
+/// Test-only: lets BDD pin the GH #223 `DeltaLogPruned` refusal
+/// contract deterministically. The BDD cluster harness pins
+/// `KISEKI_WATERMARK_ADVANCE_INTERVAL_MS` high so the supervisor's
+/// own advance round never fires mid-suite — this knob is the only
+/// way the GC boundary moves on a harnessed cluster, and it exercises
+/// the REAL Raft consensus + state-machine prune path (not a mock).
+///
+/// Leader-only: `advance_watermark` is a `client_write`, so followers
+/// answer 409 CONFLICT and the caller tries the next node.
+async fn admin_test_advance_watermark(
+    State(state): State<UiState>,
+    axum::extract::Path((shard_id_str, position)): axum::extract::Path<(String, u64)>,
+) -> impl IntoResponse {
+    if !test_knobs_enabled() {
+        return test_knobs_disabled_response();
+    }
+    let Ok(uuid) = uuid::Uuid::parse_str(&shard_id_str) else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({"error": "shard_id must be a UUID"})),
+        );
+    };
+    let Some(ref log) = state.log_store else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "log store not initialized"})),
+        );
+    };
+    match log
+        .advance_watermark(
+            kiseki_common::ids::ShardId(uuid),
+            kiseki_log::traits::HYDRATOR_CONSUMER,
+            kiseki_common::ids::SequenceNumber(position),
+        )
+        .await
+    {
+        Ok(()) => (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "shard_id": shard_id_str,
+                "consumer": kiseki_log::traits::HYDRATOR_CONSUMER,
+                "position": position,
+            })),
+        ),
+        Err(e) => (
+            axum::http::StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({"error": e.to_string()})),
+        ),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::type_complexity, clippy::redundant_closure)]
 mod cluster_info_rev2_tests {
@@ -1031,7 +1102,7 @@ mod cluster_info_rev2_tests {
         }
         UiState {
             aggregator,
-            metrics_encode: Arc::new(|| String::new()),
+            metrics_encode: Arc::new(String::new),
             diagnostics,
             log_store: None,
             node_info: NodeInfo {
@@ -1119,7 +1190,7 @@ mod cluster_info_rev2_tests {
         let aggregator = Arc::new(MetricsAggregator::new("127.0.0.1:9090".to_owned(), 10));
         let state = UiState {
             aggregator,
-            metrics_encode: Arc::new(|| String::new()),
+            metrics_encode: Arc::new(String::new),
             diagnostics: super::super::events::new_shared(),
             log_store: None,
             node_info: NodeInfo {
@@ -1205,7 +1276,7 @@ mod ui_router_auth_tests {
         // check the auth-layer outcome, never the handler body.
         UiState {
             aggregator: Arc::new(MetricsAggregator::new("127.0.0.1:9090".to_owned(), 10)),
-            metrics_encode: Arc::new(|| String::new()),
+            metrics_encode: Arc::new(String::new),
             diagnostics: super::super::events::new_shared(),
             log_store: None,
             node_info: NodeInfo {
@@ -1359,5 +1430,120 @@ mod ui_router_auth_tests {
             status_of(router, get_req(&path, Some("client"))).await,
             StatusCode::SERVICE_UNAVAILABLE,
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod admin_inspect_composition_tests {
+    //! P4 (#226/#227) read-coherence on the inspection path
+    //! (ADR-047 §F-3 / I-CS2): a composition created at ack on an
+    //! async surface lives in the `CompositionStore`'s volatile
+    //! overlay until the hydrator materializes it. The
+    //! `/admin/composition/{id}` handler must consult the
+    //! overlay-aware `CompositionOps::get` — the raw-storage read it
+    //! previously used is overlay-blind BY DESIGN (the hydrator
+    //! depends on that) and 404'd a fresh async object on the very
+    //! node that acked the PUT, which is exactly the Tier-2
+    //! chunk-storage regression this pins.
+
+    use super::*;
+    use kiseki_common::ids::{ChunkId, NamespaceId, OrgId, ShardId};
+    use kiseki_composition::composition::CompositionStore;
+    use kiseki_composition::Namespace;
+
+    fn ui_state_with_compositions(store: Arc<CompositionStore>) -> UiState {
+        UiState {
+            aggregator: Arc::new(MetricsAggregator::new("127.0.0.1:9090".to_owned(), 10)),
+            metrics_encode: Arc::new(String::new),
+            diagnostics: super::super::events::new_shared(),
+            log_store: None,
+            node_info: NodeInfo {
+                node_id: 1,
+                s3_addr: "10.0.0.1:9000".to_owned(),
+                nfs_addr: "10.0.0.1:2049".to_owned(),
+                metrics_addr: "10.0.0.1:9090".to_owned(),
+                raft_peers: vec![],
+            },
+            compositions: Some(store),
+            local_chunk_store: None,
+            cluster_control: None,
+            cluster_control_store: None,
+            audit: None,
+            key_manager: None,
+            tenants: None,
+            namespaces: None,
+            drain: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn volatile_overlay_row_is_visible_to_admin_inspection() {
+        let store = Arc::new(CompositionStore::default());
+        let ns_id = NamespaceId(uuid::Uuid::from_u128(7));
+        store.add_namespace(Namespace {
+            id: ns_id,
+            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
+            shard_id: ShardId(uuid::Uuid::from_u128(1)),
+            read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
+        });
+        // Volatile-at-ack row (P4): lands in the overlay, NOT storage.
+        let comp_id = store
+            .create_volatile(ns_id, vec![ChunkId([7u8; 32])], 1024)
+            .expect("volatile create");
+
+        // Pin the regression mechanism: the raw-storage read the
+        // handler previously used is overlay-blind — it must NOT see
+        // the row (the hydrator's staging path depends on exactly
+        // this), which is why the handler must not read through it.
+        let raw = store
+            .with_storage_locked(|s| s.get(comp_id))
+            .expect("raw storage read");
+        assert!(
+            raw.is_none(),
+            "overlay row unexpectedly visible at the raw storage layer — \
+             the P4 overlay contract changed; revisit this test AND the \
+             admin handler",
+        );
+
+        // The admin inspection handler must see it (overlay-aware get).
+        let state = ui_state_with_compositions(Arc::clone(&store));
+        let resp =
+            admin_inspect_composition(State(state), axum::extract::Path(comp_id.0.to_string()))
+                .await
+                .into_response();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "admin inspection must surface the volatile-at-ack row \
+             (ADR-047 §F-3 async-ack visibility)",
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["found"], serde_json::Value::Bool(true));
+        assert_eq!(
+            json["chunk_ids"].as_array().map(Vec::len),
+            Some(1),
+            "chunk-id list must come from the overlay row: {json}",
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_composition_still_reports_not_found() {
+        let store = Arc::new(CompositionStore::default());
+        let state = ui_state_with_compositions(store);
+        let resp = admin_inspect_composition(
+            State(state),
+            axum::extract::Path(uuid::Uuid::from_u128(99).to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
     }
 }

@@ -197,6 +197,198 @@ async fn when_admin_merge_back(w: &mut KisekiWorld) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// P3a DeltaLogPruned refusal contract (error-taxonomy 41b23b5, GH #223).
+//
+// The cluster harness pins KISEKI_WATERMARK_ADVANCE_INTERVAL_MS high,
+// so the supervisor's own watermark round never advances a harnessed
+// shard's GC boundary — these steps advance it explicitly through the
+// `/admin/test/shard/{id}/advance-watermark/{pos}` knob (real Raft
+// AdvanceWatermark consensus + state-machine prune, not a mock) on a
+// scenario-private 1-shard namespace, then assert SplitShard refuses
+// with the typed FAILED_PRECONDITION refusal.
+// ---------------------------------------------------------------------------
+
+#[given("a fresh single-shard lifecycle namespace created via admin HTTP")]
+async fn given_fresh_lifecycle_namespace(w: &mut KisekiWorld) {
+    // Snapshot (node_id, metrics_port) without holding the borrow
+    // across awaits. namespace-create is leader-only and the HTTP
+    // handler does not forward — hit every node until the
+    // control-plane leader accepts (same shape as
+    // `when_admin_create_sharded_ns`).
+    let ports: Vec<(u64, u16)> = {
+        let g = cluster(w);
+        g.nodes().map(|n| (n.node_id, n.ports.metrics)).collect()
+    };
+    let body = serde_json::json!({
+        "namespace_id": uuid::Uuid::new_v4().to_string(),
+        "tenant_id": uuid::Uuid::new_v4().to_string(),
+        "shards": 1,
+    });
+    let http = reqwest::Client::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut shard_id: Option<String> = None;
+    let mut last_err = String::new();
+    'outer: loop {
+        for (node_id, port) in &ports {
+            let url = format!("http://127.0.0.1:{port}/admin/topology/namespaces");
+            match http.post(&url).json(&body).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let json: serde_json::Value = resp.json().await.unwrap_or_default();
+                    if status.is_success() {
+                        shard_id = json
+                            .get("shards")
+                            .and_then(|s| s.as_array())
+                            .and_then(|arr| arr.first())
+                            .and_then(|s| s.get("shard_id"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
+                        break 'outer;
+                    }
+                    last_err = format!("node-{node_id} HTTP {status}: {json}");
+                }
+                Err(e) => last_err = format!("node-{node_id} POST failed: {e}"),
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    let shard_id = shard_id.unwrap_or_else(|| {
+        panic!("lifecycle namespace-create not accepted within 30s (last: {last_err})")
+    });
+
+    // Wait for the fresh shard to elect a raft leader — the
+    // advance-watermark knob below is a leader-only `client_write`,
+    // so without a leader every node would 409 forever.
+    let probe_port = ports[0].1;
+    let leader_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let url = format!("http://127.0.0.1:{probe_port}/cluster/shards/{shard_id}/leader");
+        let leader: Option<u64> = match http.get(&url).send().await {
+            Ok(resp) => resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|j| j.get("leader_id").and_then(serde_json::Value::as_u64)),
+            Err(_) => None,
+        };
+        if leader.is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < leader_deadline,
+            "lifecycle shard {shard_id} never elected a raft leader within 20s",
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
+    w.cluster
+        .name_index_state
+        .insert("lifecycle_shard_id".into(), shard_id);
+}
+
+#[when("the test knob advances the lifecycle shard's hydrator watermark past the replay floor")]
+async fn when_advance_lifecycle_watermark(w: &mut KisekiWorld) {
+    let shard_id = w
+        .cluster
+        .name_index_state
+        .get("lifecycle_shard_id")
+        .cloned()
+        .expect("lifecycle namespace step must run first");
+    let ports: Vec<(u64, u16)> = {
+        let g = cluster(w);
+        g.nodes().map(|n| (n.node_id, n.ports.metrics)).collect()
+    };
+    // Position 8 — any value > 1 trips the DeltaLogPruned gate
+    // (echoes the boundary=8 the 2026-06-10 Tier-2 run observed on
+    // the bootstrap shard). The knob is leader-only; try every node.
+    let http = reqwest::Client::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut accepted = false;
+    let mut last_err = String::new();
+    'outer: loop {
+        for (node_id, port) in &ports {
+            let url =
+                format!("http://127.0.0.1:{port}/admin/test/shard/{shard_id}/advance-watermark/8");
+            match http.post(&url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    accepted = true;
+                    break 'outer;
+                }
+                Ok(resp) => last_err = format!("node-{node_id} HTTP {}", resp.status()),
+                Err(e) => last_err = format!("node-{node_id} POST failed: {e}"),
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert!(
+        accepted,
+        "advance-watermark knob not accepted by any node within 20s \
+         (last: {last_err}) — is KISEKI_ENABLE_TEST_KNOBS=1 set on the harness?",
+    );
+    // The knob acks after the shard LEADER applied the replicated
+    // AdvanceWatermark; the SplitShard below may be served by a
+    // different node (control-plane forwarding) whose replica applies
+    // one heartbeat later (~ms). 1 s is 10-100× margin — and the deep
+    // gate inside `redistribute_upper_half` keeps the refusal correct
+    // even if the handler's fail-fast read were to lag.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+}
+
+#[then(
+    "SplitShard for the lifecycle shard via node-1 admin gRPC is refused as FAILED_PRECONDITION citing a pruned delta log"
+)]
+async fn then_split_lifecycle_refused(w: &mut KisekiWorld) {
+    let shard_id = w
+        .cluster
+        .name_index_state
+        .get("lifecycle_shard_id")
+        .cloned()
+        .expect("lifecycle namespace step must run first");
+    let port = node1_admin_port(w);
+    let mut client = admin_client_for_port(port).await;
+    let resp = client
+        .split_shard(pb::SplitShardRequest {
+            shard_id: shard_id.clone(),
+            pivot_key: String::new(),
+        })
+        .await;
+    match resp {
+        Ok(r) => panic!(
+            "GH #223: SplitShard on the pruned lifecycle shard {shard_id} must \
+             refuse, but it SUCCEEDED (right_shard_id={}) — the DeltaLogPruned \
+             gate silently lost the pruned history",
+            r.into_inner().right_shard_id,
+        ),
+        Err(s) => {
+            // Assert the error CLASS (typed refusal → gRPC
+            // FAILED_PRECONDITION, matching kiseki_log::grpc::
+            // to_status) plus the minimal pruned-delta-log marker
+            // that distinguishes it from MaintenanceMode (which
+            // shares the class) — NOT the full message string.
+            assert_eq!(
+                s.code(),
+                tonic::Code::FailedPrecondition,
+                "GH #223: expected FAILED_PRECONDITION refusal, got {:?}: {}",
+                s.code(),
+                s.message(),
+            );
+            assert!(
+                s.message().contains("pruned"),
+                "GH #223: refusal must cite the pruned delta log \
+                 (DeltaLogPruned), got: {}",
+                s.message(),
+            );
+        }
+    }
+}
+
 #[then("every node logged the apply hook registering the new shard locally")]
 async fn then_apply_hook_fired_on_every_node(w: &mut KisekiWorld) {
     // The post-#4 control-plane apply hook hits a metric we already
