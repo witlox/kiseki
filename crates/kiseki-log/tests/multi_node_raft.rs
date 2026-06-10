@@ -459,3 +459,233 @@ async fn leader_append_delta_with_forwarding_commits_normally() {
         .expect("leader writes must succeed");
     assert_eq!(seq, SequenceNumber(1));
 }
+
+// =========================================================================
+// P3 / I-L4 — supervisor-driven delta pruning: each node reports its
+// hydrator position LOCALLY; the shard leader's supervisor gathers all
+// voters' positions and proposes min as ONE replicated AdvanceWatermark,
+// whose apply prunes deltas on every replica deterministically.
+// =========================================================================
+
+/// 3-node `RaftShardStore` cluster (the production wrapper — node-local
+/// report map + `consumer_positions` aux dispatcher + per-shard
+/// supervisor, all wired by `create_shard`).
+///
+/// Plain `#[test]` (not `#[tokio::test]`) because `RaftShardStore` owns
+/// its own tokio runtime; nesting it inside an outer runtime panics on
+/// drop (same convention as `raft_shard_store_topology.rs`).
+///
+/// Asserts the full ADR-040-§D6.3-safety contract:
+/// 1. writes applied, two of three voters reported → NO pruning (the
+///    round requires EVERY voter);
+/// 2. the third voter reports a LOWER position → boundary advances to
+///    exactly that min on ALL THREE nodes, never past it, and
+///    `earliest_visible_seq == boundary` after the prune;
+/// 3. the slow voter catches up → boundary follows to the new min.
+#[test]
+#[allow(clippy::too_many_lines)] // one cluster lifetime, three sequential phases — splitting would re-pay the ~10 s election per phase
+fn supervisor_prunes_deltas_only_after_all_voters_reported_min() {
+    use kiseki_log::traits::{LogOps, HYDRATOR_CONSUMER};
+    use kiseki_log::RaftShardStore;
+
+    // Process-local env (safe under nextest's process-per-test):
+    // shrink the watermark-advance round to 300 ms (6 supervisor
+    // ticks) and the per-store Raft runtime to 2 threads so three
+    // stores fit one CI process.
+    std::env::set_var("KISEKI_WATERMARK_ADVANCE_INTERVAL_MS", "300");
+    std::env::set_var("KISEKI_RAFT_THREADS", "2");
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let ports = find_ports(3);
+    let peers = peers_map(&ports);
+    let shard = test_shard();
+
+    // data_dir per node: the per-shard supervisor (the watermark
+    // gather lives on its tick loop) only spawns for shards whose
+    // intent store opened durably.
+    let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let stores: Vec<RaftShardStore> = (0..3usize)
+        .map(|i| {
+            let node_id = u64::try_from(i).unwrap() + 1;
+            let store =
+                RaftShardStore::new(node_id, peers.clone(), Some(dirs[i].path().to_path_buf()));
+            let addr = format!("127.0.0.1:{}", ports[i]);
+            store.create_shard(
+                shard,
+                test_tenant(),
+                kiseki_common::ids::NodeId(node_id),
+                kiseki_log::shard::ShardConfig::default(),
+                Some(&addr),
+            );
+            store
+        })
+        .collect();
+    stores[0].initialize_shard(shard).expect("initialize");
+
+    // Wait for leader election (quorum 2/3) — poll all nodes agree.
+    let elected = rt.block_on(async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let mut leaders = Vec::new();
+            for s in &stores {
+                leaders.push(s.shard_health(shard).await.ok().and_then(|h| h.leader));
+            }
+            if leaders.iter().all(|l| l.is_some() && *l == leaders[0]) {
+                return true;
+            }
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    assert!(elected, "3-node cluster failed to elect a leader");
+
+    // Append 10 deltas through the leader.
+    rt.block_on(async {
+        let leader_id = usize::try_from(
+            stores[0]
+                .shard_health(shard)
+                .await
+                .unwrap()
+                .leader
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        let leader = &stores[leader_id - 1];
+        for i in 0u8..10 {
+            leader.append_delta(make_append_req(i)).await.unwrap();
+        }
+        // Wait for replication to all followers.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut tips = Vec::new();
+            for s in &stores {
+                tips.push(s.shard_health(shard).await.unwrap().tip.0);
+            }
+            if tips.iter().all(|t| *t == 10) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "replication stalled: tips {tips:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+
+    // Poll helper: (gc_boundary, earliest_visible_seq) per node.
+    let snapshot = |rt: &tokio::runtime::Runtime| -> Vec<(u64, u64)> {
+        rt.block_on(async {
+            let mut out = Vec::new();
+            for s in &stores {
+                out.push((
+                    s.gc_boundary(shard).await.unwrap().0,
+                    s.earliest_visible_seq(shard).await.unwrap().0,
+                ));
+            }
+            out
+        })
+    };
+
+    // --- Phase 1: only 2 of 3 voters reported → NO pruning ----------
+    stores[0].report_consumer_position(shard, HYDRATOR_CONSUMER, SequenceNumber(10));
+    stores[1].report_consumer_position(shard, HYDRATOR_CONSUMER, SequenceNumber(10));
+    // Give the leader several advance rounds (300 ms each) to
+    // (incorrectly) advance.
+    rt.block_on(async { tokio::time::sleep(Duration::from_secs(2)).await });
+    for (node, (boundary, earliest)) in snapshot(&rt).iter().enumerate() {
+        assert_eq!(
+            *boundary,
+            0,
+            "node {} pruned with a voter missing (boundary {boundary}) — \
+             the round must require EVERY voter",
+            node + 1,
+        );
+        assert_eq!(
+            *earliest,
+            1,
+            "node {}: deltas must be intact while a voter is unreported",
+            node + 1,
+        );
+    }
+
+    // --- Phase 2: third voter reports LOWER (4) → boundary == min ---
+    stores[2].report_consumer_position(shard, HYDRATOR_CONSUMER, SequenceNumber(4));
+    let converged = rt.block_on(async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let mut ok = true;
+            for s in &stores {
+                let b = s.gc_boundary(shard).await.unwrap().0;
+                assert!(
+                    b <= 4,
+                    "boundary {b} advanced past the slowest voter's position (4)"
+                );
+                ok &= b == 4;
+            }
+            if ok {
+                return true;
+            }
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    assert!(
+        converged,
+        "boundary never converged to the min (4) on all nodes"
+    );
+    for (node, (boundary, earliest)) in snapshot(&rt).iter().enumerate() {
+        assert_eq!(
+            *boundary,
+            4,
+            "node {}: boundary pinned at the min",
+            node + 1
+        );
+        assert_eq!(
+            *earliest,
+            4,
+            "node {}: earliest_visible_seq must equal the boundary after \
+             the prune (deltas 1-3 gone, 4 survives)",
+            node + 1,
+        );
+    }
+
+    // --- Phase 3: the slow voter catches up → boundary follows ------
+    stores[2].report_consumer_position(shard, HYDRATOR_CONSUMER, SequenceNumber(10));
+    let converged = rt.block_on(async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let mut ok = true;
+            for s in &stores {
+                let b = s.gc_boundary(shard).await.unwrap().0;
+                assert!(b <= 10, "boundary {b} advanced past every voter's position");
+                ok &= b == 10;
+            }
+            if ok {
+                return true;
+            }
+            if std::time::Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    assert!(converged, "boundary never followed the catch-up to 10");
+    for (node, (boundary, earliest)) in snapshot(&rt).iter().enumerate() {
+        assert_eq!(*boundary, 10, "node {}", node + 1);
+        assert_eq!(
+            *earliest,
+            10,
+            "node {}: prune is `sequence < boundary` — delta 10 survives \
+             and is the earliest visible",
+            node + 1,
+        );
+    }
+}

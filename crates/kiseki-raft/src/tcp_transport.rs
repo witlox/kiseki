@@ -1363,6 +1363,7 @@ fn normalize_op(tag: &str) -> &'static str {
         "full_snapshot" => crate::transport_metrics::op::FULL_SNAPSHOT,
         "intent_put" => crate::transport_metrics::op::INTENT_PUT,
         "intent_gather_pending" => crate::transport_metrics::op::INTENT_GATHER_PENDING,
+        "consumer_positions" => crate::transport_metrics::op::CONSUMER_POSITIONS,
         _ => crate::transport_metrics::op::UNKNOWN,
     }
 }

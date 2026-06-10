@@ -15,7 +15,7 @@ architecture it gets enforced. Invariant without enforcement = violation.
 | I-L1 (total order within shard) | `kiseki-log` Raft leader | Raft assigns monotonic sequence numbers |
 | I-L2 (durable on majority before ack) | `kiseki-log` Raft commit | openraft commit callback; no ack until majority persist |
 | I-L3 (delta immutable once committed) | `kiseki-log` storage layer | Append-only SSTable format; no mutation API |
-| I-L4 (GC requires all consumers advanced) | `kiseki-log` truncation | ConsumerWatermarks checked; min(all watermarks) = GC boundary |
+| I-L4 (GC requires all consumers advanced) | `kiseki-log` watermark-advance GC | ConsumerWatermarks checked; min(all watermarks) = GC boundary (deltas with `sequence < boundary` pruned; `== boundary` survives). Enforced at three points: `raft/state_machine.rs` prunes on every applied `AdvanceWatermark` (P3a — replicated, deterministic on all replicas); `raft_shard_store.rs` supervisor watermark round proposes min over EVERY voter's reported hydrator position (any missing voter skips the round); membership-add guard (`OpenRaftLogStore::guard_replica_add` + the `test_cluster.rs` add paths) refuses a NEW replica with `DeltaLogPruned` once boundary > 1 (a fresh replica's hydrator cannot replay pruned history — ADR-040 §D6.3). |
 | I-L5 (composition visible only after chunks durable) | `kiseki-composition` write path | Finalize step gates visibility; chunks confirmed before delta commit |
 | I-L6 (hard shard ceiling) | `kiseki-log` shard monitor | Background task checks dimensions; triggers SplitShard |
 | I-L7 (header/payload structural separation) | `kiseki-log` + `kiseki-crypto` | DeltaHeader + DeltaPayload structs; compaction reads headers only |

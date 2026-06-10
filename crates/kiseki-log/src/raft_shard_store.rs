@@ -19,13 +19,17 @@ use kiseki_common::ids::{ChunkId, NodeId, OrgId, SequenceNumber, ShardId};
 use crate::delta::Delta;
 use crate::error::LogError;
 use crate::intent::{FjallIntentStore, InMemIntentStore, IntentStore, WriteIntent};
-use crate::intent_sync::{build_intent_dispatcher, TransportIntentGatherer};
+use crate::intent_sync::{
+    build_shard_aux_dispatcher, fetch_consumer_positions, TransportIntentGatherer,
+};
 use crate::raft::state_machine::ClusterChunkStateEntry;
 use crate::raft::OpenRaftLogStore;
 use crate::raft_intent_sink::RaftLogIncorporationSink;
 use crate::shard::{ShardConfig, ShardInfo, ShardState};
 use crate::shard_committer::{PeerIntentGatherer, ShardCommitter};
-use crate::traits::{AppendChunkAndDeltaRequest, AppendDeltaRequest, LogOps, ReadDeltasRequest};
+use crate::traits::{
+    AppendChunkAndDeltaRequest, AppendDeltaRequest, LogOps, ReadDeltasRequest, HYDRATOR_CONSUMER,
+};
 use kiseki_common::locks::LockOrDie;
 
 /// Default min durable copies for an acked decoupled write when
@@ -147,7 +151,20 @@ pub struct RaftShardStore {
     /// local `put_batch` + one `intent_put` RPC per peer, amortising the
     /// fjall WAL sync and dropping the cluster-wide fan RPC volume by 4-8×.
     intent_fan_coalescers: IntentFanCoalescerMap,
+    /// P3 / I-L4 — NODE-LOCAL reported consumer positions, keyed by
+    /// `(shard, consumer)`, monotonic max. Written by
+    /// [`LogOps::report_consumer_position`] (the hydrator's per-poll
+    /// report — synchronous, infallible, never touches Raft); read by
+    /// the `consumer_positions` aux dispatcher (serving the shard
+    /// leader's gather) and by the local supervisor's own gather leg.
+    /// Shared (`Arc`) so `create_shard` can hand a clone to the
+    /// per-shard dispatcher closure and supervisor task.
+    consumer_positions: SharedConsumerPositions,
 }
+
+/// P3 / I-L4: the node-local `(shard, consumer) → position` report map.
+/// See [`RaftShardStore::consumer_positions`].
+type SharedConsumerPositions = Arc<Mutex<HashMap<(ShardId, String), SequenceNumber>>>;
 
 /// W12 (2026-06-02): per-shard handle map for the intent-fan coalescer.
 /// Aliased so the field declaration on [`RaftShardStore`] stays inside the
@@ -219,6 +236,7 @@ impl RaftShardStore {
             listener_registry: Mutex::new(None),
             transport_metrics: Mutex::new(None),
             intent_fan_coalescers: Mutex::new(HashMap::new()),
+            consumer_positions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -351,6 +369,49 @@ impl RaftShardStore {
             .lock_or_die("raft_shard_store.intent_stores")
             .get(&shard_id)
             .map(Arc::clone)
+    }
+
+    /// This node's locally-reported consumer positions for `shard_id`
+    /// (P3 / I-L4), as `(consumer, position)` pairs. What the
+    /// `consumer_positions` aux dispatcher serves to the shard
+    /// leader's watermark-advance gather.
+    #[must_use]
+    pub fn local_consumer_positions(&self, shard_id: ShardId) -> Vec<(String, u64)> {
+        read_local_positions(&self.consumer_positions, shard_id)
+    }
+
+    /// The `consumer_positions` aux-dispatcher source for `shard_id`
+    /// (P3): a closure over the shared node-local report map, re-read
+    /// per request.
+    fn positions_fn_for(&self, shard_id: ShardId) -> crate::intent_sync::ConsumerPositionsFn {
+        let positions = Arc::clone(&self.consumer_positions);
+        Arc::new(move || read_local_positions(&positions, shard_id))
+    }
+
+    /// Register this shard's Raft handle + aux dispatcher with the
+    /// multiplexed listener so inbound RPCs route here (ADR-041). The
+    /// aux dispatcher serves the ADR-047 `IntentSync` tags plus the P3
+    /// `consumer_positions` read (the shard leader's watermark-advance
+    /// gather reads this node's local hydrator position); the listener
+    /// consults it only after the Raft dispatcher returns `UnknownTag`,
+    /// so the consensus path is untouched. No-op when no listener is
+    /// running (`registry == None`).
+    fn register_listener_dispatchers(
+        &self,
+        registry: Option<kiseki_raft::tcp_transport::RegistryHandle>,
+        shard_id: ShardId,
+        store: &Arc<OpenRaftLogStore>,
+        intent_store: &Arc<dyn IntentStore>,
+    ) {
+        let Some(reg) = registry else {
+            return;
+        };
+        reg.register_shard(shard_id, store.raft_handle());
+        reg.register_aux(
+            shard_id,
+            build_shard_aux_dispatcher(Arc::clone(intent_store), self.positions_fn_for(shard_id)),
+        );
+        tracing::info!(shard_id = %shard_id.0, "shard registered with Raft RPC listener");
     }
 
     /// Build a [`TransportIntentGatherer`] for `shard_id` (ADR-047 phase
@@ -553,6 +614,11 @@ impl RaftShardStore {
             .lock()
             .lock_or_die("raft_shard_store.intent_fan_coalescers")
             .remove(&shard_id);
+        // P3: drop the shard's node-local consumer position reports.
+        self.consumer_positions
+            .lock()
+            .lock_or_die("raft_shard_store.consumer_positions")
+            .retain(|(s, _), _| *s != shard_id);
         self.shards
             .lock()
             .lock_or_die("raft_shard_store.shards")
@@ -736,19 +802,7 @@ impl RaftShardStore {
                 .insert(shard_id);
         }
 
-        // Register this shard's Raft handle with the listener so
-        // inbound multiplexed RPCs route here.
-        if let Some(reg) = registry {
-            reg.register_shard(shard_id, store.raft_handle());
-            // ADR-047 aux dispatcher: register the IntentSync handler on the
-            // SAME shard so a peer's committer can read this node's intent
-            // state over the multiplexed transport (and now also receive a
-            // fanned `intent_put`). The listener consults it only after the
-            // Raft dispatcher returns `UnknownTag`, so the consensus path is
-            // untouched.
-            reg.register_aux(shard_id, build_intent_dispatcher(Arc::clone(&intent_store)));
-            tracing::info!(shard_id = %shard_id.0, "shard registered with Raft RPC listener");
-        }
+        self.register_listener_dispatchers(registry, shard_id, &store, &intent_store);
 
         {
             let mut shards = self.shards.lock().lock_or_die("raft_shard_store.shards");
@@ -969,6 +1023,17 @@ impl RaftShardStore {
         // A separate handle to the SAME intent store, for the per-node
         // self-prune (the committer owns its own clone for incorporation).
         let prune_store = Arc::clone(&intent_store);
+        // P3 / I-L4 — the leader-side watermark-advance round: every
+        // `every_ticks` ticks (≈5 s), gather every voter's node-local
+        // hydrator position and propose `min` as ONE replicated
+        // `AdvanceWatermark` (whose apply prunes deltas on every
+        // replica, state_machine.rs P3a).
+        let watermark = WatermarkAdvanceCtx {
+            positions: Arc::clone(&self.consumer_positions),
+            peers: self.peers.clone(),
+            local_node: self.node_id,
+            every_ticks: watermark_advance_every_ticks(COMMITTER_INTERVAL),
+        };
         let join = std::thread::Builder::new()
             .name(format!("kiseki-committer-{}", shard_id.0))
             .spawn(move || {
@@ -988,6 +1053,7 @@ impl RaftShardStore {
                         gatherer,
                         leadership_store,
                         prune_store,
+                        watermark,
                         COMMITTER_INTERVAL,
                         shutdown_rx,
                     )
@@ -1163,6 +1229,297 @@ const POST_PROMOTION_WAIT_MAX: Duration = Duration::from_secs(5);
 /// PART 8 §W — poll cadence for the post-promotion wait.
 const POST_PROMOTION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// P3 / I-L4 — default cadence for the leader's watermark-advance
+/// round. Overridable via `KISEKI_WATERMARK_ADVANCE_INTERVAL_MS`
+/// (integration tests shrink it); converted to supervisor ticks by
+/// [`watermark_advance_every_ticks`].
+const WATERMARK_ADVANCE_DEFAULT_INTERVAL_MS: u64 = 5_000;
+
+/// P3 — per-peer timeout for the `consumer_positions` gather, bounded
+/// like the intent fan so one dead peer delays a round by at most
+/// this (the round is then skipped — safety first). The per-peer
+/// fetches run CONCURRENTLY (`join_all`), so the worst-case round is
+/// ~one timeout regardless of how many voters are blackholed.
+const WATERMARK_GATHER_PEER_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// P3 observability — throttle for the skipped-round WARN: at most
+/// one per shard per this interval. Per-voter detail stays at DEBUG;
+/// the WARN names the missing voter ids so a permanently-stalled
+/// prune (e.g. a halted hydrator reporting nothing) is visible
+/// without debug logging.
+const WATERMARK_SKIP_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Prometheus counter for skipped watermark-advance rounds (P3
+/// observability). `OnceLock` so multi-shard processes register the
+/// metric once — same idiom as `state_machine.rs`.
+fn watermark_round_skipped_counter() -> &'static prometheus::IntCounterVec {
+    static C: std::sync::OnceLock<prometheus::IntCounterVec> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        prometheus::register_int_counter_vec!(
+            prometheus::Opts::new(
+                "kiseki_log_watermark_round_skipped_total",
+                "Per-shard count of watermark-advance rounds skipped because \
+                 a voter was unreachable, had no transport addr, or has not \
+                 reported a hydrator position (P3 / I-L4). A persistently \
+                 increasing count means delta pruning is stalled — find the \
+                 voter named in the throttled WARN and investigate."
+            ),
+            &["shard"],
+        )
+        .expect("kiseki-log: failed to register watermark_round_skipped counter")
+    })
+}
+
+/// How many supervisor ticks between watermark-advance rounds:
+/// `KISEKI_WATERMARK_ADVANCE_INTERVAL_MS` (default
+/// [`WATERMARK_ADVANCE_DEFAULT_INTERVAL_MS`]) divided by the tick
+/// interval, floor 1.
+fn watermark_advance_every_ticks(tick_interval: Duration) -> u64 {
+    let ms = std::env::var("KISEKI_WATERMARK_ADVANCE_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(WATERMARK_ADVANCE_DEFAULT_INTERVAL_MS);
+    let tick_ms = u64::try_from(tick_interval.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    (ms / tick_ms).max(1)
+}
+
+/// Context for the supervisor's periodic watermark-advance round
+/// (P3 / I-L4). Bundled so `run_supervisor_loop`'s signature stays
+/// readable.
+struct WatermarkAdvanceCtx {
+    /// This node's local report map (shared with
+    /// `report_consumer_position` and the aux dispatcher).
+    positions: SharedConsumerPositions,
+    /// Configured `node_id → transport addr` map — resolves voter ids
+    /// from the live membership to dialable addrs.
+    peers: BTreeMap<u64, String>,
+    /// This node's Raft id (its own leg of the gather reads the local
+    /// map instead of dialing itself).
+    local_node: u64,
+    /// Ticks between rounds (see [`watermark_advance_every_ticks`]).
+    every_ticks: u64,
+}
+
+/// P3 / I-L4 — the leader's watermark-advance decision, pure for
+/// testability. `positions[i]` is voter *i*'s reported `hydrator`
+/// position (`None` = unreachable / no addr / never reported);
+/// `current` is the SM's current `hydrator` watermark.
+///
+/// Rules (safety first):
+/// - EVERY current voter must have answered with a position — any
+///   `None` skips the round (no advance), because the missing voter
+///   might be the slowest and pruning past it would permanently halt
+///   its hydrator via the ADR-040 §D6.3 gap evidence;
+/// - the proposal is `min` across voters, so the boundary can never
+///   outrun the slowest node's hydrator;
+/// - only a strictly-forward move is proposed (`min > current`) — the
+///   SM's `ConsumerWatermarks::advance` is monotonic anyway, this
+///   just avoids no-op Raft writes.
+fn watermark_advance_decision(positions: &[Option<u64>], current: u64) -> Option<u64> {
+    if positions.is_empty() {
+        return None;
+    }
+    let mut min = u64::MAX;
+    for p in positions {
+        min = min.min((*p)?);
+    }
+    (min > current).then_some(min)
+}
+
+/// Record a node-local consumer position report (P3 / I-L4):
+/// monotonic max per `(shard, consumer)`. The buffered-write sentinel
+/// (`SequenceNumber::BUFFERED`) is ignored — advancing a watermark
+/// with it would collapse the GC boundary to `u64::MAX` and discard
+/// everything (same guard as `MemShardStore::advance_watermark`).
+fn record_local_position(
+    map: &SharedConsumerPositions,
+    shard_id: ShardId,
+    consumer: &str,
+    position: SequenceNumber,
+) {
+    if position.is_buffered_sentinel() {
+        return;
+    }
+    let mut guard = map
+        .lock()
+        .lock_or_die("raft_shard_store.consumer_positions");
+    let entry = guard
+        .entry((shard_id, consumer.to_owned()))
+        .or_insert(position);
+    if position > *entry {
+        *entry = position;
+    }
+}
+
+/// Snapshot one shard's node-local reported positions as
+/// `(consumer, position)` pairs (P3 / I-L4).
+fn read_local_positions(map: &SharedConsumerPositions, shard_id: ShardId) -> Vec<(String, u64)> {
+    map.lock()
+        .lock_or_die("raft_shard_store.consumer_positions")
+        .iter()
+        .filter(|((s, _), _)| *s == shard_id)
+        .map(|((_, c), p)| (c.clone(), p.0))
+        .collect()
+}
+
+/// One watermark-advance round (P3 / I-L4), leader side. Gathers
+/// every CURRENT VOTER's node-local `hydrator` position — self from
+/// the local report map, peers via the `consumer_positions` aux RPC —
+/// and, when every voter answered and their `min` exceeds the SM's
+/// current `hydrator` watermark, proposes ONE replicated
+/// `AdvanceWatermark`. Its apply prunes deltas below the new boundary
+/// on every replica deterministically (`state_machine.rs` P3a).
+///
+/// Skips the round (no advance — safety first) when any voter is
+/// missing: no transport addr, unreachable/timed out, or no
+/// `hydrator` entry reported yet. A skipped round only delays
+/// pruning; a wrong advance permanently halts a follower's hydrator.
+/// Skips bump `kiseki_log_watermark_round_skipped_total` and WARN at
+/// most once per [`WATERMARK_SKIP_WARN_INTERVAL`] per shard
+/// (`last_skip_warn` is the supervisor-loop-local throttle state).
+///
+/// The per-voter fetches run CONCURRENTLY (one `join_all`, same
+/// per-peer timeout) so a blackholed voter costs the round ~one
+/// timeout total instead of one timeout per dead peer in sequence.
+async fn advance_hydrator_watermark_round(
+    shard_id: ShardId,
+    store: &Arc<OpenRaftLogStore>,
+    local_positions: &SharedConsumerPositions,
+    peers: &BTreeMap<u64, String>,
+    local_node: u64,
+    last_skip_warn: &mut Option<std::time::Instant>,
+) {
+    let voters = store.voter_ids();
+    if voters.is_empty() {
+        // Membership not initialized yet — nothing to advance.
+        return;
+    }
+    let gathered =
+        gather_voter_hydrator_positions(shard_id, &voters, local_positions, peers, local_node)
+            .await;
+
+    // P3 observability: a round skipped for a missing voter is only
+    // DEBUG per-leg in the gather — surface persistent stalls as a
+    // throttled WARN naming the voter(s), plus a counter.
+    let missing: Vec<u64> = gathered
+        .iter()
+        .filter(|(_, p)| p.is_none())
+        .map(|(v, _)| *v)
+        .collect();
+    if !missing.is_empty() {
+        watermark_round_skipped_counter()
+            .with_label_values(&[&shard_id.0.to_string()])
+            .inc();
+        let now = std::time::Instant::now();
+        if last_skip_warn.is_none_or(|t| now.duration_since(t) >= WATERMARK_SKIP_WARN_INTERVAL) {
+            *last_skip_warn = Some(now);
+            tracing::warn!(
+                shard_id = %shard_id.0,
+                missing_voters = ?missing,
+                "watermark advance: round skipped — voter(s) unreachable or \
+                 not reporting a hydrator position; delta pruning (I-L4) is \
+                 stalled until every voter reports",
+            );
+        }
+        return;
+    }
+
+    let positions: Vec<Option<u64>> = gathered.into_iter().map(|(_, p)| p).collect();
+    let current = store
+        .consumer_watermark(HYDRATOR_CONSUMER)
+        .await
+        .map_or(0, |s| s.0);
+    let Some(min) = watermark_advance_decision(&positions, current) else {
+        return;
+    };
+    match store
+        .advance_watermark(HYDRATOR_CONSUMER, SequenceNumber(min))
+        .await
+    {
+        Ok(()) => {
+            tracing::debug!(
+                shard_id = %shard_id.0,
+                boundary = min,
+                "watermark advance: hydrator boundary committed (P3)",
+            );
+        }
+        Err(e) => {
+            // Lost leadership mid-round (or a transient Raft error) —
+            // warn + skip; the next leader's round re-derives the min.
+            tracing::warn!(
+                shard_id = %shard_id.0,
+                boundary = min,
+                error = %e,
+                "watermark advance proposal failed — skipping round",
+            );
+        }
+    }
+}
+
+/// The gather leg of [`advance_hydrator_watermark_round`]: every
+/// voter's node-local `hydrator` position as `(voter, Option<pos>)` —
+/// self from the local report map, peers via the `consumer_positions`
+/// aux RPC. All legs run CONCURRENTLY with the same per-peer timeout,
+/// so the worst case is ~one [`WATERMARK_GATHER_PEER_TIMEOUT`]
+/// regardless of how many voters are dark.
+async fn gather_voter_hydrator_positions(
+    shard_id: ShardId,
+    voters: &[u64],
+    local_positions: &SharedConsumerPositions,
+    peers: &BTreeMap<u64, String>,
+    local_node: u64,
+) -> Vec<(u64, Option<u64>)> {
+    let gathers = voters.iter().map(|voter| {
+        let voter = *voter;
+        async move {
+            let pos = if voter == local_node {
+                read_local_positions(local_positions, shard_id)
+                    .into_iter()
+                    .find_map(|(c, p)| (c == HYDRATOR_CONSUMER).then_some(p))
+            } else if let Some(addr) = peers.get(&voter) {
+                match tokio::time::timeout(
+                    WATERMARK_GATHER_PEER_TIMEOUT,
+                    fetch_consumer_positions(addr, shard_id, None),
+                )
+                .await
+                {
+                    Ok(Ok(list)) => list
+                        .into_iter()
+                        .find_map(|(c, p)| (c == HYDRATOR_CONSUMER).then_some(p)),
+                    Ok(Err(e)) => {
+                        tracing::debug!(
+                            shard_id = %shard_id.0,
+                            voter,
+                            error = %e,
+                            "watermark gather: voter unreachable — skipping round",
+                        );
+                        None
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            shard_id = %shard_id.0,
+                            voter,
+                            "watermark gather: voter timed out — skipping round",
+                        );
+                        None
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    shard_id = %shard_id.0,
+                    voter,
+                    "watermark gather: voter has no transport addr — skipping round",
+                );
+                None
+            };
+            (voter, pos)
+        }
+    });
+    futures::future::join_all(gathers).await
+}
+
 /// The per-shard committer supervisor loop (ADR-047 `LeaderSink`, PART 8).
 ///
 /// Runs on a dedicated thread (the threading contract — drives a synchronous
@@ -1184,17 +1541,24 @@ const POST_PROMOTION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// 3. **Election recovery + recovery dedup:** gather + `recover()` (filtered to
 ///    drop already-incorporated and ancient intents on the way in — see §6).
 /// 4. **Drain (leader only, after recovery succeeded):** `drain_local()`.
+/// 5. **Watermark-advance round (leader only, every
+///    `watermark.every_ticks` ticks — P3 / I-L4):** gather every
+///    voter's node-local `hydrator` position and propose `min` as ONE
+///    replicated `AdvanceWatermark`; see
+///    [`advance_hydrator_watermark_round`].
 ///
 /// Per-tick errors are logged and swallowed so one bad pass never kills the
 /// loop. Shutdown is via the `shutdown` watch (set by `Self::shutdown` / `Drop`
 /// / shard retire).
 #[allow(clippy::too_many_lines)] // supervisor cohesion > arbitrary line cap
+#[allow(clippy::too_many_arguments)] // the spawn site is the only caller
 async fn run_supervisor_loop<S, G>(
     shard_id: ShardId,
     mut committer: ShardCommitter<S>,
     gatherer: G,
     leadership_store: Arc<OpenRaftLogStore>,
     prune_store: Arc<dyn IntentStore>,
+    watermark: WatermarkAdvanceCtx,
     interval: Duration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) where
@@ -1206,8 +1570,13 @@ async fn run_supervisor_loop<S, G>(
     }
     let mut was_leader = false;
     let mut recovered_this_term = false;
+    let mut tick: u64 = 0;
+    // P3 observability — per-shard throttle for the skipped-round WARN
+    // (at most one per WATERMARK_SKIP_WARN_INTERVAL).
+    let mut watermark_skip_warned_at: Option<std::time::Instant> = None;
 
     loop {
+        tick = tick.wrapping_add(1);
         // --- (1) Per-intent self-prune on every node (PART 8 §T) ----------
         // Snapshot the SM's recent_incorporated set and remove exactly those
         // local intents. Only intents already replicated AND applied on this
@@ -1348,6 +1717,22 @@ async fn run_supervisor_loop<S, G>(
                 if let Err(e) = committer.drain_local() {
                     tracing::warn!(shard_id = %shard_id.0, error = %e, "LeaderSink: drain failed; retrying next tick");
                 }
+            }
+
+            // (5) P3 / I-L4 — periodic watermark-advance round. Leader
+            // only: the proposal is a Raft `client_write`, and one
+            // gatherer per shard keeps the aux fan bounded. Lost
+            // leadership mid-round is handled inside (warn + skip).
+            if tick % watermark.every_ticks == 0 {
+                advance_hydrator_watermark_round(
+                    shard_id,
+                    &leadership_store,
+                    &watermark.positions,
+                    &watermark.peers,
+                    watermark.local_node,
+                    &mut watermark_skip_warned_at,
+                )
+                .await;
             }
         }
 
@@ -1544,6 +1929,11 @@ impl LogOps for RaftShardStore {
         let store = self.get_shard(shard_id)?;
         let info = store.shard_health().await;
         Ok(info)
+    }
+
+    async fn gc_boundary(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError> {
+        let store = self.get_shard(shard_id)?;
+        Ok(store.gc_boundary().await)
     }
 
     async fn earliest_visible_seq(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError> {
@@ -1771,6 +2161,21 @@ impl LogOps for RaftShardStore {
         let store = self.get_shard(shard_id)?;
         store.advance_watermark(consumer, position).await
     }
+
+    /// P3 / I-L4 — node-local, synchronous, infallible. Records into
+    /// the per-node report map (monotonic max); NEVER touches Raft.
+    /// The register/advance path forwards to the leader and fails
+    /// forever on followers — this seam is what lets every node's
+    /// hydrator report its position so the leader's supervisor can
+    /// propose `min` over all voters as the replicated watermark.
+    fn report_consumer_position(
+        &self,
+        shard_id: ShardId,
+        consumer: &str,
+        position: SequenceNumber,
+    ) {
+        record_local_position(&self.consumer_positions, shard_id, consumer, position);
+    }
 }
 
 /// ADR-033 §3 step 3: replay upper-half deltas from `source` into
@@ -1799,6 +2204,22 @@ async fn redistribute_upper_half(
 
     let source_info = source.shard_health().await;
     let source_id = source_info.shard_id;
+
+    // Refuse when the source's delta log has been pruned (gc boundary
+    // > 1): the replay below starts at sequence 1 and would silently
+    // lose every upper-half key whose only deltas were dropped by
+    // watermark-advance GC (P3a / I-SF6).
+    // TODO(compacted-replay): replay a compacted per-key image
+    // (latest delta per hashed_key) instead of raw history, then
+    // lift this refusal.
+    let boundary = source.gc_boundary().await;
+    if boundary.0 > 1 {
+        return Err(LogError::DeltaLogPruned {
+            shard_id: source_id,
+            gc_boundary: boundary.0,
+        });
+    }
+
     let tip = source_info.tip.0;
     if tip == 0 {
         return Ok(0); // empty source — nothing to redistribute
@@ -1843,4 +2264,128 @@ async fn redistribute_upper_half(
         "split: upper-half delta redistribution complete (ADR-033 §3)",
     );
     Ok(replayed)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn shard(low: u128) -> ShardId {
+        ShardId(uuid::Uuid::from_u128(low))
+    }
+
+    fn fresh_map() -> SharedConsumerPositions {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    /// P3 — node-local reports are monotonic max per `(shard,
+    /// consumer)`: a lower (stale) report never regresses the
+    /// recorded position.
+    #[test]
+    fn record_local_position_is_monotonic_max() {
+        let map = fresh_map();
+        let s = shard(1);
+        record_local_position(&map, s, HYDRATOR_CONSUMER, SequenceNumber(10));
+        record_local_position(&map, s, HYDRATOR_CONSUMER, SequenceNumber(7));
+        assert_eq!(
+            read_local_positions(&map, s),
+            vec![(HYDRATOR_CONSUMER.to_owned(), 10)],
+            "stale report must not regress the position",
+        );
+        record_local_position(&map, s, HYDRATOR_CONSUMER, SequenceNumber(12));
+        assert_eq!(
+            read_local_positions(&map, s),
+            vec![(HYDRATOR_CONSUMER.to_owned(), 12)]
+        );
+    }
+
+    /// P3 — reports are isolated per shard AND per consumer.
+    #[test]
+    fn record_local_position_is_per_shard_and_per_consumer() {
+        let map = fresh_map();
+        let (a, b) = (shard(1), shard(2));
+        record_local_position(&map, a, HYDRATOR_CONSUMER, SequenceNumber(5));
+        record_local_position(&map, b, HYDRATOR_CONSUMER, SequenceNumber(9));
+        record_local_position(&map, a, "audit", SequenceNumber(3));
+
+        let mut on_a = read_local_positions(&map, a);
+        on_a.sort();
+        assert_eq!(
+            on_a,
+            vec![("audit".to_owned(), 3), (HYDRATOR_CONSUMER.to_owned(), 5),],
+        );
+        assert_eq!(
+            read_local_positions(&map, b),
+            vec![(HYDRATOR_CONSUMER.to_owned(), 9)],
+            "shard b's report must not leak into shard a",
+        );
+    }
+
+    /// The buffered-write sentinel must never be recorded — advancing
+    /// a watermark with it would collapse the GC boundary to
+    /// `u64::MAX` and discard everything.
+    #[test]
+    fn record_local_position_rejects_buffered_sentinel() {
+        let map = fresh_map();
+        let s = shard(1);
+        record_local_position(&map, s, HYDRATOR_CONSUMER, SequenceNumber::BUFFERED);
+        assert!(read_local_positions(&map, s).is_empty());
+    }
+
+    /// `LogOps::report_consumer_position` on the production store
+    /// records into the node-local map (readable via
+    /// `local_consumer_positions`) without the shard's Raft group
+    /// existing — it must never block on, or require, consensus.
+    #[test]
+    fn report_consumer_position_records_without_raft_group() {
+        std::env::set_var("KISEKI_RAFT_THREADS", "2");
+        let store = RaftShardStore::new(1, BTreeMap::new(), None);
+        let s = shard(0xBEEF);
+        LogOps::report_consumer_position(&store, s, HYDRATOR_CONSUMER, SequenceNumber(42));
+        LogOps::report_consumer_position(&store, s, HYDRATOR_CONSUMER, SequenceNumber(41));
+        assert_eq!(
+            store.local_consumer_positions(s),
+            vec![(HYDRATOR_CONSUMER.to_owned(), 42)],
+        );
+        assert!(store.local_consumer_positions(shard(0xDEAD)).is_empty());
+    }
+
+    // --- watermark_advance_decision (P3 / I-L4) --------------------------
+
+    /// All voters answered → min; strictly-forward only.
+    #[test]
+    fn decision_takes_min_over_all_voters() {
+        assert_eq!(
+            watermark_advance_decision(&[Some(10), Some(4), Some(7)], 0),
+            Some(4),
+        );
+        // min == current → no proposal (no-op Raft write avoided).
+        assert_eq!(watermark_advance_decision(&[Some(10), Some(4)], 4), None);
+        // min < current (a voter restarted behind the committed
+        // boundary) → no proposal; the SM watermark is monotonic and
+        // must not be re-proposed backwards.
+        assert_eq!(watermark_advance_decision(&[Some(3), Some(9)], 5), None);
+        assert_eq!(watermark_advance_decision(&[Some(6)], 5), Some(6));
+    }
+
+    /// ANY missing voter (unreachable / no addr / never reported)
+    /// skips the round — the missing voter might be the slowest, and
+    /// pruning past it permanently halts its hydrator (ADR-040 §D6.3).
+    #[test]
+    fn decision_requires_every_voter() {
+        assert_eq!(watermark_advance_decision(&[Some(10), None], 0), None);
+        assert_eq!(
+            watermark_advance_decision(&[None, Some(10), Some(20)], 0),
+            None,
+        );
+        assert_eq!(watermark_advance_decision(&[None], 0), None);
+    }
+
+    /// No voters (membership not initialized) → no advance.
+    #[test]
+    fn decision_skips_on_empty_voter_set() {
+        assert_eq!(watermark_advance_decision(&[], 0), None);
+        assert_eq!(watermark_advance_decision(&[], 100), None);
+    }
 }

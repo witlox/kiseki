@@ -441,6 +441,15 @@ impl DrainOrchestrator {
     /// final step. Operators that pre-stage state via `request_drain`
     /// (e.g. acceptance tests that need to assert intermediate state)
     /// invoke this directly; full end-to-end callers use [`Self::execute_drain`].
+    ///
+    /// Once a shard's delta log has been pruned past the consumer GC
+    /// boundary (I-L4 watermark-advance GC), the consensus-layer
+    /// adapter REFUSES the replica add (`DeltaLogPruned`): a fresh
+    /// replica cannot replay pruned history to rebuild its
+    /// composition and its hydrator would halt permanently (ADR-040
+    /// §D6.3). The refusal surfaces here as
+    /// [`DrainError::Membership`]; the lift is composition bootstrap
+    /// under delta GC (see GH issue).
     pub async fn drive_voter_replacements<A: RaftMembershipAdapter + ?Sized>(
         &self,
         target: NodeId,

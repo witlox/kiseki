@@ -578,6 +578,15 @@ impl DecryptCache {
         }
     }
 
+    /// `false` when `KISEKI_DECRYPT_CACHE_TTL_MS=0` made every
+    /// `insert` a no-op. The inline PUT path branches on this: with
+    /// the cache disabled it must keep the synchronous
+    /// `small_store.put` or async-ack read-your-writes would have a
+    /// hole until the state-machine apply lands the delta-borne copy.
+    fn is_enabled(&self) -> bool {
+        !self.ttl.is_zero()
+    }
+
     fn get(
         &mut self,
         id: &kiseki_common::ids::ChunkId,
@@ -2800,10 +2809,39 @@ impl InMemoryGateway {
                     tracing::warn!(?chunk_id, error = %e, "gateway write: inline encode failed");
                     GatewayError::Upstream(e.to_string())
                 })?;
-                if let Some(ref store) = self.small_store {
-                    // #212: timed — this put was the untimed serial
-                    // fsync on the ack path (pre-group-commit); the
-                    // histogram is the A/B witness for the relax.
+                if self.decrypt_cache.lock().is_enabled() {
+                    // The ack-path `small_store.put` (the #212-timed
+                    // serial fsync) is gone: the durable copy rides
+                    // the delta (`inline_payloads_for_delta` below) —
+                    // EVERY replica's state-machine apply, leader
+                    // included, writes it to its local
+                    // SmallObjectStore under group commit (ADR-030
+                    // §2, keyed by `chunk_id`). Pre-apply
+                    // read-your-writes is served by the decrypt
+                    // cache: `piece` IS the full chunk plaintext (the
+                    // `pieces_len == 1` gate above), keyed exactly as
+                    // the GET cache hit expects.
+                    //
+                    // `to_vec` runs BEFORE taking the cache lock so
+                    // the memcpy never serializes concurrent GET
+                    // readers (same discipline as the GET miss path).
+                    let plaintext = piece.to_vec();
+                    let inline_cache_started = std::time::Instant::now();
+                    self.decrypt_cache.lock().insert(chunk_id, plaintext);
+                    self.observe_put_phase("inline_cache_insert", inline_cache_started.elapsed());
+                    tracing::debug!(
+                        ?chunk_id,
+                        inline_threshold = self.inline_threshold,
+                        "gateway write: inline path (cache insert + staged for delta)",
+                    );
+                    inline_payloads_for_delta.push((chunk_id, env_bytes));
+                    took_inline = true;
+                } else if let Some(ref store) = self.small_store {
+                    // KISEKI_DECRYPT_CACHE_TTL_MS=0 — `insert` above
+                    // would be a no-op, leaving async-ack inline PUTs
+                    // unreadable until the SM apply lands. Keep the
+                    // synchronous put: the operator chose zero
+                    // plaintext exposure over ack-path latency.
                     let inline_put_started = std::time::Instant::now();
                     let inline_put_res = store.put(&chunk_id.0, &env_bytes);
                     self.observe_put_phase("inline_store_put", inline_put_started.elapsed());
@@ -2818,12 +2856,6 @@ impl InMemoryGateway {
                             // the delta so non-leader replicas write it
                             // to their local SmallObjectStore via SM
                             // apply (keyed by `chunk_id`, ADR-030 §2).
-                            // The local put above is the single-node /
-                            // leader-side write that keeps the existing
-                            // single-host path snappy; the delta-borne
-                            // copy is what makes cross-node GET work in
-                            // a multi-node cluster. Both writes are
-                            // idempotent on the chunk_id key.
                             inline_payloads_for_delta.push((chunk_id, env_bytes));
                             took_inline = true;
                         }
@@ -2841,8 +2873,9 @@ impl InMemoryGateway {
                 }
             }
             if took_inline {
-                // Inline tier: bytes already written to small_store
-                // synchronously above; no chunk-fan needed.
+                // Inline tier: bytes ride the delta (and, cache
+                // enabled, sit in the decrypt cache for pre-apply
+                // reads); no chunk-fan needed.
                 staged_envelopes.push(None);
             } else {
                 tracing::debug!(
@@ -4338,6 +4371,190 @@ mod chunking_tests {
 /// fetch from decrypt. Without observation, the histograms would
 /// register but never tick — exactly the trap that
 /// `gateway_request_duration` fell into until the same run.
+/// Inline ack-path tests: the decrypt-cache insert replaced the
+/// synchronous `small_store.put` on the PUT ack path (the durable
+/// copy rides the delta; replicas — leader included — write it on
+/// SM apply). These pin the three behaviors that matter:
+/// read-your-writes pre-apply via the cache, the TTL=0 fallback to
+/// the synchronous put, and duplicate-content idempotency.
+#[cfg(test)]
+mod inline_ack_path_tests {
+    use super::*;
+    use crate::ops::{ReadRequest, WriteRequest, WriteSurface};
+    use kiseki_chunk::store::ChunkStore;
+    use kiseki_common::ids::{NamespaceId, OrgId};
+    use kiseki_common::tenancy::KeyEpoch;
+    use kiseki_composition::composition::CompositionStore;
+    use kiseki_crypto::keys::SystemMasterKey;
+
+    /// In-memory [`InlineStore`] double that records every put, so
+    /// tests can assert whether the ack path wrote synchronously.
+    #[derive(Default)]
+    struct MemInlineStore {
+        map: parking_lot::Mutex<std::collections::HashMap<[u8; 32], Vec<u8>>>,
+    }
+
+    impl MemInlineStore {
+        fn len(&self) -> usize {
+            self.map.lock().len()
+        }
+    }
+
+    impl kiseki_common::inline_store::InlineStore for MemInlineStore {
+        fn put(&self, key: &[u8; 32], data: &[u8]) -> std::io::Result<bool> {
+            Ok(self.map.lock().insert(*key, data.to_vec()).is_none())
+        }
+        fn get(&self, key: &[u8; 32]) -> std::io::Result<Option<Vec<u8>>> {
+            Ok(self.map.lock().get(key).cloned())
+        }
+        fn delete(&self, key: &[u8; 32]) -> std::io::Result<bool> {
+            Ok(self.map.lock().remove(key).is_some())
+        }
+    }
+
+    /// Gateway with the inline tier wired (threshold 4 KiB) and the
+    /// decrypt cache pinned to `ttl` — pinned directly (not via
+    /// `KISEKI_DECRYPT_CACHE_TTL_MS`) so parallel tests can't race
+    /// on process-shared env.
+    async fn build_gateway(
+        ttl: std::time::Duration,
+    ) -> (InMemoryGateway, Arc<MemInlineStore>, OrgId, NamespaceId) {
+        let tenant = OrgId(uuid::Uuid::from_u128(910));
+        let namespace = NamespaceId(uuid::Uuid::from_u128(911));
+        let store = Arc::new(MemInlineStore::default());
+        let gw = InMemoryGateway::new(
+            CompositionStore::new(),
+            kiseki_chunk::arc_async(ChunkStore::new()),
+            SystemMasterKey::new([0xDD; 32], KeyEpoch(1)),
+        )
+        .with_inline_threshold(4096, Arc::clone(&store) as _);
+        *gw.decrypt_cache.lock() = DecryptCache::new(ttl);
+        gw.ensure_namespace_exists(tenant, namespace).await.unwrap();
+        (gw, store, tenant, namespace)
+    }
+
+    fn write_req(tenant: OrgId, namespace: NamespaceId, data: Vec<u8>, name: &str) -> WriteRequest {
+        WriteRequest {
+            tenant_id: tenant,
+            namespace_id: namespace,
+            data,
+            name: Some(name.to_owned()),
+            conditional: None,
+            workflow_ref: None,
+            idempotency_key: None,
+            forwarded_from_node: None,
+            comp_id_override: None,
+            tier: None,
+            surface: WriteSurface::S3,
+            base_composition_id: None,
+            base_bytes: 0,
+        }
+    }
+
+    async fn read_back(
+        gw: &InMemoryGateway,
+        tenant: OrgId,
+        namespace: NamespaceId,
+        comp_id: kiseki_common::ids::CompositionId,
+        len: u64,
+    ) -> Vec<u8> {
+        gw.read(ReadRequest {
+            tenant_id: tenant,
+            namespace_id: namespace,
+            composition_id: comp_id,
+            offset: 0,
+            length: len,
+        })
+        .await
+        .expect("read must succeed")
+        .data
+    }
+
+    /// Cache enabled: the ack path must NOT put to the small store
+    /// (durability rides the delta), yet an immediate GET round-trips
+    /// — which can only come from the decrypt cache, since neither
+    /// the small store nor the chunk store hold the bytes pre-apply.
+    #[tokio::test]
+    async fn inline_put_serves_get_from_cache_without_small_store_entry() {
+        let (gw, store, tenant, namespace) =
+            build_gateway(std::time::Duration::from_secs(30)).await;
+
+        let payload = vec![0x5Au8; 1024];
+        let resp = gw
+            .write(write_req(tenant, namespace, payload.clone(), "cached"))
+            .await
+            .expect("inline write must succeed");
+
+        assert_eq!(
+            store.len(),
+            0,
+            "ack path must not write the small store synchronously \
+             (the durable copy rides the delta to the SM apply)",
+        );
+        let got = read_back(&gw, tenant, namespace, resp.composition_id, 1024).await;
+        assert_eq!(
+            got, payload,
+            "pre-apply GET must be served by the decrypt cache"
+        );
+    }
+
+    /// TTL=0 disables the cache (`insert` no-ops), so the ack path
+    /// must keep the legacy synchronous `small_store.put` — otherwise
+    /// every async-ack inline PUT has a read-your-writes hole until
+    /// the SM apply lands.
+    #[tokio::test]
+    async fn ttl_zero_falls_back_to_synchronous_small_store_put() {
+        let (gw, store, tenant, namespace) = build_gateway(std::time::Duration::ZERO).await;
+
+        let payload = vec![0xA5u8; 1024];
+        let resp = gw
+            .write(write_req(tenant, namespace, payload.clone(), "uncached"))
+            .await
+            .expect("inline write must succeed");
+
+        assert_eq!(
+            store.len(),
+            1,
+            "with the decrypt cache disabled the small store must \
+             hold the envelope right after PUT",
+        );
+        let got = read_back(&gw, tenant, namespace, resp.composition_id, 1024).await;
+        assert_eq!(
+            got, payload,
+            "GET must resolve via the small-store inline hit"
+        );
+    }
+
+    /// Duplicate-content PUT stays idempotent: the second insert is a
+    /// dup-keep no-op in the cache, both compositions resolve, and
+    /// the small store stays untouched.
+    #[tokio::test]
+    async fn duplicate_content_inline_put_is_idempotent() {
+        let (gw, store, tenant, namespace) =
+            build_gateway(std::time::Duration::from_secs(30)).await;
+
+        let payload = vec![0x3Cu8; 512];
+        let first = gw
+            .write(write_req(tenant, namespace, payload.clone(), "dup-a"))
+            .await
+            .expect("first write must succeed");
+        let second = gw
+            .write(write_req(tenant, namespace, payload.clone(), "dup-b"))
+            .await
+            .expect("duplicate-content write must succeed");
+
+        assert_ne!(
+            first.composition_id, second.composition_id,
+            "each PUT mints its own composition",
+        );
+        assert_eq!(store.len(), 0, "neither PUT may write the small store");
+        let got_a = read_back(&gw, tenant, namespace, first.composition_id, 512).await;
+        let got_b = read_back(&gw, tenant, namespace, second.composition_id, 512).await;
+        assert_eq!(got_a, payload);
+        assert_eq!(got_b, payload);
+    }
+}
+
 #[cfg(test)]
 mod phase_duration_tests {
     use super::*;

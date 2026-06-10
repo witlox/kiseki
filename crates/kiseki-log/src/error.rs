@@ -74,6 +74,26 @@ pub enum LogError {
     #[error("invalid sequence range for shard {0:?}")]
     InvalidRange(ShardId),
 
+    /// The shard's delta log has been pruned at the consumer GC
+    /// boundary (watermark-advance GC, I-L4/I-SF6). Full-history
+    /// replay operations — split redistribution, merge copy — replay
+    /// from sequence 1 and would silently drop every key whose only
+    /// deltas were pruned, so they refuse with this error instead.
+    ///
+    /// TODO(compacted-replay): replay from a compacted per-key image
+    /// (latest delta per `hashed_key`) instead of the raw delta log,
+    /// then lift this refusal.
+    #[error(
+        "delta log pruned for shard {shard_id:?} (gc boundary {gc_boundary} > 1); \
+         full-replay lifecycle op refused"
+    )]
+    DeltaLogPruned {
+        /// The shard whose history is no longer fully replayable.
+        shard_id: ShardId,
+        /// The consumer GC boundary at refusal time.
+        gc_boundary: u64,
+    },
+
     /// Raft unavailable (bootstrap, leader election, or consensus failure).
     #[error("raft unavailable")]
     Unavailable,
@@ -121,6 +141,15 @@ impl From<LogError> for KisekiError {
             LogError::KeyOutOfRange(id) | LogError::InvalidRange(id) => KisekiError::Permanent(
                 PermanentError::InvariantViolation(format!("log error on shard {id:?}")),
             ),
+            // Permanent: retrying cannot un-prune history. The
+            // operator-facing remedy is the compacted-replay follow-up
+            // (see the variant's TODO), not a retry loop.
+            LogError::DeltaLogPruned {
+                shard_id,
+                gc_boundary,
+            } => KisekiError::Permanent(PermanentError::InvariantViolation(format!(
+                "delta log pruned for shard {shard_id:?} (gc boundary {gc_boundary})"
+            ))),
             LogError::Unavailable => {
                 KisekiError::Retriable(RetriableError::ShardUnavailable(ShardId(uuid::Uuid::nil())))
             }

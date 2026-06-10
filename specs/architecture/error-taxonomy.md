@@ -30,6 +30,7 @@ No generic errors. No silent swallowing.
 | `SequenceGap` | Permanent | Log corruption detected | F-C3 |
 | `CompactionFailed` | Retriable | SSTable merge error | F-D4 |
 | `ConsumerStalled` | Retriable | Consumer watermark not advancing | I-L4 |
+| `DeltaLogPruned` | Permanent | Full-history replay (split redistribution, merge copy) or membership-add of a NEW replica (learner add / `change_membership` voter-add, incl. the ADR-035 drain-replacement flow) attempted after watermark-advance GC pruned deltas (GC boundary > 1). A fresh replica replays from sequence 1; pruned history would silently drop keys (replay) or permanently halt its hydrator (ADR-040 §D6.3) and stall watermark advance (membership-add) — so the operation refuses. Lift: compacted-replay / composition bootstrap under delta GC (GH follow-up). | I-L4, I-SF6 |
 
 ### kiseki-chunk
 

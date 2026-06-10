@@ -163,6 +163,23 @@ pub async fn prepare_merge<L: LogOps + ?Sized>(
 ///
 /// Returns the number of deltas copied.
 pub async fn copy_phase<L: LogOps + ?Sized>(log: &L, state: &MergeState) -> Result<u64, LogError> {
+    // Refuse when either input's delta log has been pruned (gc
+    // boundary > 1): the copy below replays the FULL history from
+    // sequence 1 and would silently lose every key whose only deltas
+    // were dropped by watermark-advance GC (P3a / I-SF6).
+    // TODO(compacted-replay): copy from a compacted per-key image
+    // (latest delta per hashed_key) instead of raw history, then
+    // lift this refusal.
+    for shard in [state.shard_a, state.shard_b] {
+        let boundary = log.gc_boundary(shard).await?;
+        if boundary.0 > 1 {
+            return Err(LogError::DeltaLogPruned {
+                shard_id: shard,
+                gc_boundary: boundary.0,
+            });
+        }
+    }
+
     // Read all committed deltas from both shards (skip empty shards).
     let deltas_a = if state.hwm_a.0 > 0 {
         log.read_deltas(ReadDeltasRequest {
@@ -286,6 +303,80 @@ pub fn merge_ordering_tiebreak(
 mod tests {
     use super::*;
     use kiseki_common::ids::NodeId;
+
+    /// P3a gate — a merge input whose delta log has been pruned
+    /// (gc boundary > 1) refuses the copy phase: the copy replays the
+    /// full history from sequence 1 and would silently lose pruned
+    /// keys. See `LogError::DeltaLogPruned` and its compacted-replay
+    /// TODO.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn copy_phase_refused_when_input_log_pruned() {
+        use crate::shard::ShardConfig;
+        use crate::store::MemShardStore;
+
+        let store = MemShardStore::new();
+        let shard_a = ShardId(uuid::Uuid::from_u128(1));
+        let shard_b = ShardId(uuid::Uuid::from_u128(2));
+        let tenant = OrgId(uuid::Uuid::from_u128(100));
+        store.create_shard(shard_a, tenant, NodeId(1), ShardConfig::default());
+        store.create_shard(shard_b, tenant, NodeId(1), ShardConfig::default());
+
+        for i in 0u8..3 {
+            store
+                .append_delta(AppendDeltaRequest {
+                    shard_id: shard_a,
+                    tenant_id: tenant,
+                    operation: crate::delta::OperationType::Create,
+                    timestamp: test_timestamp(),
+                    hashed_key: [i; 32],
+                    chunk_refs: vec![],
+                    payload: vec![0xBB; 8],
+                    has_inline_data: false,
+                })
+                .await
+                .unwrap();
+        }
+        // Consumer past seq 3 + truncate → shard A pruned at boundary 3.
+        store
+            .register_consumer(shard_a, "hydrator", SequenceNumber(3))
+            .unwrap();
+        store.truncate_log(shard_a).await.unwrap();
+
+        let state = MergeState {
+            shard_a,
+            shard_b,
+            tenant_id: tenant,
+            merged_shard: ShardId(uuid::Uuid::from_u128(3)),
+            range_start: [0u8; 32],
+            range_end: [0xFFu8; 32],
+            hwm_a: SequenceNumber(3),
+            hwm_b: SequenceNumber(0),
+            cutover_budget_deltas: 200,
+            convergence_timeout_secs: 60,
+        };
+        let err = copy_phase(&store, &state)
+            .await
+            .expect_err("pruned input log must refuse the merge copy");
+        assert!(
+            matches!(err, LogError::DeltaLogPruned { gc_boundary: 3, .. }),
+            "expected DeltaLogPruned, got {err:?}"
+        );
+    }
+
+    fn test_timestamp() -> kiseki_common::time::DeltaTimestamp {
+        kiseki_common::time::DeltaTimestamp {
+            hlc: HybridLogicalClock {
+                physical_ms: 0,
+                logical: 0,
+                node_id: kiseki_common::ids::NodeId(0),
+            },
+            wall: kiseki_common::time::WallTime {
+                millis_since_epoch: 0,
+                timezone: "UTC".into(),
+            },
+            quality: kiseki_common::time::ClockQuality::Ntp,
+        }
+    }
 
     // --- Merge ratio floor (log.feature @unit: "Merge refused when ratio floor would be violated") ---
 

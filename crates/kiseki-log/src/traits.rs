@@ -89,6 +89,14 @@ pub trait AppendForwarder: Send + Sync {
     ) -> Result<SequenceNumber, LogError>;
 }
 
+/// Canonical consumer name for the composition hydrator's delta-log
+/// watermark (P3 / I-L4). Each node's hydrator reports its position
+/// under this ONE name via [`LogOps::report_consumer_position`]; the
+/// per-NODE distinction happens at the gather layer (the shard
+/// leader's supervisor collects every voter's local position and
+/// proposes `min` as the replicated watermark), not in the name.
+pub const HYDRATOR_CONSUMER: &str = "hydrator";
+
 /// Request to read a range of deltas.
 #[derive(Clone, Debug)]
 pub struct ReadDeltasRequest {
@@ -242,6 +250,20 @@ pub trait LogOps: Send + Sync {
         Ok(SequenceNumber(0))
     }
 
+    /// The shard's consumer GC boundary (I-L4): deltas with
+    /// `sequence < boundary` may have been pruned — by the Raft state
+    /// machine's watermark-advance GC (P3a) or an explicit
+    /// `truncate_log`. Full-history replay operations (split
+    /// redistribution, merge copy) MUST refuse with
+    /// [`LogError::DeltaLogPruned`] when this exceeds 1: they replay
+    /// from sequence 1 and would silently lose pruned keys.
+    ///
+    /// Default `0` (= never pruned) so test doubles that don't GC
+    /// need no override; backends that prune override.
+    async fn gc_boundary(&self, _shard_id: ShardId) -> Result<SequenceNumber, LogError> {
+        Ok(SequenceNumber(0))
+    }
+
     /// Set or clear maintenance mode on a shard (I-O6).
     async fn set_maintenance(&self, shard_id: ShardId, enabled: bool) -> Result<(), LogError>;
 
@@ -337,6 +359,32 @@ pub trait LogOps: Send + Sync {
         consumer: &str,
         position: SequenceNumber,
     ) -> Result<(), LogError>;
+
+    /// Report this NODE's local consumption position for `consumer`
+    /// on `shard_id` (P3 delta pruning, I-L4). Synchronous and
+    /// infallible by design: consumers (the composition hydrator)
+    /// call it after every poll, and a node-local record must never
+    /// fail or block on consensus — on a Raft-backed store the
+    /// register/advance path forwards to the leader and FAILS forever
+    /// on followers, which is exactly the trap this seam exists to
+    /// avoid (the leader's supervisor gathers every voter's reported
+    /// position and proposes `min` as the replicated watermark).
+    ///
+    /// Positions are monotonic per `(shard, consumer)`: a lower
+    /// report than the recorded maximum is ignored.
+    ///
+    /// Default no-op so test doubles and stores that never prune need
+    /// no override; [`crate::RaftShardStore`] records into its
+    /// node-local map, [`crate::MemShardStore`] advances its local
+    /// watermark machinery directly (single-node: the local position
+    /// IS the global position).
+    fn report_consumer_position(
+        &self,
+        _shard_id: ShardId,
+        _consumer: &str,
+        _position: SequenceNumber,
+    ) {
+    }
 
     /// Phase 16c step 3: read a single `cluster_chunk_state` row.
     /// Used by the orphan-fragment scrub (does this chunk have any

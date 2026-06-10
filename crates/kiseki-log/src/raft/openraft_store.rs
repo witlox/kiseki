@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use kiseki_common::ids::{OrgId, SequenceNumber, ShardId};
+use kiseki_common::inline_store::derive_inline_key;
 use kiseki_raft::{
     FjallRaftLogStore, KisekiNode, KisekiRaftConfig, MemLogStore, StubNetworkFactory,
     TcpNetworkFactory,
@@ -812,15 +813,11 @@ impl OpenRaftLogStore {
             .take_while(|d| d.header.sequence <= req.to)
             .map(|d| {
                 // Reconstruct inline payload from store if needed.
-                // Key = hashed_key with sequence mixed into last 8 bytes
-                // (must match the key used in apply_command).
+                // Canonical derivation (must match the apply path).
                 if d.header.has_inline_data && d.payload.ciphertext.is_empty() {
                     if let Some(ref store) = inner.inline_store {
-                        let mut inline_key = d.header.hashed_key;
-                        let seq_bytes = d.header.sequence.0.to_le_bytes();
-                        for (i, &b) in seq_bytes.iter().enumerate() {
-                            inline_key[24 + i] ^= b;
-                        }
+                        let inline_key =
+                            derive_inline_key(&d.header.hashed_key, d.header.sequence.0);
                         if let Ok(Some(data)) = store.get(&inline_key) {
                             let mut reconstructed = d.clone();
                             reconstructed.payload.ciphertext = data;
@@ -1024,6 +1021,72 @@ impl OpenRaftLogStore {
             .map_or(SequenceNumber(0), |d| d.header.sequence)
     }
 
+    /// The shard's consumer GC boundary (I-L4): deltas with
+    /// `sequence < boundary` may have been pruned by the state
+    /// machine's watermark-advance GC (P3a). `0` when no consumer is
+    /// registered (an un-consumed shard never prunes). Full-history
+    /// replay operations (split redistribution, merge copy) refuse
+    /// when this exceeds 1 — see [`crate::error::LogError::DeltaLogPruned`].
+    pub async fn gc_boundary(&self) -> SequenceNumber {
+        let inner = self.state.lock().await;
+        inner.watermarks.gc_boundary().unwrap_or(SequenceNumber(0))
+    }
+
+    /// One consumer's SM watermark, `None` if it never registered.
+    /// The shard leader's watermark-advance round (P3 / I-L4) reads
+    /// this to skip `AdvanceWatermark` proposals that wouldn't move
+    /// the boundary.
+    pub async fn consumer_watermark(&self, consumer: &str) -> Option<SequenceNumber> {
+        let inner = self.state.lock().await;
+        inner.watermarks.get(consumer)
+    }
+
+    /// Membership-add gate (P3 adversary BLOCKER): refuse to add a
+    /// NEW replica to this shard's Raft group once the consumer GC
+    /// boundary has advanced past 1.
+    ///
+    /// A fresh / wiped / replacement replica boots with composition
+    /// `last_applied = 0` and replays deltas from sequence 1; with
+    /// `earliest_visible_seq == boundary > 1` it sees the gap
+    /// evidence and its hydrator enters PERMANENT halt (ADR-040
+    /// §D6.3). A halted voter then reports hydrator position 0
+    /// forever, stalling watermark advance for the whole shard.
+    /// Refusal over silent wedge — same idiom as the split/merge
+    /// [`LogError::DeltaLogPruned`] gates.
+    ///
+    /// Every path that initiates an `add_learner` or a
+    /// `change_membership` voter-add against an EXISTING group MUST
+    /// call this first (the in-process cluster's add paths in
+    /// `test_cluster.rs` enforce the same gate against the leader's
+    /// SM directly). Cluster bootstrap
+    /// ([`Self::initialize_membership`]) is unaffected: a brand-new
+    /// group has no registered consumers, so the boundary is 0.
+    ///
+    /// # Errors
+    /// [`LogError::DeltaLogPruned`] when the boundary exceeds 1.
+    ///
+    /// TODO(composition-bootstrap): hydrate a fresh replica's
+    /// composition from a peer snapshot instead of full delta replay,
+    /// then lift this refusal.
+    pub async fn guard_replica_add(&self) -> Result<(), LogError> {
+        let boundary = self.gc_boundary().await;
+        if boundary.0 > 1 {
+            tracing::error!(
+                shard_id = %self.shard_id.0,
+                gc_boundary = boundary.0,
+                "membership-add refused: delta log pruned past the consumer \
+                 GC boundary — a fresh replica's hydrator would halt \
+                 permanently (ADR-040 §D6.3) and stall watermark advance; \
+                 follow-up: composition bootstrap under delta GC (see GH issue)",
+            );
+            return Err(LogError::DeltaLogPruned {
+                shard_id: self.shard_id,
+                gc_boundary: boundary.0,
+            });
+        }
+        Ok(())
+    }
+
     /// Includes Raft leader and membership info from metrics.
     pub async fn shard_health(&self) -> ShardInfo {
         let inner = self.state.lock().await;
@@ -1121,12 +1184,10 @@ impl OpenRaftLogStore {
         if let Some(ref store) = inner.inline_store {
             for d in &inner.deltas {
                 if d.header.sequence < gc_boundary && d.header.has_inline_data {
-                    let mut inline_key = d.header.hashed_key;
-                    let seq_bytes = d.header.sequence.0.to_le_bytes();
-                    for (i, &b) in seq_bytes.iter().enumerate() {
-                        inline_key[24 + i] ^= b;
-                    }
-                    let _ = store.delete(&inline_key);
+                    let _ = store.delete(&derive_inline_key(
+                        &d.header.hashed_key,
+                        d.header.sequence.0,
+                    ));
                 }
             }
         }
@@ -1165,12 +1226,10 @@ impl OpenRaftLogStore {
                 surviving.iter().map(|d| d.header.sequence.0).collect();
             for d in &inner.deltas {
                 if d.header.has_inline_data && !surviving_seqs.contains(&d.header.sequence.0) {
-                    let mut inline_key = d.header.hashed_key;
-                    let seq_bytes = d.header.sequence.0.to_le_bytes();
-                    for (i, &b) in seq_bytes.iter().enumerate() {
-                        inline_key[24 + i] ^= b;
-                    }
-                    let _ = store.delete(&inline_key);
+                    let _ = store.delete(&derive_inline_key(
+                        &d.header.hashed_key,
+                        d.header.sequence.0,
+                    ));
                 }
             }
         }

@@ -445,9 +445,51 @@ impl RaftTestCluster {
         }
     }
 
+    /// Membership-add gate (P3 adversary BLOCKER) — the in-process
+    /// twin of `OpenRaftLogStore::guard_replica_add`, reading the
+    /// leader's state machine directly. A fresh replica boots with
+    /// composition `last_applied = 0` and replays deltas from
+    /// sequence 1; once the consumer GC boundary passes 1 that
+    /// history is pruned, the new node's hydrator halts permanently
+    /// (ADR-040 §D6.3), and its position-0 report stalls watermark
+    /// advance cluster-wide. Refuse instead of wedging silently.
+    /// Bootstrap (`RaftTestCluster::new` → `initialize`) is
+    /// unaffected: no consumer is registered yet, boundary is 0.
+    async fn guard_replica_add(&self, leader_id: u64) -> Result<(), LogError> {
+        let boundary = {
+            let inner = self.nodes[&leader_id].state.lock().await;
+            inner.watermarks.gc_boundary().unwrap_or(SequenceNumber(0))
+        };
+        if boundary.0 > 1 {
+            tracing::error!(
+                shard_id = %self.shard_id.0,
+                gc_boundary = boundary.0,
+                "membership-add refused: delta log pruned past the consumer \
+                 GC boundary — a fresh replica's hydrator would halt \
+                 permanently (ADR-040 §D6.3) and stall watermark advance; \
+                 follow-up: composition bootstrap under delta GC (see GH issue)",
+            );
+            return Err(LogError::DeltaLogPruned {
+                shard_id: self.shard_id,
+                gc_boundary: boundary.0,
+            });
+        }
+        Ok(())
+    }
+
     /// Spawn an additional node and add it as a learner to the cluster.
     /// Returns once the leader has accepted the learner change.
+    ///
+    /// Refuses with [`LogError::DeltaLogPruned`] once the shard's
+    /// consumer GC boundary exceeds 1 — see [`Self::guard_replica_add`].
     pub async fn add_learner(&mut self, new_id: u64) -> Result<(), LogError> {
+        // Gate BEFORE building the node so a refusal leaks nothing.
+        let leader_id = self
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .ok_or(LogError::Unavailable)?;
+        self.guard_replica_add(leader_id).await?;
+
         let path = self.log_dir.path().join(format!("node-{new_id}"));
         let node = build_node(
             new_id,
@@ -460,10 +502,6 @@ impl RaftTestCluster {
         self.log_paths.insert(new_id, path);
 
         // Tell the leader to add it as a learner.
-        let leader_id = self
-            .wait_for_leader(Duration::from_secs(5))
-            .await
-            .ok_or(LogError::Unavailable)?;
         let leader = &self.nodes[&leader_id];
         let kn = KisekiNode {
             addr: format!("127.0.0.1:{}", 9100 + new_id),
@@ -517,6 +555,13 @@ impl RaftTestCluster {
 
     /// Change cluster membership to the given voter set. Promotes any
     /// listed learners and removes voters not in the new set.
+    ///
+    /// A voter-ADD (any id in `voters` not currently a voter — a
+    /// learner promote included, since a learner's hydrator position
+    /// does not bound the watermark-advance round and may already
+    /// have been outrun) refuses with [`LogError::DeltaLogPruned`]
+    /// once the consumer GC boundary exceeds 1 — see
+    /// [`Self::guard_replica_add`]. Removal-only changes pass.
     pub async fn change_membership(
         &self,
         voters: BTreeMap<u64, KisekiNode>,
@@ -525,6 +570,10 @@ impl RaftTestCluster {
             .wait_for_leader(Duration::from_secs(5))
             .await
             .ok_or(LogError::Unavailable)?;
+        let current_voters: HashSet<u64> = self.voter_ids().await.into_iter().collect();
+        if voters.keys().any(|id| !current_voters.contains(id)) {
+            self.guard_replica_add(leader_id).await?;
+        }
         let leader = &self.nodes[&leader_id];
         let voter_ids: std::collections::BTreeSet<u64> = voters.keys().copied().collect();
         leader
@@ -664,6 +713,107 @@ mod tests {
                 "node {node_id} should have the replicated delta"
             );
         }
+
+        cluster.shutdown().await;
+    }
+
+    /// Drive the replicated `AdvanceWatermark` through the leader so
+    /// the SM prunes (P3a) — the precondition for the membership gate.
+    async fn advance_hydrator(cluster: &RaftTestCluster, position: u64) {
+        let leader_id = cluster
+            .wait_for_leader(Duration::from_secs(10))
+            .await
+            .expect("leader");
+        cluster.nodes[&leader_id]
+            .raft
+            .client_write(LogCommand::AdvanceWatermark {
+                consumer: "hydrator".to_owned(),
+                position,
+            })
+            .await
+            .expect("watermark advance commits");
+    }
+
+    /// P3 adversary BLOCKER — once the consumer GC boundary passes 1,
+    /// adding a NEW replica (learner add or `change_membership`
+    /// voter-add) refuses with `DeltaLogPruned` instead of silently
+    /// wedging: the fresh node's hydrator would replay from sequence 1,
+    /// hit the pruned gap, halt permanently (ADR-040 §D6.3), and its
+    /// position-0 report would stall watermark advance cluster-wide.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn membership_add_refused_once_delta_log_pruned() {
+        let shard = ShardId(uuid::Uuid::from_u128(3));
+        let tenant = OrgId(uuid::Uuid::from_u128(300));
+        let mut cluster = RaftTestCluster::new(3, shard, tenant).await;
+
+        for i in 0u8..5 {
+            cluster.write_delta(i).await.expect("write");
+        }
+        advance_hydrator(&cluster, 4).await;
+
+        // add_learner of a brand-new node: refused.
+        let err = cluster
+            .add_learner(4)
+            .await
+            .expect_err("learner add must refuse once history is pruned");
+        assert!(
+            matches!(err, LogError::DeltaLogPruned { gc_boundary: 4, .. }),
+            "expected DeltaLogPruned at boundary 4, got {err:?}",
+        );
+        assert!(!cluster.has_node(4), "refusal must not leak a node");
+
+        // change_membership voter-add of a non-member: refused.
+        let voters: BTreeMap<u64, KisekiNode> = [1u64, 2, 3, 5]
+            .into_iter()
+            .map(|id| {
+                (
+                    id,
+                    KisekiNode {
+                        addr: format!("127.0.0.1:{}", 9100 + id),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let err = cluster
+            .change_membership(voters)
+            .await
+            .expect_err("voter-add must refuse once history is pruned");
+        assert!(
+            matches!(err, LogError::DeltaLogPruned { .. }),
+            "expected DeltaLogPruned, got {err:?}",
+        );
+
+        cluster.shutdown().await;
+    }
+
+    /// The gate must NOT touch bootstrap-shaped adds: boundary `None`
+    /// (no consumer ever registered) and boundary 1 (prune is
+    /// `sequence < 1` — nothing discarded) both admit a new learner,
+    /// so the ADR-035 drain/replacement flow keeps working until
+    /// pruning has actually dropped history.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn membership_add_allowed_while_history_intact() {
+        let shard = ShardId(uuid::Uuid::from_u128(4));
+        let tenant = OrgId(uuid::Uuid::from_u128(400));
+        let mut cluster = RaftTestCluster::new(3, shard, tenant).await;
+
+        for i in 0u8..3 {
+            cluster.write_delta(i).await.expect("write");
+        }
+
+        // No consumer registered → boundary None → add allowed.
+        cluster
+            .add_learner(4)
+            .await
+            .expect("learner add must pass before any watermark exists");
+
+        // Boundary exactly 1 → full history still replayable → allowed.
+        advance_hydrator(&cluster, 1).await;
+        cluster
+            .add_learner(5)
+            .await
+            .expect("learner add must pass at boundary 1 (history intact)");
 
         cluster.shutdown().await;
     }

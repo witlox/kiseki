@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 
 use futures::TryStreamExt;
 use kiseki_common::ids::{ChunkId, OrgId, SequenceNumber, ShardId};
+use kiseki_common::inline_store::derive_inline_key;
 use kiseki_common::time::HybridLogicalClock;
 use openraft::alias::{LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf};
 use openraft::storage::{EntryResponder, RaftStateMachine, Snapshot};
@@ -50,6 +51,36 @@ fn dedup_ancient_refused_counter() -> &'static IntCounterVec {
         .expect("kiseki-log: failed to register dedup_ancient_refused counter")
     })
 }
+
+/// Prometheus counter for snapshots that serialized past the Raft
+/// transport's framed-RPC budget (GH #220). The snapshot is still
+/// returned — refusing would wedge log purge and follower hydration —
+/// but every increment means a snapshot install over the TCP
+/// transport WILL be rejected by the peer's `MAX_RAFT_RPC_SIZE`
+/// guard. Non-zero ⇒ shrink the shard (split) or raise the cap.
+fn snapshot_over_cap_counter() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter_vec!(
+            Opts::new(
+                "kiseki_log_snapshot_over_rpc_cap_total",
+                "Per-shard count of state-machine snapshots whose serialized \
+                 size exceeded MAX_RAFT_RPC_SIZE minus wire-frame headroom \
+                 (GH #220). The snapshot is returned anyway (loud, not \
+                 wedged) but cross-node snapshot transfer will fail."
+            ),
+            &["shard"],
+        )
+        .expect("kiseki-log: failed to register snapshot_over_cap counter")
+    })
+}
+
+/// Snapshot size budget: the multiplexed Raft transport rejects any
+/// framed RPC above [`kiseki_raft::MAX_RAFT_RPC_SIZE`]; reserve the
+/// envelope headroom so a snapshot at the cap still frames (ADR-041
+/// gate-1 F-M3, GH #220).
+const SNAPSHOT_SIZE_CAP: usize =
+    kiseki_raft::MAX_RAFT_RPC_SIZE - kiseki_raft::WIRE_FRAME_OVERHEAD_RESERVED;
 
 /// Read the entry-cap from `KISEKI_DEDUP_WINDOW_ENTRIES`, defaulting to
 /// [`DEFAULT_DEDUP_WINDOW_ENTRIES`]. Used by `ShardSmInner::new` so every fresh
@@ -107,6 +138,16 @@ pub struct ClusterChunkStateEntry {
 type C = LogTypeConfig;
 
 /// Serializable snapshot of a shard's delta state.
+///
+/// Encoded with **postcard** (node-internal format; pre-prod, no
+/// compat shim — serde_json was 2-4× the bytes and the encode cost).
+///
+/// PR-NOTE (#220 review): `cluster_chunk_state` is ABSENT from this
+/// snapshot — a follower installed from snapshot (or a restarted
+/// node recovering through one) loses chunk refcounts + placement
+/// until re-replicated. Restart-correctness gap, tracked separately.
+/// PR-NOTE: `recent_incorporated` rides every snapshot — up to
+/// `dedup_window_entries` (default 100k) entries of dedup state.
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct ShardSnapshot {
     /// Number of deltas committed.
@@ -168,6 +209,9 @@ struct SerializableDelta {
     chunk_refs: Vec<[u8; 32]>,
     payload_size: u32,
     has_inline_data: bool,
+    /// `serde_bytes` gives postcard the length-prefix + memcpy fast
+    /// path instead of per-byte seq dispatch (GH #194 pattern).
+    #[serde(with = "serde_bytes")]
     ciphertext: Vec<u8>,
 }
 
@@ -443,11 +487,17 @@ impl ShardSmInner {
     ///   2. ancient cutoff check (refuse-with-alarm if log_idx < cutoff),
     ///   3. atomic chunk-meta + delta append (same body as ChunkAndDelta),
     ///   4. recent_incorporated push + evict-and-advance-cutoff.
-    fn apply_one_incorporate(
+    ///
+    /// Inline payloads are NOT written here — they accumulate in
+    /// `inline_batch` (payloads borrowed from the command, zero
+    /// copies) so the caller commits ONE `put_many` per applied Raft
+    /// entry regardless of item count (#212).
+    fn apply_one_incorporate<'a>(
         &mut self,
-        item: &IncorporateItem,
+        item: &'a IncorporateItem,
         log_index: u64,
         now_ms: u64,
+        inline_batch: &mut Vec<([u8; 32], &'a [u8])>,
     ) -> u64 {
         // (1) Duplicate gate — seq already in the recent window. No-op,
         // return the unchanged tip (matches the pre-PART-8 `Appended(tip)`
@@ -494,26 +544,15 @@ impl ShardSmInner {
         // Same as the ChunkAndDelta apply branch above — every
         // replica that applies this intent gets the bytes locally
         // so the gateway read path on ANY node finds them via
-        // small_store.get(&chunk_id.0).
-        if !item.inline_payloads.is_empty() {
-            if let Some(ref store) = self.inline_store {
-                // #212: one batched commit for the whole entry instead
-                // of one per payload — the per-put fjall journal commit
-                // was the measured `sm.append_delta_inner`-adjacent
-                // apply cost on every replica.
-                let items: Vec<(&[u8; 32], &[u8])> = item
-                    .inline_payloads
+        // small_store.get(&chunk_id.0). Accumulated, not written —
+        // the per-entry `put_many` happens in `apply_command_at`
+        // (#212: one durable commit per applied Raft entry).
+        if !item.inline_payloads.is_empty() && self.inline_store.is_some() {
+            inline_batch.extend(
+                item.inline_payloads
                     .iter()
-                    .map(|entry| (&entry.chunk_id, entry.payload.as_slice()))
-                    .collect();
-                if let Err(e) = store.put_many(&items) {
-                    tracing::warn!(
-                        count = items.len(),
-                        error = %e,
-                        "sm.apply_one_incorporate: inline_store.put_many failed (#129); fallback via chunk tier",
-                    );
-                }
-            }
+                    .map(|entry| (entry.chunk_id, entry.payload.as_slice())),
+            );
         }
         // ADR-047 hot-path timer (sm.append_delta_inner) — THE
         // per-apply cost: tip bump + delta append + (optional)
@@ -528,6 +567,7 @@ impl ShardSmInner {
                 &item.payload,
                 item.has_inline_data,
                 log_index,
+                inline_batch,
             )
         });
         // (4) Record + evict — same apply block, so a follower applying this
@@ -551,15 +591,16 @@ impl ShardSmInner {
     }
 
     #[allow(clippy::too_many_arguments)] // mirrors delta-args structure on the wire
-    fn append_delta_inner(
+    fn append_delta_inner<'a>(
         &mut self,
         tenant_id_bytes: &[u8; 16],
         operation: u8,
         hashed_key: &[u8; 32],
         chunk_refs: &[[u8; 32]],
-        payload: &[u8],
+        payload: &'a [u8],
         has_inline_data: bool,
         log_index: u64,
+        inline_batch: &mut Vec<([u8; 32], &'a [u8])>,
     ) -> u64 {
         self.tip += 1;
         self.delta_count += 1;
@@ -584,24 +625,16 @@ impl ShardSmInner {
         };
 
         // Offload inline content to the store if available (I-SF5).
-        // Key = hashed_key XOR sequence (last 8 bytes), so two deltas
+        // Canonical key derivation (`derive_inline_key`): two deltas
         // with the same hashed_key but different sequences produce
-        // different inline keys.
-        let inline_key = {
-            let mut k = *hashed_key;
-            let seq_bytes = self.tip.to_le_bytes();
-            for (i, &b) in seq_bytes.iter().enumerate() {
-                k[24 + i] ^= b;
-            }
-            k
-        };
-        let ciphertext = if has_inline_data {
-            if let Some(ref store) = self.inline_store {
-                let _ = store.put(&inline_key, payload);
-                Vec::new()
-            } else {
-                payload.to_vec()
-            }
+        // different inline keys. The payload is accumulated into the
+        // per-entry batch — committed by `apply_command_at` in ONE
+        // `put_many` per applied Raft entry (#212). Clearing semantics
+        // match the old per-delta `store.put` whose Result was
+        // discarded: ciphertext is cleared regardless of put outcome.
+        let ciphertext = if has_inline_data && self.inline_store.is_some() {
+            inline_batch.push((derive_inline_key(hashed_key, self.tip), payload));
+            Vec::new()
         } else {
             payload.to_vec()
         };
@@ -657,6 +690,132 @@ impl ShardSmInner {
         }
     }
 
+    /// Commit one applied Raft entry's accumulated inline payloads in
+    /// a SINGLE `put_many` (#212) — a durable backend (fjall) amortises
+    /// one journal commit across the batch instead of N. On error,
+    /// retry once item-by-item with per-item warns: a single bad
+    /// payload keeps the pre-#212 per-item blast radius on the cold
+    /// path instead of failing the whole entry's offload.
+    fn flush_inline_batch(&self, batch: &[([u8; 32], &[u8])]) {
+        if batch.is_empty() {
+            return;
+        }
+        let Some(ref store) = self.inline_store else {
+            return;
+        };
+        let items: Vec<(&[u8; 32], &[u8])> = batch.iter().map(|(k, p)| (k, *p)).collect();
+        if let Err(e) = store.put_many(&items) {
+            tracing::warn!(
+                count = batch.len(),
+                error = %e,
+                "sm.apply: inline_store.put_many failed; retrying per-item",
+            );
+            for (key, payload) in batch {
+                if let Err(e) = store.put(key, payload) {
+                    tracing::warn!(
+                        key = ?key,
+                        error = %e,
+                        "sm.apply: inline_store.put retry failed; read path falls back to chunk tier",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Drop deltas below the consumer GC boundary (I-L4) and delete
+    /// their offloaded inline payloads (I-SF6). Runs on every applied
+    /// `AdvanceWatermark` — the command is Raft-replicated and the
+    /// watermark state is part of the SM, so every replica computes
+    /// the same boundary and drains the same prefix (deterministic).
+    /// `gc_boundary() == None` (no consumers registered) is a no-op:
+    /// an un-consumed shard never prunes.
+    ///
+    /// `delta_count` is intentionally NOT decremented — it is the
+    /// cumulative committed count (split-trigger input), matching the
+    /// existing `truncate_log` semantics.
+    fn prune_deltas_below_gc_boundary(&mut self) {
+        let Some(boundary) = self.watermarks.gc_boundary() else {
+            return;
+        };
+        // `deltas` is sorted ascending by sequence (tip += 1, push).
+        let cut = self
+            .deltas
+            .partition_point(|d| d.header.sequence < boundary);
+        if cut == 0 {
+            return;
+        }
+        if let Some(ref store) = self.inline_store {
+            for d in &self.deltas[..cut] {
+                if d.header.has_inline_data {
+                    // Best-effort: a leaked inline entry is recoverable
+                    // (scrub), a stalled prune isn't.
+                    let _ = store.delete(&derive_inline_key(
+                        &d.header.hashed_key,
+                        d.header.sequence.0,
+                    ));
+                }
+            }
+        }
+        self.deltas.drain(..cut);
+    }
+
+    /// Serialize the SM image for snapshot transfer / install.
+    ///
+    /// Single source of truth for BOTH snapshot paths
+    /// (`build_snapshot` and `get_current_snapshot`): inline-offloaded
+    /// deltas are read back from the store (I-SF5) so the snapshot
+    /// carries full payloads — a follower installed via either path
+    /// gets identical bytes. (Pre-unification, `get_current_snapshot`
+    /// skipped the readback and shipped empty ciphertexts.)
+    ///
+    /// Postcard-encoded; if the result exceeds [`SNAPSHOT_SIZE_CAP`]
+    /// we log + count but STILL return it (GH #220 — loud, not
+    /// wedged: refusing would block log purge and local recovery,
+    /// while only the cross-node transfer is actually doomed).
+    fn snapshot_bytes(&self) -> io::Result<Vec<u8>> {
+        let deltas: Vec<SerializableDelta> = self
+            .deltas
+            .iter()
+            .map(|d| {
+                let mut sd = SerializableDelta::from_delta(d);
+                if d.header.has_inline_data && sd.ciphertext.is_empty() {
+                    if let Some(ref store) = self.inline_store {
+                        let key = derive_inline_key(&d.header.hashed_key, d.header.sequence.0);
+                        if let Ok(Some(data)) = store.get(&key) {
+                            sd.ciphertext = data;
+                        }
+                    }
+                }
+                sd
+            })
+            .collect();
+        let snap = ShardSnapshot {
+            delta_count: self.delta_count,
+            tip: self.tip,
+            maintenance: self.maintenance,
+            deltas,
+            watermarks: self.watermarks.as_vec(),
+            shard_id: Some(*self.shard_id.0.as_bytes()),
+            tenant_id: Some(*self.tenant_id.0.as_bytes()),
+            ancient_cutoff_log_index: self.ancient_cutoff_log_index,
+            recent_incorporated: self.recent_incorporated.iter().copied().collect(),
+        };
+        let data = postcard::to_stdvec(&snap).map_err(io::Error::other)?;
+        if data.len() > SNAPSHOT_SIZE_CAP {
+            snapshot_over_cap_counter()
+                .with_label_values(&[&self.shard_id.0.to_string()])
+                .inc();
+            tracing::error!(
+                shard = %self.shard_id.0,
+                size = data.len(),
+                cap = SNAPSHOT_SIZE_CAP,
+                "shard snapshot exceeds Raft RPC frame budget — cross-node \
+                 snapshot install WILL fail; split the shard (GH #220)",
+            );
+        }
+        Ok(data)
+    }
+
     #[allow(clippy::too_many_lines)] // Big match per LogCommand variant
     pub(crate) fn apply_command(&mut self, cmd: &LogCommand, log_index: u64) -> LogResponse {
         self.apply_command_at(cmd, log_index, now_ms())
@@ -682,6 +841,7 @@ impl ShardSmInner {
                 payload,
                 has_inline_data,
             } => {
+                let mut inline_batch = Vec::new();
                 let tip = self.append_delta_inner(
                     tenant_id_bytes,
                     *operation,
@@ -690,7 +850,9 @@ impl ShardSmInner {
                     payload,
                     *has_inline_data,
                     log_index,
+                    &mut inline_batch,
                 );
+                self.flush_inline_batch(&inline_batch);
                 LogResponse::Appended(tip)
             }
             LogCommand::ChunkAndDelta {
@@ -708,26 +870,19 @@ impl ShardSmInner {
                 // observing the delta after this apply step always
                 // finds the corresponding cluster_chunk_state.
                 self.apply_new_chunks(tenant_id_bytes, new_chunks, log_index);
-                // #129: write inline small-file payloads to the
-                // local inline store keyed by chunk_id (ADR-030
-                // §2 canonical key). Every replica that applies
-                // this entry executes this branch, so the gateway
-                // read path on ANY node finds the bytes locally
-                // via `small_store.get(&chunk_id.0)`.
-                if !inline_payloads.is_empty() {
-                    if let Some(ref store) = self.inline_store {
-                        for entry in inline_payloads {
-                            let chunk_id = &entry.chunk_id;
-                            let bytes = &entry.payload;
-                            if let Err(e) = store.put(chunk_id, bytes) {
-                                tracing::warn!(
-                                    chunk_id = ?chunk_id,
-                                    error = %e,
-                                    "sm.apply: inline_store.put failed (#129); write replicated via chunk tier fallback",
-                                );
-                            }
-                        }
-                    }
+                // #129: inline small-file payloads land in the local
+                // inline store keyed by chunk_id (ADR-030 §2 canonical
+                // key) on every replica, so the gateway read path on
+                // ANY node finds the bytes via
+                // `small_store.get(&chunk_id.0)`. Accumulated here,
+                // committed in ONE `put_many` per entry below (#212).
+                let mut inline_batch = Vec::new();
+                if !inline_payloads.is_empty() && self.inline_store.is_some() {
+                    inline_batch.extend(
+                        inline_payloads
+                            .iter()
+                            .map(|entry| (entry.chunk_id, entry.payload.as_slice())),
+                    );
                 }
                 let tip = self.append_delta_inner(
                     tenant_id_bytes,
@@ -737,7 +892,9 @@ impl ShardSmInner {
                     payload,
                     *has_inline_data,
                     log_index,
+                    &mut inline_batch,
                 );
+                self.flush_inline_batch(&inline_batch);
                 LogResponse::Appended(tip)
             }
             // ADR-047 PART 8 — an async-committed intent. Two complementary
@@ -777,7 +934,9 @@ impl ShardSmInner {
                     perspective_seq: *perspective_seq,
                     inline_payloads: inline_payloads.clone(),
                 };
-                let tip = self.apply_one_incorporate(&item, log_index, now_ms);
+                let mut inline_batch = Vec::new();
+                let tip = self.apply_one_incorporate(&item, log_index, now_ms, &mut inline_batch);
+                self.flush_inline_batch(&inline_batch);
                 LogResponse::Appended(tip)
             }
             // PART 8 §U — the batched variant. Each item runs through the
@@ -787,9 +946,16 @@ impl ShardSmInner {
             // (post-batch), matching the single-variant shape.
             LogCommand::IncorporateIntents { items } => {
                 let mut last_tip = self.tip;
+                // ONE inline-store commit for the whole entry (#212):
+                // each item accumulates its payloads (borrowed from
+                // `cmd`, zero copies); `flush_inline_batch` issues a
+                // single `put_many` after the last item.
+                let mut inline_batch = Vec::new();
                 for item in items {
-                    last_tip = self.apply_one_incorporate(item, log_index, now_ms);
+                    last_tip =
+                        self.apply_one_incorporate(item, log_index, now_ms, &mut inline_batch);
                 }
+                self.flush_inline_batch(&inline_batch);
                 LogResponse::Appended(last_tip)
             }
             LogCommand::IncrementChunkRefcount {
@@ -830,6 +996,11 @@ impl ShardSmInner {
             }
             LogCommand::AdvanceWatermark { consumer, position } => {
                 self.watermarks.advance(consumer, SequenceNumber(*position));
+                // P3a: GC at watermark-advance time. The dead-weight
+                // alternative — deltas only ever pruned by an explicit
+                // local `truncate_log` nobody schedules — let the Vec
+                // (and every snapshot) grow without bound.
+                self.prune_deltas_below_gc_boundary();
                 LogResponse::Ok
             }
             LogCommand::SetShardState { state } => {
@@ -887,28 +1058,6 @@ impl ShardStateMachine {
 impl RaftSnapshotBuilder<C> for ShardStateMachine {
     async fn build_snapshot(&mut self) -> Result<SnapshotOf<C>, io::Error> {
         let inner = self.inner.lock().await;
-        // Build serializable deltas, reading inline content from store
-        // for deltas whose ciphertext was offloaded (I-SF5).
-        let deltas: Vec<SerializableDelta> = inner
-            .deltas
-            .iter()
-            .map(|d| {
-                let mut sd = SerializableDelta::from_delta(d);
-                if d.header.has_inline_data && sd.ciphertext.is_empty() {
-                    if let Some(ref store) = inner.inline_store {
-                        let mut inline_key = d.header.hashed_key;
-                        let seq_bytes = d.header.sequence.0.to_le_bytes();
-                        for (i, &b) in seq_bytes.iter().enumerate() {
-                            inline_key[24 + i] ^= b;
-                        }
-                        if let Ok(Some(data)) = store.get(&inline_key) {
-                            sd.ciphertext = data;
-                        }
-                    }
-                }
-                sd
-            })
-            .collect();
         // PART 8 — defensive sanity bound: the recent window must never grow
         // past 2× its configured entry-cap. Catches a runaway eviction bug
         // before it floods the snapshot.
@@ -918,18 +1067,9 @@ impl RaftSnapshotBuilder<C> for ShardStateMachine {
             inner.recent_incorporated.len(),
             inner.dedup_window_entries
         );
-        let snap = ShardSnapshot {
-            delta_count: inner.delta_count,
-            tip: inner.tip,
-            maintenance: inner.maintenance,
-            deltas,
-            watermarks: inner.watermarks.as_vec(),
-            shard_id: Some(*inner.shard_id.0.as_bytes()),
-            tenant_id: Some(*inner.tenant_id.0.as_bytes()),
-            ancient_cutoff_log_index: inner.ancient_cutoff_log_index,
-            recent_incorporated: inner.recent_incorporated.iter().copied().collect(),
-        };
-        let data = serde_json::to_vec(&snap).map_err(io::Error::other)?;
+        // Shared image builder — inline readback (I-SF5) + postcard
+        // encode + size-cap check, identical to `get_current_snapshot`.
+        let data = inner.snapshot_bytes()?;
         // #212 flush-ordering barrier: openraft purges the log only
         // after a snapshot covers it, and restart recovery for the
         // (in-memory) SM is full retained-log replay. With the inline
@@ -1005,7 +1145,7 @@ impl RaftStateMachine<C> for ShardStateMachine {
         snapshot: <C as openraft::RaftTypeConfig>::SnapshotData,
     ) -> Result<(), io::Error> {
         let data = snapshot.into_inner();
-        let snap: ShardSnapshot = serde_json::from_slice(&data)
+        let snap: ShardSnapshot = postcard::from_bytes(&data)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let mut inner = self.inner.lock().await;
         inner.delta_count = snap.delta_count;
@@ -1034,7 +1174,15 @@ impl RaftStateMachine<C> for ShardStateMachine {
                 let delta = sd.to_delta();
                 if delta.header.has_inline_data && !sd.ciphertext.is_empty() {
                     if let Some(ref store) = inner.inline_store {
-                        let _ = store.put(&delta.header.hashed_key, &sd.ciphertext);
+                        // #213: the offload key MUST be the canonical
+                        // derive_inline_key(hashed_key, sequence) — the
+                        // read paths (read_deltas, snapshot_bytes, GC
+                        // deletes) all derive with the sequence mixed
+                        // in. Writing at the plain hashed_key left every
+                        // snapshot-installed inline payload unreadable.
+                        let key =
+                            derive_inline_key(&delta.header.hashed_key, delta.header.sequence.0);
+                        let _ = store.put(&key, &sd.ciphertext);
                     }
                 }
                 // Clear ciphertext from in-memory delta if store is available.
@@ -1068,22 +1216,11 @@ impl RaftStateMachine<C> for ShardStateMachine {
         let Some(ref last) = inner.last_applied_log else {
             return Ok(None);
         };
-        let snap = ShardSnapshot {
-            delta_count: inner.delta_count,
-            tip: inner.tip,
-            maintenance: inner.maintenance,
-            deltas: inner
-                .deltas
-                .iter()
-                .map(SerializableDelta::from_delta)
-                .collect(),
-            watermarks: inner.watermarks.as_vec(),
-            shard_id: Some(*inner.shard_id.0.as_bytes()),
-            tenant_id: Some(*inner.tenant_id.0.as_bytes()),
-            ancient_cutoff_log_index: inner.ancient_cutoff_log_index,
-            recent_incorporated: inner.recent_incorporated.iter().copied().collect(),
-        };
-        let data = serde_json::to_vec(&snap).map_err(io::Error::other)?;
+        // Same image builder as `build_snapshot` — INCLUDING the
+        // inline readback. The pre-unification version skipped it, so
+        // a follower hydrated through this path got empty ciphertexts
+        // for every offloaded delta (divergent snapshot payloads).
+        let data = inner.snapshot_bytes()?;
         let meta = SnapshotMetaOf::<C> {
             last_log_id: Some(*last),
             last_membership: inner.last_membership.clone(),
@@ -1102,23 +1239,14 @@ impl RaftStateMachine<C> for ShardStateMachine {
 
 #[cfg(test)]
 mod tests {
-    /// Inline store key derivation: XOR sequence into last 8 bytes of `hashed_key`.
-    /// Two deltas with the same `hashed_key` but different sequences must produce
-    /// different inline keys (I-SF5 uniqueness invariant).
-    fn compute_inline_key(hashed_key: &[u8; 32], sequence: u64) -> [u8; 32] {
-        let mut k = *hashed_key;
-        let seq_bytes = sequence.to_le_bytes();
-        for (i, &b) in seq_bytes.iter().enumerate() {
-            k[24 + i] ^= b;
-        }
-        k
-    }
-
+    /// Inline store key derivation (I-SF5 uniqueness invariant) — the
+    /// SM uses the canonical `kiseki_common::inline_store::derive_inline_key`
+    /// everywhere (#213 fix surface; the open-coded XOR copies are gone).
     #[test]
     fn inline_key_differs_for_different_sequences() {
         let hashed_key = [0xAB_u8; 32];
-        let key_seq1 = compute_inline_key(&hashed_key, 1);
-        let key_seq2 = compute_inline_key(&hashed_key, 2);
+        let key_seq1 = derive_inline_key(&hashed_key, 1);
+        let key_seq2 = derive_inline_key(&hashed_key, 2);
         assert_ne!(
             key_seq1, key_seq2,
             "inline keys for same hashed_key with different sequences must differ"
@@ -1128,8 +1256,8 @@ mod tests {
     #[test]
     fn inline_key_same_for_same_sequence() {
         let hashed_key = [0xCD_u8; 32];
-        let key_a = compute_inline_key(&hashed_key, 42);
-        let key_b = compute_inline_key(&hashed_key, 42);
+        let key_a = derive_inline_key(&hashed_key, 42);
+        let key_b = derive_inline_key(&hashed_key, 42);
         assert_eq!(
             key_a, key_b,
             "inline keys for same hashed_key and same sequence must be identical"
@@ -1139,7 +1267,7 @@ mod tests {
     #[test]
     fn inline_key_xor_only_affects_last_8_bytes() {
         let hashed_key = [0xFF_u8; 32];
-        let key = compute_inline_key(&hashed_key, 1);
+        let key = derive_inline_key(&hashed_key, 1);
         // First 24 bytes should be unchanged.
         assert_eq!(&key[..24], &[0xFF_u8; 24]);
         // Last 8 bytes should differ from original (XOR with non-zero sequence).
@@ -1644,8 +1772,8 @@ mod tests {
             ancient_cutoff_log_index: 99,
             recent_incorporated: recent.clone(),
         };
-        let bytes = serde_json::to_vec(&snap).unwrap();
-        let loaded: ShardSnapshot = serde_json::from_slice(&bytes).unwrap();
+        let bytes = postcard::to_stdvec(&snap).unwrap();
+        let loaded: ShardSnapshot = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(loaded.ancient_cutoff_log_index, 99);
         assert_eq!(loaded.recent_incorporated.len(), 2);
         assert_eq!(loaded.recent_incorporated[0].perspective_seq, hlc(1, 0, 1));
@@ -1757,6 +1885,305 @@ mod tests {
             inner.deltas.len(),
             pre_delta_count + 2,
             "two fresh items appended on the non-ancient pass",
+        );
+    }
+
+    // -----------------------------------------------------------
+    // #212 per-entry inline batching + P3a watermark pruning +
+    // P3b postcard snapshots (#213 install key fix).
+    // -----------------------------------------------------------
+
+    use kiseki_common::inline_store::InlineStore;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// HashMap-backed inline store that counts `put` / `put_many`
+    /// invocations — `put_many` is overridden (the trait default
+    /// falls back to per-item `put`, which would hide batching).
+    #[derive(Default)]
+    struct MapInlineStore {
+        entries: std::sync::Mutex<HashMap<[u8; 32], Vec<u8>>>,
+        put_calls: AtomicUsize,
+        put_many_calls: AtomicUsize,
+    }
+
+    impl MapInlineStore {
+        fn len(&self) -> usize {
+            self.entries.lock().unwrap().len()
+        }
+    }
+
+    impl InlineStore for MapInlineStore {
+        fn put(&self, key: &[u8; 32], data: &[u8]) -> std::io::Result<bool> {
+            self.put_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(self
+                .entries
+                .lock()
+                .unwrap()
+                .insert(*key, data.to_vec())
+                .is_none())
+        }
+        fn put_many(&self, items: &[(&[u8; 32], &[u8])]) -> std::io::Result<u64> {
+            self.put_many_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            let mut entries = self.entries.lock().unwrap();
+            let mut new_count = 0;
+            for (key, data) in items {
+                if entries.insert(**key, data.to_vec()).is_none() {
+                    new_count += 1;
+                }
+            }
+            Ok(new_count)
+        }
+        fn get(&self, key: &[u8; 32]) -> std::io::Result<Option<Vec<u8>>> {
+            Ok(self.entries.lock().unwrap().get(key).cloned())
+        }
+        fn delete(&self, key: &[u8; 32]) -> std::io::Result<bool> {
+            Ok(self.entries.lock().unwrap().remove(key).is_some())
+        }
+    }
+
+    fn inner_with_store() -> (ShardSmInner, Arc<MapInlineStore>) {
+        let store = Arc::new(MapInlineStore::default());
+        let mut inner = fresh_inner();
+        inner.inline_store = Some(Arc::clone(&store) as Arc<dyn InlineStore>);
+        (inner, store)
+    }
+
+    /// #212 — ONE `put_many` commit per applied Raft entry, regardless
+    /// of how many items (and inline payloads per item) the entry
+    /// carries. Each item contributes both its #129 chunk-id-keyed
+    /// payload and its `derive_inline_key`-keyed delta offload to the
+    /// same batch; no per-item `put` fires on the happy path.
+    #[test]
+    fn incorporate_intents_entry_commits_one_put_many_per_entry() {
+        let (mut inner, store) = inner_with_store();
+        let tenant = org(1);
+        let mk_item = |i: u8| IncorporateItem {
+            tenant_id_bytes: tenant,
+            operation: 0,
+            hashed_key: [i; 32],
+            chunk_refs: vec![],
+            payload: vec![i; 4],
+            has_inline_data: true,
+            new_chunks: vec![],
+            perspective_seq: hlc(u64::from(i), 0, 1),
+            inline_payloads: vec![([i | 0x40; 32], vec![i; 2]).into()],
+        };
+
+        let batch = LogCommand::IncorporateIntents {
+            items: vec![mk_item(1), mk_item(2), mk_item(3)],
+        };
+        let _ = inner.apply_command_at(&batch, 1, 1_000);
+
+        assert_eq!(
+            store.put_many_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "one put_many per applied entry, regardless of item count"
+        );
+        assert_eq!(
+            store.put_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "no per-item puts on the happy path"
+        );
+        // 3 chunk-id keys (#129) + 3 derived delta keys (I-SF5).
+        assert_eq!(store.len(), 6);
+        for i in 1..=3u8 {
+            assert_eq!(
+                store.get(&[i | 0x40; 32]).unwrap().as_deref(),
+                Some(&[i, i][..]),
+                "chunk-id-keyed payload present"
+            );
+            assert_eq!(
+                store
+                    .get(&derive_inline_key(&[i; 32], u64::from(i)))
+                    .unwrap()
+                    .as_deref(),
+                Some(&[i; 4][..]),
+                "delta offload at the canonical derived key"
+            );
+        }
+        // In-memory ciphertexts cleared (offloaded).
+        assert!(inner.deltas.iter().all(|d| d.payload.ciphertext.is_empty()));
+
+        // A second applied entry costs exactly one more commit.
+        let single = LogCommand::IncorporateIntents {
+            items: vec![mk_item(4)],
+        };
+        let _ = inner.apply_command_at(&single, 2, 1_010);
+        assert_eq!(store.put_many_calls.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    /// P3a — applying the replicated `AdvanceWatermark` command prunes
+    /// deltas below the consumer GC boundary (I-L4) and deletes their
+    /// offloaded inline payloads at the canonical key (I-SF6). The
+    /// deltas Vec is bounded by the boundary; a hydrator-style range
+    /// read from below it observes the documented compaction-gap
+    /// evidence (first visible sequence > requested from, ADR-040
+    /// §D6.3 / #87).
+    #[test]
+    fn advance_watermark_prunes_deltas_and_deletes_inline_payloads() {
+        let (mut inner, store) = inner_with_store();
+        let tenant = org(1);
+        for i in 1..=5u8 {
+            let _ = inner.apply_command_at(
+                &LogCommand::AppendDelta {
+                    tenant_id_bytes: tenant,
+                    operation: 0,
+                    hashed_key: [i; 32],
+                    chunk_refs: vec![],
+                    payload: vec![i; 8],
+                    has_inline_data: true,
+                },
+                u64::from(i),
+                1_000,
+            );
+        }
+        assert_eq!(inner.deltas.len(), 5);
+        assert_eq!(store.len(), 5);
+
+        // No consumers registered → gc_boundary() is None → no-op.
+        inner.prune_deltas_below_gc_boundary();
+        assert_eq!(inner.deltas.len(), 5, "no consumers: prune is a no-op");
+
+        // The replicated command is the production prune trigger.
+        let _ = inner.apply_command_at(
+            &LogCommand::AdvanceWatermark {
+                consumer: "hydrator".into(),
+                position: 3,
+            },
+            6,
+            1_100,
+        );
+        assert_eq!(inner.deltas.len(), 3, "deltas below boundary pruned");
+        assert_eq!(
+            inner.deltas[0].header.sequence,
+            SequenceNumber(3),
+            "earliest visible sequence == gc boundary"
+        );
+        assert_eq!(inner.tip, 5, "tip is monotonic, unaffected by pruning");
+        // I-SF6: pruned deltas' offloads deleted at the canonical key.
+        assert!(store
+            .get(&derive_inline_key(&[1; 32], 1))
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get(&derive_inline_key(&[2; 32], 2))
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get(&derive_inline_key(&[3; 32], 3))
+            .unwrap()
+            .is_some());
+        assert_eq!(store.len(), 3);
+
+        // Hydrator-style read from below the boundary: sequences 1-2
+        // are unobtainable; first visible (3) > requested from (1) is
+        // the documented gap evidence (ADR-040 §D6.3, #87).
+        let from = SequenceNumber(1);
+        let start = inner.deltas.partition_point(|d| d.header.sequence < from);
+        let first_visible = inner.deltas[start..]
+            .first()
+            .map(|d| d.header.sequence)
+            .expect("deltas remain above the boundary");
+        assert!(
+            first_visible > from,
+            "gap evidence: first visible {first_visible:?} > requested {from:?}"
+        );
+
+        // A second consumer registering at a LOWER position lowers the
+        // boundary but cannot resurrect pruned deltas — and prunes
+        // nothing further.
+        let _ = inner.apply_command_at(
+            &LogCommand::AdvanceWatermark {
+                consumer: "audit".into(),
+                position: 2,
+            },
+            7,
+            1_200,
+        );
+        assert_eq!(inner.deltas.len(), 3);
+
+        // Both consumers past the tip → everything prunes; the Vec
+        // (and therefore every future snapshot) is bounded.
+        for consumer in ["hydrator", "audit"] {
+            let _ = inner.apply_command_at(
+                &LogCommand::AdvanceWatermark {
+                    consumer: consumer.into(),
+                    position: 10,
+                },
+                8,
+                1_300,
+            );
+        }
+        assert!(inner.deltas.is_empty());
+        assert_eq!(store.len(), 0, "all inline offloads deleted (I-SF6)");
+    }
+
+    /// P3b — postcard snapshot round-trip: `build_snapshot` reads the
+    /// offloaded ciphertext back from the inline store (I-SF5), and
+    /// `install_snapshot` re-offloads it on the receiving node at the
+    /// CANONICAL `derive_inline_key(hashed_key, sequence)` key — the
+    /// #213 fix (it previously wrote at the plain hashed_key, which no
+    /// reader ever derives).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_postcard_round_trip_installs_inline_at_derived_key() {
+        let (mut inner_a, store_a) = inner_with_store();
+        let hashed_key = [0x42u8; 32];
+        let payload = vec![0xAB, 0xCD, 0xEF];
+        let _ = inner_a.apply_command_at(
+            &LogCommand::AppendDelta {
+                tenant_id_bytes: org(1),
+                operation: 0,
+                hashed_key,
+                chunk_refs: vec![],
+                payload: payload.clone(),
+                has_inline_data: true,
+            },
+            1,
+            1_000,
+        );
+        let derived = derive_inline_key(&hashed_key, 1);
+        assert!(inner_a.deltas[0].payload.ciphertext.is_empty(), "offloaded");
+        assert_eq!(
+            store_a.get(&derived).unwrap().as_deref(),
+            Some(&payload[..])
+        );
+
+        let mut sm_a = ShardStateMachine::new(Arc::new(futures::lock::Mutex::new(inner_a)));
+        let snapshot = sm_a.build_snapshot().await.expect("build_snapshot");
+        let bytes = snapshot.snapshot.get_ref().clone();
+        // Postcard image carries the read-back ciphertext — both
+        // snapshot paths share `snapshot_bytes`, so this also covers
+        // `get_current_snapshot`'s readback.
+        let decoded: ShardSnapshot = postcard::from_bytes(&bytes).expect("postcard image");
+        assert_eq!(decoded.deltas.len(), 1);
+        assert_eq!(decoded.deltas[0].ciphertext, payload, "inline readback");
+
+        // Install into a fresh SM with its own (empty) inline store.
+        let (inner_b, store_b) = inner_with_store();
+        let mut sm_b = ShardStateMachine::new(Arc::new(futures::lock::Mutex::new(inner_b)));
+        sm_b.install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .expect("install_snapshot");
+
+        let inner_b = sm_b.inner.lock().await;
+        assert_eq!(inner_b.tip, 1);
+        assert_eq!(inner_b.delta_count, 1);
+        assert_eq!(inner_b.deltas.len(), 1);
+        assert_eq!(inner_b.deltas[0].header.hashed_key, hashed_key);
+        assert!(
+            inner_b.deltas[0].payload.ciphertext.is_empty(),
+            "re-offloaded on install"
+        );
+        // #213: readers derive the key with the sequence mixed in —
+        // the install offload MUST land there, not at the plain key.
+        assert_eq!(
+            store_b.get(&derived).unwrap().as_deref(),
+            Some(&payload[..]),
+            "installed offload readable at the canonical derived key (#213)"
+        );
+        assert!(
+            store_b.get(&hashed_key).unwrap().is_none(),
+            "nothing written at the plain hashed_key"
         );
     }
 }
