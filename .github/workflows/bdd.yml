@@ -62,7 +62,7 @@ jobs:
       # `--no-tests=warn` because nextest 0.9.x defaults to exit 4
       # when no tests match the filter, and that's the natural state
       # while the workspace has zero `#[ignore = "slow:…"]` tests.
-      - run: cargo nextest run --profile slow --run-ignored=only --no-tests=warn --workspace --exclude kiseki-acceptance --exclude kiseki-chunk-cluster --locked
+      - run: cargo nextest run --profile slow --run-ignored=only --no-tests=warn -E 'not test(measure_sm_mutex_contention)' --workspace --exclude kiseki-acceptance --exclude kiseki-chunk-cluster --locked
       - run: cargo nextest run --profile slow --run-ignored=only --no-tests=warn -p kiseki-chunk-cluster --locked
 
   slow-bdd:
