@@ -101,6 +101,27 @@ impl PortReservation {
     }
 }
 
+/// Create a per-run data dir for a spawned server / persistent
+/// driver. Default is `tempfile::tempdir()` — on most Linux distros
+/// that lands on tmpfs `/tmp`, where fsync is ~free, which silently
+/// voids any durability/fsync A/B (finding C-5b). When
+/// `KISEKI_PROFILE_DATA_ROOT` is set, the dir is created under that
+/// root instead (unique per-run subdir, still removed on drop) so
+/// the data path hits a real disk.
+pub fn profile_data_dir(label: &str) -> Result<tempfile::TempDir, String> {
+    match std::env::var("KISEKI_PROFILE_DATA_ROOT") {
+        Ok(root) if !root.is_empty() => {
+            std::fs::create_dir_all(&root)
+                .map_err(|e| format!("create KISEKI_PROFILE_DATA_ROOT {root}: {e}"))?;
+            tempfile::Builder::new()
+                .prefix(&format!("kiseki-profile-{label}-"))
+                .tempdir_in(&root)
+                .map_err(|e| format!("tempdir under KISEKI_PROFILE_DATA_ROOT {root}: {e}"))
+        }
+        _ => tempfile::tempdir().map_err(|e| format!("tempdir ({label}): {e}")),
+    }
+}
+
 pub struct ProfileServer {
     process: Child,
     _data_dir: tempfile::TempDir,
@@ -123,7 +144,7 @@ impl ProfileServer {
             Some(p) => p.to_path_buf(),
             None => find_server_binary()?,
         };
-        let data_dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        let data_dir = profile_data_dir("single")?;
         let ports = Ports::allocate();
         let mut cmd = Command::new(&binary);
         cmd.env_clear()
@@ -170,6 +191,11 @@ impl ProfileServer {
             "KISEKI_COMPOSITION_FLUSH_INTERVAL_MS",
             "KISEKI_CHUNK_FLUSH_INTERVAL_MS",
             "KISEKI_RAFT_FLUSH_INTERVAL_MS",
+            // #217 group-commit A/B knobs — the strict arm (=0) must
+            // reach the spawned server or both arms measure the
+            // group-commit default (finding C-5a).
+            "KISEKI_SMALL_OBJECT_FLUSH_INTERVAL_MS",
+            "KISEKI_INTENT_FLUSH_INTERVAL_MS",
             // ADR-047 escalation harness knob — simulated outbound
             // RTT (µs) injected into every Raft client RPC. Read once
             // at module init by kiseki-raft::tcp_transport. Forwarded
@@ -757,7 +783,7 @@ fn spawn_cluster_node(
     bootstrap: bool,
     pprof_out: Option<&Path>,
 ) -> Result<ClusterNode, String> {
-    let data_dir = tempfile::tempdir().map_err(|e| format!("tempdir for node-{node_id}: {e}"))?;
+    let data_dir = profile_data_dir(&format!("node{node_id}"))?;
     let mut cmd = Command::new(binary);
     cmd.env_clear()
         .env("KISEKI_DATA_ADDR", format!("127.0.0.1:{}", ports.grpc_data))
@@ -835,6 +861,11 @@ fn spawn_cluster_node(
         // forward list. Lets the bench size a per-node chunk store
         // to its actual write volume instead of the 4 GiB default.
         "KISEKI_CHUNK_DEVICE_BYTES",
+        // #217 group-commit A/B knobs — the strict arm (=0) must
+        // reach every spawned node or both arms measure the
+        // group-commit default (finding C-5a).
+        "KISEKI_SMALL_OBJECT_FLUSH_INTERVAL_MS",
+        "KISEKI_INTENT_FLUSH_INTERVAL_MS",
     ] {
         if let Ok(v) = std::env::var(var) {
             if var == "DHAT_OUTPUT_FILE" {

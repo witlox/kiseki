@@ -72,6 +72,18 @@ pub struct BenchConfig {
     pub duration: Duration,
     /// For GetHeavy/Mixed: how many objects to PUT during warmup.
     pub warmup_objects: usize,
+    /// Discarded warm-up pass: run the same closed-loop workload for
+    /// this many seconds before the measured clock starts, throwing
+    /// away every sample and counter. Keeps the known cold-ramp ~2×
+    /// artifact out of the measured window. 0 disables.
+    pub warmup_secs: u64,
+    /// Error-rate gate threshold: `failed / total` above this means
+    /// the run is functionally broken. The bin enforces it (exit 2)
+    /// after the report prints — see `error_rate_exceeded`.
+    pub max_error_rate: f64,
+    /// Client identity recorded in the report so multi-client sweep
+    /// artifacts are attributable. `None` → kernel hostname.
+    pub client_id: Option<String>,
     /// Emit machine-readable JSON instead of the human table.
     pub json: bool,
     /// Override the `tenant_id` used by the bench. `None` → the
@@ -129,6 +141,9 @@ pub struct BenchReport {
     pub shape: String,
     /// Effective in-flight worker count.
     pub concurrency: usize,
+    /// TCP connections in the client pool (the second sweep axis —
+    /// without it, conn×conc sweep cells are indistinguishable).
+    pub connections: usize,
     /// Per-object payload size in bytes.
     pub object_size: usize,
     /// Wall-clock elapsed for the measurement phase.
@@ -137,6 +152,10 @@ pub struct BenchReport {
     pub ops: u64,
     /// Failed op count.
     pub errors: u64,
+    /// GETs whose returned byte length != `object_size`. Also counted
+    /// in `errors`; broken out so truncation (#127-class) is
+    /// distinguishable from transport failures.
+    pub get_length_mismatches: u64,
     /// Successful ops per second.
     pub ops_per_sec: f64,
     /// Throughput in MiB/sec (= `ops` × `object_size` / MiB / seconds).
@@ -147,6 +166,28 @@ pub struct BenchReport {
     pub p95_us: u32,
     /// p99 latency in microseconds.
     pub p99_us: u32,
+    /// Per-process payload-seed nonce (hex). Provenance: lets a
+    /// post-run dedup audit tie chunks back to this run.
+    pub run_nonce: String,
+    /// Client host identity (`--client-id`, default kernel hostname).
+    pub client_id: String,
+    /// Length of the discarded warm-up pass.
+    pub warmup_secs: u64,
+    /// Error-rate gate threshold the bin enforces after printing.
+    pub max_error_rate: f64,
+}
+
+/// Error-rate gate (C-2): `true` when `errors / (ops + errors)`
+/// exceeds the allowed rate. A run that completed zero ops total is
+/// always a functional break — it must not pass any gate.
+#[must_use]
+#[allow(clippy::cast_precision_loss)] // bench totals stay far below 2^52
+pub fn error_rate_exceeded(ops: u64, errors: u64, max_error_rate: f64) -> bool {
+    let total = ops + errors;
+    if total == 0 {
+        return true;
+    }
+    (errors as f64) / (total as f64) > max_error_rate
 }
 
 #[derive(Clone, Debug)]
@@ -218,6 +259,48 @@ async fn build_driver(cfg: &BenchConfig) -> Result<Arc<dyn Driver>, String> {
         "unsupported endpoint scheme: {} — use kiseki://host:port or http(s)://host:port",
         cfg.endpoint
     ))
+}
+
+/// Seed-space phase tags. Distinct constants per phase make the three
+/// seed spaces provably disjoint for any fixed nonce — warmup-object,
+/// warmup-loop, and measured payloads can never collide with each
+/// other (a collision would dedup away exactly the commit under test).
+const PHASE_WARMUP_OBJECTS: u64 = 1;
+const PHASE_WARMUP_LOOP: u64 = 2;
+const PHASE_MEASURED: u64 = 3;
+
+/// One splitmix64 finalization round (the Stafford mix13 variant).
+const fn mix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Payload-seed derivation: hash(`run_nonce`, phase, worker,
+/// `op_index`) via chained splitmix64 rounds (C-1 fix). The per-process nonce
+/// keeps re-runs against a non-wiped cluster and concurrent
+/// multi-client sweeps from emitting identical payload streams —
+/// which content-addressed dedup would otherwise collapse, skipping
+/// the very fsync path the A/B varies.
+fn mix_seed(nonce: u128, phase: u64, worker_id: u64, op_index: u64) -> u64 {
+    #[allow(clippy::cast_possible_truncation)] // intentional: fold u128 nonce into two u64 absorbs
+    let (hi, lo) = ((nonce >> 64) as u64, nonce as u64);
+    let mut h = mix64(hi ^ 0x9E37_79B9_7F4A_7C15);
+    h = mix64(h ^ lo);
+    h = mix64(h ^ phase);
+    h = mix64(h ^ worker_id);
+    h = mix64(h ^ op_index);
+    h
+}
+
+/// Default client identity: the kernel hostname. Falls back to
+/// "unknown" off-Linux or when /proc is unreadable.
+fn default_client_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Generate DISTINCT, high-entropy payload bytes seeded by `seed`.
@@ -313,63 +396,47 @@ fn provision_bench_namespace(
     }
 }
 
-/// Run the benchmark and emit a report on stdout. Returns the report
-/// so callers can inspect it programmatically.
-///
-/// # Errors
-/// Returns the underlying driver error if the endpoint scheme is
-/// unsupported, the connection fails, or the warmup PUTs fail.
-#[allow(clippy::too_many_lines)] // workload loop + stats wiring is intrinsically long
-pub async fn run(cfg: BenchConfig) -> Result<BenchReport, String> {
-    let (tenant_id, namespace_id) = resolve_bench_ids(&cfg);
-    // Best-effort: provision the bench namespace before driving load.
-    // Only when --admin-endpoint is set; GCP runbook expects external
-    // provisioning via setup-shards.sh and leaves this unset.
-    if let Some(admin) = cfg.admin_endpoint.as_deref() {
-        provision_bench_namespace(admin, tenant_id, namespace_id, cfg.bench_shards)?;
-        // The control-plane apply hook hydrates each gateway's
-        // per-namespace registry asynchronously after the admin POST
-        // returns. Probe-and-wait so the first warmup PUT lands on a
-        // gateway that knows the namespace.
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-    let driver = build_driver(&cfg).await?;
+/// Counters + samples from one closed-loop workload pass.
+struct PassResult {
+    ops: u64,
+    errors: u64,
+    get_length_mismatches: u64,
+    /// Sorted latency samples (1 in 16 ops), microseconds.
+    samples: Vec<u32>,
+    elapsed: Duration,
+}
 
-    // Warmup keys for GetHeavy / Mixed. Each object gets DISTINCT,
-    // high-entropy content (`make_payload`) so content-addressed dedup
-    // does not collapse the whole run onto one chunk — which would make
-    // throughput meaningless (GH #102 / bench-realism). Warmup seeds use
-    // the top half of the seed space so they never alias workload seeds.
-    let warmup_keys: Vec<Key> = if matches!(cfg.shape, Shape::GetHeavy | Shape::Mixed) {
-        let n = cfg.warmup_objects.max(1);
-        let mut keys = Vec::with_capacity(n);
-        for i in 0..n {
-            let seed = (1u64 << 63) | i as u64;
-            keys.push(driver.put(&make_payload(cfg.object_size, seed)).await?);
-        }
-        keys
-    } else {
-        Vec::new()
-    };
-
-    // Workload.
+/// One closed-loop workload pass: `cfg.concurrency` workers, each
+/// keeping exactly one op in flight until `duration` elapses. The
+/// warm-up pass and the measured pass run this same loop — only the
+/// seed-space `phase` tag and what happens to the result differ.
+async fn run_pass(
+    driver: &Arc<dyn Driver>,
+    cfg: &BenchConfig,
+    warmup_keys: &[Key],
+    nonce: u128,
+    phase: u64,
+    duration: Duration,
+) -> PassResult {
     let ops = Arc::new(AtomicU64::new(0));
     let errs = Arc::new(AtomicU64::new(0));
+    let mismatches = Arc::new(AtomicU64::new(0));
     // Bounded latency sample buffer per worker — we sample every Nth
     // op to keep memory flat for long runs.
     let latency_samples = Arc::new(parking_lot::Mutex::new(Vec::<u32>::new()));
 
     let started = Instant::now();
-    let deadline = started + cfg.duration;
+    let deadline = started + duration;
     let mut handles = Vec::with_capacity(cfg.concurrency);
 
     for worker_id in 0..cfg.concurrency {
-        let driver = Arc::clone(&driver);
+        let driver = Arc::clone(driver);
         let ops = Arc::clone(&ops);
         let errs = Arc::clone(&errs);
+        let mismatches = Arc::clone(&mismatches);
         let latency_samples = Arc::clone(&latency_samples);
         let object_size = cfg.object_size;
-        let warmup_keys = warmup_keys.clone();
+        let warmup_keys = warmup_keys.to_vec();
         let shape = cfg.shape;
         handles.push(tokio::spawn(async move {
             // Each worker keeps its own local latency vec, flushed at
@@ -390,20 +457,31 @@ pub async fn run(cfg: BenchConfig) -> Result<BenchReport, String> {
                 };
                 let t0 = Instant::now();
                 let res = if is_put {
-                    // Distinct content per (worker, op) so dedup doesn't
-                    // collapse the write workload onto one chunk.
-                    let seed = (worker_id as u64).wrapping_shl(40) ^ n;
+                    // Distinct content per (nonce, phase, worker, op)
+                    // so dedup can't collapse the write workload —
+                    // across workers, passes, clients, OR re-runs.
+                    let seed = mix_seed(nonce, phase, worker_id as u64, n);
                     driver
                         .put(&make_payload(object_size, seed))
                         .await
-                        .map(|_| 0)
+                        .map(|_| ())
                 } else {
                     let idx = (worker_id + n_usize) % warmup_keys.len();
-                    driver.get(&warmup_keys[idx]).await
+                    // A GET must return exactly object_size bytes —
+                    // 0-byte / truncated responses are failures, not
+                    // throughput (#127-class regressions).
+                    match driver.get(&warmup_keys[idx]).await {
+                        Ok(len) if len == object_size => Ok(()),
+                        Ok(len) => {
+                            mismatches.fetch_add(1, Ordering::Relaxed);
+                            Err(format!("get returned {len} bytes, want {object_size}"))
+                        }
+                        Err(e) => Err(e),
+                    }
                 };
                 let elapsed_us = u32::try_from(t0.elapsed().as_micros()).unwrap_or(u32::MAX);
                 match res {
-                    Ok(_) => {
+                    Ok(()) => {
                         ops.fetch_add(1, Ordering::Relaxed);
                         // Sample 1 in 16 to keep memory bounded.
                         if n % 16 == 0 {
@@ -425,10 +503,87 @@ pub async fn run(cfg: BenchConfig) -> Result<BenchReport, String> {
     }
     let elapsed = started.elapsed();
 
-    let total_ops = ops.load(Ordering::Relaxed);
-    let total_errs = errs.load(Ordering::Relaxed);
     let mut samples = latency_samples.lock().clone();
     samples.sort_unstable();
+    PassResult {
+        ops: ops.load(Ordering::Relaxed),
+        errors: errs.load(Ordering::Relaxed),
+        get_length_mismatches: mismatches.load(Ordering::Relaxed),
+        samples,
+        elapsed,
+    }
+}
+
+/// Run the benchmark and emit a report on stdout. Returns the report
+/// so callers can inspect it programmatically.
+///
+/// # Errors
+/// Returns the underlying driver error if the endpoint scheme is
+/// unsupported, the connection fails, or the warmup PUTs fail.
+#[allow(clippy::too_many_lines)] // provision + warmup + measured pass + report wiring is intrinsically long
+pub async fn run(cfg: BenchConfig) -> Result<BenchReport, String> {
+    // Per-process nonce: every payload seed this run derives mixes it
+    // in, so no two runs (or concurrent clients) share a seed space.
+    let run_nonce = uuid::Uuid::new_v4();
+    let (tenant_id, namespace_id) = resolve_bench_ids(&cfg);
+    // Best-effort: provision the bench namespace before driving load.
+    // Only when --admin-endpoint is set; GCP runbook expects external
+    // provisioning via setup-shards.sh and leaves this unset.
+    if let Some(admin) = cfg.admin_endpoint.as_deref() {
+        provision_bench_namespace(admin, tenant_id, namespace_id, cfg.bench_shards)?;
+        // The control-plane apply hook hydrates each gateway's
+        // per-namespace registry asynchronously after the admin POST
+        // returns. Probe-and-wait so the first warmup PUT lands on a
+        // gateway that knows the namespace.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let driver = build_driver(&cfg).await?;
+
+    // Warmup keys for GetHeavy / Mixed. Each object gets DISTINCT,
+    // high-entropy content (`make_payload`) so content-addressed dedup
+    // does not collapse the whole run onto one chunk — which would make
+    // throughput meaningless (GH #102 / bench-realism). The
+    // PHASE_WARMUP_OBJECTS tag keeps these seeds disjoint from both
+    // loop phases.
+    let warmup_keys: Vec<Key> = if matches!(cfg.shape, Shape::GetHeavy | Shape::Mixed) {
+        let n = cfg.warmup_objects.max(1);
+        let mut keys = Vec::with_capacity(n);
+        for i in 0..n {
+            let seed = mix_seed(run_nonce.as_u128(), PHASE_WARMUP_OBJECTS, 0, i as u64);
+            keys.push(driver.put(&make_payload(cfg.object_size, seed)).await?);
+        }
+        keys
+    } else {
+        Vec::new()
+    };
+
+    // Discarded warm-up pass: same closed-loop shape, separate seed
+    // space, nothing lands in the report. Keeps the cold-ramp artifact
+    // out of the measured window for every shape (put-heavy included).
+    if cfg.warmup_secs > 0 {
+        let _ = run_pass(
+            &driver,
+            &cfg,
+            &warmup_keys,
+            run_nonce.as_u128(),
+            PHASE_WARMUP_LOOP,
+            Duration::from_secs(cfg.warmup_secs),
+        )
+        .await;
+    }
+
+    // Measured pass — the only one the report sees.
+    let pass = run_pass(
+        &driver,
+        &cfg,
+        &warmup_keys,
+        run_nonce.as_u128(),
+        PHASE_MEASURED,
+        cfg.duration,
+    )
+    .await;
+
+    let samples = &pass.samples;
     // Integer percentile: idx = floor(len * q). Avoids f64 casts at
     // the expense of slight non-interpolation — bench precision is
     // ±1 sample anyway.
@@ -445,24 +600,30 @@ pub async fn run(cfg: BenchConfig) -> Result<BenchReport, String> {
     // sane run (that's 4.5 PiB of data or 4.5 quadrillion ops), so
     // mantissa truncation cannot trigger here.
     #[allow(clippy::cast_precision_loss)]
-    let ops_per_sec = (total_ops as f64) / elapsed.as_secs_f64();
+    let ops_per_sec = (pass.ops as f64) / pass.elapsed.as_secs_f64();
     #[allow(clippy::cast_precision_loss)]
     let mib_per_sec =
-        (total_ops as f64 * cfg.object_size as f64) / (1024.0 * 1024.0 * elapsed.as_secs_f64());
+        (pass.ops as f64 * cfg.object_size as f64) / (1024.0 * 1024.0 * pass.elapsed.as_secs_f64());
 
     let report = BenchReport {
         protocol: driver.label().into(),
         shape: format!("{:?}", cfg.shape),
         concurrency: cfg.concurrency,
+        connections: cfg.connections,
         object_size: cfg.object_size,
-        duration_secs: elapsed.as_secs_f64(),
-        ops: total_ops,
-        errors: total_errs,
+        duration_secs: pass.elapsed.as_secs_f64(),
+        ops: pass.ops,
+        errors: pass.errors,
+        get_length_mismatches: pass.get_length_mismatches,
         ops_per_sec,
         mib_per_sec,
         p50_us: p(50, 100),
         p95_us: p(95, 100),
         p99_us: p(99, 100),
+        run_nonce: run_nonce.simple().to_string(),
+        client_id: cfg.client_id.clone().unwrap_or_else(default_client_id),
+        warmup_secs: cfg.warmup_secs,
+        max_error_rate: cfg.max_error_rate,
     };
 
     if cfg.json {
@@ -472,8 +633,12 @@ pub async fn run(cfg: BenchConfig) -> Result<BenchReport, String> {
         );
     } else {
         println!(
-            "protocol={} shape={} concurrency={} object_size={}",
-            report.protocol, report.shape, report.concurrency, report.object_size
+            "protocol={} shape={} concurrency={} connections={} object_size={}",
+            report.protocol,
+            report.shape,
+            report.concurrency,
+            report.connections,
+            report.object_size
         );
         println!(
             "ops={} throughput={:.1} op/s {:.2} MiB/s",
@@ -483,8 +648,15 @@ pub async fn run(cfg: BenchConfig) -> Result<BenchReport, String> {
             "latency_us p50={} p95={} p99={}",
             report.p50_us, report.p95_us, report.p99_us
         );
+        println!(
+            "client_id={} run_nonce={} warmup_secs={} max_error_rate={}",
+            report.client_id, report.run_nonce, report.warmup_secs, report.max_error_rate
+        );
         if report.errors > 0 {
-            println!("errors={}", report.errors);
+            println!(
+                "errors={} get_length_mismatches={}",
+                report.errors, report.get_length_mismatches
+            );
         }
     }
 
@@ -839,6 +1011,9 @@ mod tests {
             object_size: 1024,
             duration: Duration::from_secs(1),
             warmup_objects: 0,
+            warmup_secs: 0,
+            max_error_rate: 0.0,
+            client_id: None,
             json: false,
             tenant_id: None,
             namespace_id: None,
@@ -869,6 +1044,9 @@ mod tests {
             object_size: 1024,
             duration: Duration::from_secs(1),
             warmup_objects: 0,
+            warmup_secs: 0,
+            max_error_rate: 0.0,
+            client_id: None,
             json: false,
             tenant_id: None,
             namespace_id: None,
@@ -883,5 +1061,66 @@ mod tests {
             !err.is_empty(),
             "build_driver must produce a non-empty error message"
         );
+    }
+
+    // --- C-1: payload-seed derivation ---
+
+    #[test]
+    fn seed_spaces_disjoint_across_phases_workers_ops() {
+        let nonce = uuid::Uuid::new_v4().as_u128();
+        let mut seen = std::collections::HashSet::new();
+        for phase in [PHASE_WARMUP_OBJECTS, PHASE_WARMUP_LOOP, PHASE_MEASURED] {
+            for worker in 0..16u64 {
+                for op in 0..256u64 {
+                    assert!(
+                        seen.insert(mix_seed(nonce, phase, worker, op)),
+                        "seed collision at phase={phase} worker={worker} op={op}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn seed_is_nonce_sensitive() {
+        // Two runs (or two clients) must never share a payload stream —
+        // identical (phase, worker, op) under different nonces must
+        // produce different seeds AND different payload bytes.
+        let (n1, n2) = (
+            uuid::Uuid::new_v4().as_u128(),
+            uuid::Uuid::new_v4().as_u128(),
+        );
+        for op in 0..64u64 {
+            let (s1, s2) = (
+                mix_seed(n1, PHASE_MEASURED, 0, op),
+                mix_seed(n2, PHASE_MEASURED, 0, op),
+            );
+            assert_ne!(s1, s2, "nonce did not perturb seed at op={op}");
+            assert_ne!(
+                make_payload(4096, s1),
+                make_payload(4096, s2),
+                "payloads collided at op={op} — dedup trap"
+            );
+        }
+    }
+
+    // --- C-2: error-rate gate ---
+
+    #[test]
+    fn error_rate_gate_thresholds() {
+        // Default 0.0: any error trips the gate.
+        assert!(!error_rate_exceeded(100, 0, 0.0));
+        assert!(error_rate_exceeded(99, 1, 0.0));
+        // Strictly-greater-than semantics at a nonzero threshold.
+        assert!(!error_rate_exceeded(90, 10, 0.1)); // 10/100 == 0.1, not >
+        assert!(error_rate_exceeded(89, 11, 0.1)); // 11/100 > 0.1
+    }
+
+    #[test]
+    fn error_rate_gate_rejects_zero_op_runs() {
+        // A run that completed nothing is a functional break, not a
+        // clean pass — it must trip the gate at any threshold.
+        assert!(error_rate_exceeded(0, 0, 0.0));
+        assert!(error_rate_exceeded(0, 0, 1.0));
     }
 }

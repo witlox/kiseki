@@ -264,6 +264,100 @@ kiseki-admin --endpoint http://10.0.0.10:9090 device evacuate <device-id>
 (Per-tenant **quota** enforcement is deferred on the IAM milestone — see
 ADR-045 §D6; these device/pool ops are operator-scoped and need no identity.)
 
+## #212 saturation A/B (small-object / intent fsync arms)
+
+The A/B varies the per-write fsync posture of the small-object store and
+the per-shard intent stores. **Both knobs default to the post-#217
+group-commit mode — with no arm file, both "arms" measure the same
+thing and the A/B is a silent null result** (C-4, 2026-06-10
+bench-correctness review). Run at `--object-size 4096` (≤ the inline
+threshold) or the knobs under test never fire.
+
+### Arm swap (write the arm file on ALL storage nodes, restart, verify)
+
+The systemd unit (`scripts/setup-raw-storage.sh`) reads
+`EnvironmentFile=-/etc/kiseki/perf-arm.env` — optional file, values
+override the unit's `Environment=` lines. Swap arms WITHOUT editing the
+unit:
+
+```bash
+# Arm STRICT (per-write fsync — the pre-#217 posture):
+for n in 1 2 3 4 5 6; do
+  gcloud compute ssh "kiseki-storage-$n" ... --command="sudo bash -c '
+    mkdir -p /etc/kiseki
+    printf \"KISEKI_SMALL_OBJECT_FLUSH_INTERVAL_MS=0\nKISEKI_INTENT_FLUSH_INTERVAL_MS=0\n\" > /etc/kiseki/perf-arm.env
+    systemctl restart kiseki-server'"
+done
+
+# Arm GROUP-COMMIT (100 ms — the post-#217 default, but write it
+# EXPLICITLY so the artifact records the arm, not an absence):
+#   ... same loop with =100 for both knobs ...
+```
+
+**Verify the EFFECTIVE mode on every node — the boot log line is truth,
+the env file is only intent:**
+
+```bash
+journalctl -u kiseki-server -b | grep -E 'intent store: (strict|group commit)|small object store'
+# strict arm  → "intent store: strict per-write fsync (KISEKI_INTENT_FLUSH_INTERVAL_MS=0)"
+#               + "small object store: … group_commit=false"
+# group arm   → "intent store: group commit (page-cache per write + periodic fsync, #212)"
+#               + "small object store: … group_commit=true flush_interval_ms=100"
+```
+
+`phases/00-health.sh` snapshots `/etc/kiseki/perf-arm.env` from
+storage-1 into the results dir (`ARM-DEFAULT` when absent), so every
+run's artifacts carry the arm label. Re-run phase 00 after every swap.
+
+### 3×3 sweep loop (per arm)
+
+Phases 10/11 honor `BENCH_CONCURRENCY` / `BENCH_CONNECTIONS` and embed
+the cell label `conc<N>-conn<M>` in every output file, so cells never
+overwrite each other:
+
+```bash
+cd /opt/kiseki-bench
+for conc in 64 128 256; do
+  for conn in 1 4 8; do
+    # warm pass — DISCARD (see warm-run discipline below)
+    BENCH_CONCURRENCY=$conc BENCH_CONNECTIONS=$conn KISEKI_BENCH_OBJECT_SIZE=4096 \
+      ./bench run 11-native-parallel || break 2
+    # measured pass (same cell label — overwrites the warm pass's files,
+    # which is the discard)
+    BENCH_CONCURRENCY=$conc BENCH_CONNECTIONS=$conn KISEKI_BENCH_OBJECT_SIZE=4096 \
+      ./bench run 11-native-parallel || break 2
+  done
+done
+```
+
+Phase 11 spreads client *i* → storage node *i mod N* native endpoints
+by default (all-clients-at-one-leader pays the forward-to-leader hop on
+(N-1)/N of writes — the verified ~8× crush). `BENCH_SINGLE_ENDPOINT=1`
+restores the old single-leader aim if you specifically want to measure
+that.
+
+### Warm-run discipline
+
+The first pass per cell is the ramp: cold connection pools, cold
+DecryptCache, fjall journal growth — a known ~2× artifact inside the
+measured window. **Discard the first pass per cell** (the loop above
+runs each cell twice; the second pass's files are the keepers). The
+bench also has `--warmup-secs` for in-process warm-up outside the
+measured clock — prefer it for hand-driven runs; the double-pass loop
+is the belt-and-braces for everything the in-process warm-up can't
+touch (server-side caches survive between passes).
+
+### Halt-on-error contract
+
+Every phase that drives `kiseki-client bench` now (a) propagates the
+bench exit code and (b) independently sums the report JSONs' `errors`
+field — either non-zero → the phase logs `HALT` and exits 2, and the
+`bench` driver stops the run. **Never quote numbers from a run that
+halted** — investigate the break first (standing rule: no perf numbers
+while ops are 500ing). A halted cell invalidates the whole arm sweep
+until the cause is understood, because an error-rate change between
+arms means the arms are no longer measuring the same workload.
+
 ## 5. Tear down IMMEDIATELY when done (~$13-18/hr)
 ```bash
 cd infra/gcp && terraform destroy -auto-approve

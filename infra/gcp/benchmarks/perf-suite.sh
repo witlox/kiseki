@@ -184,9 +184,15 @@ node_ssh "$FIRST_CLIENT" "
     # direct_io). Use dd with conv=fdatasync so the fsync time is
     # included in the elapsed total — that gives real gateway
     # throughput rather than memcpy-to-page-cache speed.
-    echo '  Sequential write (dd 1GB, bs=1M, conv=fdatasync — fsync in elapsed):'
+    echo '  Sequential write (dd 1GB random, bs=1M, conv=fdatasync — fsync in elapsed):'
     rm -f /mnt/kiseki-fuse/dd-write 2>/dev/null
-    DD_OUT=\$(dd if=/dev/zero of=/mnt/kiseki-fuse/dd-write bs=1M count=1024 conv=fdatasync 2>&1 | tail -1)
+    # F7: /dev/zero dedups to one chunk → measures the refcount path.
+    # Random source generated OUTSIDE the timed dd (fresh per run →
+    # also defeats cross-run dedup); the timed write reads it
+    # page-cache-warm.
+    dd if=/dev/urandom of=/tmp/kiseki-bench-rand-1g bs=1M count=1024 2>/dev/null
+    DD_OUT=\$(dd if=/tmp/kiseki-bench-rand-1g of=/mnt/kiseki-fuse/dd-write bs=1M conv=fdatasync 2>&1 | tail -1)
+    rm -f /tmp/kiseki-bench-rand-1g
     echo \"    \$DD_OUT\"
 
     echo '  Sequential read (dd 1GB, bs=1M, page cache dropped):'
@@ -231,7 +237,10 @@ node_ssh "$FIRST_CLIENT" "
   LATS=''
   for i in \$(seq 1 100); do
     S=\$(date +%s%N)
-    echo 'x' | curl -sf -X PUT \"\$EP/perf-seq/lat-\$i\" --data-binary @- >/dev/null
+    # F7: unique random bytes per object — a constant payload makes
+    # every PUT after the first a dedup hit (refcount path, not the
+    # write path). Also matches the advertised 1KB size.
+    head -c 1024 /dev/urandom | curl -sf -X PUT \"\$EP/perf-seq/lat-\$i\" --data-binary @- >/dev/null
     E=\$(date +%s%N)
     LATS=\"\$LATS \$(( (E - S) / 1000 ))\"
   done

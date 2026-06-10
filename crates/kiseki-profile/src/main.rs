@@ -110,6 +110,13 @@ enum Cli {
 }
 
 #[derive(Parser, Debug)]
+#[command(
+    after_help = "Data dirs default to tempfile::tempdir(), which on most Linux \
+distros lands on tmpfs /tmp — there fsync is ~free, so durability/fsync A/Bs (e.g. \
+KISEKI_SMALL_OBJECT_FLUSH_INTERVAL_MS / KISEKI_INTENT_FLUSH_INTERVAL_MS arms) measure \
+nothing. Set KISEKI_PROFILE_DATA_ROOT to a real-disk path (or TMPDIR) to put per-run \
+data dirs on durable media; they are removed on exit like the tempdir."
+)]
 struct RunArgs {
     /// Which data-path protocol to drive.
     #[arg(long, value_enum)]
@@ -341,9 +348,17 @@ async fn run(args: RunArgs) -> Result<(), String> {
             "[warmup] pre-creating {} objects of {} bytes",
             args.warmup_objects, args.object_size,
         );
-        let payload: Arc<[u8]> = vec![0xa5u8; args.object_size].into();
+        // Stamp the object index + a per-run nonce into every warmup
+        // buffer. A shared constant-0xa5 payload made all warmup
+        // objects dedup server-side to ONE stored object — the GET
+        // working set was a single composition, not warmup_objects of
+        // them. The nonce keeps re-runs against a persisted store
+        // from deduping into the previous run's objects.
+        let run_nonce: u64 = uuid::Uuid::new_v4().as_u64_pair().0;
+        let mut payload = vec![0xa5u8; args.object_size];
         let mut keys = Vec::with_capacity(args.warmup_objects);
-        for _ in 0..args.warmup_objects {
+        for i in 0..args.warmup_objects {
+            stamp_prefix(&mut payload, i as u64, run_nonce);
             let key = driver
                 .put(&payload)
                 .await
@@ -360,7 +375,8 @@ async fn run(args: RunArgs) -> Result<(), String> {
 
     let payload: Arc<[u8]> = vec![0xa5u8; args.object_size].into();
     let stats = Arc::new(stats::Stats::new());
-    let deadline = Instant::now() + Duration::from_secs(args.duration_secs);
+    let workload_start = Instant::now();
+    let deadline = workload_start + Duration::from_secs(args.duration_secs);
 
     let mut handles = Vec::with_capacity(args.concurrency);
     for worker_id in 0..args.concurrency {
@@ -386,11 +402,11 @@ async fn run(args: RunArgs) -> Result<(), String> {
         let _ = h.await;
     }
 
-    let elapsed = (deadline - Instant::now())
-        .checked_sub(Duration::from_secs(0))
-        .map_or(Duration::from_secs(args.duration_secs), |_| {
-            Duration::from_secs(args.duration_secs)
-        });
+    // Actual wall clock from workload start to last worker joined —
+    // workers overrun the deadline by up to one in-flight op, so the
+    // nominal --duration-secs under-states the window and inflates
+    // ops/s.
+    let elapsed = workload_start.elapsed();
     let report = stats.report(args.object_size, elapsed);
 
     println!(
@@ -411,6 +427,26 @@ async fn run(args: RunArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// Mixed-shape op selector: over every 10 consecutive op indices,
+/// 0..6 → PUT and 7..9 → GET — exactly 70/30. The index MUST advance
+/// by exactly one per issued op: the previous implementation shared
+/// this counter with the GET key cursor, consuming two ticks per GET
+/// and skewing the mix to ~75/25.
+fn mixed_pick_get(op_index: u64) -> bool {
+    (op_index % 10) >= 7
+}
+
+/// Stamp `(a, b)` little-endian into the first (up to) 16 bytes of
+/// `buf` so the payload's `chunk_id = SHA-256(plaintext)` is unique
+/// per stamp. Buffers shorter than 16 bytes get a truncated stamp.
+fn stamp_prefix(buf: &mut [u8], a: u64, b: u64) {
+    let mut stamp = [0u8; 16];
+    stamp[..8].copy_from_slice(&a.to_le_bytes());
+    stamp[8..].copy_from_slice(&b.to_le_bytes());
+    let n = buf.len().min(16);
+    buf[..n].copy_from_slice(&stamp[..n]);
+}
+
 async fn worker(
     worker_id: usize,
     driver: Arc<dyn protocols::Driver>,
@@ -420,8 +456,11 @@ async fn worker(
     stats: Arc<stats::Stats>,
     deadline: Instant,
 ) {
-    use std::cell::Cell;
-    let counter: Cell<u64> = Cell::new(worker_id as u64);
+    // op_n drives the Mixed put/get selector and advances exactly
+    // once per issued op; get_n is the separate GET key round-robin
+    // cursor. Both start at worker_id to stagger workers' phases.
+    let mut op_n: u64 = worker_id as u64;
+    let mut get_n: u64 = worker_id as u64;
     // Per-worker mutable PUT buffer. Pre-prod the harness used a
     // single shared `Arc<[u8]>` of `0xa5` bytes for every worker on
     // every PUT — same content, same `chunk_id = SHA-256(plaintext)`,
@@ -443,33 +482,24 @@ async fn worker(
         let pick_get = match shape {
             Shape::PutHeavy => false,
             Shape::GetHeavy => true,
-            Shape::Mixed => {
-                // Cheap rotating selector: 0..6 → put, 7..9 → get.
-                let n = counter.get();
-                counter.set(n.wrapping_add(1));
-                (n % 10) >= 7
-            }
+            Shape::Mixed => mixed_pick_get(op_n),
         };
+        op_n = op_n.wrapping_add(1);
         let start = Instant::now();
         let result = if pick_get {
             if warmup_keys.is_empty() {
                 stats.record_error();
                 continue;
             }
-            let n = counter.get();
-            counter.set(n.wrapping_add(1));
-            let key = &warmup_keys[usize::try_from(n).unwrap_or(0) % warmup_keys.len()];
+            let key = &warmup_keys[usize::try_from(get_n).unwrap_or(0) % warmup_keys.len()];
+            get_n = get_n.wrapping_add(1);
             driver.get(key).await.map(|_| ())
         } else {
-            // Stamp a unique (worker, op, salt) prefix so each PUT's
-            // chunk_id is unique. 16 bytes is sufficient for SHA-256
-            // to produce a different output even on a 64 KiB buffer
-            // whose remaining bytes are identical.
-            if put_buf.len() >= 16 {
-                put_buf[0..8]
-                    .copy_from_slice(&((worker_id as u64).wrapping_shl(40) ^ put_n).to_le_bytes());
-                put_buf[8..16].copy_from_slice(&salt.to_le_bytes());
-            }
+            stamp_prefix(
+                &mut put_buf,
+                (worker_id as u64).wrapping_shl(40) ^ put_n,
+                salt,
+            );
             put_n = put_n.wrapping_add(1);
             driver.put(&put_buf).await.map(|_| ())
         };
@@ -484,5 +514,44 @@ async fn worker(
                 stats.record_error();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mixed_pick_get, stamp_prefix};
+
+    #[test]
+    fn mixed_shape_is_exactly_70_30() {
+        // Period is 10, so any 1000-op window — regardless of the
+        // worker's staggered start — must contain exactly 300 GETs.
+        for start in [0u64, 1, 3, 7, 9, 12_345] {
+            let gets = (start..start + 1000).filter(|&n| mixed_pick_get(n)).count();
+            assert_eq!(gets, 300, "start={start}");
+        }
+    }
+
+    #[test]
+    fn stamp_prefix_distinguishes_payloads() {
+        let mut a = vec![0xa5u8; 64];
+        let mut b = vec![0xa5u8; 64];
+        stamp_prefix(&mut a, 1, 99);
+        stamp_prefix(&mut b, 2, 99);
+        assert_ne!(a, b, "different index, same nonce");
+        let mut c = vec![0xa5u8; 64];
+        stamp_prefix(&mut c, 1, 100);
+        assert_ne!(a, c, "same index, different nonce");
+        // Tail beyond the 16-byte stamp is untouched.
+        assert!(a[16..].iter().all(|&x| x == 0xa5));
+    }
+
+    #[test]
+    fn stamp_prefix_truncates_on_short_buffers() {
+        let mut short = vec![0u8; 4];
+        stamp_prefix(&mut short, 0x0403_0201, u64::MAX);
+        assert_eq!(short, [1, 2, 3, 4]);
+        let mut empty: Vec<u8> = Vec::new();
+        stamp_prefix(&mut empty, 7, 7);
+        assert!(empty.is_empty());
     }
 }

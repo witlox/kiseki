@@ -324,6 +324,19 @@ Environment=KISEKI_RAFT_FLUSH_INTERVAL_MS=100
 Environment=KISEKI_COMPOSITION_FLUSH_INTERVAL_MS=100
 Environment=KISEKI_CHUNK_FLUSH_INTERVAL_MS=100
 
+# #212 / #217 A/B arm control: per-arm overrides (e.g.
+# KISEKI_SMALL_OBJECT_FLUSH_INTERVAL_MS / KISEKI_INTENT_FLUSH_INTERVAL_MS,
+# both default to 100 ms group commit; =0 = strict per-write fsync)
+# live in /etc/kiseki/perf-arm.env so operators swap arms by writing
+# that file and restarting kiseki-server — no unit edit. The dash
+# prefix makes the file optional (no error when absent); values in
+# it OVERRIDE the Environment= lines above (systemd.exec: environment
+# files apply after Environment=). phases/00-health.sh snapshots the
+# file into the results dir so every run records its arm.
+# (Comment hygiene: this unit is rendered through an UNQUOTED heredoc,
+# so backticks in comments would EXECUTE at boot time — never add any.)
+EnvironmentFile=-/etc/kiseki/perf-arm.env
+
 # 2026-06-01 — Raft TCP transport per-peer connection cap. The in-code
 # default was raised to 256 in the same commit that added these lines;
 # they are written here explicitly so future operators see the choice
@@ -359,6 +372,10 @@ Environment=KISEKI_PPROF_OUT=/var/log/kiseki-pprof.svg
 [Install]
 WantedBy=multi-user.target
 EOF
+
+# Arm-file directory must exist so operators can write perf-arm.env
+# without a mkdir dance (the file itself stays optional).
+mkdir -p /etc/kiseki
 
 systemctl daemon-reload
 systemctl enable kiseki-server

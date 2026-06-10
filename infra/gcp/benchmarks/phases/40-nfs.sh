@@ -135,7 +135,9 @@ elif [ "$MODE" = "gcp" ]; then
   # fragile through the heredoc → client_run → remote-shell layers (it was
   # never confirmed to emit on a real gcp run; the 2026-05-27 numbers came
   # from hand-driven fio). `WRITE:` / `READ:` summary lines are stable.
-  client_run 0 <<EOF | tee -a "$OUT"
+  # pipefail is set, so the remote rc (exit 1 on any mount failure)
+  # survives the tee — C-2: a failed pass must halt, not print "OK".
+  client_run 0 <<EOF | tee -a "$OUT" || { echo "HALT: gcp NFS pass failed (rc != 0 — mount or remote-shell failure)" | tee -a "$OUT"; exit 2; }
 mkdir -p /mnt/kiseki-nfs
 umount /mnt/kiseki-nfs 2>/dev/null
 

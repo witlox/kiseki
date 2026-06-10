@@ -924,6 +924,9 @@ fn handle_bench(args: &[String]) {
     let mut object_size: usize = 65_536;
     let mut duration_secs: u64 = 30;
     let mut warmup_objects: usize = 256;
+    let mut warmup_secs: u64 = 5;
+    let mut max_error_rate: f64 = 0.0;
+    let mut client_id: Option<String> = None;
     let mut json = false;
     let mut tenant_id_override: Option<kiseki_common::ids::OrgId> = None;
     let mut namespace_id_override: Option<kiseki_common::ids::NamespaceId> = None;
@@ -995,6 +998,24 @@ fn handle_bench(args: &[String]) {
                     .unwrap_or(warmup_objects);
                 i += 2;
             }
+            "--warmup-secs" => {
+                warmup_secs = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(warmup_secs);
+                i += 2;
+            }
+            "--max-error-rate" => {
+                max_error_rate = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(max_error_rate);
+                i += 2;
+            }
+            "--client-id" => {
+                client_id = args.get(i + 1).cloned();
+                i += 2;
+            }
             "--json" => {
                 json = true;
                 i += 1;
@@ -1052,6 +1073,15 @@ OPTIONS:
     --object-size <bytes>     payload size     (default: 65536)
     --duration-secs <N>       wall-clock cap   (default: 30)
     --warmup-objects <N>      pre-populate for GET shapes (default: 256)
+    --warmup-secs <N>         discarded warm-up pass before the measured
+                              clock starts — same closed-loop workload,
+                              all counters/samples thrown away
+                              (default: 5; 0 disables)
+    --max-error-rate <f>      exit 2 when failed/total exceeds this,
+                              after the report prints (default: 0.0 —
+                              any error fails the run)
+    --client-id <id>          client identity recorded in the report
+                              (default: kernel hostname)
     --json                    machine-readable single-line JSON
     --tenant <uuid>           override the bench tenant_id
                               (default: UUIDv5(NAMESPACE_DNS, \"kiseki-bench-tenant\"))
@@ -1116,6 +1146,9 @@ NAMESPACE PROVISIONING:
         object_size,
         duration: std::time::Duration::from_secs(duration_secs),
         warmup_objects,
+        warmup_secs,
+        max_error_rate,
+        client_id,
         json,
         tenant_id: tenant_id_override,
         namespace_id: namespace_id_override,
@@ -1128,9 +1161,28 @@ NAMESPACE PROVISIONING:
         .thread_name("kiseki-bench")
         .build()
         .expect("tokio runtime");
-    if let Err(e) = rt.block_on(kiseki_client::bench::run(cfg)) {
-        eprintln!("bench failed: {e}");
-        std::process::exit(1);
+    match rt.block_on(kiseki_client::bench::run(cfg)) {
+        Ok(report) => {
+            // C-2: never exit 0 on a functionally-broken run. The
+            // report (human or JSON) has already printed by now.
+            if kiseki_client::bench::error_rate_exceeded(
+                report.ops,
+                report.errors,
+                report.max_error_rate,
+            ) {
+                eprintln!(
+                    "bench error-rate gate: {} errors / {} total ops exceeds --max-error-rate {}",
+                    report.errors,
+                    report.ops + report.errors,
+                    report.max_error_rate
+                );
+                std::process::exit(2);
+            }
+        }
+        Err(e) => {
+            eprintln!("bench failed: {e}");
+            std::process::exit(1);
+        }
     }
 }
 

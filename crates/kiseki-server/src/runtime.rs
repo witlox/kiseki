@@ -1448,6 +1448,16 @@ pub async fn run_main(
     // Only fires `set_shard_config` when the new value differs from
     // the current — keeps the Raft log noise-free and avoids spurious
     // apply-hook work.
+    //
+    // KISEKI_INLINE_THRESHOLD_RECOMPUTE_S sets the poll interval
+    // (default 60 s). `0` disables the task entirely — nothing is
+    // spawned and each shard's inline threshold stays wherever it was
+    // last committed (benchmark runs pin the small-object path this
+    // way). Unset or unparsable keeps the default.
+    let recompute_interval_s = std::env::var("KISEKI_INLINE_THRESHOLD_RECOMPUTE_S")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(60);
     // ADR-030 §3 — gateway slot the recompute task pushes the
     // committed per-shard threshold into. Constructed here so the
     // task can capture a clone; the gateway-build block below stores
@@ -1457,7 +1467,11 @@ pub async fn run_main(
     let gateway_for_threshold_push: Arc<
         parking_lot::RwLock<Option<std::sync::Weak<kiseki_gateway::InMemoryGateway>>>,
     > = Arc::new(parking_lot::RwLock::new(None));
-    if let Some(ref shard_store_for_recompute) = raft_shard_store_for_admin {
+    if recompute_interval_s == 0 {
+        tracing::info!(
+            "ADR-030 inline-threshold recompute task disabled (KISEKI_INLINE_THRESHOLD_RECOMPUTE_S=0)"
+        );
+    } else if let Some(ref shard_store_for_recompute) = raft_shard_store_for_admin {
         let store = Arc::clone(shard_store_for_recompute);
         let metrics_for_recompute = metrics.clone();
         let gateway_slot = Arc::clone(&gateway_for_threshold_push);
@@ -1474,11 +1488,6 @@ pub async fn run_main(
             .filter(|(id, _)| *id != cfg.node_id)
             .map(|(_, addr)| metrics_url_from_raft_peer(addr))
             .collect();
-        let interval_s = std::env::var("KISEKI_INLINE_THRESHOLD_RECOMPUTE_S")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|s| *s > 0)
-            .unwrap_or(60);
         let mbps_limit = std::env::var("KISEKI_RAFT_INLINE_MBPS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -1487,7 +1496,8 @@ pub async fn run_main(
         tokio::spawn(async move {
             use std::collections::HashMap;
             use std::time::Instant;
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_s));
+            let mut tick =
+                tokio::time::interval(std::time::Duration::from_secs(recompute_interval_s));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Per-shard throughput guards live for the lifetime of the
             // task (one entry per shard the leader has seen). On
@@ -1502,7 +1512,8 @@ pub async fn run_main(
             // `min(soft_limit)` aggregation. Survives scrape errors
             // up to `voter_soft_limit_stale_after`; beyond that the
             // stale value is dropped.
-            let voter_soft_limit_stale_after = std::time::Duration::from_secs(interval_s * 3);
+            let voter_soft_limit_stale_after =
+                std::time::Duration::from_secs(recompute_interval_s * 3);
             let mut peer_soft_limit_cache: HashMap<String, (u64, Instant)> = HashMap::new();
             loop {
                 tick.tick().await;
@@ -1642,7 +1653,7 @@ pub async fn run_main(
             }
         });
         tracing::info!(
-            interval_s,
+            interval_s = recompute_interval_s,
             mbps_limit,
             "ADR-030 inline-threshold recompute task spawned (leader-only per shard)",
         );

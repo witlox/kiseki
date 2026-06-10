@@ -13,6 +13,9 @@ Each script:
    `$ALL_STORAGE`, `discover_leader`, and the metric / fio helpers.
 2. Writes its output files under `$RESULTS/` — typically
    `$RESULTS/<phase-name>.txt` plus any auxiliary metric snapshots.
+   Sweep-aware phases (10, 11) append the cell label
+   `conc<BENCH_CONCURRENCY>-conn<BENCH_CONNECTIONS>` so sweep cells
+   never overwrite each other.
 3. Exits with:
    - `0` — phase completed (raw numbers should be checked; "low
      throughput" is NOT a halt — only "stop the run" conditions are).
