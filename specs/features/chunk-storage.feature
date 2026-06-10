@@ -97,6 +97,14 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
   # distribution lands in 16b. Each peer holds the whole envelope at
   # `fragment_index = 0`. Spec: phase-16-cross-node-chunks.md (rev 4),
   # ADR-005, ADR-026.
+  #
+  # Visibility contract (ADR-047 §F-3 / I-CS2, P4 #226/#227): the
+  # composition row is volatile-at-ack on async surfaces — the ingress
+  # node serves it from the CompositionStore overlay immediately, and
+  # cross-node visibility is BOUNDED-STALE (hydration ≤ ~100 ms poll +
+  # drain). The chunk-id discovery sweep below therefore polls with a
+  # bounded 2 s budget (`composition_chunks_any_node`); the fragment-
+  # PLACEMENT assertions stay strict.
 
   @integration @multi-node @cross-node
   Scenario: Replication-3 places one fragment on each node
@@ -112,7 +120,9 @@ Feature: Chunk Storage - Encrypted chunk persistence, placement, and lifecycle
   # (DELETE /admin/test/chunk/{id}/fragment/{idx}; gated by
   # KISEKI_ENABLE_TEST_KNOBS=1). Drops node-2's local fragment
   # AFTER the PUT lands (so dedup isn't an issue), then reads
-  # via node-2 — local miss must fall back to fabric.
+  # via node-2 — local miss must fall back to fabric. Chunk-id
+  # discovery uses the same bounded-stale sweep as above (ADR-047
+  # async-ack visibility).
   @integration @multi-node @cross-node
   Scenario: Read falls back to fabric when local fragment is missing
     Given a 3-node kiseki cluster

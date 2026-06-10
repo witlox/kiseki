@@ -1208,6 +1208,31 @@ impl StorageAdminService for StorageAdminGrpc {
                 *mid = source_info.range_start[i] / 2 + source_info.range_end[i] / 2;
             }
 
+            // P3a refusal gate (GH #223, error-taxonomy 41b23b5):
+            // split redistribution replays the source's delta history
+            // from sequence 1; once watermark-advance GC has pruned
+            // the log (gc boundary > 1) that replay would silently
+            // lose every upper-half key whose only deltas are gone.
+            // Refuse FAIL-FAST — before the control-plane RecordSplit
+            // — so a refused split leaves no dangling topology entry
+            // or empty per-shard Raft group behind. The deep gate
+            // inside `redistribute_upper_half` still guards the
+            // replay itself (defense in depth against the boundary
+            // advancing between this check and step 3).
+            // FAILED_PRECONDITION mirrors `kiseki_log::grpc::
+            // to_status` — retrying cannot un-prune history; the
+            // compacted-replay unlock is #223/#230 follow-up.
+            let boundary = log.gc_boundary(shard).await.map_or(0, |b| b.0);
+            if boundary > 1 {
+                return Err(Status::failed_precondition(
+                    kiseki_log::error::LogError::DeltaLogPruned {
+                        shard_id: shard,
+                        gc_boundary: boundary,
+                    }
+                    .to_string(),
+                ));
+            }
+
             if let Some(ctrl) = self.cluster_control.as_ref() {
                 // 1. Replicate the topology mutation. Apply hook on
                 //    every node registers the new shard's per-shard
@@ -1278,6 +1303,14 @@ impl StorageAdminService for StorageAdminGrpc {
                     Ok(_) => break,
                     Err(kiseki_log::error::LogError::ShardNotFound(_)) => {
                         return Err(Status::not_found(format!("shard {} not found", r.shard_id)));
+                    }
+                    // P3a (GH #223): typed refusal — surface as
+                    // FAILED_PRECONDITION (matches `kiseki_log::grpc::
+                    // to_status`), not an opaque INTERNAL. Reached
+                    // only when the boundary advanced between the
+                    // fail-fast gate above and this step.
+                    Err(e @ kiseki_log::error::LogError::DeltaLogPruned { .. }) => {
+                        return Err(Status::failed_precondition(format!("split: {e}")));
                     }
                     Err(e)
                         if matches!(
@@ -1355,6 +1388,25 @@ impl StorageAdminService for StorageAdminGrpc {
                     .map_err(|e| Status::internal(format!("merge: read right: {e}")))?;
                 let new_range_start = l_info.range_start.min(r_info.range_start);
                 let new_range_end = l_info.range_end.max(r_info.range_end);
+                // P3a refusal gate (GH #223) — same fail-fast as
+                // SplitShard: the merge copy phase replays BOTH
+                // inputs' full delta history from sequence 1, so a
+                // pruned log on either side refuses BEFORE the
+                // control-plane RecordMerge mutates topology. The
+                // deep gate in `merge::copy_phase` still guards the
+                // copy itself.
+                for s in [left, right] {
+                    let boundary = log.gc_boundary(s).await.map_or(0, |b| b.0);
+                    if boundary > 1 {
+                        return Err(Status::failed_precondition(
+                            kiseki_log::error::LogError::DeltaLogPruned {
+                                shard_id: s,
+                                gc_boundary: boundary,
+                            }
+                            .to_string(),
+                        ));
+                    }
+                }
                 let cmd = crate::cluster_control::ControlCommand::RecordMerge {
                     namespace_id: self.bootstrap_namespace.clone(),
                     surviving_shard_id: left,
@@ -1364,12 +1416,18 @@ impl StorageAdminService for StorageAdminGrpc {
                 };
                 submit_with_leader_retry(ctrl.as_ref(), cmd, "merge").await?;
             }
-            log.merge_shards(left, right).map_err(|e| {
-                if matches!(e, kiseki_log::error::LogError::ShardNotFound(_)) {
+            log.merge_shards(left, right).map_err(|e| match e {
+                kiseki_log::error::LogError::ShardNotFound(_) => {
                     Status::not_found(format!("merge: {e}"))
-                } else {
-                    Status::internal(format!("merge: {e}"))
                 }
+                // P3a (GH #223): merge copies the retiring shard's
+                // full delta history — same typed refusal as split
+                // once the log is pruned. FAILED_PRECONDITION
+                // mirrors `kiseki_log::grpc::to_status`.
+                kiseki_log::error::LogError::DeltaLogPruned { .. } => {
+                    Status::failed_precondition(format!("merge: {e}"))
+                }
+                _ => Status::internal(format!("merge: {e}")),
             })?;
             Ok(Response::new(pb::MergeShardsResponse {
                 merged_shard_id: left.0.to_string(),
@@ -3109,6 +3167,168 @@ mod tests {
             }))
             .await;
         assert_eq!(r.expect_err("err").code(), Code::NotFound);
+    }
+
+    /// Delegating `LogOps` wrapper whose `gc_boundary` reports a
+    /// pruned delta log. Pins the P3a fail-fast refusal gate
+    /// (GH #223, error-taxonomy 41b23b5): `SplitShard` on a pruned
+    /// shard must refuse with `FAILED_PRECONDITION` — the typed
+    /// `DeltaLogPruned` class, not an opaque INTERNAL — and must do
+    /// so BEFORE any topology mutation.
+    struct PrunedBoundaryLog {
+        inner: Arc<dyn LogOps + Send + Sync>,
+        boundary: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl LogOps for PrunedBoundaryLog {
+        async fn append_delta(
+            &self,
+            req: kiseki_log::traits::AppendDeltaRequest,
+        ) -> Result<kiseki_common::ids::SequenceNumber, kiseki_log::error::LogError> {
+            self.inner.append_delta(req).await
+        }
+        async fn put_intent_and_fan(
+            &self,
+            shard_id: ShardId,
+            intent: kiseki_log::intent::WriteIntent,
+        ) -> Result<(), kiseki_log::error::LogError> {
+            self.inner.put_intent_and_fan(shard_id, intent).await
+        }
+        async fn read_deltas(
+            &self,
+            req: kiseki_log::traits::ReadDeltasRequest,
+        ) -> Result<Vec<kiseki_log::delta::Delta>, kiseki_log::error::LogError> {
+            self.inner.read_deltas(req).await
+        }
+        async fn shard_health(
+            &self,
+            shard_id: ShardId,
+        ) -> Result<kiseki_log::shard::ShardInfo, kiseki_log::error::LogError> {
+            self.inner.shard_health(shard_id).await
+        }
+        async fn gc_boundary(
+            &self,
+            _shard_id: ShardId,
+        ) -> Result<kiseki_common::ids::SequenceNumber, kiseki_log::error::LogError> {
+            Ok(kiseki_common::ids::SequenceNumber(self.boundary))
+        }
+        async fn set_maintenance(
+            &self,
+            shard_id: ShardId,
+            enabled: bool,
+        ) -> Result<(), kiseki_log::error::LogError> {
+            self.inner.set_maintenance(shard_id, enabled).await
+        }
+        async fn truncate_log(
+            &self,
+            shard_id: ShardId,
+        ) -> Result<kiseki_common::ids::SequenceNumber, kiseki_log::error::LogError> {
+            self.inner.truncate_log(shard_id).await
+        }
+        async fn compact_shard(
+            &self,
+            shard_id: ShardId,
+        ) -> Result<u64, kiseki_log::error::LogError> {
+            self.inner.compact_shard(shard_id).await
+        }
+        fn create_shard(
+            &self,
+            shard_id: ShardId,
+            tenant_id: kiseki_common::ids::OrgId,
+            node_id: kiseki_common::ids::NodeId,
+            config: kiseki_log::shard::ShardConfig,
+        ) {
+            self.inner
+                .create_shard(shard_id, tenant_id, node_id, config);
+        }
+        fn update_shard_range(
+            &self,
+            shard_id: ShardId,
+            range_start: [u8; 32],
+            range_end: [u8; 32],
+        ) {
+            self.inner
+                .update_shard_range(shard_id, range_start, range_end);
+        }
+        fn set_shard_state(&self, shard_id: ShardId, state: kiseki_log::shard::ShardState) {
+            self.inner.set_shard_state(shard_id, state);
+        }
+        fn set_shard_config(&self, shard_id: ShardId, config: kiseki_log::shard::ShardConfig) {
+            self.inner.set_shard_config(shard_id, config);
+        }
+        fn split_shard(
+            &self,
+            shard_id: ShardId,
+            new_shard_id: ShardId,
+            node_id: kiseki_common::ids::NodeId,
+        ) -> Result<ShardId, kiseki_log::error::LogError> {
+            self.inner.split_shard(shard_id, new_shard_id, node_id)
+        }
+        fn merge_shards(
+            &self,
+            target_shard_id: ShardId,
+            source_shard_id: ShardId,
+        ) -> Result<(), kiseki_log::error::LogError> {
+            self.inner.merge_shards(target_shard_id, source_shard_id)
+        }
+        async fn register_consumer(
+            &self,
+            shard_id: ShardId,
+            consumer: &str,
+            position: kiseki_common::ids::SequenceNumber,
+        ) -> Result<(), kiseki_log::error::LogError> {
+            self.inner
+                .register_consumer(shard_id, consumer, position)
+                .await
+        }
+        async fn advance_watermark(
+            &self,
+            shard_id: ShardId,
+            consumer: &str,
+            position: kiseki_common::ids::SequenceNumber,
+        ) -> Result<(), kiseki_log::error::LogError> {
+            self.inner
+                .advance_watermark(shard_id, consumer, position)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn split_shard_pruned_boundary_refuses_failed_precondition() {
+        use kiseki_log::{shard::ShardConfig, MemShardStore};
+        let inner: Arc<dyn LogOps + Send + Sync> = Arc::new(MemShardStore::new());
+        let shard = ShardId(uuid::Uuid::from_u128(42));
+        inner.create_shard(
+            shard,
+            kiseki_common::ids::OrgId(uuid::Uuid::nil()),
+            kiseki_common::ids::NodeId(0),
+            ShardConfig::default(),
+        );
+        // Boundary 8 echoes the 2026-06-10 Tier-2 run's observed
+        // bootstrap-shard boundary; any value > 1 trips the gate.
+        let log: Arc<dyn LogOps + Send + Sync> = Arc::new(PrunedBoundaryLog { inner, boundary: 8 });
+        let grpc = StorageAdminGrpc::for_tests().with_log_store(log);
+        let err = grpc
+            .split_shard(Request::new(pb::SplitShardRequest {
+                shard_id: shard.0.to_string(),
+                pivot_key: String::new(),
+            }))
+            .await
+            .expect_err("pruned shard must refuse the split");
+        assert_eq!(
+            err.code(),
+            Code::FailedPrecondition,
+            "DeltaLogPruned must surface as FAILED_PRECONDITION \
+             (kiseki_log::grpc::to_status parity), got {:?}: {}",
+            err.code(),
+            err.message(),
+        );
+        assert!(
+            err.message().contains("pruned"),
+            "refusal must cite the pruned delta log, got: {}",
+            err.message(),
+        );
     }
 
     #[tokio::test]

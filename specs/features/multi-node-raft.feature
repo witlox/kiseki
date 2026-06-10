@@ -497,6 +497,18 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
   # cluster-wide consensus path through `RaftShardStore::split_shard` /
   # `merge_shards`. Closes the @library→@integration fidelity gap that
   # the gate-2 audit flagged for shard lifecycle.
+  #
+  # Contract note (error-taxonomy entry 41b23b5, P3a, GH #223): once
+  # watermark-advance GC prunes a shard's delta log (gc boundary > 1),
+  # full-replay lifecycle ops — split redistribution, merge copy —
+  # REFUSE with the typed `DeltaLogPruned` error (refusal over silent
+  # key loss; the compacted-replay unlock is the #223/#230 follow-up).
+  # The cluster harness pins KISEKI_WATERMARK_ADVANCE_INTERVAL_MS high
+  # on spawned nodes so unrelated suite traffic on this long-lived
+  # singleton never advances the bootstrap shard's boundary mid-suite:
+  # the three lifecycle scenarios below deterministically pin the
+  # UNPRUNED-shard lifecycle, and the refusal contract itself is pinned
+  # by the dedicated DeltaLogPruned scenario further down.
 
   @integration @multi-node @shard-mgmt @smoke
   Scenario: Admin SplitShard returns a new shard id on a 3-node cluster (ADR-033)
@@ -523,6 +535,27 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     Given a 3-node kiseki cluster
     When the admin calls SplitShard for the bootstrap shard via node-1 admin gRPC
     Then every node logged the apply hook registering the new shard locally
+
+  # P3a refusal contract (error-taxonomy 41b23b5, GH #223): a shard
+  # whose delta log has been pruned (gc boundary > 1) REFUSES
+  # full-replay lifecycle ops with the typed `DeltaLogPruned` error —
+  # surfaced as gRPC FAILED_PRECONDITION at the admin boundary, and
+  # raised fail-fast BEFORE the control-plane RecordSplit so a refused
+  # split leaves no dangling topology entry behind. The boundary is
+  # advanced via the advance-watermark test knob (the harness pins the
+  # supervisor's own advance cadence off — see the contract note
+  # above), which drives the REAL replicated AdvanceWatermark + prune
+  # path. Runs against a scenario-private 1-shard namespace so the
+  # shared singleton's bootstrap shard stays unpruned for the
+  # lifecycle scenarios above. Asserts the error CLASS
+  # (FAILED_PRECONDITION + the pruned-delta-log marker), not the full
+  # message string.
+  @integration @multi-node @shard-mgmt
+  Scenario: SplitShard on a pruned delta log is refused with the typed DeltaLogPruned error (P3a, GH #223)
+    Given a 3-node kiseki cluster
+    And a fresh single-shard lifecycle namespace created via admin HTTP
+    When the test knob advances the lifecycle shard's hydrator watermark past the replay floor
+    Then SplitShard for the lifecycle shard via node-1 admin gRPC is refused as FAILED_PRECONDITION citing a pruned delta log
 
   # GH #99: `topology namespace-create` fans out the per-shard Raft
   # groups via the control-plane apply hook, but pre-fix NO node called

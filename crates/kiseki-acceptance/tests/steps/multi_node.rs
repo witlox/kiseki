@@ -992,17 +992,33 @@ async fn composition_chunks_via(node: &NodeHandle, comp_id: &str) -> Vec<String>
 
 /// Try every node in the cluster for `comp_id`'s chunk list; return
 /// the first non-empty result.
+///
+/// ADR-047 §F-3 / I-CS2 (P4, #226/#227): composition visibility at
+/// PUT-ack is BOUNDED-STALE on async surfaces. The ingress node
+/// serves the row immediately from the CompositionStore's volatile
+/// overlay; followers materialize it via hydration (≤ ~100 ms poll +
+/// drain). A one-shot sweep right at ack can therefore race the
+/// drain — poll with a bounded budget (2 s, 50 ms interval, mirroring
+/// the gateway's own 1 s read-retry posture) so the helper pins
+/// bounded-stale-with-budget, not eventual-maybe. Exhausting the
+/// budget returns empty and the caller's assertion fails loudly.
 async fn composition_chunks_any_node(
     cluster: &crate::steps::cluster_harness::ClusterHarness,
     comp_id: &str,
 ) -> Vec<String> {
-    for n in cluster.nodes() {
-        let chunks = composition_chunks_via(n, comp_id).await;
-        if !chunks.is_empty() {
-            return chunks;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        for n in cluster.nodes() {
+            let chunks = composition_chunks_via(n, comp_id).await;
+            if !chunks.is_empty() {
+                return chunks;
+            }
         }
+        if std::time::Instant::now() >= deadline {
+            return Vec::new();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    Vec::new()
 }
 
 /// `GET /admin/chunk/{chunk_id}` on `node`, returning the parsed body
