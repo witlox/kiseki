@@ -365,6 +365,11 @@ impl kiseki_gateway::mem_gateway::NamespaceProvisioner for ControlPlaneProvision
             namespace_id: namespace_id.0.to_string(),
             tenant_id,
             shards,
+            // First-touch namespaces (S3 bucket auto-create, NFS /
+            // FUSE root) genuinely have no policy — defaults are the
+            // correct fidelity here, matching what
+            // `ensure_namespace_exists` registers locally.
+            fidelity: crate::cluster_control::NamespaceFidelity::default(),
         };
         // The data path may be on the host tokio runtime; openraft's
         // client_write must run on the Raft runtime. Cross to the
@@ -490,17 +495,21 @@ impl kiseki_gateway::mem_gateway::NamespaceProvisioner for ControlPlaneProvision
 /// registers locally and no cross-node replication is needed (and
 /// re-emitting on every restart replay would be wrong).
 ///
-/// Fidelity note: `ControlCommand::CreateNamespace` doesn't carry
-/// `tier_policy` / `size_band_pools`, so a restart re-registers
-/// namespaces with default policy. The full-fidelity registration
-/// (admin handler → `NamespaceCreate` delta → hydrator) wins when it
-/// exists: this registrar no-ops on any already-registered namespace.
+/// PR #232: the command carries the full creation-time fidelity
+/// (`tier_policy`, `size_band_pools`, flags), so every registration
+/// this bridge performs — including restart log replay and snapshot
+/// install — restores the creator's exact policy, not defaults.
 pub(crate) struct GatewayNamespaceRegistrar {
     pub(crate) gw: Arc<kiseki_gateway::InMemoryGateway>,
 }
 
 impl crate::cluster_control::NamespaceRegistrar for GatewayNamespaceRegistrar {
-    fn register_namespace(&self, namespace_id: &str, tenant_id: kiseki_common::ids::OrgId) {
+    fn register_namespace(
+        &self,
+        namespace_id: &str,
+        tenant_id: kiseki_common::ids::OrgId,
+        fidelity: &crate::cluster_control::NamespaceFidelity,
+    ) {
         // The control-plane keys namespaces by string id; the
         // composition store by `NamespaceId(Uuid)`. The CLI / bench /
         // admin API pass UUID strings; legacy non-UUID ids skip
@@ -509,31 +518,33 @@ impl crate::cluster_control::NamespaceRegistrar for GatewayNamespaceRegistrar {
             return;
         };
         let ns_id = kiseki_common::ids::NamespaceId(ns_uuid);
-        // Idempotent: never clobber an existing registration (the
-        // hydrator / admin handler may have installed one with real
-        // tier policy; ours would be defaults-only).
+        // Keep-first. This check-then-insert is not atomic against
+        // the admin handler's concurrent `add_namespace` (the
+        // responder fires before the apply hook, so the handler can
+        // resume mid-race) — but both writers now carry the SAME
+        // creation-time fidelity from the command, so either ordering
+        // converges on the identical record. Keep-first additionally
+        // preserves post-create policy updates (the size-band-pools /
+        // tier-policy admin routes mutate the live registration
+        // in-place) against a late snapshot-install replay.
         if self.gw.compositions_handle().namespace(ns_id).is_some() {
             return;
         }
-        let ns = kiseki_composition::namespace::Namespace {
-            id: ns_id,
+        // Primary/fallback shard pointer — same convention as the
+        // admin handler and `ensure_namespace_exists`. Actual write
+        // routing goes through the shard_map (`route_to_shard`),
+        // which the control-plane apply hydrates independently.
+        let ns = fidelity.to_namespace(
+            ns_id,
             tenant_id,
-            // Primary/fallback shard pointer — same convention as the
-            // admin handler and `ensure_namespace_exists`. Actual
-            // write routing goes through the shard_map (`route_to_shard`),
-            // which the control-plane apply hydrates independently.
-            shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
-            read_only: false,
-            versioning_enabled: false,
-            compliance_tags: Vec::new(),
-            tier_policy: Vec::new(),
-            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
-        };
+            kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
+        );
         self.gw.add_namespace_sync(ns);
         tracing::info!(
             namespace_id,
             tenant_id = %tenant_id.0,
-            "gateway namespace registry: re-hydrated from control-plane topology (GH #192)",
+            "gateway namespace registry: re-hydrated from control-plane topology \
+             with creation-time fidelity (GH #192 / PR #232)",
         );
     }
 }
@@ -3651,15 +3662,17 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    /// GH #192: the gateway namespace registrar (a) registers a
-    /// control-plane namespace into the gateway's composition store
-    /// so writes stop failing with `NamespaceNotFound` after a
-    /// restart, (b) is idempotent and never clobbers an existing
-    /// full-fidelity registration (hydrator / admin handler may have
-    /// installed one with real tier policy), and (c) skips legacy
-    /// non-UUID namespace ids like the admin handler does.
+    /// GH #192 / PR #232: the gateway namespace registrar (a)
+    /// registers a control-plane namespace into the gateway's
+    /// composition store WITH the command's full creation-time
+    /// fidelity (tier policy, size-band pools) so restart replay
+    /// restores the creator's policy and writes stop failing with
+    /// `NamespaceNotFound`, (b) is idempotent (keep-first: a live
+    /// registration — possibly carrying post-create policy updates —
+    /// is preserved), and (c) skips legacy non-UUID namespace ids
+    /// like the admin handler does.
     #[tokio::test]
-    async fn gateway_namespace_registrar_wires_and_is_idempotent() {
+    async fn gateway_namespace_registrar_wires_full_fidelity_and_is_idempotent() {
         use crate::cluster_control::NamespaceRegistrar;
 
         let gw = std::sync::Arc::new(kiseki_gateway::InMemoryGateway::new(
@@ -3677,25 +3690,41 @@ mod tests {
         let tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(42));
         let ns_uuid = uuid::Uuid::from_u128(0x192);
         let ns_id = kiseki_common::ids::NamespaceId(ns_uuid);
+        let fidelity = crate::cluster_control::NamespaceFidelity {
+            tier_policy: vec![kiseki_composition::namespace::TierQuota {
+                tier: "fast".to_owned(),
+                quota_bytes: 2048,
+            }],
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools {
+                ec: Some("bulk".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
         // Restart-shaped: the namespace exists in the control-plane
         // Raft but not in the (volatile) gateway registry.
         assert!(gw.compositions_handle().namespace(ns_id).is_none());
-        registrar.register_namespace(&ns_uuid.to_string(), tenant);
+        registrar.register_namespace(&ns_uuid.to_string(), tenant, &fidelity);
         let ns = gw
             .compositions_handle()
             .namespace(ns_id)
             .expect("registrar registered the namespace");
         assert_eq!(ns.tenant_id, tenant);
+        // PR #232: full fidelity from the command — restart replay no
+        // longer re-registers with defaults.
+        assert_eq!(ns.tier_policy, fidelity.tier_policy);
+        assert_eq!(ns.size_band_pools, fidelity.size_band_pools);
         assert!(!ns.read_only);
 
-        // Never clobbers: install a full-fidelity registration
-        // (read_only flipped as the marker), re-run the registrar,
-        // and assert the existing registration is preserved.
-        let mut full = ns.clone();
-        full.read_only = true;
-        gw.add_namespace_sync(full);
-        registrar.register_namespace(&ns_uuid.to_string(), tenant);
+        // Keep-first: install an updated registration (read_only
+        // flipped as the post-create-update marker), re-run the
+        // registrar, and assert the existing registration is
+        // preserved.
+        let mut updated = ns.clone();
+        updated.read_only = true;
+        gw.add_namespace_sync(updated);
+        registrar.register_namespace(&ns_uuid.to_string(), tenant, &fidelity);
         assert!(
             gw.compositions_handle()
                 .namespace(ns_id)
@@ -3705,7 +3734,7 @@ mod tests {
         );
 
         // Legacy non-UUID ids: skipped without panicking.
-        registrar.register_namespace("not-a-uuid", tenant);
+        registrar.register_namespace("not-a-uuid", tenant, &fidelity);
     }
 
     /// The 5 canonical persistent store paths that the runtime constructs

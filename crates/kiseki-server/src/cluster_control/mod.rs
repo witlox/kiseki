@@ -58,7 +58,7 @@ pub mod phase5_boot;
 // Nth boot uses the resolved mount the prior boot recorded.
 pub mod boot_paths;
 
-pub use commands::ControlCommand;
+pub use commands::{ControlCommand, NamespaceFidelity};
 pub use metrics::ClusterControlMetrics;
 // Re-exports kept for the follow-up subtask that switches admin
 // RPCs over to control-plane consensus and adds external readers

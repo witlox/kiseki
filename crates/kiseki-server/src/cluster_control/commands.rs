@@ -31,6 +31,15 @@ pub enum ControlCommand {
         /// from `compute_shard_ranges`) so the state machine itself
         /// stays free of placement policy.
         shards: Vec<ShardRecord>,
+        /// Full gateway-side namespace fidelity (PR #232 review
+        /// blocker). Carried in the command so that EVERY path that
+        /// registers the namespace with a gateway — live apply hook,
+        /// restart log replay, snapshot install, and the boot drain
+        /// pass — restores the exact tier policy / size-band pools /
+        /// flags the creator requested, not defaults. Without this,
+        /// the apply-hook registrar racing the admin handler could
+        /// silently discard the request-supplied policy.
+        fidelity: NamespaceFidelity,
     },
     /// Record that a shard has been split. Removes `source_shard_id`
     /// from the namespace's shards, replaces it with two halves —
@@ -169,6 +178,60 @@ impl std::fmt::Display for ControlCommand {
                 "SetWorkloadParams(avg_file_bytes={}, R={}, headroom_pct={})",
                 params.avg_file_bytes, params.metadata_replication, params.fast_headroom_pct,
             ),
+        }
+    }
+}
+
+/// Full gateway-side namespace fidelity, carried in
+/// `ControlCommand::CreateNamespace` (PR #232 review blocker).
+///
+/// These are the `kiseki_composition::namespace::Namespace` fields
+/// beyond identity (`id` / `tenant_id` / `shard_id`): they drive
+/// write-path behavior (`tier_policy` → device-class spill order,
+/// `size_band_pools` → `select_pool_for_write`) and access semantics
+/// (`read_only`, `versioning_enabled`, `compliance_tags`). Carrying
+/// them through consensus means restart log replay and snapshot
+/// install re-register namespaces with the exact creation-time
+/// policy — the gateway's volatile namespace map is fully
+/// reconstructible from the control-plane Raft alone.
+///
+/// `Default` = the defaults `ensure_namespace_exists` uses for
+/// first-touch namespaces (no policy, writable, unversioned).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NamespaceFidelity {
+    /// Whether the namespace is read-only.
+    pub read_only: bool,
+    /// Whether object versioning is enabled.
+    pub versioning_enabled: bool,
+    /// Compliance tags applied at the namespace level.
+    pub compliance_tags: Vec<kiseki_composition::namespace::ComplianceTag>,
+    /// Placement-tier policy (ADR-045 §D3). Empty = default
+    /// fastest-fit.
+    pub tier_policy: Vec<kiseki_composition::namespace::TierQuota>,
+    /// Per-size-band pool selector (ADR-024 amendment). Empty =
+    /// cluster default chain.
+    pub size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools,
+}
+
+impl NamespaceFidelity {
+    /// Build the full composition `Namespace` this fidelity plus the
+    /// given identity describes.
+    #[must_use]
+    pub fn to_namespace(
+        &self,
+        id: kiseki_common::ids::NamespaceId,
+        tenant_id: OrgId,
+        shard_id: ShardId,
+    ) -> kiseki_composition::namespace::Namespace {
+        kiseki_composition::namespace::Namespace {
+            id,
+            tenant_id,
+            shard_id,
+            read_only: self.read_only,
+            versioning_enabled: self.versioning_enabled,
+            compliance_tags: self.compliance_tags.clone(),
+            tier_policy: self.tier_policy.clone(),
+            size_band_pools: self.size_band_pools.clone(),
         }
     }
 }

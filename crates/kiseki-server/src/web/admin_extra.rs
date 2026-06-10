@@ -580,10 +580,23 @@ async fn api_create_sharded_namespace(
         })
         .collect();
 
+    // PR #232: carry the full namespace fidelity through consensus so
+    // the apply-hook registrar (live, restart log replay, snapshot
+    // install) registers the creator's exact policy on every node —
+    // not defaults.
+    let fidelity = crate::cluster_control::NamespaceFidelity {
+        read_only: false,
+        versioning_enabled: false,
+        compliance_tags: Vec::new(),
+        tier_policy,
+        size_band_pools,
+    };
+
     let cmd = crate::cluster_control::ControlCommand::CreateNamespace {
         namespace_id: namespace_id.clone(),
         tenant_id,
         shards: shards.clone(),
+        fidelity: fidelity.clone(),
     };
 
     match cluster_control_store.submit(cmd).await {
@@ -595,23 +608,21 @@ async fn api_create_sharded_namespace(
                 _ => shard_count,
             };
 
-            // Issue #93: the control-plane submit creates per-shard
-            // Raft groups + populates the NamespaceShardMap (via the
-            // apply hooks), but does NOT register the namespace in
-            // the gateway's composition store or emit a
-            // NamespaceCreate delta. Without these two steps, any
-            // gateway write that addresses the namespace by ID (the
-            // native protocol path, FUSE/NFS writes, anything that
-            // bypasses the S3 `ensure_namespace_exists` fallback)
-            // returns "namespace not found".
-            //
-            // Mirror the steps the S3 first-touch path takes in
-            // `mem_gateway::ensure_namespace_exists`:
-            //   1. Add the namespace to the local composition store
-            //      (idempotent — skip if already present).
-            //   2. Emit a `NamespaceCreate` delta on the bootstrap
-            //      shard so followers' hydrators register the
-            //      namespace on their composition stores.
+            // Issue #93 + PR #232 review blocker: register the
+            // namespace with the local gateway and emit the
+            // `NamespaceCreate` delta. UNCONDITIONAL on the 201 path —
+            // the control-plane submit's responder fires before the
+            // apply hook dispatches, so the hook's registrar
+            // (`GatewayNamespaceRegistrar`) can race this block and
+            // register the namespace first. The old
+            // `comps.namespace(ns_id).is_none()` guard then skipped
+            // both the add AND the delta emit nondeterministically.
+            // The 409 early-return above already dedupes repeat
+            // creates, and `add_namespace` is an overwriting insert
+            // carrying the same `fidelity` the hook registers — so
+            // running unconditionally converges on the identical
+            // record regardless of race ordering and makes the delta
+            // emit deterministic.
             //
             // namespace_id at this layer is a String; the composition
             // store is keyed by `NamespaceId(Uuid)`. The CLI + bench
@@ -622,40 +633,12 @@ async fn api_create_sharded_namespace(
                 (state.compositions.as_ref(), state.log_store.as_ref())
             {
                 if let Ok(ns_uuid) = uuid::Uuid::parse_str(&namespace_id) {
-                    let ns_id = kiseki_common::ids::NamespaceId(ns_uuid);
-                    if comps.namespace(ns_id).is_none() {
-                        let shard_id = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
-                        let ns = kiseki_composition::namespace::Namespace {
-                            id: ns_id,
-                            tenant_id,
-                            shard_id,
-                            read_only: false,
-                            versioning_enabled: false,
-                            compliance_tags: Vec::new(),
-                            tier_policy: tier_policy.clone(),
-                            size_band_pools: size_band_pools.clone(),
-                        };
-                        comps.add_namespace(ns.clone());
-                        if let Err(e) = kiseki_composition::log_bridge::emit_namespace_create(
-                            log.as_ref(),
-                            shard_id,
-                            tenant_id,
-                            &ns,
-                        )
-                        .await
-                        {
-                            // Roll back the local add — without
-                            // follower visibility this would be a
-                            // stealth single-node namespace. Same
-                            // contract as `ensure_namespace_exists`.
-                            comps.remove_namespace(ns_id);
-                            tracing::warn!(
-                                namespace_id = %ns_uuid,
-                                error = %e,
-                                "admin namespace-create: NamespaceCreate delta emit failed — rolled back",
-                            );
-                        }
-                    }
+                    let ns = fidelity.to_namespace(
+                        kiseki_common::ids::NamespaceId(ns_uuid),
+                        tenant_id,
+                        kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
+                    );
+                    register_created_namespace_locally(comps.as_ref(), log.as_ref(), &ns).await;
                 }
             }
 
@@ -724,6 +707,46 @@ async fn api_create_sharded_namespace(
                 })),
             )
         }
+    }
+}
+
+/// Issue #93 + PR #232: register a freshly-created namespace with the
+/// local gateway (full-fidelity, overwriting insert) and emit the
+/// `NamespaceCreate` delta so followers' hydrators register it too.
+///
+/// Mirrors the steps the S3 first-touch path takes in
+/// `mem_gateway::ensure_namespace_exists`:
+///   1. Add the namespace to the local composition store.
+///      Unconditional overwrite: the apply-hook registrar
+///      (`GatewayNamespaceRegistrar`) may have raced us here, but it
+///      registers the same creation-time fidelity (carried in
+///      `ControlCommand::CreateNamespace`), so the overwrite is
+///      idempotent in content and deterministic in outcome.
+///   2. Emit a `NamespaceCreate` delta on the bootstrap shard.
+///
+/// On delta-emit failure the local registration is KEPT (warn-only).
+/// The historical rollback ("stealth single-node namespace"
+/// prevention) is obsolete: follower visibility no longer depends on
+/// the delta — every node's control-plane apply hook registers the
+/// namespace locally with full fidelity (PR #232). Rolling back here
+/// could instead clobber the hook's valid registration and leave the
+/// namespace unwritable on this node only.
+pub(crate) async fn register_created_namespace_locally(
+    comps: &kiseki_composition::composition::CompositionStore,
+    log: &(dyn kiseki_log::LogOps + Send + Sync),
+    ns: &kiseki_composition::namespace::Namespace,
+) {
+    comps.add_namespace(ns.clone());
+    if let Err(e) =
+        kiseki_composition::log_bridge::emit_namespace_create(log, ns.shard_id, ns.tenant_id, ns)
+            .await
+    {
+        tracing::warn!(
+            namespace_id = %ns.id.0,
+            error = %e,
+            "admin namespace-create: NamespaceCreate delta emit failed — local \
+             registration kept (followers recover via the control-plane apply hook)",
+        );
     }
 }
 
@@ -3485,5 +3508,234 @@ mod tests {
         // total - used when missing.
         assert_eq!(d2.used_bytes, 0);
         assert_eq!(d2.free_bytes, 2000);
+    }
+
+    // --- PR #232 review blocker: handler-vs-apply-hook race ------------
+
+    /// Minimal `LogOps` stub: records `append_delta` calls (the path
+    /// `emit_namespace_create` takes) and optionally fails them, so
+    /// the tests can assert both the delta emit and the no-rollback
+    /// failure semantics.
+    #[derive(Default)]
+    struct RecordingNamespaceLog {
+        fail_appends: bool,
+        appends: std::sync::Mutex<Vec<kiseki_log::traits::AppendDeltaRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl kiseki_log::LogOps for RecordingNamespaceLog {
+        async fn put_intent_and_fan(
+            &self,
+            _shard_id: kiseki_common::ids::ShardId,
+            _intent: kiseki_log::intent::WriteIntent,
+        ) -> Result<(), kiseki_log::error::LogError> {
+            Err(kiseki_log::error::LogError::Unavailable)
+        }
+
+        async fn append_delta(
+            &self,
+            req: kiseki_log::traits::AppendDeltaRequest,
+        ) -> Result<kiseki_common::ids::SequenceNumber, kiseki_log::error::LogError> {
+            if self.fail_appends {
+                return Err(kiseki_log::error::LogError::Unavailable);
+            }
+            self.appends.lock().unwrap().push(req);
+            Ok(kiseki_common::ids::SequenceNumber(1))
+        }
+
+        async fn append_chunk_and_delta(
+            &self,
+            _req: kiseki_log::traits::AppendChunkAndDeltaRequest,
+        ) -> Result<kiseki_common::ids::SequenceNumber, kiseki_log::error::LogError> {
+            Err(kiseki_log::error::LogError::Unavailable)
+        }
+
+        async fn read_deltas(
+            &self,
+            _req: kiseki_log::traits::ReadDeltasRequest,
+        ) -> Result<Vec<kiseki_log::delta::Delta>, kiseki_log::error::LogError> {
+            Err(kiseki_log::error::LogError::Unavailable)
+        }
+
+        async fn shard_health(
+            &self,
+            shard_id: kiseki_common::ids::ShardId,
+        ) -> Result<kiseki_log::shard::ShardInfo, kiseki_log::error::LogError> {
+            Err(kiseki_log::error::LogError::ShardNotFound(shard_id))
+        }
+
+        async fn set_maintenance(
+            &self,
+            _shard_id: kiseki_common::ids::ShardId,
+            _enabled: bool,
+        ) -> Result<(), kiseki_log::error::LogError> {
+            Ok(())
+        }
+
+        async fn truncate_log(
+            &self,
+            _shard_id: kiseki_common::ids::ShardId,
+        ) -> Result<kiseki_common::ids::SequenceNumber, kiseki_log::error::LogError> {
+            Ok(kiseki_common::ids::SequenceNumber(0))
+        }
+
+        async fn compact_shard(
+            &self,
+            _shard_id: kiseki_common::ids::ShardId,
+        ) -> Result<u64, kiseki_log::error::LogError> {
+            Ok(0)
+        }
+
+        fn create_shard(
+            &self,
+            _shard_id: kiseki_common::ids::ShardId,
+            _tenant_id: kiseki_common::ids::OrgId,
+            _node_id: kiseki_common::ids::NodeId,
+            _config: kiseki_log::shard::ShardConfig,
+        ) {
+        }
+
+        fn update_shard_range(
+            &self,
+            _shard_id: kiseki_common::ids::ShardId,
+            _range_start: [u8; 32],
+            _range_end: [u8; 32],
+        ) {
+        }
+
+        fn set_shard_state(
+            &self,
+            _shard_id: kiseki_common::ids::ShardId,
+            _state: kiseki_log::shard::ShardState,
+        ) {
+        }
+
+        fn set_shard_config(
+            &self,
+            _shard_id: kiseki_common::ids::ShardId,
+            _config: kiseki_log::shard::ShardConfig,
+        ) {
+        }
+
+        async fn register_consumer(
+            &self,
+            _shard_id: kiseki_common::ids::ShardId,
+            _consumer: &str,
+            _position: kiseki_common::ids::SequenceNumber,
+        ) -> Result<(), kiseki_log::error::LogError> {
+            Ok(())
+        }
+
+        async fn advance_watermark(
+            &self,
+            _shard_id: kiseki_common::ids::ShardId,
+            _consumer: &str,
+            _position: kiseki_common::ids::SequenceNumber,
+        ) -> Result<(), kiseki_log::error::LogError> {
+            Ok(())
+        }
+    }
+
+    fn race_fidelity() -> crate::cluster_control::NamespaceFidelity {
+        crate::cluster_control::NamespaceFidelity {
+            tier_policy: vec![kiseki_composition::namespace::TierQuota {
+                tier: "fast".to_owned(),
+                quota_bytes: 1024,
+            }],
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools {
+                inline: Some("fast".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// PR #232 review blocker (handler-vs-hook race): the control-
+    /// plane submit's responder fires before `dispatch_hook`, so the
+    /// apply hook's `GatewayNamespaceRegistrar` can register the
+    /// namespace BEFORE the admin handler's #93 block resumes. The
+    /// old `is_none()` guard then skipped both the full-fidelity
+    /// `add_namespace` and the `NamespaceCreate` delta emit. The
+    /// block is now unconditional: hook-first ordering must still end
+    /// with the handler's policy in the store AND exactly one delta
+    /// emitted.
+    #[tokio::test]
+    async fn handler_block_overwrites_hook_registration_and_emits_delta() {
+        let comps = kiseki_composition::composition::CompositionStore::new();
+        let log = RecordingNamespaceLog::default();
+
+        let ns_id = kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0x232));
+        let tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(7));
+        let shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
+
+        // Hook wins the race. Modeled as a defaults-only record (the
+        // pre-#232 worst case) to prove the handler's write wins even
+        // against a divergent earlier registration.
+        comps.add_namespace(kiseki_composition::namespace::Namespace {
+            id: ns_id,
+            tenant_id: tenant,
+            shard_id: shard,
+            read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
+            size_band_pools: Default::default(),
+        });
+
+        // The handler block then runs unconditionally with the
+        // request-supplied fidelity.
+        let fidelity = race_fidelity();
+        let ns = fidelity.to_namespace(ns_id, tenant, shard);
+        register_created_namespace_locally(&comps, &log, &ns).await;
+
+        // Final state carries the handler's policy (not the hook's
+        // defaults) ...
+        let got = comps.namespace(ns_id).expect("namespace registered");
+        assert_eq!(
+            got.tier_policy, ns.tier_policy,
+            "handler's tier policy wins"
+        );
+        assert_eq!(got.size_band_pools, ns.size_band_pools);
+
+        // ... AND the NamespaceCreate delta was emitted, with the
+        // full fidelity in its payload.
+        let appends = log.appends.lock().unwrap();
+        assert_eq!(appends.len(), 1, "exactly one NamespaceCreate delta");
+        assert_eq!(
+            appends[0].operation,
+            kiseki_log::delta::OperationType::NamespaceCreate
+        );
+        let decoded =
+            kiseki_composition::composition::decode_namespace_create_payload(&appends[0].payload)
+                .expect("payload decodes");
+        assert_eq!(decoded.tier_policy, ns.tier_policy);
+        assert_eq!(decoded.size_band_pools, ns.size_band_pools);
+    }
+
+    /// PR #232: a failed delta emit must NOT roll back the local
+    /// registration. The historical rollback predates the apply-hook
+    /// registrar — with every node registering via its own apply hook
+    /// (full fidelity), removing the local record here would clobber
+    /// the hook's valid registration and leave the namespace
+    /// unwritable on this node only.
+    #[tokio::test]
+    async fn handler_block_keeps_registration_when_delta_emit_fails() {
+        let comps = kiseki_composition::composition::CompositionStore::new();
+        let log = RecordingNamespaceLog {
+            fail_appends: true,
+            ..Default::default()
+        };
+
+        let ns_id = kiseki_common::ids::NamespaceId(uuid::Uuid::from_u128(0x233));
+        let tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(7));
+        let shard = kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1));
+
+        let ns = race_fidelity().to_namespace(ns_id, tenant, shard);
+        register_created_namespace_locally(&comps, &log, &ns).await;
+
+        let got = comps
+            .namespace(ns_id)
+            .expect("registration survives delta-emit failure");
+        assert_eq!(got.tier_policy, ns.tier_policy);
     }
 }
