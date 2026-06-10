@@ -153,23 +153,31 @@ async fn cap_is_enforced_at_listener_layer() {
         .await
         .expect("TCP layer accepts cap+1");
     let mut buf = [0u8; 16];
-    let read_outcome = tokio::time::timeout(Duration::from_secs(2), extra.read(&mut buf)).await;
 
-    let Ok(read_inner) = read_outcome else {
-        panic!(
-            "cap+1 connection wasn't dropped within 2 s — server \
-             may be holding the connection in the accept-queue past \
-             the per-peer cap",
-        );
-    };
-    match read_inner {
-        Ok(0) => {} // clean EOF — listener dropped us. Expected.
-        Ok(n) => panic!(
-            "cap+1 connection received {n} bytes — listener didn't \
-             drop it, NATIVE_TCP_FRAMED_PER_PEER_MAX may not be \
-             enforced",
-        ),
-        Err(_io_err) => {} // transport error — also expected (RST etc.)
+    // Poll for the drop instead of a one-shot deadline. The CONTRACT
+    // is "the cap+1 connection gets dropped", not "dropped within 2 s
+    // on any hardware" — a hard 2 s read deadline deterministically
+    // failed on slow GitHub-hosted release runners (release.yml
+    // Preflight, run 27130713337), blocking the entire pipeline.
+    // 100 ms intervals up to 10 s; tokio's TcpStream::read is
+    // cancel-safe, so re-issuing it after a timeout is sound.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout(Duration::from_millis(100), extra.read(&mut buf)).await {
+            Ok(Ok(0)) => break, // clean EOF — listener dropped us. Expected.
+            Ok(Ok(n)) => panic!(
+                "cap+1 connection received {n} bytes — listener didn't \
+                 drop it, NATIVE_TCP_FRAMED_PER_PEER_MAX may not be \
+                 enforced",
+            ),
+            Ok(Err(_io_err)) => break, // transport error — also expected (RST etc.)
+            Err(_not_yet) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "cap+1 connection wasn't dropped within 10 s — server \
+                 may be holding the connection in the accept-queue past \
+                 the per-peer cap",
+            ),
+        }
     }
 
     drop(held);

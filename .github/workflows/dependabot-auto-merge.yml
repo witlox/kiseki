@@ -30,7 +30,10 @@ jobs:
         if: |
           steps.meta.outputs.update-type == 'version-update:semver-patch' ||
           steps.meta.outputs.update-type == 'version-update:semver-minor'
-        run: gh pr merge --auto --merge "$PR_URL"
+        # --rebase, not --merge: the repo requires linear history, so
+        # GraphQL rejects merge-commit auto-merge (seen on #215) and
+        # every dependabot PR ended up needing a manual merge.
+        run: gh pr merge --auto --rebase "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
