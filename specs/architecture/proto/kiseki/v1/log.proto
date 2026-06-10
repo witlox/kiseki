@@ -42,6 +42,16 @@ service LogService {
 
   // Set or clear maintenance mode on a shard (I-O6).
   rpc SetMaintenance(SetMaintenanceRequest) returns (SetMaintenanceResponse);
+
+  // Phase 16c / I-C2 — decrement a chunk's replicated
+  // `cluster_chunk_state` refcount on the shard LEADER. The #111
+  // forward half of the delete path: a follower-ingress gateway whose
+  // local `client_write` hit `ForwardToLeader` re-issues the decrement
+  // here so a DELETE landing on a non-leader node cannot silently drop
+  // the cluster-track decrement (the chunk would never tombstone and
+  // the GC scrub would have no signal). Loop-safe: the handler commits
+  // locally and does NOT re-forward.
+  rpc DecrementChunkRefcount(DecrementChunkRefcountRequest) returns (DecrementChunkRefcountResponse);
 }
 
 message AppendDeltaRequest {
@@ -114,6 +124,19 @@ message SetMaintenanceRequest {
 }
 
 message SetMaintenanceResponse {}
+
+message DecrementChunkRefcountRequest {
+  ShardId shard_id  = 1;
+  OrgId   tenant_id = 2;
+  ChunkId chunk_id  = 3; // 32 bytes
+}
+
+message DecrementChunkRefcountResponse {
+  // True iff this decrement transitioned the `cluster_chunk_state`
+  // entry to tombstoned (refcount hit 0) — the caller fans
+  // `DeleteFragment` out to the placement list on that signal.
+  bool tombstoned = 1;
+}
 
 // ============================================================================
 // Delta envelope (I-L7: structural separation of header and payload)

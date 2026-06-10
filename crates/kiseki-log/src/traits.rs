@@ -73,9 +73,11 @@ pub struct AppendChunkAndDeltaRequest {
 ///
 /// One mechanism covers every metadata mutation — write, delete,
 /// multipart-complete — because they all funnel through the shard's
-/// append (refcount inc/dec ride inside those flows). The production
-/// impl dials the leader's `LogService.AppendChunkAndDelta`; tests use
-/// a mock.
+/// append. The delete path's cluster refcount decrement is the one
+/// mutation that does NOT ride an append (it is its own Raft command,
+/// issued per released chunk AFTER the local delete), so it gets its
+/// own forward verb. The production impl dials the leader's
+/// `LogService`; tests use a mock.
 #[async_trait::async_trait]
 pub trait AppendForwarder: Send + Sync {
     /// Re-issue `req` against `leader_node`'s shard log and return the
@@ -87,6 +89,19 @@ pub trait AppendForwarder: Send + Sync {
         leader_node: NodeId,
         req: AppendChunkAndDeltaRequest,
     ) -> Result<SequenceNumber, LogError>;
+
+    /// Phase 16c / I-C2 (#111, delete half): re-issue a
+    /// `cluster_chunk_state` refcount decrement against `leader_node`.
+    /// Returns the leader's tombstone signal (`true` iff the decrement
+    /// transitioned the entry to refcount 0). Same loop-safety contract
+    /// as [`Self::forward_append`].
+    async fn forward_decrement_chunk_refcount(
+        &self,
+        leader_node: NodeId,
+        shard_id: ShardId,
+        tenant_id: OrgId,
+        chunk_id: ChunkId,
+    ) -> Result<bool, LogError>;
 }
 
 /// Canonical consumer name for the composition hydrator's delta-log

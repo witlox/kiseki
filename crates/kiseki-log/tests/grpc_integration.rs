@@ -263,6 +263,79 @@ async fn grpc_maintenance_mode() {
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 }
 
+/// I-C2 (#111, delete half): the `DecrementChunkRefcount` RPC — the
+/// leader-side commit of a forwarded cluster refcount decrement —
+/// round-trips over a real tonic server. The in-memory store's default
+/// returns `tombstoned=false`; the wire shape (ids parse, response
+/// field) is what this pins. The Raft-backed semantics are pinned by
+/// the `state_machine` unit tests + the gateway forward test.
+#[tokio::test]
+async fn grpc_decrement_chunk_refcount_roundtrip() {
+    let store = Arc::new(MemShardStore::new());
+    store.create_shard(
+        test_shard(),
+        test_tenant(),
+        NodeId(1),
+        ShardConfig::default(),
+    );
+
+    let log_grpc = LogGrpc::new(Arc::clone(&store) as Arc<dyn kiseki_log::LogOps + Send + Sync>);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(LogServiceServer::new(log_grpc))
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut client = proto::log_service_client::LogServiceClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+
+    let resp = client
+        .decrement_chunk_refcount(proto::DecrementChunkRefcountRequest {
+            shard_id: Some(proto::ShardId {
+                value: test_shard().0.to_string(),
+            }),
+            tenant_id: Some(proto::OrgId {
+                value: test_tenant().0.to_string(),
+            }),
+            chunk_id: Some(proto::ChunkId {
+                value: vec![0x42; 32],
+            }),
+        })
+        .await
+        .unwrap();
+    assert!(
+        !resp.into_inner().tombstoned,
+        "in-memory default reports tombstoned=false"
+    );
+
+    // Malformed chunk id refuses loudly, not silently.
+    let err = client
+        .decrement_chunk_refcount(proto::DecrementChunkRefcountRequest {
+            shard_id: Some(proto::ShardId {
+                value: test_shard().0.to_string(),
+            }),
+            tenant_id: Some(proto::OrgId {
+                value: test_tenant().0.to_string(),
+            }),
+            chunk_id: Some(proto::ChunkId {
+                value: vec![0x42; 16], // not 32 bytes
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
 #[tokio::test]
 async fn grpc_shard_not_found() {
     let store = Arc::new(MemShardStore::new());
