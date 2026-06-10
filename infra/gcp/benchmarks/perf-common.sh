@@ -196,6 +196,13 @@ native_endpoints() {
   done
 }
 
+# Comma-joined form of native_endpoints — the value `kiseki-client
+# bench --endpoint` takes for the GH #229 per-client ingress spread
+# (connection i → endpoint i mod E). One line, no trailing comma.
+native_endpoints_csv() {
+  native_endpoints | paste -sd, -
+}
+
 # client idx → native endpoint (idx mod n_storage). Escape hatch:
 # BENCH_SINGLE_ENDPOINT=1 restores the old all-clients-one-leader
 # behavior. Local mode always uses $LEADER_NATIVE_URL (single compose

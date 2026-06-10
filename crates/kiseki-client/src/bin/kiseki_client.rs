@@ -1059,9 +1059,18 @@ fn handle_bench(args: &[String]) {
 kiseki-client bench -- drive PUT/GET against an externally-running cluster
 
 OPTIONS:
-    --endpoint <url>          REQUIRED. kiseki://host:9103 (native TCP-framed)
+    --endpoint <url[,url..]>  REQUIRED. kiseki://host:9103 (native TCP-framed)
                               or kiseki://host:9100 (with --binding grpc) or
-                              http(s)://host:9000 (S3 listener)
+                              http(s)://host:9000 (S3 listener).
+                              Native accepts a comma-separated LIST
+                              (kiseki://h1:9103,kiseki://h2:9103,...): with
+                              N --connections and E endpoints, connection i
+                              dials endpoint i mod E (GH #229 ingress
+                              spread). --connections must be >= E to dial
+                              every endpoint; with --connections 1 only the
+                              FIRST endpoint is used (warned). The report's
+                              \"endpoints\" field records the list. S3 takes
+                              exactly one endpoint.
     --shape <s>               put-heavy | get-heavy | mixed     (default: put-heavy)
     --binding <b>             tcp | grpc       (default: tcp; only for kiseki://)
     --concurrency <N>         in-flight ops    (default: 16)

@@ -9,15 +9,28 @@
 # the documented ~8× crush). BENCH_SINGLE_ENDPOINT=1 restores the old
 # all-clients-one-leader behavior.
 #
+# BENCH_SPREAD_ALL=1 (GH #229, step 2 of the 100k roadmap #226): every
+# client gets the FULL comma-separated native endpoint list instead of
+# one node; `kiseki-client bench` assigns connection i → endpoint
+# i mod E, so each client spreads its sockets across ALL storage nodes
+# and writes enter via 6/6 ingress gateways instead of 3/6. Requires
+# BENCH_CONNECTIONS >= the storage-node count or the tail endpoints
+# are never dialled (the bench warns; this phase notes it too).
+# Default stays client-i→storage-i; the runbook decides per run.
+# Mutually exclusive with BENCH_SINGLE_ENDPOINT=1 (HALT if both).
+#
 # Local mode: spawns N concurrent bench processes on the same host
 # (still useful for measuring server-side concurrent-connection
 # handling, even though we don't get cross-NIC parallelism).
+# BENCH_SPREAD_ALL is a no-op locally (single compose host).
 #
 # Env:
 #   KISEKI_BENCH_DURATION_SECS   (default: 30)
 #   BENCH_CONCURRENCY            (default: KISEKI_BENCH_CONCURRENCY, then 16)
 #   BENCH_CONNECTIONS            (default: 1) per-client TCP connections
 #   BENCH_SINGLE_ENDPOINT        (default: 0) 1 = all clients → leader
+#   BENCH_SPREAD_ALL             (default: 0) 1 = every client → ALL storage
+#                                endpoints (#229 6-ingress spread)
 #   KISEKI_BENCH_OBJECT_SIZE     (default: 65536)
 #   KISEKI_BENCH_PARALLEL_CLIENTS (default: 2 local / count of CLIENT_ARRAY on gcp)
 #
@@ -38,6 +51,11 @@ CONC="${BENCH_CONCURRENCY:-${KISEKI_BENCH_CONCURRENCY:-16}}"
 CONNS="${BENCH_CONNECTIONS:-1}"
 OBJSZ="${KISEKI_BENCH_OBJECT_SIZE:-65536}"
 CELL="conc${CONC}-conn${CONNS}"
+# Fold the endpoint-arm into the cell label so A/B arms at the same
+# conc/conn never overwrite each other's artifacts (the C-3/F13
+# no-overwrite contract — review blocker on #229).
+[ "${BENCH_SPREAD_ALL:-0}" = "1" ] && CELL="${CELL}-spread"
+[ "${BENCH_SINGLE_ENDPOINT:-0}" = "1" ] && CELL="${CELL}-single"
 
 MODE=$(bench_mode)
 if [ "$MODE" = "gcp" ]; then
@@ -47,14 +65,34 @@ else
 fi
 
 OUT="$RESULTS/11-native-parallel-${CELL}.txt"
+
+# GH #229: BENCH_SPREAD_ALL and BENCH_SINGLE_ENDPOINT contradict each
+# other (all-ingress vs one-ingress) — refuse the ambiguous combination
+# rather than silently picking one.
+if [ "${BENCH_SPREAD_ALL:-0}" = "1" ] && [ "${BENCH_SINGLE_ENDPOINT:-0}" = "1" ]; then
+  echo "HALT: BENCH_SPREAD_ALL=1 and BENCH_SINGLE_ENDPOINT=1 are mutually exclusive" | tee "$OUT"
+  exit 2
+fi
+
 {
   echo "=== Phase 11: parallel native put-heavy ==="
-  echo "mode=$MODE n_clients=$N_CLIENTS cell=$CELL single_endpoint=${BENCH_SINGLE_ENDPOINT:-0}"
+  echo "mode=$MODE n_clients=$N_CLIENTS cell=$CELL single_endpoint=${BENCH_SINGLE_ENDPOINT:-0} spread_all=${BENCH_SPREAD_ALL:-0}"
   echo "per-client: duration=${DURATION}s concurrency=$CONC connections=$CONNS object_size=$OBJSZ"
   echo "native endpoints:"
   native_endpoints | sed 's/^/  /'
   echo ""
 } | tee "$OUT"
+
+if [ "${BENCH_SPREAD_ALL:-0}" = "1" ]; then
+  if [ "$MODE" != "gcp" ]; then
+    echo "NOTE: BENCH_SPREAD_ALL=1 ignored in local mode (single compose host)" | tee -a "$OUT"
+  else
+    N_ENDPOINTS=${#STORAGE_IPS_ARRAY[@]}
+    if [ "$CONNS" -lt "$N_ENDPOINTS" ]; then
+      echo "NOTE: BENCH_CONNECTIONS=$CONNS < $N_ENDPOINTS endpoints — only the first $CONNS endpoint(s) get a connection (conn i -> endpoint i mod E); raise BENCH_CONNECTIONS to >= $N_ENDPOINTS for full 6-ingress spread" | tee -a "$OUT"
+    fi
+  fi
+fi
 
 CLIENT_BIN=""
 if [ "$MODE" = "gcp" ]; then
@@ -89,7 +127,13 @@ echo "" | tee -a "$OUT"
 PIDS=()
 for i in $(seq 0 $((N_CLIENTS - 1))); do
   CLIENT_OUT="$RESULTS/11-native-parallel-${CELL}-client-$i.json"
-  EP=$(pick_native_endpoint_for_client "$i")
+  if [ "${BENCH_SPREAD_ALL:-0}" = "1" ] && [ "$MODE" = "gcp" ]; then
+    # #229: every client dials ALL storage nodes; the bench assigns
+    # connection i → endpoint i mod E.
+    EP=$(native_endpoints_csv)
+  else
+    EP=$(pick_native_endpoint_for_client "$i")
+  fi
   echo "client-$i → $EP" | tee -a "$OUT"
   if [ "$MODE" = "gcp" ]; then
     (
