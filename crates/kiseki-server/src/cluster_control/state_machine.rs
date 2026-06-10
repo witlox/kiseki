@@ -738,6 +738,22 @@ impl RaftStateMachine<C> for ControlStateMachine {
                 );
             }
         }
+        // GH #192: snapshot-driven catch-up bypasses the per-command
+        // apply path, so the gateway-side namespace registration
+        // (`ApplyHook::on_namespace_applied`) must fire here too —
+        // otherwise a node that catches up via snapshot install has a
+        // populated shard map but an empty gateway namespace registry
+        // and every write 404s with `NamespaceNotFound`. Idempotent
+        // (the registrar no-ops on already-registered namespaces).
+        // Note: per-shard Raft group creation (`on_create_namespace`)
+        // is deliberately NOT dispatched here — snapshot install for
+        // shard-group state is a separate pre-existing gap tracked
+        // with the split/merge BDD scenarios.
+        if let Some(hook) = self.apply_hook.as_ref() {
+            for (ns_id, ns_snap) in &snap.namespaces {
+                hook.on_namespace_applied(ns_id, ns_snap.tenant_id);
+            }
+        }
         let mut inner = self.inner.lock().await;
         inner.namespaces = snap.namespaces;
         inner.catalog = snap.catalog;
@@ -797,6 +813,76 @@ mod tests {
             range_end: [0xFFu8; 32],
             leader_node: NodeId(1),
         }
+    }
+
+    /// GH #192: snapshot-driven catch-up bypasses the per-command
+    /// apply path, so `install_snapshot` must fire
+    /// `ApplyHook::on_namespace_applied` for every namespace in the
+    /// installed snapshot — otherwise a node that catches up via
+    /// snapshot has a populated shard map but an empty gateway
+    /// namespace registry.
+    #[tokio::test]
+    async fn install_snapshot_fires_namespace_applied_for_each_namespace() {
+        #[derive(Default)]
+        struct RecordingHook {
+            namespaces: std::sync::Mutex<Vec<(String, OrgId)>>,
+        }
+        impl ApplyHook for RecordingHook {
+            fn on_create_namespace(&self, _: &str, _: OrgId, _: ShardId, _: NodeId) {}
+            fn on_namespace_applied(&self, ns: &str, tenant_id: OrgId) {
+                self.namespaces
+                    .lock()
+                    .unwrap()
+                    .push((ns.to_owned(), tenant_id));
+            }
+            fn on_split(&self, _: &str, _: ShardId, _: ShardId, _: NodeId) {}
+            fn on_merge(&self, _: &str, _: ShardId, _: ShardId) {}
+            fn on_retire(&self, _: &str, _: ShardId) {}
+        }
+
+        let hook = std::sync::Arc::new(RecordingHook::default());
+        let mut sm = ControlStateMachine::with_apply_hook(
+            std::sync::Arc::clone(&hook) as Arc<dyn ApplyHook>
+        );
+
+        let mut namespaces = HashMap::new();
+        namespaces.insert(
+            ns(),
+            NamespaceShardMapSnapshot {
+                namespace_id: ns(),
+                tenant_id: org(),
+                version: 1,
+                shards: vec![ShardSnapshot {
+                    shard_id: shard(1),
+                    range_start: [0u8; 32],
+                    range_end: [0xFFu8; 32],
+                    leader_node: NodeId(1),
+                    is_retiring: false,
+                }],
+            },
+        );
+        let snap = ControlSnapshot {
+            namespaces,
+            catalog: ClusterDeviceCatalog::default(),
+        };
+        let data = serde_json::to_vec(&snap).unwrap();
+        let meta = SnapshotMetaOf::<C> {
+            last_log_id: None,
+            last_membership: StoredMembershipOf::<C>::default(),
+            snapshot_id: "snap-test".to_owned(),
+        };
+        sm.install_snapshot(&meta, Cursor::new(data))
+            .await
+            .expect("install ok");
+
+        assert_eq!(
+            hook.namespaces.lock().unwrap().as_slice(),
+            &[(ns(), org())],
+            "on_namespace_applied fires once per namespace on snapshot install",
+        );
+        // The state itself landed too.
+        let post = sm.snapshot().await;
+        assert!(post.namespaces.contains_key(&ns()));
     }
 
     #[test]

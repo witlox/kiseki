@@ -69,7 +69,8 @@ pub use metrics::ClusterControlMetrics;
 pub use state_machine::{ControlStateMachine, NamespaceShardMapSnapshot};
 #[allow(unused_imports)]
 pub use store::{
-    ApplyHook, NoopApplyHook, OpenRaftControlStore, ShardStoreApplyHook, CONTROL_RAFT_GROUP_ID,
+    ApplyHook, NamespaceRegistrar, NoopApplyHook, OpenRaftControlStore, ShardStoreApplyHook,
+    CONTROL_RAFT_GROUP_ID,
 };
 #[allow(unused_imports)]
 pub use types::{ControlResponse, ControlTypeConfig};
