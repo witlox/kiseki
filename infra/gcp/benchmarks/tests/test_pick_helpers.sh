@@ -93,6 +93,25 @@ assert_eq "idx=5 -> 10.0.0.6" "10.0.0.6" "$(pick_storage_for_client 5)"
 assert_eq "idx=6 -> 10.0.0.1 (wraps)" "10.0.0.1" "$(pick_storage_for_client 6)"
 assert_eq "idx=11 -> 10.0.0.6 (wraps)" "10.0.0.6" "$(pick_storage_for_client 11)"
 
+# GH #229: native_endpoints_csv — the comma-joined endpoint list every
+# client passes to `kiseki-client bench --endpoint` under
+# BENCH_SPREAD_ALL=1. native_endpoints reads $ALL_STORAGE (set at
+# source time from the fixture's 3 IPs); override it here per case.
+echo
+echo "[native_endpoints_csv] comma-joined, no trailing comma (#229)"
+ALL_STORAGE="10.0.0.1 10.0.0.2 10.0.0.3"
+assert_eq "3 nodes" \
+  "kiseki://10.0.0.1:9103,kiseki://10.0.0.2:9103,kiseki://10.0.0.3:9103" \
+  "$(native_endpoints_csv)"
+ALL_STORAGE="10.0.0.1 10.0.0.2 10.0.0.3 10.0.0.4 10.0.0.5 10.0.0.6"
+assert_eq "6 nodes (default profile)" \
+  "kiseki://10.0.0.1:9103,kiseki://10.0.0.2:9103,kiseki://10.0.0.3:9103,kiseki://10.0.0.4:9103,kiseki://10.0.0.5:9103,kiseki://10.0.0.6:9103" \
+  "$(native_endpoints_csv)"
+ALL_STORAGE="10.0.0.7"
+assert_eq "1 node (degenerate, no comma)" \
+  "kiseki://10.0.0.7:9103" \
+  "$(native_endpoints_csv)"
+
 echo
 echo "═══════════════════════════════════════════════════════"
 if [ "$FAIL" -eq 0 ]; then

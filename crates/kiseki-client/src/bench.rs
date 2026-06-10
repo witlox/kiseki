@@ -51,7 +51,14 @@ pub enum NativeBinding {
 /// Bench configuration. Names + defaults mirror `kiseki-profile run`.
 #[derive(Clone, Debug)]
 pub struct BenchConfig {
-    /// Endpoint URL: `kiseki://host:port` for native, `http(s)://host:port` for S3.
+    /// Endpoint URL(s): `kiseki://host:port` for native,
+    /// `http(s)://host:port` for S3. Accepts a comma-separated LIST
+    /// (`kiseki://h1:p,kiseki://h2:p,...`) — GH #229 ingress spread:
+    /// with N `connections` and E endpoints, connection *i* dials
+    /// endpoint *i mod E*, so one client process spreads its sockets
+    /// across every storage node instead of funnelling all writes
+    /// through one ingress gateway. Multi-endpoint is native-only
+    /// (`kiseki://`); the S3 driver takes exactly one endpoint.
     pub endpoint: String,
     /// ADR-042 binding selector (only consulted for `kiseki://`).
     pub binding: NativeBinding,
@@ -175,6 +182,65 @@ pub struct BenchReport {
     pub warmup_secs: u64,
     /// Error-rate gate threshold the bin enforces after printing.
     pub max_error_rate: f64,
+    /// Endpoint list this run dialled (GH #229 — additive field).
+    /// Connection *i* in the pool dials `endpoints[i mod E]`; a
+    /// single-endpoint run records a one-element list. Lets sweep
+    /// artifacts distinguish a 6-ingress spread cell from a
+    /// single-ingress cell post-hoc.
+    pub endpoints: Vec<String>,
+}
+
+/// Parse the `--endpoint` value into a list (GH #229). Splits on
+/// commas, trims surrounding whitespace per entry. Strict: an empty
+/// input, an empty entry (`a,,b`, trailing comma), or a list mixing
+/// URL schemes is an error — silent dropping would mask operator
+/// typos in a measurement tool.
+///
+/// # Errors
+/// Returns a description of the malformed entry.
+pub fn parse_endpoint_list(raw: &str) -> Result<Vec<String>, String> {
+    if raw.trim().is_empty() {
+        return Err("endpoint list is empty".to_string());
+    }
+    let endpoints: Vec<String> = raw
+        .split(',')
+        .map(|e| e.trim().to_string())
+        .collect::<Vec<_>>();
+    if endpoints.iter().any(String::is_empty) {
+        return Err(format!(
+            "empty endpoint in list {raw:?} — check for a doubled or trailing comma"
+        ));
+    }
+    let scheme = |e: &str| -> &'static str {
+        if e.starts_with("kiseki://") {
+            "kiseki"
+        } else if e.starts_with("http://") || e.starts_with("https://") {
+            "http"
+        } else {
+            "other"
+        }
+    };
+    let first_scheme = scheme(&endpoints[0]);
+    if let Some(mixed) = endpoints.iter().find(|e| scheme(e) != first_scheme) {
+        return Err(format!(
+            "endpoint list mixes URL schemes ({} vs {mixed}) — all endpoints must use the same scheme",
+            endpoints[0]
+        ));
+    }
+    Ok(endpoints)
+}
+
+/// Per-connection endpoint assignment (GH #229): connection *i* dials
+/// endpoint *i mod E*. Deterministic round-robin so a sweep cell's
+/// socket→node mapping is reproducible from (connections, endpoints)
+/// alone. With 1 connection and multiple endpoints, the rule reduces
+/// to "use the FIRST endpoint" — single-conn semantics stay
+/// deterministic (the caller warns; see `run`).
+#[must_use]
+pub fn connection_endpoint_assignment(connections: usize, n_endpoints: usize) -> Vec<usize> {
+    let connections = connections.max(1);
+    let n_endpoints = n_endpoints.max(1);
+    (0..connections).map(|i| i % n_endpoints).collect()
 }
 
 /// Error-rate gate (C-2): `true` when `errors / (ops + errors)`
@@ -222,33 +288,59 @@ fn resolve_bench_ids(cfg: &BenchConfig) -> (OrgId, NamespaceId) {
     )
 }
 
-/// Build the right driver from the endpoint URL and binding selector.
+/// Build the right driver from the endpoint URL(s) and binding
+/// selector. `cfg.endpoint` may be a comma-separated list (GH #229);
+/// native drivers assign connection *i* → endpoint *i mod E*.
 async fn build_driver(cfg: &BenchConfig) -> Result<Arc<dyn Driver>, String> {
-    if let Some(addr) = cfg.endpoint.strip_prefix("kiseki://") {
+    let endpoints = parse_endpoint_list(&cfg.endpoint)?;
+    if endpoints[0].starts_with("kiseki://") {
+        // parse_endpoint_list guarantees a uniform scheme, so every
+        // entry strips cleanly here.
+        let addrs: Vec<String> = endpoints
+            .iter()
+            .map(|e| {
+                e.strip_prefix("kiseki://")
+                    .expect("uniform scheme enforced by parse_endpoint_list")
+                    .to_string()
+            })
+            .collect();
         #[cfg(feature = "native")]
         {
             let (tenant_id, namespace_id) = resolve_bench_ids(cfg);
             match cfg.binding {
                 NativeBinding::Tcp => {
-                    return native::build_tcp(addr, cfg.connections, tenant_id, namespace_id).await
+                    return native::build_tcp(&addrs, cfg.connections, tenant_id, namespace_id)
+                        .await
                 }
                 NativeBinding::Grpc => {
-                    return native::build_grpc(addr, cfg.connections, tenant_id, namespace_id).await
+                    return native::build_grpc(&addrs, cfg.connections, tenant_id, namespace_id)
+                        .await
                 }
             }
         }
         #[cfg(not(feature = "native"))]
         {
-            let _ = addr;
+            let _ = addrs;
             return Err(
                 "kiseki:// endpoint requires the `native` feature; rebuild kiseki-client with `--features native`"
                     .to_string(),
             );
         }
     }
-    if cfg.endpoint.starts_with("http://") || cfg.endpoint.starts_with("https://") {
+    if endpoints[0].starts_with("http://") || endpoints[0].starts_with("https://") {
+        // Multi-endpoint spread is native-only: the S3 driver's
+        // reqwest pool has no per-connection endpoint mapping, so a
+        // list here would silently measure something other than the
+        // documented round-robin semantics. Checked before the
+        // feature gate so the error is the same in every build.
+        if endpoints.len() > 1 {
+            return Err(format!(
+                "multi-endpoint spread is native-only (kiseki://); got {} http(s) endpoints — pass exactly one S3 endpoint",
+                endpoints.len()
+            ));
+        }
         #[cfg(feature = "remote-http")]
-        return Ok(Arc::new(s3::S3Driver::new(&cfg.endpoint).await?));
+        return Ok(Arc::new(s3::S3Driver::new(&endpoints[0]).await?));
         #[cfg(not(feature = "remote-http"))]
         return Err(
             "http(s):// endpoint requires the `remote-http` feature; rebuild kiseki-client with `--features remote-http`"
@@ -257,7 +349,7 @@ async fn build_driver(cfg: &BenchConfig) -> Result<Arc<dyn Driver>, String> {
     }
     Err(format!(
         "unsupported endpoint scheme: {} — use kiseki://host:port or http(s)://host:port",
-        cfg.endpoint
+        endpoints[0]
     ))
 }
 
@@ -525,6 +617,23 @@ pub async fn run(cfg: BenchConfig) -> Result<BenchReport, String> {
     // Per-process nonce: every payload seed this run derives mixes it
     // in, so no two runs (or concurrent clients) share a seed space.
     let run_nonce = uuid::Uuid::new_v4();
+    // GH #229: parse the endpoint list up front so (a) malformed lists
+    // fail before any provisioning side-effects and (b) the report
+    // records exactly what was dialled. Connection *i* → endpoint
+    // *i mod E* (see connection_endpoint_assignment); with fewer
+    // connections than endpoints the tail endpoints are never dialled
+    // — warn loudly so a "spread across 6" run with --connections 1
+    // is visibly a single-ingress run (deterministic: first endpoint).
+    let endpoints = parse_endpoint_list(&cfg.endpoint)?;
+    if endpoints.len() > 1 && cfg.connections.max(1) < endpoints.len() {
+        eprintln!(
+            "warning: --connections {} < {} endpoints — only the first {} endpoint(s) will be dialled (connection i -> endpoint i mod E); raise --connections to >= {} to use every endpoint",
+            cfg.connections.max(1),
+            endpoints.len(),
+            cfg.connections.max(1),
+            endpoints.len()
+        );
+    }
     let (tenant_id, namespace_id) = resolve_bench_ids(&cfg);
     // Best-effort: provision the bench namespace before driving load.
     // Only when --admin-endpoint is set; GCP runbook expects external
@@ -624,6 +733,7 @@ pub async fn run(cfg: BenchConfig) -> Result<BenchReport, String> {
         client_id: cfg.client_id.clone().unwrap_or_else(default_client_id),
         warmup_secs: cfg.warmup_secs,
         max_error_rate: cfg.max_error_rate,
+        endpoints,
     };
 
     if cfg.json {
@@ -652,6 +762,7 @@ pub async fn run(cfg: BenchConfig) -> Result<BenchReport, String> {
             "client_id={} run_nonce={} warmup_secs={} max_error_rate={}",
             report.client_id, report.run_nonce, report.warmup_secs, report.max_error_rate
         );
+        println!("endpoints={}", report.endpoints.join(","));
         if report.errors > 0 {
             println!(
                 "errors={} get_length_mismatches={}",
@@ -689,19 +800,28 @@ mod native {
 
     // -- TCP-framed -----------------------------------------------------------
 
+    /// Build the TCP-framed driver pool. GH #229: `addrs` is the
+    /// (scheme-stripped) endpoint list; connection *i* dials
+    /// `addrs[i mod E]` per `connection_endpoint_assignment`, so one
+    /// bench process spreads its sockets across every storage node.
+    /// Worker→connection mapping is unchanged: workers round-robin
+    /// ops across the whole pool (see `TcpFramedDriver::pick`), which
+    /// keeps closed-loop in-flight semantics intact and spreads ops
+    /// evenly across endpoints.
     pub(super) async fn build_tcp(
-        addr: &str,
+        addrs: &[String],
         pool_size: usize,
         tenant_id: OrgId,
         namespace_id: NamespaceId,
     ) -> Result<Arc<dyn Driver>, String> {
-        let pool_size = pool_size.max(1);
-        let mut clients = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
+        let assignment = super::connection_endpoint_assignment(pool_size, addrs.len());
+        let mut clients = Vec::with_capacity(assignment.len());
+        for &ep_idx in &assignment {
+            let addr = &addrs[ep_idx];
             let client =
                 crate::native::tcp_framed::client::TcpFramedClient::connect_plaintext(addr)
                     .await
-                    .map_err(|e| format!("tcp-framed connect: {e}"))?;
+                    .map_err(|e| format!("tcp-framed connect ({addr}): {e}"))?;
             clients.push(client);
         }
         Ok(Arc::new(TcpFramedDriver {
@@ -794,17 +914,20 @@ mod native {
 
     // -- gRPC ----------------------------------------------------------------
 
+    /// Build the gRPC driver pool. Same GH #229 spread contract as
+    /// `build_tcp`: channel *i* dials `addrs[i mod E]`.
     pub(super) async fn build_grpc(
-        addr: &str,
+        addrs: &[String],
         pool_size: usize,
         tenant_id: OrgId,
         namespace_id: NamespaceId,
     ) -> Result<Arc<dyn Driver>, String> {
-        let pool_size = pool_size.max(1);
-        let mut clients = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
+        let assignment = super::connection_endpoint_assignment(pool_size, addrs.len());
+        let mut clients = Vec::with_capacity(assignment.len());
+        for &ep_idx in &assignment {
+            let addr = &addrs[ep_idx];
             let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-                .map_err(|e| format!("grpc endpoint: {e}"))?
+                .map_err(|e| format!("grpc endpoint ({addr}): {e}"))?
                 .tcp_nodelay(true)
                 .initial_stream_window_size(Some(16 * 1024 * 1024))
                 .initial_connection_window_size(Some(32 * 1024 * 1024))
@@ -812,7 +935,7 @@ mod native {
             let channel = endpoint
                 .connect()
                 .await
-                .map_err(|e| format!("grpc connect: {e}"))?;
+                .map_err(|e| format!("grpc connect ({addr}): {e}"))?;
             let client =
                 kiseki_proto::v1::native::gateway_data_service_client::GatewayDataServiceClient::new(channel)
                     .max_decoding_message_size(64 * 1024 * 1024)
@@ -1061,6 +1184,145 @@ mod tests {
             !err.is_empty(),
             "build_driver must produce a non-empty error message"
         );
+    }
+
+    // --- GH #229: endpoint-list parsing + per-connection assignment ---
+
+    #[test]
+    fn parse_endpoint_list_single() {
+        assert_eq!(
+            parse_endpoint_list("kiseki://10.0.0.10:9103").unwrap(),
+            vec!["kiseki://10.0.0.10:9103".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_list_multi_trims_whitespace() {
+        let parsed = parse_endpoint_list("kiseki://h1:9103, kiseki://h2:9103 ,kiseki://h3:9103")
+            .expect("valid 3-element list");
+        assert_eq!(
+            parsed,
+            vec![
+                "kiseki://h1:9103".to_string(),
+                "kiseki://h2:9103".to_string(),
+                "kiseki://h3:9103".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_list_rejects_empty_entries() {
+        // Doubled comma, trailing comma, empty input: all must error —
+        // silent dropping would mask an operator typo in the spread list.
+        for bad in ["kiseki://h1:1,,kiseki://h2:1", "kiseki://h1:1,"] {
+            let err = parse_endpoint_list(bad).expect_err("must reject");
+            assert!(err.contains("empty endpoint"), "got: {err}");
+        }
+        let err = parse_endpoint_list("").expect_err("empty input must be rejected");
+        assert!(err.contains("endpoint list is empty"), "got: {err}");
+        let err = parse_endpoint_list("  ").expect_err("blank input must be rejected");
+        assert!(err.contains("endpoint list is empty"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_endpoint_list_rejects_mixed_schemes() {
+        let err = parse_endpoint_list("kiseki://h1:9103,http://h2:9000")
+            .expect_err("mixed schemes must be rejected");
+        assert!(err.contains("mixes URL schemes"), "got: {err}");
+    }
+
+    #[test]
+    fn connection_assignment_round_robin_e6_c8() {
+        // 8 connections over 6 endpoints: conn i → endpoint i mod 6.
+        // Exact mapping (not just the distribution) so a refactor that
+        // shuffles assignment order trips this fence.
+        assert_eq!(
+            connection_endpoint_assignment(8, 6),
+            vec![0, 1, 2, 3, 4, 5, 0, 1]
+        );
+        // Per-endpoint counts: endpoints 0,1 carry 2 connections each.
+        let mut counts = [0usize; 6];
+        for idx in connection_endpoint_assignment(8, 6) {
+            counts[idx] += 1;
+        }
+        assert_eq!(counts, [2, 2, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn connection_assignment_single_conn_uses_first_endpoint() {
+        // conn=1 + multiple endpoints: deterministic — the FIRST
+        // endpoint only (run() warns). Keeps single-conn semantics
+        // identical to a single-endpoint invocation.
+        assert_eq!(connection_endpoint_assignment(1, 6), vec![0]);
+    }
+
+    #[test]
+    fn connection_assignment_degenerate_inputs_clamp() {
+        // 0 connections / 0 endpoints clamp to 1 — never panics,
+        // never returns an empty pool.
+        assert_eq!(connection_endpoint_assignment(0, 0), vec![0]);
+        assert_eq!(connection_endpoint_assignment(3, 1), vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn bench_report_serializes_endpoints_field() {
+        let report = BenchReport {
+            protocol: "native-tcp".into(),
+            shape: "PutHeavy".into(),
+            concurrency: 16,
+            connections: 8,
+            object_size: 4096,
+            duration_secs: 1.0,
+            ops: 1,
+            errors: 0,
+            get_length_mismatches: 0,
+            ops_per_sec: 1.0,
+            mib_per_sec: 0.1,
+            p50_us: 1,
+            p95_us: 2,
+            p99_us: 3,
+            run_nonce: "deadbeef".into(),
+            client_id: "test".into(),
+            warmup_secs: 0,
+            max_error_rate: 0.0,
+            endpoints: vec![
+                "kiseki://h1:9103".to_string(),
+                "kiseki://h2:9103".to_string(),
+            ],
+        };
+        let json = serde_json::to_string(&report).expect("serializable");
+        assert!(
+            json.contains(r#""endpoints":["kiseki://h1:9103","kiseki://h2:9103"]"#),
+            "endpoints field missing from report JSON: {json}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_driver_rejects_multi_endpoint_s3() {
+        // Multi-endpoint spread is native-only; the rejection fires
+        // before the remote-http feature gate so every build agrees.
+        let cfg = BenchConfig {
+            endpoint: "http://h1:9000,http://h2:9000".into(),
+            binding: NativeBinding::Tcp,
+            shape: Shape::PutHeavy,
+            concurrency: 1,
+            connections: 2,
+            object_size: 1024,
+            duration: Duration::from_secs(1),
+            warmup_objects: 0,
+            warmup_secs: 0,
+            max_error_rate: 0.0,
+            client_id: None,
+            json: false,
+            tenant_id: None,
+            namespace_id: None,
+            admin_endpoint: None,
+            bench_shards: 1,
+        };
+        let Err(err) = build_driver(&cfg).await else {
+            panic!("multi-endpoint http list must be rejected");
+        };
+        assert!(err.contains("native-only"), "got: {err}");
     }
 
     // --- C-1: payload-seed derivation ---

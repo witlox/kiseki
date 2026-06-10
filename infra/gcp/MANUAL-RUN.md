@@ -113,7 +113,10 @@ hard-won gotchas:
    Per-client endpoint `kiseki://10.0.0.1<c>:9103` where `<c>` ∈ {0, 1, 2}
    addresses storage-{1, 2, 3} respectively. Pointing all three at one node
    pays the forward-to-leader hop on 5/6 of writes and crushes the headline
-   number by ~8× (verified 2026-06-02 — operator mistake).
+   number by ~8× (verified 2026-06-02 — operator mistake). For the **full
+   6-node ingress spread** (#229 / #226 step 2), pass a comma-separated
+   endpoint list with `--connections ≥ 6` instead — see the
+   "#226 step 2" section below.
 
 #### Pass A — internal re-baseline (vs L4 / W12 / W11)
 Same shape as every recent A/B. 5 min wall-clock, 3 shapes.
@@ -334,7 +337,55 @@ Phase 11 spreads client *i* → storage node *i mod N* native endpoints
 by default (all-clients-at-one-leader pays the forward-to-leader hop on
 (N-1)/N of writes — the verified ~8× crush). `BENCH_SINGLE_ENDPOINT=1`
 restores the old single-leader aim if you specifically want to measure
-that.
+that. `BENCH_SPREAD_ALL=1` (GH #229 — see the next section) goes the
+other way: every client dials ALL storage nodes.
+
+## #226 step 2 — 6-node ingress spread (GH #229)
+
+The #226 occupancy analysis showed writes enter via only HALF the
+cluster: 3 client VMs map 1:1 to storage-1/2/3, so storage-4/5/6 do
+zero ingress work and per-node ingress occupancy is the cluster
+ceiling. Step 2 of the 100k roadmap widens ingress 3→6 by having each
+client spread its connections across **all** storage nodes. Expected
+with step 1: ~44–50k (the 48k bar sits at the top of this band).
+
+Mechanism: `kiseki-client bench --endpoint` accepts a comma-separated
+list; with N `--connections` and E endpoints, connection *i* dials
+endpoint *i mod E*. Workers still round-robin ops across the whole
+pool, so closed-loop in-flight semantics are unchanged and ops spread
+evenly across endpoints. The report's `endpoints` JSON field records
+the list, so spread cells are distinguishable in artifacts post-hoc.
+
+Two ways to run the 6-ingress arm:
+
+```bash
+# A) Phase 11, opt-in (default stays client-i→storage-i):
+BENCH_SPREAD_ALL=1 BENCH_CONNECTIONS=6 BENCH_CONCURRENCY=128 \
+  KISEKI_BENCH_OBJECT_SIZE=4096 ./bench run 11-native-parallel
+
+# B) Hand-driven (per client VM; same per-client value on all 3):
+EPS=kiseki://10.0.0.10:9103,kiseki://10.0.0.11:9103,kiseki://10.0.0.12:9103,kiseki://10.0.0.13:9103,kiseki://10.0.0.14:9103,kiseki://10.0.0.15:9103
+kiseki-client bench --endpoint "$EPS" \
+  --tenant $TEN --namespace $NS \
+  --shape put-heavy --concurrency 128 --connections 6 \
+  --object-size 4096 --duration-secs 60 --json
+```
+
+**Connection-count guidance: `--connections` must be ≥ E (here 6) to
+dial every endpoint.** With fewer connections only the first
+`--connections` endpoints get a socket (conn *i* → endpoint *i mod E*;
+the bench warns on stderr). `--connections 1` + a list degenerates to
+the FIRST endpoint, deterministically — i.e. exactly the old
+single-ingress shape. `BENCH_SPREAD_ALL=1` and `BENCH_SINGLE_ENDPOINT=1`
+are mutually exclusive (phase 11 HALTs).
+
+A/B the arms in one sweep: run each cell once with the default
+client-i→storage-i mapping (3-ingress) and once with
+`BENCH_SPREAD_ALL=1` (6-ingress); the runbook decides per run which
+arm is the keeper. Watch per-node `kiseki_gateway_requests_total` —
+the 6-ingress arm should show all six storage nodes taking ingress
+(forwarding share rises toward a uniform 17/18 with 18 shards;
+route-to-leader #135 becomes more valuable, not required).
 
 ### Warm-run discipline
 
