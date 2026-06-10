@@ -103,8 +103,17 @@ impl HydratorRegistry {
                 "composition hydrator: per-shard poll loop started",
             );
             loop {
-                let _applied = hydrator.poll(log.as_ref()).await;
-                tokio::time::sleep(interval).await;
+                let applied = hydrator.poll(log.as_ref()).await;
+                // #212 / #133 residue: drain while busy. Sleeping
+                // unconditionally capped sustained hydration at
+                // ~window/interval deltas/s and — once the write rate
+                // outran that — let the backlog cross the compaction
+                // horizon into permanent halt. Re-poll immediately
+                // whenever the last poll applied anything; only sleep
+                // once caught up (applied == 0).
+                if applied == 0 {
+                    tokio::time::sleep(interval).await;
+                }
             }
         });
     }

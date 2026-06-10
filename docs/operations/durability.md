@@ -88,6 +88,72 @@ the group-commit pattern; not a target.
 
 ---
 
+### `KISEKI_SMALL_OBJECT_FLUSH_INTERVAL_MS` (inline small-object store group commit, #212)
+
+| Aspect | Value |
+|---|---|
+| Default interval | `100` ms (group commit **on by default** when `KISEKI_DATA_DIR` is set) |
+| Disable group commit | set to `0` (strict per-write fsync) |
+| Recommended for production | default (`100` ms) |
+| Recommended for perf bench | default |
+
+The `SmallObjectStore` (inline file content, ADR-030) is hit once per
+inline PUT on the gateway ack path AND per applied entry in every
+hosted shard's Raft state machine — all through one shared fjall
+journal. Until #212 it was the last store running per-write
+`PersistMode::SyncAll`, which serialized the gateway hot path and all
+local shard appliers on one fsync-under-mutex. Default is now
+page-cache per write (`PersistMode::Buffer`) + one periodic
+`SyncAll` every N ms + a registered `fsync_pending` hook.
+
+**Loss window on power loss:** up to N ms of locally-materialized
+inline content. The same bytes are quorum-durable in the intent
+(fanned to `min_acks` peers at ack) and ride the Raft-replicated
+delta, so restart replay of the retained log re-seeds the store; a
+snapshot-build flush barrier guarantees the log is never purged past
+un-flushed inline puts.
+
+**Multi-node mitigation:** intent quorum + Raft log replay, as above.
+
+**Single-node:** dev only — same caveat as the chunk flag.
+
+---
+
+### `KISEKI_INTENT_FLUSH_INTERVAL_MS` (per-shard intent store group commit, #212)
+
+| Aspect | Value |
+|---|---|
+| Default interval | `100` ms (group commit **on by default** on multi-node Raft deployments) |
+| Disable group commit | set to `0` (strict per-write fsync) |
+| Recommended for production | default (`100` ms) |
+| Recommended for perf bench | default |
+
+ADR-047's decoupled write ack records every PUT in a per-shard
+durable intent store and fans it to `min_acks` peers before acking.
+Until #212 every coalesced intent batch paid a full fsync on the
+producer AND on each fanned peer — stricter than the spec: ADR-047
+rev-2 O4 / I-L5 define the ack durability point as **page cache on
+`min_acks` nodes**. Default is now `PersistMode::Buffer` per batch
+(OS page cache — survives process crash) + a periodic `SyncAll`
+every N ms + a registered `fsync_pending` hook
+(`RaftShardStore::flush_intent_stores`).
+
+**Loss window on power loss:** an acked write is lost only if **all
+`min_acks` nodes holding its intent lose power simultaneously**
+within the flush window — the documented I-L5 whole-cluster
+correlated-loss case. Any single-node power loss is recovered from
+the surviving intent replicas (intent-recovery on election).
+
+**Verification:** the discriminating test is a simultaneous hard
+kill of `min_acks` nodes' power (not a single-node kill — `min_acks`
+replication already covers that regardless of this knob).
+
+**Single-node / `min_acks=1`:** the page-cache window has no
+replica to recover from — set `0` if a single-node deployment
+hosts data that matters (dev / smoke only).
+
+---
+
 ### `KISEKI_COMPOSITION_FLUSH_INTERVAL_MS` (composition redb group commit)
 
 | Aspect | Value |
@@ -236,8 +302,9 @@ Kiseki's FUSE driver follows POSIX:
   Group commit's bounded loss window applies.
 - `FUSE_FSYNC` (called on `fsync(2)`) drains the dirty buffer **and**
   drives `gateway.fsync_pending()` — every registered fsync hook
-  runs (composition redb + chunk-store device). The call only
-  returns once data is durable.
+  runs (composition store + chunk-store device + small-object store
+  + per-shard intent stores, #212). The call only returns once data
+  is durable.
 
 Apps that need durability must call `fsync(2)` after critical writes.
 This matches the contract of every other Linux filesystem (ext4,

@@ -497,16 +497,21 @@ impl ShardSmInner {
         // small_store.get(&chunk_id.0).
         if !item.inline_payloads.is_empty() {
             if let Some(ref store) = self.inline_store {
-                for entry in &item.inline_payloads {
-                    let chunk_id = &entry.chunk_id;
-                    let bytes = &entry.payload;
-                    if let Err(e) = store.put(chunk_id, bytes) {
-                        tracing::warn!(
-                            chunk_id = ?chunk_id,
-                            error = %e,
-                            "sm.apply_one_incorporate: inline_store.put failed (#129); fallback via chunk tier",
-                        );
-                    }
+                // #212: one batched commit for the whole entry instead
+                // of one per payload — the per-put fjall journal commit
+                // was the measured `sm.append_delta_inner`-adjacent
+                // apply cost on every replica.
+                let items: Vec<(&[u8; 32], &[u8])> = item
+                    .inline_payloads
+                    .iter()
+                    .map(|entry| (&entry.chunk_id, entry.payload.as_slice()))
+                    .collect();
+                if let Err(e) = store.put_many(&items) {
+                    tracing::warn!(
+                        count = items.len(),
+                        error = %e,
+                        "sm.apply_one_incorporate: inline_store.put_many failed (#129); fallback via chunk tier",
+                    );
                 }
             }
         }
@@ -925,6 +930,17 @@ impl RaftSnapshotBuilder<C> for ShardStateMachine {
             recent_incorporated: inner.recent_incorporated.iter().copied().collect(),
         };
         let data = serde_json::to_vec(&snap).map_err(io::Error::other)?;
+        // #212 flush-ordering barrier: openraft purges the log only
+        // after a snapshot covers it, and restart recovery for the
+        // (in-memory) SM is full retained-log replay. With the inline
+        // store on group commit, a purged entry's buffered put would
+        // be unrecoverable after power loss — so force the store
+        // durable BEFORE this snapshot (and any purge it gates) can
+        // exist. Failing the flush fails the snapshot, which is the
+        // safe direction (log stays, replay still covers everything).
+        if let Some(ref store) = inner.inline_store {
+            store.flush()?;
+        }
         let snapshot_id = format!(
             "snap-{}",
             inner

@@ -213,6 +213,18 @@ pub trait IntentStore: Send + Sync {
         Ok(())
     }
 
+    /// Durability barrier: force buffered intent writes to stable
+    /// storage. The gateway's `fsync_pending` hook chain calls this so
+    /// POSIX `fsync(2)` keeps its "on disk now" contract while the
+    /// per-write path runs at the I-L5 group-commit point (#212).
+    /// No-op for in-memory / always-synced impls.
+    ///
+    /// # Errors
+    /// Backing-store I/O failure (durable impls only).
+    fn flush(&self) -> Result<(), IntentError> {
+        Ok(())
+    }
+
     /// Pending count — observability + backpressure (ADR-047 §F-6).
     ///
     /// # Errors
@@ -699,15 +711,21 @@ impl FjallIntentStore {
         Ok(())
     }
 
-    /// Build a batch whose durability follows `sync_per_write`. `None`
-    /// durability = "queue the WAL bytes; periodic flusher fsyncs".
+    /// Build a batch whose durability follows `sync_per_write`.
+    /// Relaxed = `PersistMode::Buffer`, NOT `None`: `None` parks the
+    /// committed bytes in fjall's user-space `BufWriter`, where a plain
+    /// process crash loses an *acked* intent — beyond the I-L5 window.
+    /// `Buffer` flushes to OS page cache, the durability point ADR-047
+    /// rev-2 O4 approves for the quorum-intent ack floor (survives
+    /// process crash; the periodic flusher bounds the power-loss
+    /// window; `min_acks` replicas bound correlated loss).
     fn batch_for_write(&self) -> OwnedWriteBatch {
         let durability = if self.sync_per_write.load(Ordering::Relaxed) {
-            Some(PersistMode::SyncAll)
+            PersistMode::SyncAll
         } else {
-            None
+            PersistMode::Buffer
         };
-        self.db.batch().durability(durability)
+        self.db.batch().durability(Some(durability))
     }
 }
 
@@ -1023,6 +1041,10 @@ impl IntentStore for FjallIntentStore {
             .lock_or_die("intent_store.fjall.pending_index");
         Ok(idx.by_seq.len())
     }
+
+    fn flush(&self) -> Result<(), IntentError> {
+        Self::flush(self)
+    }
 }
 
 #[cfg(test)]
@@ -1216,6 +1238,33 @@ mod tests {
     }
 
     // -- FjallIntentStore (the durable store) ----------------------------
+
+    #[test]
+    fn fjall_buffered_put_survives_flush_and_reopen() {
+        // #212 group-commit ship form: relaxed durability commits at
+        // PersistMode::Buffer (OS page cache — NOT fjall's user-space
+        // BufWriter); an explicit flush (periodic flusher /
+        // fsync_pending hook) makes the batch durable across reopen.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intents");
+        {
+            let s = FjallIntentStore::open(&path).unwrap();
+            s.set_sync_per_write(false);
+            assert_eq!(
+                s.put(intent(seq(1, 0, 1), None)).unwrap(),
+                PutOutcome::Recorded
+            );
+            assert_eq!(
+                s.put_batch(vec![intent(seq(2, 0, 1), None), intent(seq(3, 0, 1), None)])
+                    .unwrap(),
+                vec![PutOutcome::Recorded, PutOutcome::Recorded]
+            );
+            IntentStore::flush(&s).unwrap();
+        }
+        let s = FjallIntentStore::open(&path).unwrap();
+        assert_eq!(s.pending_len().unwrap(), 3);
+        assert_eq!(s.next_pending_seq().unwrap(), Some(seq(1, 0, 1)));
+    }
 
     #[test]
     fn fjall_persists_across_reopen() {

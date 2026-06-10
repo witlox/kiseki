@@ -641,6 +641,10 @@ pub async fn run_main(
 
     // Small object store for inline files (ADR-030).
     // Created before the log store so Raft state machines can use it.
+    // Captures the flusher for the gateway `fsync_pending` hook when
+    // group commit is on (#212) — registered further down next to the
+    // chunk + composition hooks.
+    let mut small_flusher_for_fsync: Option<kiseki_chunk::SmallObjectFlusher> = None;
     let small_store: Option<std::sync::Arc<kiseki_chunk::SmallObjectStore>> =
         if let Some(ref dir) = cfg.data_dir {
             // ADR-022 rev-5 (#129 unblock): SmallObjectStore moved
@@ -654,9 +658,47 @@ pub async fn run_main(
             }
             let store = kiseki_chunk::SmallObjectStore::open(&path)
                 .map_err(|e| format!("small object store at {}: {e}", path.display()))?;
+            // Group commit (#212): this store is hit once per inline
+            // PUT on the gateway ack path AND per-entry in every
+            // hosted shard's Raft apply — all through one fjall
+            // journal whose per-write `SyncAll` serialized the node.
+            // Relax to page-cache-per-write (I-L5 durability point;
+            // intent quorum + retained-log replay recover the local
+            // window) with a periodic fsync bounding power loss.
+            // `KISEKI_SMALL_OBJECT_FLUSH_INTERVAL_MS=0` opts back
+            // into strict per-write fsync.
+            let flush_interval_ms = std::env::var("KISEKI_SMALL_OBJECT_FLUSH_INTERVAL_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(100);
+            if flush_interval_ms > 0 {
+                store.set_sync_per_write(false);
+                let flusher = store.flusher();
+                small_flusher_for_fsync = Some(flusher.clone());
+                tokio::spawn(async move {
+                    let mut tick =
+                        tokio::time::interval(std::time::Duration::from_millis(flush_interval_ms));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tick.tick().await;
+                        let f = flusher.clone();
+                        let res = tokio::task::spawn_blocking(move || f.flush())
+                            .await
+                            .ok()
+                            .and_then(Result::ok);
+                        if res.is_none() {
+                            tracing::warn!(
+                                "small object store group-commit flush failed; retry next tick"
+                            );
+                        }
+                    }
+                });
+            }
             tracing::info!(
                 path = %path.display(),
                 resolved = boot_paths.has_resolved(),
+                group_commit = flush_interval_ms > 0,
+                flush_interval_ms,
                 "small object store: persistent (fjall, ADR-022 rev-5, ADR-049-routed)",
             );
             Some(std::sync::Arc::new(store))
@@ -2428,6 +2470,30 @@ pub async fn run_main(
             })
         }));
         tracing::info!("fsync hook: chunk-store device registered");
+    }
+    if let Some(flusher) = small_flusher_for_fsync {
+        // #212: the small-object store runs on group commit by default;
+        // explicit fsync(2) forces the inline-tier WAL durable now.
+        gw.register_fsync_hook(std::sync::Arc::new(move || {
+            flusher.flush().map_err(|e| {
+                kiseki_gateway::error::GatewayError::Upstream(format!(
+                    "small object store fsync: {e}"
+                ))
+            })
+        }));
+        tracing::info!("fsync hook: small-object store (fjall) registered");
+    }
+    if let Some(ref shard_store) = raft_shard_store_for_admin {
+        // #212: per-shard intent stores run at the I-L5 group-commit
+        // point (page-cache on min_acks); fsync(2) must still mean
+        // "durable on THIS node now" for POSIX surfaces.
+        let shard_store = std::sync::Arc::clone(shard_store);
+        gw.register_fsync_hook(std::sync::Arc::new(move || {
+            shard_store.flush_intent_stores().map_err(|e| {
+                kiseki_gateway::error::GatewayError::Upstream(format!("intent store fsync: {e}"))
+            })
+        }));
+        tracing::info!("fsync hook: per-shard intent stores registered");
     }
 
     gw.set_workflow_ref_writes_metric(Arc::new(metrics.gateway_workflow_ref_writes_total.clone()));

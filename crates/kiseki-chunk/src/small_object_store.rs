@@ -129,11 +129,17 @@ impl SmallObjectStore {
         }
     }
 
-    fn batch_durability(&self) -> Option<PersistMode> {
+    fn batch_durability(&self) -> PersistMode {
         if self.sync_per_write.load(Ordering::Relaxed) {
-            Some(PersistMode::SyncAll)
+            PersistMode::SyncAll
         } else {
-            None
+            // Buffer, NOT None: `None` parks committed bytes in fjall's
+            // user-space `BufWriter`, where a plain process crash loses
+            // them. `Buffer` flushes to OS page cache, which is the
+            // durability point I-L5 approves for group-commit stores
+            // (survives process crash; the periodic flusher bounds the
+            // power-loss window).
+            PersistMode::Buffer
         }
     }
 
@@ -158,13 +164,57 @@ impl SmallObjectStore {
         if existed {
             return Ok(false);
         }
-        let mut batch = self.db.batch().durability(self.batch_durability());
+        let mut batch = self.db.batch().durability(Some(self.batch_durability()));
         batch.insert(&self.objects, chunk_id.0.to_vec(), data.to_vec());
         batch
             .commit()
             .map_err(|e| io::Error::other(e.to_string()))?;
         self.approx_len.fetch_add(1, Ordering::Relaxed);
         Ok(true)
+    }
+
+    /// Batched [`SmallObjectStore::put`] (#212): one fjall batch + one
+    /// commit for every new entry, instead of N independent commits.
+    /// The Raft apply path submits all inline payloads of one entry
+    /// here so the journal commit (and its fsync when
+    /// `sync_per_write` is on) amortises across the batch.
+    ///
+    /// Existing keys are skipped (dedup, mirroring `put`'s `false`).
+    /// Returns the number of newly-stored entries.
+    ///
+    /// # Errors
+    /// Returns the underlying `io::Error` on read or commit failure.
+    pub fn put_many(&self, items: &[(&[u8; 32], &[u8])]) -> io::Result<u64> {
+        let mut batch = self.db.batch().durability(Some(self.batch_durability()));
+        let mut new_count: u64 = 0;
+        // Dedup within the batch too: the existence check below reads
+        // committed state, so a key repeated in `items` (same content
+        // → same content-addressed chunk_id) would otherwise double-
+        // insert and drift `approx_len`.
+        let mut staged: std::collections::HashSet<&[u8; 32]> = std::collections::HashSet::new();
+        for (key, data) in items {
+            if !staged.insert(key) {
+                continue;
+            }
+            let existed = self
+                .objects
+                .get(key.as_slice())
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .is_some();
+            if existed {
+                continue;
+            }
+            batch.insert(&self.objects, key.to_vec(), data.to_vec());
+            new_count += 1;
+        }
+        if new_count == 0 {
+            return Ok(0);
+        }
+        batch
+            .commit()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        self.approx_len.fetch_add(new_count, Ordering::Relaxed);
+        Ok(new_count)
     }
 
     /// Retrieve inline content for a chunk.
@@ -194,7 +244,7 @@ impl SmallObjectStore {
         if !existed {
             return Ok(false);
         }
-        let mut batch = self.db.batch().durability(self.batch_durability());
+        let mut batch = self.db.batch().durability(Some(self.batch_durability()));
         batch.remove(&self.objects, chunk_id.0.to_vec());
         batch
             .commit()
@@ -240,12 +290,20 @@ impl kiseki_common::inline_store::InlineStore for SmallObjectStore {
         self.put(&ChunkId(*key), data)
     }
 
+    fn put_many(&self, items: &[(&[u8; 32], &[u8])]) -> io::Result<u64> {
+        Self::put_many(self, items)
+    }
+
     fn get(&self, key: &[u8; 32]) -> io::Result<Option<Vec<u8>>> {
         self.get(&ChunkId(*key))
     }
 
     fn delete(&self, key: &[u8; 32]) -> io::Result<bool> {
         self.delete(&ChunkId(*key))
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        Self::flush(self)
     }
 }
 
@@ -400,6 +458,77 @@ mod tests {
         {
             let store = SmallObjectStore::open(&path).expect("reopen ok");
             assert_eq!(store.len().unwrap(), 3);
+        }
+    }
+
+    #[test]
+    fn put_many_mixed_new_dup_and_repeated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_at(&dir, "test-put-many");
+
+        // Pre-existing entry: must be skipped (dedup).
+        store.put(&test_chunk_id(0x20), b"existing").unwrap();
+
+        let k_existing = [0x20u8; 32];
+        let k_new_a = [0x21u8; 32];
+        let k_new_b = [0x22u8; 32];
+        let items: Vec<(&[u8; 32], &[u8])> = vec![
+            (&k_existing, b"existing"),
+            (&k_new_a, b"a"),
+            (&k_new_b, b"b"),
+            // Repeated within the same batch: counted once.
+            (&k_new_a, b"a"),
+        ];
+        let new_count = store.put_many(&items).unwrap();
+        assert_eq!(new_count, 2);
+        assert_eq!(store.len().unwrap(), 3);
+        assert_eq!(
+            store.get(&test_chunk_id(0x21)).unwrap(),
+            Some(b"a".to_vec())
+        );
+        assert_eq!(
+            store.get(&test_chunk_id(0x22)).unwrap(),
+            Some(b"b".to_vec())
+        );
+    }
+
+    #[test]
+    fn put_many_all_dups_commits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_at(&dir, "test-put-many-dups");
+        store.put(&test_chunk_id(0x30), b"x").unwrap();
+        let k = [0x30u8; 32];
+        let items: Vec<(&[u8; 32], &[u8])> = vec![(&k, b"x")];
+        assert_eq!(store.put_many(&items).unwrap(), 0);
+        assert_eq!(store.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn buffered_put_many_survives_flush_and_reopen() {
+        // Group-commit shape (#212): relaxed durability + explicit
+        // flush must make the batch durable across reopen.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test-buffered-reopen");
+        let k_a = [0x40u8; 32];
+        let k_b = [0x41u8; 32];
+        {
+            let store = SmallObjectStore::open(&path).expect("open ok");
+            store.set_sync_per_write(false);
+            let items: Vec<(&[u8; 32], &[u8])> = vec![(&k_a, b"a"), (&k_b, b"b")];
+            assert_eq!(store.put_many(&items).unwrap(), 2);
+            store.flush().unwrap();
+        }
+        {
+            let store = SmallObjectStore::open(&path).expect("reopen ok");
+            assert_eq!(
+                store.get(&test_chunk_id(0x40)).unwrap(),
+                Some(b"a".to_vec())
+            );
+            assert_eq!(
+                store.get(&test_chunk_id(0x41)).unwrap(),
+                Some(b"b".to_vec())
+            );
+            assert_eq!(store.len().unwrap(), 2);
         }
     }
 
