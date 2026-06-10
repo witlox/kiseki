@@ -9,9 +9,16 @@
 #
 # Configurable via env:
 #   KISEKI_BENCH_DURATION_SECS   (default: 30)
-#   KISEKI_BENCH_CONCURRENCY     (default: 16)
+#   BENCH_CONCURRENCY            (default: KISEKI_BENCH_CONCURRENCY, then 16)
+#   BENCH_CONNECTIONS            (default: 1 — the realistic single-
+#                                 process mount shape; sweep axis for
+#                                 the #212 saturation A/B)
 #   KISEKI_BENCH_OBJECT_SIZE     (default: 65536)
 #   KISEKI_BENCH_WARMUP_OBJECTS  (default: 256)
+#
+# Output embeds the sweep-cell label conc<N>-conn<M> so cells of a
+# concurrency × connections sweep never overwrite each other (C-3/F13,
+# 2026-06-10 bench-correctness review).
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -22,15 +29,17 @@ source "$BENCH_DIR/perf-common.sh"
 discover_leader > /dev/null 2>&1
 leader_endpoints
 DURATION="${KISEKI_BENCH_DURATION_SECS:-30}"
-CONC="${KISEKI_BENCH_CONCURRENCY:-16}"
+CONC="${BENCH_CONCURRENCY:-${KISEKI_BENCH_CONCURRENCY:-16}}"
+CONNS="${BENCH_CONNECTIONS:-1}"
 OBJSZ="${KISEKI_BENCH_OBJECT_SIZE:-65536}"
 WARMUP="${KISEKI_BENCH_WARMUP_OBJECTS:-256}"
+CELL="conc${CONC}-conn${CONNS}"
 
-OUT="$RESULTS/10-native-single.txt"
+OUT="$RESULTS/10-native-single-${CELL}.txt"
 {
   echo "=== Phase 10: native single-client (TCP-framed) ==="
-  echo "endpoint=$LEADER_NATIVE_URL"
-  echo "duration=${DURATION}s concurrency=$CONC object_size=$OBJSZ warmup=$WARMUP"
+  echo "endpoint=$LEADER_NATIVE_URL cell=$CELL"
+  echo "duration=${DURATION}s concurrency=$CONC connections=$CONNS object_size=$OBJSZ warmup=$WARMUP"
   echo ""
 } | tee "$OUT"
 
@@ -44,25 +53,31 @@ CLIENT_BIN=""
 # instead of running the workload — exactly what happened in the
 # initial local smoke.
 if [ "$(bench_mode)" = "gcp" ]; then
-  cands=(/usr/local/bin/kiseki-client)
+  # kiseki-client lives on the client VMs (the bench runs there via
+  # client_run), NOT on bench-ctrl — probe it remotely.
+  CLIENT_BIN=/usr/local/bin/kiseki-client
+  if ! client_run 0 <<< "test -x $CLIENT_BIN && $CLIENT_BIN --help 2>&1 | grep -qE '^[[:space:]]+bench[[:space:]]'"; then
+    echo "HALT: no $CLIENT_BIN with 'bench' subcommand on client VM 0" | tee -a "$OUT"
+    echo "  ensure the staged tarball was built post-#58" | tee -a "$OUT"
+    exit 2
+  fi
 else
   cands=(
     "$BENCH_DIR/../../../target/debug/kiseki-client"
     "$BENCH_DIR/../../../target/release/kiseki-client"
     "$(which kiseki-client 2>/dev/null || true)"
   )
+  for cand in "${cands[@]}"; do
+    [ -x "$cand" ] || continue
+    if "$cand" --help 2>&1 | grep -qE '^[[:space:]]+bench[[:space:]]'; then
+      CLIENT_BIN="$cand"
+      break
+    fi
+  done
 fi
-for cand in "${cands[@]}"; do
-  [ -x "$cand" ] || continue
-  if "$cand" --help 2>&1 | grep -qE '^[[:space:]]+bench[[:space:]]'; then
-    CLIENT_BIN="$cand"
-    break
-  fi
-done
 if [ -z "$CLIENT_BIN" ]; then
   echo "HALT: no kiseki-client binary with 'bench' subcommand found." | tee -a "$OUT"
   echo "  local: cargo build -p kiseki-client --features native,remote-http --bin kiseki-client" | tee -a "$OUT"
-  echo "  gcp:   ensure the staged tarball was built post-#58" | tee -a "$OUT"
   exit 2
 fi
 echo "client=$CLIENT_BIN" | tee -a "$OUT"
@@ -72,21 +87,31 @@ ERR=0
 for shape in put-heavy get-heavy mixed; do
   echo "--- shape=$shape ---" | tee -a "$OUT"
   if [ "$(bench_mode)" = "gcp" ]; then
-    client_run 0 <<EOF | tee -a "$OUT"
+    # pipefail is set, so a non-zero bench rc survives the tee.
+    client_run 0 <<EOF | tee -a "$OUT" || ERR=$((ERR + 1))
 $CLIENT_BIN bench --endpoint $LEADER_NATIVE_URL --shape $shape \
-  --concurrency $CONC --object-size $OBJSZ \
+  --concurrency $CONC --connections $CONNS --object-size $OBJSZ \
   --duration-secs $DURATION --warmup-objects $WARMUP --json
 EOF
   else
     "$CLIENT_BIN" bench --endpoint "$LEADER_NATIVE_URL" --shape "$shape" \
-      --concurrency "$CONC" --object-size "$OBJSZ" \
+      --concurrency "$CONC" --connections "$CONNS" --object-size "$OBJSZ" \
       --duration-secs "$DURATION" --warmup-objects "$WARMUP" --json 2>&1 \
       | tee -a "$OUT" || ERR=$((ERR + 1))
   fi
 done
 
 if [ "$ERR" -gt 0 ]; then
-  echo "HALT: $ERR of 3 shapes failed" | tee -a "$OUT"
+  echo "HALT: $ERR of 3 shapes failed (bench rc != 0)" | tee -a "$OUT"
+  exit 2
+fi
+
+# C-2: never report numbers while ops are failing — the bench's exit
+# code is checked above, but independently sum the report JSONs'
+# errors field too.
+ERRS=$(bench_errors_total "$OUT") || true
+if [ "$ERRS" != "0" ]; then
+  echo "HALT (C-2): bench reported errors=$ERRS (or no parsable report) — functional break, numbers invalid" | tee -a "$OUT"
   exit 2
 fi
 echo "" | tee -a "$OUT"

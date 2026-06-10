@@ -2,6 +2,9 @@
 #
 # Resume the profile matrix: only run combinations whose output is missing.
 # Phase 1 = CPU (pprof SVG), Phase 2 = heap (dhat JSON).
+#
+# DATA DIRS: tmpfs /tmp makes fsync ~free; real-disk A/Bs need
+# KISEKI_PROFILE_DATA_ROOT (or TMPDIR) — see run-all.sh header.
 
 set -uo pipefail
 

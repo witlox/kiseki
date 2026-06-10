@@ -55,7 +55,14 @@ fi
 
 if [ "$MODE" = "gcp" ]; then
   echo "TODO: gcp mode SSHes into a client VM; pasted shape, untested" | tee -a "$OUT"
-  client_run 0 <<EOF | tee -a "$OUT"
+  # F7 (dedup-degenerate payloads): /dev/zero writes dedup to one
+  # chunk and measure the refcount path. Pre-generate ONE random
+  # source file per run OUTSIDE the timed dd — a fresh urandom file
+  # per run also defeats cross-run dedup on a non-wiped cluster —
+  # then write from it (page-cache-warm read, so the timed window is
+  # the FUSE write path, not urandom CPU).
+  # pipefail is set, so a non-zero remote rc survives the tee.
+  client_run 0 <<EOF | tee -a "$OUT" || { echo "HALT: gcp FUSE pass failed (rc != 0)" | tee -a "$OUT"; exit 2; }
 sudo umount -l $MOUNT_POINT 2>/dev/null
 sudo mkdir -p $MOUNT_POINT $CACHE_DIR
 sudo $CLIENT_BIN mount --endpoint $LEADER_NATIVE_URL --mountpoint $MOUNT_POINT \\
@@ -63,15 +70,22 @@ sudo $CLIENT_BIN mount --endpoint $LEADER_NATIVE_URL --mountpoint $MOUNT_POINT \
 sleep 5
 if mountpoint -q $MOUNT_POINT; then
   echo MOUNTED
-  sudo dd if=/dev/zero of=$MOUNT_POINT/dd-write bs=1M count=$SIZE_MB conv=fdatasync 2>&1 | tail -1
+  dd if=/dev/urandom of=/tmp/kiseki-bench-rand-${SIZE_MB}m bs=1M count=$SIZE_MB 2>/dev/null
+  sudo dd if=/tmp/kiseki-bench-rand-${SIZE_MB}m of=$MOUNT_POINT/dd-write bs=1M conv=fdatasync 2>&1 | tail -1
+  rm -f /tmp/kiseki-bench-rand-${SIZE_MB}m
   sudo sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
   sudo dd if=$MOUNT_POINT/dd-write of=/dev/null bs=1M 2>&1 | tail -1
   sudo rm -f $MOUNT_POINT/dd-write
   sudo umount -l $MOUNT_POINT
 else
   echo MOUNT-FAILED
+  exit 1
 fi
 EOF
+  if grep -q 'MOUNT-FAILED' "$OUT"; then
+    echo "HALT: FUSE mount failed on client VM" | tee -a "$OUT"
+    exit 2
+  fi
 else
   # Local mode: needs fuse mount + sudo. Skip with a clear message if
   # the operator isn't running this with the right privileges.
@@ -103,9 +117,15 @@ else
   fi
   echo "MOUNTED" | tee -a "$OUT"
 
-  echo "--- write ${SIZE_MB}MB ---" | tee -a "$OUT"
+  echo "--- write ${SIZE_MB}MB (random payload) ---" | tee -a "$OUT"
   sudo rm -f "$MOUNT_POINT/dd-write" 2>/dev/null
-  W=$(sudo dd if=/dev/zero of="$MOUNT_POINT/dd-write" bs=1M count="$SIZE_MB" conv=fdatasync 2>&1 | tail -1)
+  # F7: /dev/zero dedups to one chunk. Generate the random source
+  # OUTSIDE the timed dd (fresh per run → also defeats cross-run
+  # dedup); the timed write then reads it page-cache-warm.
+  RAND_SRC="/tmp/kiseki-bench-rand-${SIZE_MB}m"
+  dd if=/dev/urandom of="$RAND_SRC" bs=1M count="$SIZE_MB" 2>/dev/null
+  W=$(sudo dd if="$RAND_SRC" of="$MOUNT_POINT/dd-write" bs=1M conv=fdatasync 2>&1 | tail -1)
+  rm -f "$RAND_SRC"
   echo "$W" | tee -a "$OUT"
 
   echo "--- read ${SIZE_MB}MB (caches dropped) ---" | tee -a "$OUT"

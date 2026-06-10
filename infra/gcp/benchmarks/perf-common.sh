@@ -184,6 +184,65 @@ pick_namespace_for_client() {
   echo "perf-agg-ns$((idx % n))"
 }
 
+# Full set of storage-node native (ADR-042 TCP-framed, port 9103) data
+# endpoints, one per line. F5 (2026-06-10 bench-correctness review):
+# aiming every parallel client at ONE leader endpoint pays the
+# forward-to-leader hop on (N-1)/N of writes — the documented ~8×
+# crush. Phase 11 spreads clients across these instead.
+native_endpoints() {
+  local ip
+  for ip in $ALL_STORAGE; do
+    echo "kiseki://$ip:9103"
+  done
+}
+
+# client idx → native endpoint (idx mod n_storage). Escape hatch:
+# BENCH_SINGLE_ENDPOINT=1 restores the old all-clients-one-leader
+# behavior. Local mode always uses $LEADER_NATIVE_URL (single compose
+# host; the spread is meaningless there) — callers must have run
+# leader_endpoints first.
+pick_native_endpoint_for_client() {
+  local idx=$1
+  if [ "${BENCH_SINGLE_ENDPOINT:-0}" = "1" ] || [ "$(bench_mode)" != "gcp" ]; then
+    echo "$LEADER_NATIVE_URL"
+    return
+  fi
+  local n=${#STORAGE_IPS_ARRAY[@]}
+  echo "kiseki://${STORAGE_IPS_ARRAY[$((idx % n))]}:9103"
+}
+
+# ----------------------------------------------------------------------------
+# Halt-on-break helper (C-2, 2026-06-10 bench-correctness review).
+# `kiseki-client bench` historically exited 0 at a 100 % error rate, so
+# phases must independently sum the `errors` field across every report
+# JSON line in an output file. Echoes the total; echoes -1 and returns
+# 1 when no parsable report is present — callers treat both a non-zero
+# total and -1 as a functional break (exit 2 so the `bench` driver
+# halts).
+# ----------------------------------------------------------------------------
+
+bench_errors_total() {
+  local file=$1
+  local total=""
+  if command -v jq >/dev/null 2>&1; then
+    total=$(grep '^{' "$file" 2>/dev/null \
+      | jq -s 'map(.errors // 0) | add // empty' 2>/dev/null)
+  else
+    # Dev boxes without jq: same sum via python3.
+    total=$(grep '^{' "$file" 2>/dev/null | python3 -c '
+import json, sys
+vals = [json.loads(l).get("errors", 0) for l in sys.stdin if l.strip()]
+if vals:
+    print(sum(vals))
+' 2>/dev/null)
+  fi
+  if [ -z "$total" ]; then
+    echo "-1"
+    return 1
+  fi
+  echo "$total"
+}
+
 # ----------------------------------------------------------------------------
 # Cluster health + Raft leader discovery
 # ----------------------------------------------------------------------------

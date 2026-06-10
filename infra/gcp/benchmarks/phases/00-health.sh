@@ -88,4 +88,18 @@ if [ "$CAP_OK" != "1" ]; then
   exit 2
 fi
 
+# C-4 (#212 A/B provenance): record which durability arm the storage
+# nodes booted with. setup-raw-storage.sh's unit reads the optional
+# /etc/kiseki/perf-arm.env (EnvironmentFile=-); absence = post-#217
+# group-commit defaults. Without this label in the results dir, two
+# A/B arms are indistinguishable after the fact.
+echo "" | tee -a "$OUT"
+echo "Perf arm (storage-1 /etc/kiseki/perf-arm.env):" | tee -a "$OUT"
+if [ "$MODE" = "gcp" ]; then
+  node_ssh "$FIRST_STORAGE" "cat /etc/kiseki/perf-arm.env 2>/dev/null || echo ARM-DEFAULT" 2>/dev/null \
+    | sed 's/^/  /' | tee -a "$OUT"
+else
+  echo "  ARM-DEFAULT (local mode — no perf-arm.env)" | tee -a "$OUT"
+fi
+
 echo "OK" | tee -a "$OUT"

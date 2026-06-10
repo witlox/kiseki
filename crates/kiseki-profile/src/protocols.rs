@@ -1357,8 +1357,7 @@ impl InProcessPersistentDriver {
         use kiseki_crypto::keys::SystemMasterKey;
         use kiseki_gateway::mem_gateway::InMemoryGateway;
 
-        let data_dir =
-            tempfile::tempdir().map_err(|e| format!("InProcessPersistent tempdir: {e}"))?;
+        let data_dir = crate::harness::profile_data_dir("in-process-persistent")?;
         let dir = data_dir.path();
 
         // 1. Persistent chunk store — same shape as runtime.rs:

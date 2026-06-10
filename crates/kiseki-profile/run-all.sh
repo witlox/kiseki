@@ -5,6 +5,13 @@
 # Heap profile is captured by spawning the dhat-enabled server.
 # Both write per-protocol/per-shape output under OUT_DIR (default
 # /tmp/kiseki-prof).
+#
+# DATA DIRS: server data dirs default to tempfile::tempdir(), which
+# on most Linux distros lands on tmpfs /tmp — fsync there is ~free,
+# so durability/fsync A/Bs (KISEKI_SMALL_OBJECT_FLUSH_INTERVAL_MS /
+# KISEKI_INTENT_FLUSH_INTERVAL_MS arms) measure NOTHING. For real-
+# disk runs export KISEKI_PROFILE_DATA_ROOT=/path/on/real/disk (or
+# TMPDIR); per-run subdirs are created under it and removed on exit.
 
 set -uo pipefail
 

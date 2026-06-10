@@ -63,11 +63,16 @@ impl Stats {
     }
 }
 
+/// Nearest-rank percentile: `rank = ceil(n * p / 100)`, returning
+/// `sorted[rank - 1]` clamped to `[0, n - 1]`. The previous
+/// `floor(n * p / 100)` over-read the tail by one rank (p99 of 100
+/// samples returned the max instead of `sorted[98]`).
 fn pct(sorted: &[u32], p: u8) -> u32 {
     if sorted.is_empty() {
         return 0;
     }
-    let idx = ((sorted.len() as u64 * u64::from(p)) / 100) as usize;
+    let rank = (sorted.len() as u64 * u64::from(p)).div_ceil(100);
+    let idx = usize::try_from(rank.saturating_sub(1)).unwrap_or(usize::MAX);
     sorted[idx.min(sorted.len() - 1)]
 }
 
@@ -79,4 +84,49 @@ pub struct Report {
     pub p50_us: u32,
     pub p95_us: u32,
     pub p99_us: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pct;
+
+    #[test]
+    fn pct_empty_is_zero() {
+        assert_eq!(pct(&[], 99), 0);
+    }
+
+    #[test]
+    fn pct_single_sample_is_that_sample() {
+        assert_eq!(pct(&[42], 50), 42);
+        assert_eq!(pct(&[42], 99), 42);
+    }
+
+    #[test]
+    fn pct_nearest_rank_100_samples() {
+        // sorted[i] = i for 0..100. Nearest-rank: rank = ceil(n*p/100).
+        let s: Vec<u32> = (0..100).collect();
+        assert_eq!(pct(&s, 50), s[49]);
+        assert_eq!(pct(&s, 95), s[94]);
+        // p99 of 100 samples MUST be sorted[98], not the max.
+        assert_eq!(pct(&s, 99), s[98]);
+        assert_eq!(pct(&s, 100), s[99]);
+    }
+
+    #[test]
+    fn pct_nearest_rank_non_divisible_n() {
+        // n = 10: rank(p50) = ceil(5) = 5 → idx 4; rank(p99) = ceil(9.9)
+        // = 10 → idx 9 (the max — correct for n < 100 at p99).
+        let s: Vec<u32> = (0..10).collect();
+        assert_eq!(pct(&s, 50), s[4]);
+        assert_eq!(pct(&s, 99), s[9]);
+        // n = 3: rank(p50) = ceil(1.5) = 2 → idx 1 (the median).
+        let s3 = [10, 20, 30];
+        assert_eq!(pct(&s3, 50), 20);
+    }
+
+    #[test]
+    fn pct_p0_clamps_to_first_sample() {
+        let s: Vec<u32> = (0..100).collect();
+        assert_eq!(pct(&s, 0), s[0]);
+    }
 }
