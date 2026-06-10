@@ -65,6 +65,14 @@ use crate::intent_sync::{WireIntent, INTENT_PUT_TAG};
 struct CoalesceReq {
     intent: WriteIntent,
     submitted_at: Instant,
+    /// ADR-047 hot-path timer (`pif.enqueue_wait`) — started at submit,
+    /// ended by the flusher the moment it TAKES the batch (set to
+    /// `None` in [`run_flush_cycle`]), so it measures submit →
+    /// batch-taken, not submit → ack. Held as a struct field (the
+    /// `hot_timer!` macro can't span two functions), which is why this
+    /// uses `HotTimer::new` directly — the off-feature `HotTimer` is a
+    /// ZST with a no-op `Drop`, so production builds pay nothing.
+    enqueue_wait: Option<kiseki_tracing::hot_path::HotTimer>,
     /// Resolves when the batch this intent belongs to has finished
     /// its fan. `Ok(())` once durable copies reach `min_acks` for this
     /// intent; otherwise `Err(QuorumLost)` or `Err(Unavailable)`.
@@ -158,6 +166,7 @@ impl IntentFanCoalescer {
         let req = CoalesceReq {
             intent,
             submitted_at: Instant::now(),
+            enqueue_wait: Some(kiseki_tracing::hot_path::HotTimer::new("pif.enqueue_wait")),
             ack: ack_tx,
         };
 
@@ -200,7 +209,7 @@ async fn run_flush_cycle(inner: Arc<CoalescerInner>) {
     }
 
     // Take the accumulated batch and re-arm the slot for the next one.
-    let batch: Vec<CoalesceReq> = {
+    let mut batch: Vec<CoalesceReq> = {
         let mut s = inner.state.lock().lock_or_die("intent_fan_coalescer.state");
         let taken = std::mem::take(&mut s.pending);
         s.flusher_running = false;
@@ -209,12 +218,26 @@ async fn run_flush_cycle(inner: Arc<CoalescerInner>) {
 
     // Observe the per-intent wait + batch size BEFORE the flush.
     let flushed_at = Instant::now();
-    for req in &batch {
+    for req in &mut batch {
         intent_metrics::observe_coalesce_wait(
             flushed_at.saturating_duration_since(req.submitted_at),
         );
+        // ADR-047 (pif.enqueue_wait) ends HERE — the flusher has taken
+        // the batch; everything after this point is flush wall time
+        // (pif.flush_total), not queueing.
+        req.enqueue_wait = None;
     }
+    // Batch-size distribution — the direct evidence for the conc128
+    // batch-cap convoy hypothesis (KISEKI_INTENT_FAN_BATCH_MAX=16
+    // default pinning batches at the cap under load). The always-on
+    // `kiseki_intent_put_batch_size` histogram is the canonical view;
+    // the debug line below gives a scrape-free read on a live run.
     intent_metrics::observe_intent_put_batch_size(batch.len());
+    tracing::debug!(
+        shard_id = %inner.cfg.shard_id.0,
+        batch_size = batch.len(),
+        "intent fan coalescer: batch taken for flush",
+    );
 
     flush_batch(&inner.cfg, batch).await;
 }
@@ -222,9 +245,18 @@ async fn run_flush_cycle(inner: Arc<CoalescerInner>) {
 async fn flush_batch(cfg: &CoalescerConfig, batch: Vec<CoalesceReq>) {
     use futures::StreamExt;
 
+    // ADR-047 hot-path timer (pif.flush_total) — wall time of the whole
+    // flush: local put + leader-first hop + top-up + ack distribution.
+    // RAII, so every early return (fast path, quorum reached, shortfall)
+    // still observes. Together with pif.enqueue_wait this partitions
+    // pif.total: total ≈ enqueue_wait + flush_total per intent.
+    kiseki_tracing::hot_timer_guard!(_ht_pif_flush_total = "pif.flush_total");
+
     // 1. Local durable copy (one fjall batch, one WAL sync).
+    // ADR-047 hot-path timer (pif.local_put) — the synchronous fjall
+    // put_batch (WAL append + fsync) on the submitting node.
     let intents: Vec<WriteIntent> = batch.iter().map(|r| r.intent.clone()).collect();
-    let put_res = cfg.store.put_batch(intents);
+    let put_res = kiseki_tracing::hot_span!("pif.local_put", { cfg.store.put_batch(intents) });
     if let Err(e) = put_res {
         tracing::warn!(
             shard_id = %cfg.shard_id.0,
@@ -256,14 +288,19 @@ async fn flush_batch(cfg: &CoalescerConfig, batch: Vec<CoalesceReq>) {
     if !leader_is_local {
         if let Some(lid) = leader_id {
             if let Some((node_id, addr)) = peers.iter().find(|(n, _)| n.0 == lid).cloned() {
-                let acked = fan_one_batch(
-                    node_id,
-                    addr,
-                    cfg.shard_id,
-                    wire_batch.clone(),
-                    cfg.peer_rpc_timeout,
-                )
-                .await;
+                // ADR-047 hot-path timer (pif.leader_first_hop) — the
+                // awaited leader-first peer RPC (MF-3). Serial with the
+                // top-up, so it's a pure add to the flush wall time.
+                let acked = kiseki_tracing::hot_span!("pif.leader_first_hop", {
+                    fan_one_batch(
+                        node_id,
+                        addr,
+                        cfg.shard_id,
+                        wire_batch.clone(),
+                        cfg.peer_rpc_timeout,
+                    )
+                    .await
+                });
                 if acked {
                     peer_acks += 1;
                     if local_acks + peer_acks >= cfg.min_acks {
@@ -278,6 +315,10 @@ async fn flush_batch(cfg: &CoalescerConfig, batch: Vec<CoalesceReq>) {
     }
 
     // 5. Parallel top-up to remaining voter peers.
+    // ADR-047 hot-path timer (pif.topup) — from launching the parallel
+    // fan to flush exit (quorum return, drain, or shortfall; RAII drops
+    // at every path). The shortfall tail adds only a warn! + ack sends.
+    kiseki_tracing::hot_timer_guard!(_ht_pif_topup = "pif.topup");
     let mut fan = futures::stream::FuturesUnordered::new();
     for (node_id, addr) in peers {
         if !leader_is_local && leader_id == Some(node_id.0) {
@@ -501,5 +542,41 @@ mod tests {
             assert!(coalescer.submit(intent(seq(3, i, 1))).await.is_ok());
         }
         assert_eq!(store.pending_len().unwrap(), 3);
+    }
+
+    /// Instrumented flush path (`pif.enqueue_wait` / `pif.flush_total` /
+    /// `pif.local_put` sub-spans) still acks every submitter across
+    /// MULTIPLE flush cycles: 8 submitters with cap=3 forces at least
+    /// three batches (cap-reached + timer flushes mixed), so the
+    /// enqueue-timer reset in `run_flush_cycle` runs on both the
+    /// flusher and waiter paths repeatedly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_cycle_flush_acks_every_submitter() {
+        let store: Arc<dyn IntentStore> = Arc::new(InMemIntentStore::new());
+        let resolver: PeerLeaderResolver = Arc::new(|| (Vec::new(), None));
+        let coalescer = spawn(
+            &tokio::runtime::Handle::current(),
+            CoalescerConfig {
+                shard_id: ShardId(uuid::Uuid::from_u128(4)),
+                local_node: NodeId(1),
+                store: Arc::clone(&store),
+                resolver,
+                min_acks: 1,
+                cap_max: 3,
+                cap_timeout: Duration::from_micros(100),
+                peer_rpc_timeout: Duration::from_secs(1),
+            },
+        );
+        let mut handles = Vec::new();
+        for i in 0..8u32 {
+            let c = coalescer.clone();
+            handles.push(tokio::spawn(
+                async move { c.submit(intent(seq(4, i, 1))).await },
+            ));
+        }
+        for h in handles {
+            assert!(h.await.unwrap().is_ok(), "every submitter must see Ok");
+        }
+        assert_eq!(store.pending_len().unwrap(), 8);
     }
 }
