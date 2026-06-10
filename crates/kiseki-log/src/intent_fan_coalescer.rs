@@ -69,7 +69,7 @@ use std::time::{Duration, Instant};
 
 use kiseki_common::ids::{NodeId, ShardId};
 use kiseki_common::locks::LockOrDie;
-use kiseki_raft::tcp_transport::rpc_call;
+use kiseki_raft::tcp_transport::rpc_call_aux;
 use tokio::sync::{oneshot, Notify};
 
 use crate::error::LogError;
@@ -363,11 +363,13 @@ async fn flush_batch(inner: &CoalescerInner, batch: Vec<CoalesceReq>) {
     // candidate on timeout/error — the min_acks guarantee and most of
     // the tail benefit survive a slow peer at a fraction of the RPC
     // load. Steady-state RPC cancellation is gone; the SLOW-PEER
-    // fallback still drops its timed-out in-flight future (one
-    // cancelled pooled stream per timeout, and the timed-out peer may
-    // still apply server-side — applies/write can exceed 2.0 under
-    // sustained peer pressure; watch kiseki_intent_commit_batch_size
-    // and the applies/write ratio on instrumented runs).
+    // fallback still drops its timed-out in-flight future (since
+    // PR-1c the drop only abandons a request_id on the shared mux
+    // connection — no stream is torn down — but the timed-out peer
+    // may still apply server-side, so applies/write can exceed 2.0
+    // under sustained peer pressure; watch
+    // kiseki_intent_commit_batch_size and the applies/write ratio on
+    // instrumented runs).
     //
     // ADR-047 hot-path timer (pif.topup) — from entering the top-up walk
     // to flush exit (quorum return or shortfall; RAII drops at every
@@ -418,6 +420,14 @@ async fn flush_batch(inner: &CoalescerInner, batch: Vec<CoalesceReq>) {
 }
 
 /// Fan ONE `intent_put` RPC to one peer, carrying the whole batch.
+///
+/// Rides the request_id-multiplexed aux transport (GH #228 PR-1c):
+/// concurrent fans to the same peer share a pooled connection, so fan
+/// concurrency no longer consumes connection slots or counts against
+/// the peer's inbound connection cap. Dropping this future on the
+/// top-up timeout below is safe — the abandoned request is reaped
+/// client-side and its late response is read-and-dropped without
+/// disturbing the shared stream (see `rpc_call_aux`).
 async fn fan_one_batch(
     node_id: NodeId,
     addr: String,
@@ -425,7 +435,7 @@ async fn fan_one_batch(
     wire_batch: Vec<WireIntent>,
     timeout: Duration,
 ) -> bool {
-    let call = rpc_call::<_, Vec<bool>>(&addr, shard_id, INTENT_PUT_TAG, None, &wire_batch);
+    let call = rpc_call_aux::<_, Vec<bool>>(&addr, shard_id, INTENT_PUT_TAG, None, &wire_batch);
     match tokio::time::timeout(timeout, call).await {
         Ok(Ok(acks)) => !acks.is_empty() && acks.iter().all(|b| *b),
         Ok(Err(e)) => {

@@ -17,7 +17,10 @@
 //! - The **client** side ([`TransportIntentGatherer`]) implements
 //!   [`PeerIntentGatherer`](crate::shard_committer::PeerIntentGatherer) by
 //!   fanning [`INTENT_GATHER_PENDING_TAG`] out to the shard's voter peers over
-//!   [`rpc_call`](kiseki_raft::tcp_transport::rpc_call).
+//!   [`rpc_call_aux`](kiseki_raft::tcp_transport::rpc_call_aux) — the
+//!   request_id-multiplexed aux transport (GH #228 PR-1c), so N
+//!   concurrent intent RPCs share one pooled connection instead of one
+//!   connection each.
 //!
 //! **`LeaderSink`: no steady-state gossip.** The old `next_pending` watermark
 //! gather is GONE — under `LeaderSink` the leader incorporates from its own store
@@ -43,7 +46,7 @@ use kiseki_proto::v1::AppendChunkAndDeltaRequest as ProtoChunkAppendReq;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 
-use kiseki_raft::tcp_transport::{rpc_call, DispatchOutcome, ShardDispatch};
+use kiseki_raft::tcp_transport::{rpc_call_aux, DispatchOutcome, ShardDispatch};
 
 use crate::grpc::{append_chunk_and_delta_request_to_proto, proto_to_append_chunk_and_delta};
 use crate::intent::{IntentError, IntentStore, PerspectiveSeq, WriteIntent};
@@ -327,7 +330,7 @@ pub async fn fetch_consumer_positions(
     shard_id: ShardId,
     tls_config: Option<&Arc<rustls::ClientConfig>>,
 ) -> std::io::Result<Vec<(String, u64)>> {
-    rpc_call(addr, shard_id, CONSUMER_POSITIONS_TAG, tls_config, &()).await
+    rpc_call_aux(addr, shard_id, CONSUMER_POSITIONS_TAG, tls_config, &()).await
 }
 
 /// Postcard-encode an `Ok` response body, degrading an encode fault to
@@ -459,7 +462,7 @@ impl PeerIntentGatherer for TransportIntentGatherer {
         let mut out = Vec::with_capacity(peers.len());
         for peer in &peers {
             // postcard(Vec<WireIntent>) on the wire.
-            let resp: Result<Vec<WireIntent>, _> = rpc_call(
+            let resp: Result<Vec<WireIntent>, _> = rpc_call_aux(
                 &peer.addr,
                 self.shard_id,
                 INTENT_GATHER_PENDING_TAG,

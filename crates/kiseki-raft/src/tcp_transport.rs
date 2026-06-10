@@ -15,12 +15,24 @@
 //! `DispatcherPanic`) so callers can distinguish a retired shard
 //! from a transient transport failure. `Ok` body is postcard-encoded.
 //!
+//! **Auxiliary multiplexed frames (V3, GH #228 PR-1c).** The non-Raft
+//! aux RPCs (ADR-047 `intent_put` fan / `intent_gather_pending` /
+//! `consumer_positions`) ride a request_id-demultiplexed frame so ONE
+//! pooled connection carries N concurrent in-flight aux requests —
+//! decoupling fan concurrency from connection count. The Raft
+//! consensus frames (V2: `append_entries` / `vote` / `full_snapshot`)
+//! are **byte-identical and serially dispatched exactly as before**;
+//! a V3 frame is routed ONLY to the shard's aux dispatcher, never the
+//! Raft dispatcher, so consensus ordering is structurally untouchable
+//! from the mux path. See [`RAFT_TRANSPORT_AUX_VERSION_V3`] for the
+//! frame layout and [`rpc_call_aux`] for the client seam.
+//!
 //! See `specs/architecture/adr/041-raft-transport-shard-multiplexing.md`
 //! for the full wire format + lifecycle.
 
 use std::io;
 use std::io::Cursor;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -34,8 +46,9 @@ use openraft::network::RaftNetworkFactory;
 use openraft::RaftTypeConfig;
 use rustls::pki_types::ServerName;
 use serde::{de::DeserializeOwned, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
 
 use crate::node::KisekiNode;
@@ -59,6 +72,30 @@ pub const RAFT_TRANSPORT_VERSION_V2: u8 = 2;
 /// Backwards-compat alias for downstream callers that referenced the
 /// old name. Same value; new code should use `..._V2`.
 pub const RAFT_TRANSPORT_VERSION_V1: u8 = RAFT_TRANSPORT_VERSION_V2;
+
+/// Wire-format version byte for **auxiliary multiplexed** frames
+/// (GH #228 PR-1c, 2026-06-10). Pre-prod — no compat shim; both sides
+/// of the aux path change in the same commit (operators wipe +
+/// redeploy, per ADR-004 pre-1.0 policy).
+///
+/// Aux request frame:
+/// `[u32 len][u8 ver=3][u64 request_id BE][postcard(shard_id_bytes, tag, payload_bytes)]`
+///
+/// Aux response frame:
+/// `[u32 len][u8 status][u64 request_id BE][postcard body when Ok]`
+///
+/// The postcard outer tuple is byte-for-byte the V2 outer tuple; only
+/// the fixed header differs (the 8-byte `request_id` that lets a
+/// client demultiplex out-of-order responses on one connection).
+///
+/// Scope guard: the listener routes a V3 frame ONLY to the shard's
+/// **aux** dispatcher (`register_aux`) — never the Raft dispatcher —
+/// so `append_entries`/`vote`/`full_snapshot` cannot be invoked
+/// concurrently/out-of-order via this path (the consensus-ordering
+/// hazard that sank the archived full-transport rewrite,
+/// `archive/2026-06-04-s1s3-regressed`). A Raft tag in a V3 frame
+/// degrades to the `ParseError` wire status.
+pub const RAFT_TRANSPORT_AUX_VERSION_V3: u8 = 3;
 
 /// Reserved version-byte values that match the start of a JSON value.
 /// Pre-ADR-041 frames (no version byte) started with one of these
@@ -298,11 +335,38 @@ fn encode_request_body<P: Serialize>(
     tag: &str,
     payload: &P,
 ) -> io::Result<Vec<u8>> {
-    let payload_bytes = postcard::to_stdvec(payload).map_err(io::Error::other)?;
-    let outer = (*shard_id.0.as_bytes(), tag.to_owned(), payload_bytes);
-    let outer_bytes = postcard::to_stdvec(&outer).map_err(io::Error::other)?;
+    let outer_bytes = encode_outer_tuple(shard_id, tag, payload)?;
     let mut body = Vec::with_capacity(1 + outer_bytes.len());
     body.push(RAFT_TRANSPORT_VERSION_V2);
+    body.extend_from_slice(&outer_bytes);
+    Ok(body)
+}
+
+/// Postcard-encode the outer tuple `(shard_id_bytes, tag, payload_bytes)`
+/// shared byte-for-byte by the V2 (Raft) and V3 (aux mux) request frames.
+fn encode_outer_tuple<P: Serialize>(
+    shard_id: ShardId,
+    tag: &str,
+    payload: &P,
+) -> io::Result<Vec<u8>> {
+    let payload_bytes = postcard::to_stdvec(payload).map_err(io::Error::other)?;
+    let outer = (*shard_id.0.as_bytes(), tag.to_owned(), payload_bytes);
+    postcard::to_stdvec(&outer).map_err(io::Error::other)
+}
+
+/// Build an aux (V3) request frame body:
+/// `[ver=3][u64 request_id BE][outer tuple]`. See
+/// [`RAFT_TRANSPORT_AUX_VERSION_V3`].
+fn encode_aux_request_body<P: Serialize>(
+    request_id: u64,
+    shard_id: ShardId,
+    tag: &str,
+    payload: &P,
+) -> io::Result<Vec<u8>> {
+    let outer_bytes = encode_outer_tuple(shard_id, tag, payload)?;
+    let mut body = Vec::with_capacity(9 + outer_bytes.len());
+    body.push(RAFT_TRANSPORT_AUX_VERSION_V3);
+    body.extend_from_slice(&request_id.to_be_bytes());
     body.extend_from_slice(&outer_bytes);
     Ok(body)
 }
@@ -314,7 +378,11 @@ fn decode_request_body(body: &[u8]) -> Option<(ShardId, String, Vec<u8>)> {
     if version != RAFT_TRANSPORT_VERSION_V2 || RESERVED_VERSION_BYTES.contains(&version) {
         return None;
     }
-    let outer_bytes = &body[1..];
+    decode_outer_tuple(&body[1..])
+}
+
+/// Decode the postcard outer tuple shared by the V2 and V3 frames.
+fn decode_outer_tuple(outer_bytes: &[u8]) -> Option<(ShardId, String, Vec<u8>)> {
     let (id_bytes, tag, payload_bytes): ([u8; 16], String, Vec<u8>) =
         postcard::from_bytes(outer_bytes).ok()?;
     let shard_id = ShardId(uuid::Uuid::from_bytes(id_bytes));
@@ -379,8 +447,20 @@ where
             format!("unknown response status byte 0x{:02x}", resp_buf[0]),
         )
     })?;
+    decode_status_response(status, &resp_buf[1..], shard_id)
+}
+
+/// Map a wire `DispatchStatus` + `Ok` body to the typed client result —
+/// shared by the serial (V2) [`rpc_exchange`] and the aux mux (V3)
+/// [`AuxMuxPool::rpc`] response paths. Behavior identical to the
+/// pre-#228 inline match.
+fn decode_status_response<Resp: DeserializeOwned>(
+    status: DispatchStatus,
+    ok_body: &[u8],
+    shard_id: ShardId,
+) -> io::Result<Resp> {
     match status {
-        DispatchStatus::Ok => postcard::from_bytes(&resp_buf[1..]).map_err(io::Error::other),
+        DispatchStatus::Ok => postcard::from_bytes(ok_body).map_err(io::Error::other),
         DispatchStatus::UnknownShard => Err(network_error(
             NetworkErrorKind::ShardRetired,
             shard_id.0.to_string(),
@@ -494,12 +574,12 @@ async fn rpc_call_tls<Req: Serialize, Resp: DeserializeOwned>(
 /// The pool holds [`raft_pool_size_per_peer()`] slots per
 /// `(addr, tls?)` key; slots reconnect lazily on first use or after
 /// any I/O error. The server side already supports keep-alive (see
-/// [`handle_one_connection`] looping [`serve_one_request`]) — no
-/// wire-format change.
+/// [`serve_connection_frames`]) — no wire-format change.
 ///
-/// This is the call seam ADR-047's `TransportIntentGatherer` uses to
-/// reach a peer's auxiliary (non-Raft) `IntentSync` dispatcher — the
-/// same wire path the Raft `vote` / `full_snapshot` calls take.
+/// ADR-047's aux callers (`IntentSync` fan / gather / consumer
+/// positions) moved OFF this seam to [`rpc_call_aux`] (GH #228 PR-1c);
+/// this serial path now carries only the Raft `vote` / `full_snapshot`
+/// calls (plus any caller that wants strict one-at-a-time framing).
 ///
 /// # Errors
 /// Returns an `io::Error` on connect/transport failure or when the peer
@@ -663,6 +743,446 @@ fn get_or_create_peer_pool(
         .or_insert_with(|| Arc::clone(&pool))
         .value()
         .clone()
+}
+
+// ---------------------------------------------------------------------------
+// Aux mux client (GH #228 PR-1c) — request_id-demultiplexed connections
+// for the NON-RAFT aux RPCs only (`intent_put` fan, recovery gather,
+// consumer positions). The Raft path above is untouched: `rpc_call` /
+// `rpc_pooled` still speak serial V2 frames over the existing pool.
+// ---------------------------------------------------------------------------
+
+/// Response payload delivered through a pending aux request's oneshot:
+/// `(status, ok_body)`. `ok_body` is the postcard-encoded response body
+/// for `Ok`, empty otherwise.
+type AuxCallResponse = (DispatchStatus, Vec<u8>);
+
+/// Pending outbound aux requests keyed by `request_id`. The
+/// [`AuxMuxPool::rpc`] caller inserts; the reader task removes +
+/// signals. Behind `Arc` so the reader task and the guards share it.
+type AuxPendingMap = DashMap<u64, oneshot::Sender<AuxCallResponse>>;
+
+/// RAII guard that deregisters an in-flight `request_id` from the
+/// pending map on drop — making [`AuxMuxPool::rpc`] cancel-safe. Armed
+/// before any `.await`; disarmed only once the response resolves
+/// normally (the reader has already removed the entry by then).
+///
+/// This is the load-bearing piece for the producer fan's top-up path,
+/// which drops its RPC future on a 100 ms timeout
+/// (`KISEKI_INTENT_TOPUP_TIMEOUT_MS`): the abandoned entry is reaped
+/// here, and the late response — when it eventually arrives — finds no
+/// pending entry and is read-and-dropped by the reader WITHOUT
+/// desyncing the stream or leaking a map slot.
+struct AuxPendingGuard {
+    pending: Arc<AuxPendingMap>,
+    id: u64,
+    armed: bool,
+}
+
+impl Drop for AuxPendingGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.pending.remove(&self.id);
+        }
+    }
+}
+
+/// Boxed write half of a multiplexed aux connection (plain or TLS).
+type AuxWriteHalf = Box<dyn AsyncWrite + Send + Unpin>;
+
+/// One persistent, multiplexed aux connection to a peer. The write half
+/// sits in `Mutex<Option<..>>` and is **taken out** for the duration of
+/// each frame emission (the same cancel-safe take/put-back pattern as
+/// [`PeerConnPool::rpc`]): if the emitting future is cancelled mid-write
+/// the half-written stream can never be handed to another writer, and
+/// the [`AuxWriteKillGuard`] tears the connection down deterministically
+/// instead of leaving a wedged socket. The reader task owns the read
+/// half and demultiplexes responses by `request_id`.
+struct AuxMuxConn {
+    write_half: tokio::sync::Mutex<Option<AuxWriteHalf>>,
+    pending: Arc<AuxPendingMap>,
+    /// Set the instant the connection dies (reader exit OR kill),
+    /// BEFORE `pending` is drained. A caller that inserts after the
+    /// drain re-checks this and self-removes rather than hanging
+    /// forever (the post-drain insert race the archived S1 transport
+    /// closed with the same flag ordering).
+    closed: Arc<AtomicBool>,
+    next_request_id: AtomicU64,
+    reader_task: tokio::task::JoinHandle<()>,
+}
+
+impl AuxMuxConn {
+    /// Tear the connection down: mark closed (FIRST — see `closed`),
+    /// abort the reader, and fail every pending caller by dropping its
+    /// sender. Idempotent.
+    fn kill(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.reader_task.abort();
+        self.pending.clear();
+    }
+}
+
+impl Drop for AuxMuxConn {
+    fn drop(&mut self) {
+        // Aborting the reader drops the read half; any still-pending
+        // callers resolve with error via the reader's DrainGuard (or
+        // were already drained by `kill`).
+        self.reader_task.abort();
+    }
+}
+
+/// RAII guard armed across the frame write in [`AuxMuxPool::rpc`]. If
+/// the rpc future is dropped mid-`write_all` (e.g. the top-up timeout
+/// firing exactly while the socket exerts backpressure) the stream has
+/// a partial frame on it and CANNOT be reused — the guard kills the
+/// connection so every other in-flight caller fails fast and the next
+/// caller re-dials, instead of silently wedging the peer link.
+struct AuxWriteKillGuard<'a> {
+    conn: &'a AuxMuxConn,
+    armed: bool,
+}
+
+impl Drop for AuxWriteKillGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.conn.kill();
+        }
+    }
+}
+
+/// Reader task for one [`AuxMuxConn`]: pull
+/// `[len][status][request_id][body]` frames off the read half and signal
+/// the matching pending oneshot. Ends on EOF or any framing-level desync
+/// (a multiplexed stream cannot be resynchronised). The `DrainGuard`
+/// then flips `closed` and wakes every still-pending caller with error.
+async fn aux_reader_loop<R>(mut read_half: R, pending: Arc<AuxPendingMap>, closed: Arc<AtomicBool>)
+where
+    R: AsyncRead + Unpin,
+{
+    struct DrainGuard {
+        pending: Arc<AuxPendingMap>,
+        closed: Arc<AtomicBool>,
+    }
+    impl Drop for DrainGuard {
+        fn drop(&mut self) {
+            // Order matters: set `closed` FIRST so a racing `rpc()`
+            // whose insert lands after this sees the flag and
+            // self-removes; THEN drop every sender (each caller's
+            // `rx.await` wakes with Err).
+            self.closed.store(true, Ordering::SeqCst);
+            self.pending.clear();
+        }
+    }
+    let _guard = DrainGuard {
+        pending: Arc::clone(&pending),
+        closed,
+    };
+
+    let mut len_buf = [0u8; 4];
+    while read_half.read_exact(&mut len_buf).await.is_ok() {
+        let resp_len = u32::from_be_bytes(len_buf) as usize;
+        // An aux response is at minimum status(1) + request_id(8); a
+        // multiplexed stream cannot be resynchronised, so close on any
+        // out-of-bounds length.
+        if !(9..=MAX_RAFT_RPC_SIZE).contains(&resp_len) {
+            break;
+        }
+        let mut buf = vec![0u8; resp_len];
+        if read_half.read_exact(&mut buf).await.is_err() {
+            break;
+        }
+        let Some(status) = DispatchStatus::from_u8(buf[0]) else {
+            break; // unreadable status byte — desync, close
+        };
+        let request_id = u64::from_be_bytes(buf[1..9].try_into().expect("len checked >= 9"));
+        if let Some((_, tx)) = pending.remove(&request_id) {
+            let _ = tx.send((status, buf[9..].to_vec()));
+        }
+        // Unmatched id = late response to an abandoned (cancelled /
+        // timed-out) call: the whole frame was already consumed above,
+        // so it is read-and-dropped and the stream stays synced. The
+        // monotonic per-connection id is never reused while in flight,
+        // so this can never mis-deliver to a different caller.
+    }
+}
+
+/// Per-peer pool of N long-lived **multiplexed** aux connections.
+/// Picked round-robin by [`Self::rpc`]; each connection carries many
+/// concurrent in-flight RPCs (request_id demux), so the pool size is a
+/// socket-parallelism choice, NOT a concurrency bound — the per-peer
+/// connection cap can no longer couple to fan concurrency on this path.
+struct AuxMuxPool {
+    addr: String,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
+    conns: Vec<tokio::sync::Mutex<Option<Arc<AuxMuxConn>>>>,
+    next: AtomicU32,
+}
+
+impl AuxMuxPool {
+    fn new(addr: String, tls_config: Option<Arc<rustls::ClientConfig>>, conn_count: usize) -> Self {
+        let conns = (0..conn_count.max(1))
+            .map(|_| tokio::sync::Mutex::new(None))
+            .collect();
+        Self {
+            addr,
+            tls_config,
+            conns,
+            next: AtomicU32::new(0),
+        }
+    }
+
+    /// Dial a fresh multiplexed connection: connect (plain or mTLS),
+    /// split, spawn the reader task.
+    async fn dial(&self) -> io::Result<Arc<AuxMuxConn>> {
+        let tcp = TcpStream::connect(&self.addr).await?;
+        let _ = tcp.set_nodelay(true);
+        let (read_half, write_half): (Box<dyn AsyncRead + Send + Unpin>, AuxWriteHalf) =
+            match &self.tls_config {
+                None => {
+                    let (r, w) = tokio::io::split(tcp);
+                    (Box::new(r), Box::new(w))
+                }
+                Some(cfg) => {
+                    let connector = tokio_rustls::TlsConnector::from(Arc::clone(cfg));
+                    let ip: std::net::IpAddr = self
+                        .addr
+                        .split(':')
+                        .next()
+                        .and_then(|h| h.parse().ok())
+                        .ok_or_else(|| {
+                            network_error(NetworkErrorKind::Transport, "invalid Raft peer address")
+                        })?;
+                    let server_name = ServerName::IpAddress(ip.into());
+                    let tls = connector
+                        .connect(server_name, tcp)
+                        .await
+                        .map_err(|e| network_error(NetworkErrorKind::Transport, e))?;
+                    let (r, w) = tokio::io::split(tls);
+                    (Box::new(r), Box::new(w))
+                }
+            };
+        let pending: Arc<AuxPendingMap> = Arc::new(DashMap::new());
+        let closed = Arc::new(AtomicBool::new(false));
+        let reader_task = tokio::spawn(aux_reader_loop(
+            read_half,
+            Arc::clone(&pending),
+            Arc::clone(&closed),
+        ));
+        Ok(Arc::new(AuxMuxConn {
+            write_half: tokio::sync::Mutex::new(Some(write_half)),
+            pending,
+            closed,
+            next_request_id: AtomicU64::new(1),
+            reader_task,
+        }))
+    }
+
+    /// Get the connection in slot `idx`, dialing if absent or dead. The
+    /// slot lock is held only across the dial, never across an RPC, so
+    /// callers sharing a live connection pipeline freely.
+    async fn get_or_dial(&self, idx: usize) -> io::Result<Arc<AuxMuxConn>> {
+        let mut slot = self.conns[idx].lock().await;
+        if let Some(c) = slot.as_ref() {
+            if !c.closed.load(Ordering::SeqCst) && !c.reader_task.is_finished() {
+                return Ok(Arc::clone(c));
+            }
+        }
+        let c = self.dial().await?;
+        *slot = Some(Arc::clone(&c));
+        Ok(c)
+    }
+
+    /// Kill `conn` and clear its slot so the next caller re-dials.
+    /// Idempotent; only clears the slot if it still points at `conn`,
+    /// so a concurrent fresh dial is never clobbered.
+    async fn kill_conn(&self, idx: usize, conn: &Arc<AuxMuxConn>) {
+        conn.kill();
+        let mut slot = self.conns[idx].lock().await;
+        if slot.as_ref().is_some_and(|c| Arc::ptr_eq(c, conn)) {
+            *slot = None;
+        }
+    }
+
+    /// One multiplexed aux RPC: register a pending oneshot, emit one V3
+    /// frame, await the demuxed response. Concurrent callers share the
+    /// connection — the write lock is held only across frame emission,
+    /// never across the response await.
+    ///
+    /// Cancel-safety (the top-up path drops this future on a 100 ms
+    /// timeout as a matter of course):
+    /// - parked awaiting the write lock → lock acquisition is
+    ///   cancel-safe; nothing registered yet beyond the pending entry,
+    ///   which [`AuxPendingGuard`] reaps.
+    /// - mid-`write_all` → the taken write half drops (it can never be
+    ///   reused half-written) and [`AuxWriteKillGuard`] kills the
+    ///   connection so other in-flight callers fail fast instead of
+    ///   wedging.
+    /// - awaiting the response → [`AuxPendingGuard`] reaps the entry;
+    ///   the late response is read-and-dropped by the reader.
+    async fn rpc<Req: Serialize, Resp: DeserializeOwned>(
+        &self,
+        shard_id: ShardId,
+        tag: &str,
+        req: &Req,
+    ) -> io::Result<Resp> {
+        maybe_inject_fake_rtt().await;
+
+        let idx = (self.next.fetch_add(1, Ordering::Relaxed) as usize) % self.conns.len();
+        let conn = self.get_or_dial(idx).await?;
+
+        let request_id = conn.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        let prev = conn.pending.insert(request_id, tx);
+        debug_assert!(
+            prev.is_none(),
+            "aux request_id {request_id} reused while in flight"
+        );
+        let mut pending_guard = AuxPendingGuard {
+            pending: Arc::clone(&conn.pending),
+            id: request_id,
+            armed: true,
+        };
+
+        // Re-check `closed` AFTER insert: if the reader's DrainGuard
+        // fired between `get_or_dial` and here, our entry would
+        // otherwise hang forever. The guard removes it on this early
+        // return.
+        if conn.closed.load(Ordering::SeqCst) {
+            return Err(network_error(
+                NetworkErrorKind::Transport,
+                "aux peer connection closed",
+            ));
+        }
+
+        let body = encode_aux_request_body(request_id, shard_id, tag, req)?;
+        if body.len() > MAX_RAFT_RPC_SIZE {
+            return Err(network_error(
+                NetworkErrorKind::Transport,
+                "aux request too large",
+            ));
+        }
+        {
+            let mut slot = conn.write_half.lock().await;
+            let Some(mut w) = slot.take() else {
+                // A concurrent writer was cancelled mid-frame and the
+                // kill guard already tore the connection down.
+                return Err(network_error(
+                    NetworkErrorKind::Transport,
+                    "aux peer connection closed",
+                ));
+            };
+            let mut kill_guard = AuxWriteKillGuard {
+                conn: &conn,
+                armed: true,
+            };
+            let write_res = async {
+                w.write_all(
+                    &u32::try_from(body.len())
+                        .expect("checked above")
+                        .to_be_bytes(),
+                )
+                .await?;
+                w.write_all(&body).await?;
+                w.flush().await
+            }
+            .await;
+            kill_guard.armed = false;
+            match write_res {
+                Ok(()) => *slot = Some(w),
+                Err(e) => {
+                    drop(slot);
+                    self.kill_conn(idx, &conn).await;
+                    return Err(e); // pending_guard reaps the entry
+                }
+            }
+        }
+
+        match rx.await {
+            Ok((status, ok_body)) => {
+                pending_guard.armed = false; // reader already removed the entry
+                decode_status_response(status, &ok_body, shard_id)
+            }
+            // Sender dropped → reader died / connection killed.
+            Err(_) => Err(network_error(
+                NetworkErrorKind::Transport,
+                "aux peer connection closed before response",
+            )),
+        }
+    }
+}
+
+/// Number of physical multiplexed aux connections per peer — a socket
+/// parallelism choice, NOT a concurrency bound (each connection carries
+/// any number of in-flight aux RPCs via request_id demux). Default 4:
+/// enough TCP streams to avoid single-stream throughput ceilings on the
+/// fan payloads while keeping per-peer connection counts far below the
+/// inbound cap (the `active=129` cap collision class this PR removes).
+/// Tune with `KISEKI_AUX_MUX_CONNS_PER_PEER`; `1` forces one shared
+/// connection (diagnostics — the demux still serves concurrent RPCs).
+///
+/// Deliberately separate from `KISEKI_RAFT_CONN_POOL_PER_PEER`, whose
+/// default is untouched in this PR (one variable at a time).
+fn aux_mux_conns_per_peer() -> usize {
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("KISEKI_AUX_MUX_CONNS_PER_PEER")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(4)
+    })
+}
+
+/// Process-wide registry of [`AuxMuxPool`]s, keyed like [`PEER_POOLS`].
+static AUX_MUX_POOLS: OnceLock<DashMap<(String, bool), Arc<AuxMuxPool>>> = OnceLock::new();
+
+fn get_or_create_aux_mux_pool(
+    addr: &str,
+    tls_config: Option<&Arc<rustls::ClientConfig>>,
+) -> Arc<AuxMuxPool> {
+    let pools = AUX_MUX_POOLS.get_or_init(DashMap::new);
+    let key = (addr.to_string(), tls_config.is_some());
+    if let Some(p) = pools.get(&key) {
+        return Arc::clone(&p);
+    }
+    let pool = Arc::new(AuxMuxPool::new(
+        addr.to_string(),
+        tls_config.cloned(),
+        aux_mux_conns_per_peer(),
+    ));
+    pools
+        .entry(key)
+        .or_insert_with(|| Arc::clone(&pool))
+        .value()
+        .clone()
+}
+
+/// Send one **auxiliary** (non-Raft) RPC to `addr` for `shard_id` under
+/// `tag` over a request_id-multiplexed pooled connection (GH #228
+/// PR-1c). Unlike [`rpc_call`], concurrent calls to the same peer share
+/// a connection with N requests in flight — fan concurrency no longer
+/// consumes connection-pool slots or counts against the per-peer
+/// inbound cap.
+///
+/// AUX TAGS ONLY: the listener routes the V3 frame straight to the
+/// shard's `register_aux` dispatcher. A Raft tag
+/// (`append_entries`/`vote`/`full_snapshot`) sent through here degrades
+/// to `ParseError` — by design; the consensus path stays on the serial
+/// V2 transport.
+///
+/// # Errors
+/// Connect/transport failure or a non-`Ok` wire status, exactly as
+/// [`rpc_call`]; classify with [`classify_network_error`]. Dropping the
+/// returned future at any await point is safe (see [`AuxMuxPool::rpc`]).
+pub async fn rpc_call_aux<Req: Serialize, Resp: DeserializeOwned>(
+    addr: &str,
+    shard_id: ShardId,
+    tag: &str,
+    tls_config: Option<&Arc<rustls::ClientConfig>>,
+    req: &Req,
+) -> io::Result<Resp> {
+    let pool = get_or_create_aux_mux_pool(addr, tls_config);
+    pool.rpc(shard_id, tag, req).await
 }
 
 fn to_rpc_error<C: RaftTypeConfig>(e: io::Error) -> RPCError<C> {
@@ -1103,8 +1623,8 @@ impl RaftRpcListener {
                 let result = handle_one_connection(
                     tcp_stream,
                     acceptor.as_ref().clone(),
-                    &registry,
-                    metrics.as_deref(),
+                    registry,
+                    metrics.clone(),
                 )
                 .await;
                 if let Some(c) = per_peer.get(&peer_key) {
@@ -1171,25 +1691,107 @@ where
 async fn handle_one_connection(
     tcp_stream: tokio::net::TcpStream,
     acceptor: Option<TlsAcceptor>,
-    registry: &RegistryHandle,
-    metrics: Option<&crate::transport_metrics::RaftTransportMetrics>,
+    registry: RegistryHandle,
+    metrics: Option<Arc<crate::transport_metrics::RaftTransportMetrics>>,
 ) -> io::Result<()> {
     if let Some(acc) = acceptor {
         let tls = acc
             .accept(tcp_stream)
             .await
             .map_err(|e| network_error(NetworkErrorKind::Transport, e))?;
-        let mut s = tls;
-        // Connection reuse: serve requests on this stream until the peer
-        // closes it (Ok(false)) or an I/O error occurs. The client side
-        // keeps one persistent connection per (peer, shard) and pipelines
-        // sequential RPCs over it instead of re-dialing per call.
-        while serve_one_request(&mut s, registry, metrics).await? {}
-        Ok(())
+        serve_connection_frames(tls, registry, metrics).await
     } else {
-        let mut s = tcp_stream;
-        while serve_one_request(&mut s, registry, metrics).await? {}
-        Ok(())
+        serve_connection_frames(tcp_stream, registry, metrics).await
+    }
+}
+
+/// Per-connection frame loop. Reads `[u32 len][body]` frames and routes
+/// by the body's version byte:
+///
+/// - **V2 (Raft + legacy aux fallthrough)** — served INLINE, one frame
+///   at a time, exactly the pre-#228 behavior (`serve_v2_request` is
+///   the old `serve_one_request` body): same-connection Raft RPCs stay
+///   strictly ordered, responses positional. The client side keeps one
+///   persistent connection per (peer, shard) and pipelines sequential
+///   RPCs over it instead of re-dialing per call.
+/// - **V3 (aux mux, GH #228 PR-1c)** — spawned per frame so aux
+///   requests on one connection process CONCURRENTLY (mirroring the
+///   slice-4 native data-plane `serve_connection`, the proven win in
+///   #203/#204); each response carries the request's id and response
+///   writes serialize on the shared write-half mutex (mutex, not a
+///   writer task — the task hop is a known regression class). The aux
+///   tags are commutative (idempotent durable put keyed by seq, two
+///   read-only gathers), so no per-shard ordering lanes are needed —
+///   that machinery was only ever required for consensus tags, which
+///   structurally cannot ride V3.
+///
+/// A spawned aux handler may outlive this loop by the tail of its
+/// dispatch (the read side EOF'd while it works); its response write
+/// then fails on the closed socket and the task exits.
+async fn serve_connection_frames<S>(
+    stream: S,
+    registry: RegistryHandle,
+    metrics: Option<Arc<crate::transport_metrics::RaftTransportMetrics>>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut read_half, write_half) = tokio::io::split(stream);
+    let write_half = Arc::new(tokio::sync::Mutex::new(write_half));
+
+    loop {
+        let started = std::time::Instant::now();
+        let mut len_buf = [0u8; 4];
+        if read_half.read_exact(&mut len_buf).await.is_err() {
+            return Ok(()); // peer closed
+        }
+        let req_len = u32::from_be_bytes(len_buf) as usize;
+        if req_len > MAX_RAFT_RPC_SIZE {
+            tracing::warn!(req_len, max = MAX_RAFT_RPC_SIZE, "Raft RPC oversized");
+            write_response_locked(&write_half, DispatchStatus::ParseError, Vec::new()).await?;
+            if let Some(m) = &metrics {
+                m.record_rpc(
+                    "unknown",
+                    crate::transport_metrics::op::UNKNOWN,
+                    crate::transport_metrics::outcome::PARSE_ERROR,
+                    started.elapsed(),
+                );
+            }
+            // We did NOT drain the oversized body — the stream is
+            // desynced; close rather than keep-alive.
+            return Ok(());
+        }
+        let mut req_buf = vec![0u8; req_len];
+        if read_half.read_exact(&mut req_buf).await.is_err() {
+            return Ok(()); // peer closed mid-frame
+        }
+
+        if req_buf.first() == Some(&RAFT_TRANSPORT_AUX_VERSION_V3) {
+            // Aux mux frame: [ver][u64 request_id BE][outer tuple].
+            if req_buf.len() < 9 {
+                // Too short to carry a request_id — there is no id to
+                // address a response to, so the only safe move is to
+                // close; the client fails its pending calls via the
+                // reader-EOF drain.
+                return Ok(());
+            }
+            let request_id =
+                u64::from_be_bytes(req_buf[1..9].try_into().expect("len checked >= 9"));
+            let registry = registry.clone();
+            let write_half = Arc::clone(&write_half);
+            let metrics = metrics.clone();
+            tokio::spawn(async move {
+                serve_aux_mux_request(req_buf, request_id, write_half, registry, metrics, started)
+                    .await;
+            });
+        } else {
+            // V2 — the pre-#228 serial path, byte-identical.
+            if !serve_v2_request(req_buf, &write_half, &registry, metrics.as_deref(), started)
+                .await?
+            {
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -1226,46 +1828,27 @@ async fn aux_fallthrough(
     }
 }
 
-async fn serve_one_request<S>(
-    stream: &mut S,
+/// Serve ONE already-read V2 frame inline — the pre-#228
+/// `serve_one_request` body, unchanged except that the frame was read
+/// by [`serve_connection_frames`] and responses go through the shared
+/// write-half mutex (uncontended on pure-V2 connections, which is what
+/// every Raft-path client produces).
+///
+/// Returns Ok(true) when the request was served and the connection is
+/// still frame-synced (keep-alive); Ok(false) when the connection must
+/// close.
+async fn serve_v2_request<W>(
+    req_buf: Vec<u8>,
+    write_half: &Arc<tokio::sync::Mutex<W>>,
     registry: &RegistryHandle,
     metrics: Option<&crate::transport_metrics::RaftTransportMetrics>,
+    started: std::time::Instant,
 ) -> io::Result<bool>
 where
-    S: AsyncReadExt + AsyncWriteExt + Unpin,
+    W: AsyncWrite + Unpin,
 {
-    // Returns Ok(true) when a request was served and the connection is
-    // still frame-synced (the caller may keep it alive for the next
-    // request — connection reuse, the pooling fix); Ok(false) when the
-    // peer closed or the stream desynced and the connection must close.
-    let started = std::time::Instant::now();
-    let mut len_buf = [0u8; 4];
-    if stream.read_exact(&mut len_buf).await.is_err() {
-        return Ok(false); // peer closed
-    }
-    let req_len = u32::from_be_bytes(len_buf) as usize;
-    if req_len > MAX_RAFT_RPC_SIZE {
-        tracing::warn!(req_len, max = MAX_RAFT_RPC_SIZE, "Raft RPC oversized");
-        write_response(stream, DispatchStatus::ParseError, Vec::new()).await?;
-        if let Some(m) = metrics {
-            m.record_rpc(
-                "unknown",
-                crate::transport_metrics::op::UNKNOWN,
-                crate::transport_metrics::outcome::PARSE_ERROR,
-                started.elapsed(),
-            );
-        }
-        // We did NOT drain the oversized body — the stream is desynced;
-        // close rather than keep-alive.
-        return Ok(false);
-    }
-    let mut req_buf = vec![0u8; req_len];
-    if stream.read_exact(&mut req_buf).await.is_err() {
-        return Ok(false); // peer closed mid-frame
-    }
-
     let Some((shard_id, tag, payload_value)) = decode_request_body(&req_buf) else {
-        write_response(stream, DispatchStatus::ParseError, Vec::new()).await?;
+        write_response_locked(write_half, DispatchStatus::ParseError, Vec::new()).await?;
         if let Some(m) = metrics {
             m.record_rpc(
                 "unknown",
@@ -1278,7 +1861,7 @@ where
     };
 
     let Some(dispatch) = registry.inner.get(&shard_id).map(|e| Arc::clone(&*e)) else {
-        write_response(stream, DispatchStatus::UnknownShard, Vec::new()).await?;
+        write_response_locked(write_half, DispatchStatus::UnknownShard, Vec::new()).await?;
         let shard_str = shard_id.0.to_string();
         if let Some(m) = metrics {
             m.record_rpc(
@@ -1342,8 +1925,118 @@ where
             );
         }
     }
-    write_response(stream, status, body).await?;
+    write_response_locked(write_half, status, body).await?;
     Ok(true)
+}
+
+/// Serve ONE spawned aux mux (V3) request: decode the outer tuple from
+/// `req_buf[9..]`, route to the shard's **aux** dispatcher, and write a
+/// `[status][request_id][body]` response under the shared write-half
+/// mutex.
+///
+/// CONSENSUS GUARD: this path NEVER consults the shard's Raft
+/// dispatcher (`registry.inner` is only probed to distinguish
+/// `UnknownShard` from "shard exists but serves no aux"), so the
+/// per-frame spawn cannot reorder `append_entries`/`vote`/snapshot
+/// application — the hazard that forced the archived full-transport
+/// rewrite into per-(conn, shard) ordered lanes. Aux dispatchers must
+/// tolerate concurrent, arrival-order-independent invocation; the three
+/// ADR-047 tags do (idempotent seq-keyed put + two read-only gathers).
+async fn serve_aux_mux_request<W>(
+    req_buf: Vec<u8>,
+    request_id: u64,
+    write_half: Arc<tokio::sync::Mutex<W>>,
+    registry: RegistryHandle,
+    metrics: Option<Arc<crate::transport_metrics::RaftTransportMetrics>>,
+    started: std::time::Instant,
+) where
+    W: AsyncWrite + Unpin,
+{
+    let Some((shard_id, tag, payload)) = decode_outer_tuple(&req_buf[9..]) else {
+        if let Some(m) = &metrics {
+            m.record_rpc(
+                "unknown",
+                crate::transport_metrics::op::UNKNOWN,
+                crate::transport_metrics::outcome::PARSE_ERROR,
+                started.elapsed(),
+            );
+        }
+        // The frame was fully consumed — reply per-request and keep the
+        // connection alive (mirrors the V2 body-level ParseError).
+        let _ = write_aux_response(&write_half, DispatchStatus::ParseError, request_id, &[]).await;
+        return;
+    };
+    let shard_str = shard_id.0.to_string();
+    let op_label = normalize_op(&tag);
+
+    let outcome = match registry.aux.get(&shard_id).map(|e| Arc::clone(&*e)) {
+        Some(aux) => {
+            // Mirror `aux_fallthrough`'s panic semantics: an aux panic
+            // maps to the `DispatcherPanic` wire status.
+            let fut = std::panic::AssertUnwindSafe(aux(&tag, &payload));
+            match futures::FutureExt::catch_unwind(fut).await {
+                Ok(o) => o,
+                Err(_) => DispatchOutcome::Panicked,
+            }
+        }
+        None => {
+            if registry.inner.contains_key(&shard_id) {
+                // Shard exists but serves no aux dispatcher — same
+                // `ParseError` wire status an unknown tag gets on the
+                // V2 fallthrough path.
+                DispatchOutcome::UnknownTag
+            } else {
+                if let Some(m) = &metrics {
+                    m.record_rpc(
+                        &shard_str,
+                        op_label,
+                        crate::transport_metrics::outcome::UNKNOWN_SHARD,
+                        started.elapsed(),
+                    );
+                }
+                tracing::debug!(
+                    shard = %shard_str,
+                    tag = %tag,
+                    "aux mux RPC: unknown_shard (peer cache stale or shard retired)",
+                );
+                let _ =
+                    write_aux_response(&write_half, DispatchStatus::UnknownShard, request_id, &[])
+                        .await;
+                return;
+            }
+        }
+    };
+
+    let (status, body, outcome_label) = match outcome {
+        DispatchOutcome::Ok(b) => (DispatchStatus::Ok, b, crate::transport_metrics::outcome::OK),
+        DispatchOutcome::ParseError | DispatchOutcome::UnknownTag => (
+            DispatchStatus::ParseError,
+            Vec::new(),
+            crate::transport_metrics::outcome::PARSE_ERROR,
+        ),
+        DispatchOutcome::Panicked => (
+            DispatchStatus::DispatcherPanic,
+            Vec::new(),
+            crate::transport_metrics::outcome::DISPATCHER_PANIC,
+        ),
+    };
+    if let Some(m) = &metrics {
+        m.record_rpc(&shard_str, op_label, outcome_label, started.elapsed());
+        if matches!(
+            outcome_label,
+            crate::transport_metrics::outcome::DISPATCHER_PANIC
+        ) {
+            m.record_dispatcher_panic(&shard_str, op_label);
+            tracing::warn!(
+                shard = %shard_str,
+                tag = %tag,
+                "aux mux dispatcher panicked — listener stayed up; caller sees status 0x03",
+            );
+        }
+    }
+    // A write failure here means the connection is going/gone; the
+    // client resolves its pending calls via the reader-EOF drain.
+    let _ = write_aux_response(&write_half, status, request_id, &body).await;
 }
 
 /// Map a free-form tag string to the bounded label set used by the
@@ -1378,6 +2071,48 @@ where
     stream.write_all(&len.to_be_bytes()).await?;
     stream.write_all(&frame).await?;
     stream.flush().await?;
+    Ok(())
+}
+
+/// [`write_response`] (V2 frame, no request_id) under the shared
+/// write-half mutex. The lock spans the whole frame so a concurrent aux
+/// mux response can never interleave mid-frame.
+async fn write_response_locked<W>(
+    write_half: &Arc<tokio::sync::Mutex<W>>,
+    status: DispatchStatus,
+    body: Vec<u8>,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut w = write_half.lock().await;
+    write_response(&mut *w, status, body).await
+}
+
+/// Write one aux mux (V3) response frame
+/// `[u32 len][u8 status][u64 request_id BE][body when Ok]` under the
+/// shared write-half mutex.
+async fn write_aux_response<W>(
+    write_half: &Arc<tokio::sync::Mutex<W>>,
+    status: DispatchStatus,
+    request_id: u64,
+    body: &[u8],
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut frame = Vec::with_capacity(9 + body.len());
+    frame.push(status as u8);
+    frame.extend_from_slice(&request_id.to_be_bytes());
+    if matches!(status, DispatchStatus::Ok) {
+        frame.extend_from_slice(body);
+    }
+    let len = u32::try_from(frame.len())
+        .map_err(|_| network_error(NetworkErrorKind::Transport, "response too large"))?;
+    let mut w = write_half.lock().await;
+    w.write_all(&len.to_be_bytes()).await?;
+    w.write_all(&frame).await?;
+    w.flush().await?;
     Ok(())
 }
 
@@ -1657,6 +2392,323 @@ mod tests {
         let (status, body) = raw_rpc(&addr, shard, "intent_test", &[]).await;
         assert_eq!(status, DispatchStatus::ParseError as u8);
         assert!(body.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // GH #228 PR-1c — aux mux (request_id-demultiplexed) transport
+    // -----------------------------------------------------------------
+
+    /// The V3 aux version byte must stay distinct from V2 and outside
+    /// the reserved (JSON-shaped) version-byte set — the listener's
+    /// per-frame routing keys on it.
+    #[test]
+    fn aux_version_byte_distinct_and_unreserved() {
+        assert_ne!(RAFT_TRANSPORT_AUX_VERSION_V3, RAFT_TRANSPORT_VERSION_V2);
+        assert!(!RESERVED_VERSION_BYTES.contains(&RAFT_TRANSPORT_AUX_VERSION_V3));
+    }
+
+    /// Aux request frame layout pin: `[ver=3][u64 rid BE][outer]`, with
+    /// the outer tuple byte-identical to the V2 outer tuple.
+    #[test]
+    fn aux_request_body_layout() {
+        let shard = ShardId(uuid::Uuid::from_u128(0xA0A0));
+        let payload = vec![1u8, 2, 3];
+        let aux =
+            encode_aux_request_body(0x0102_0304_0506_0708, shard, "intent_put", &payload).unwrap();
+        assert_eq!(aux[0], RAFT_TRANSPORT_AUX_VERSION_V3);
+        assert_eq!(&aux[1..9], &0x0102_0304_0506_0708u64.to_be_bytes());
+        let v2 = encode_request_body(shard, "intent_put", &payload).unwrap();
+        assert_eq!(
+            &aux[9..],
+            &v2[1..],
+            "outer tuple must be byte-identical across V2/V3"
+        );
+        let (s, t, p) = decode_outer_tuple(&aux[9..]).expect("outer decodes");
+        assert_eq!(s, shard);
+        assert_eq!(t, "intent_put");
+        let decoded: Vec<u8> = postcard::from_bytes(&p).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    /// Aux dispatcher used by the mux tests: tag "delay_echo" decodes
+    /// `(delay_ms, echo)` and replies `echo` after sleeping `delay_ms`;
+    /// tag "echo" replies the payload immediately; everything else
+    /// falls through (`UnknownTag`).
+    fn delay_echo_aux() -> ShardDispatch {
+        Arc::new(
+            move |tag: &str, payload: &[u8]| -> futures::future::BoxFuture<'_, DispatchOutcome> {
+                let tag = tag.to_owned();
+                let payload = payload.to_vec();
+                Box::pin(async move {
+                    match tag.as_str() {
+                        "echo" => DispatchOutcome::Ok(payload),
+                        "delay_echo" => {
+                            let Ok((delay_ms, echo)) =
+                                postcard::from_bytes::<(u64, Vec<u8>)>(&payload)
+                            else {
+                                return DispatchOutcome::ParseError;
+                            };
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            DispatchOutcome::Ok(postcard::to_stdvec(&echo).unwrap())
+                        }
+                        _ => DispatchOutcome::UnknownTag,
+                    }
+                })
+            },
+        )
+    }
+
+    /// 64 concurrent `rpc` calls over a ONE-connection pool all
+    /// complete with their own response — the demux decouples
+    /// concurrency from connection count. Afterwards the pending map is
+    /// empty (no leaked entries).
+    #[tokio::test]
+    async fn aux_mux_sixty_four_concurrent_calls_over_one_connection() {
+        let (addr, registry) = spawn_listener().await;
+        let shard = ShardId(uuid::Uuid::from_u128(0x0228_0001));
+        registry.inner.insert(shard, stub_raft_dispatch());
+        registry.register_aux(shard, delay_echo_aux());
+
+        let pool = Arc::new(AuxMuxPool::new(addr, None, 1));
+        let mut tasks = Vec::new();
+        for i in 0u64..64 {
+            let pool = Arc::clone(&pool);
+            tasks.push(tokio::spawn(async move {
+                // Stagger tiny delays so responses interleave for real.
+                let echo = vec![u8::try_from(i).unwrap(); 8];
+                let resp: Vec<u8> = pool
+                    .rpc(shard, "delay_echo", &((i % 7) * 3, echo.clone()))
+                    .await
+                    .expect("rpc completes");
+                (echo, resp)
+            }));
+        }
+        for t in tasks {
+            let (expect, got) = t.await.unwrap();
+            assert_eq!(got, expect, "each caller gets ITS response");
+        }
+        let conn = pool.conns[0].lock().await.clone().expect("conn exists");
+        assert!(conn.pending.is_empty(), "no leaked pending entries");
+        assert!(!conn.closed.load(Ordering::SeqCst), "connection healthy");
+    }
+
+    /// Interleaved responses route by request_id: a slow call and a
+    /// fast call issued concurrently on ONE connection complete
+    /// fast-first, each with the right body — impossible on the old
+    /// one-frame-at-a-time path, where the fast call would queue behind
+    /// the slow one for the whole server dispatch.
+    #[tokio::test]
+    async fn aux_mux_interleaved_responses_route_by_request_id() {
+        let (addr, registry) = spawn_listener().await;
+        let shard = ShardId(uuid::Uuid::from_u128(0x0228_0002));
+        registry.inner.insert(shard, stub_raft_dispatch());
+        registry.register_aux(shard, delay_echo_aux());
+
+        let pool = Arc::new(AuxMuxPool::new(addr, None, 1));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let slow = {
+            let pool = Arc::clone(&pool);
+            let order = Arc::clone(&order);
+            tokio::spawn(async move {
+                let resp: Vec<u8> = pool
+                    .rpc(shard, "delay_echo", &(200u64, b"slow".to_vec()))
+                    .await
+                    .unwrap();
+                order.lock().unwrap().push("slow");
+                resp
+            })
+        };
+        // Let the slow request hit the wire first.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let fast = {
+            let pool = Arc::clone(&pool);
+            let order = Arc::clone(&order);
+            tokio::spawn(async move {
+                let resp: Vec<u8> = pool
+                    .rpc(shard, "delay_echo", &(5u64, b"fast".to_vec()))
+                    .await
+                    .unwrap();
+                order.lock().unwrap().push("fast");
+                resp
+            })
+        };
+
+        assert_eq!(fast.await.unwrap(), b"fast".to_vec());
+        assert_eq!(slow.await.unwrap(), b"slow".to_vec());
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["fast", "slow"],
+            "fast response overtakes the slow one on the same connection"
+        );
+    }
+
+    /// THE cancel-safety case (the top-up path drops futures on a
+    /// 100 ms timeout): a timed-out, abandoned call's request_id is
+    /// reaped from the pending map; its LATE response is read-and-
+    /// dropped by the reader; the SAME connection then serves the next
+    /// call correctly. No map leak, no desync, no redial.
+    #[tokio::test]
+    async fn aux_mux_abandoned_call_late_response_keeps_stream_healthy() {
+        let (addr, registry) = spawn_listener().await;
+        let shard = ShardId(uuid::Uuid::from_u128(0x0228_0003));
+        registry.inner.insert(shard, stub_raft_dispatch());
+        registry.register_aux(shard, delay_echo_aux());
+
+        let pool = Arc::new(AuxMuxPool::new(addr, None, 1));
+        // Abandon a slow call at 50 ms (server replies at 200 ms).
+        let abandoned = tokio::time::timeout(
+            Duration::from_millis(50),
+            pool.rpc::<_, Vec<u8>>(shard, "delay_echo", &(200u64, b"late".to_vec())),
+        )
+        .await;
+        assert!(abandoned.is_err(), "timeout must fire first");
+
+        let conn = pool.conns[0].lock().await.clone().expect("conn exists");
+        assert!(
+            conn.pending.is_empty(),
+            "PendingGuard must reap the abandoned request_id on drop"
+        );
+
+        // Let the late response arrive — the reader must read-and-drop it.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !conn.closed.load(Ordering::SeqCst),
+            "late response must not poison the stream"
+        );
+
+        // The same connection serves the next call.
+        let next_payload: Vec<u8> = vec![9, 9];
+        let resp: Vec<u8> = pool.rpc(shard, "echo", &next_payload).await.unwrap();
+        assert_eq!(resp, next_payload, "next call on the same stream works");
+        let conn_after = pool.conns[0].lock().await.clone().expect("conn exists");
+        assert!(
+            Arc::ptr_eq(&conn, &conn_after),
+            "no redial — the abandoned call must not tear the connection down"
+        );
+        assert!(conn_after.pending.is_empty(), "no map leak after success");
+    }
+
+    /// A connection drop fails ALL pending callers promptly (DrainGuard)
+    /// and the next call re-dials a fresh connection.
+    #[tokio::test]
+    async fn aux_mux_connection_drop_fails_all_pending() {
+        // A fake peer that accepts, reads, and never replies — then
+        // drops the socket after 100 ms.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut sink = vec![0u8; 4096];
+            let _ = tokio::time::timeout(Duration::from_millis(100), async {
+                loop {
+                    if s.read(&mut sink).await.unwrap_or(0) == 0 {
+                        break;
+                    }
+                }
+            })
+            .await;
+            drop(s); // RST/FIN — reader EOFs
+        });
+
+        let pool = Arc::new(AuxMuxPool::new(addr, None, 1));
+        let shard = ShardId(uuid::Uuid::from_u128(0x0228_0004));
+        let mut calls = Vec::new();
+        for _ in 0..4 {
+            let pool = Arc::clone(&pool);
+            calls.push(tokio::spawn(async move {
+                let payload: Vec<u8> = vec![1];
+                pool.rpc::<_, Vec<u8>>(shard, "echo", &payload).await
+            }));
+        }
+        for c in calls {
+            let res = tokio::time::timeout(Duration::from_secs(5), c)
+                .await
+                .expect("pending calls must FAIL promptly, not hang")
+                .unwrap();
+            assert!(res.is_err(), "dropped connection must fail the call");
+        }
+    }
+
+    /// CONSENSUS GUARD: a Raft tag sent over the aux mux path is NEVER
+    /// routed to the Raft dispatcher — it degrades to the `ParseError`
+    /// wire status (ProtocolMismatch client-side). The stub Raft
+    /// dispatcher would have answered `Ok(b"raft")` if (incorrectly)
+    /// consulted.
+    #[tokio::test]
+    async fn aux_mux_raft_tag_never_reaches_raft_dispatcher() {
+        let (addr, registry) = spawn_listener().await;
+        let shard = ShardId(uuid::Uuid::from_u128(0x0228_0005));
+        registry.inner.insert(shard, stub_raft_dispatch());
+        registry.register_aux(shard, delay_echo_aux());
+
+        let pool = AuxMuxPool::new(addr, None, 1);
+        for raft_tag in ["append_entries", "vote", "full_snapshot"] {
+            let err = pool
+                .rpc::<_, Vec<u8>>(shard, raft_tag, &())
+                .await
+                .expect_err("raft tag must be rejected on the aux path");
+            assert_eq!(
+                classify_network_error(&err),
+                Some(NetworkErrorKind::ProtocolMismatch),
+                "raft tag {raft_tag} must map to ParseError, never dispatch"
+            );
+        }
+    }
+
+    /// Status routing parity with the V2 path: unknown shard →
+    /// `ShardRetired`; shard present but no aux dispatcher →
+    /// `ProtocolMismatch` (same as the V2 fallthrough's ParseError).
+    #[tokio::test]
+    async fn aux_mux_unknown_shard_and_missing_aux_statuses() {
+        let (addr, registry) = spawn_listener().await;
+        let pool = AuxMuxPool::new(addr, None, 1);
+
+        let absent = ShardId(uuid::Uuid::from_u128(0x0228_0006));
+        let err = pool
+            .rpc::<_, Vec<u8>>(absent, "intent_put", &())
+            .await
+            .expect_err("unknown shard");
+        assert_eq!(
+            classify_network_error(&err),
+            Some(NetworkErrorKind::ShardRetired)
+        );
+
+        let no_aux = ShardId(uuid::Uuid::from_u128(0x0228_0007));
+        registry.inner.insert(no_aux, stub_raft_dispatch());
+        let err = pool
+            .rpc::<_, Vec<u8>>(no_aux, "intent_put", &())
+            .await
+            .expect_err("no aux dispatcher");
+        assert_eq!(
+            classify_network_error(&err),
+            Some(NetworkErrorKind::ProtocolMismatch)
+        );
+    }
+
+    /// The public seam end-to-end: `rpc_call_aux` through the global
+    /// pool against a real listener round-trips a typed payload, while
+    /// the SAME listener still serves serial V2 RPCs on the Raft path
+    /// (mixed-version listener).
+    #[tokio::test]
+    async fn rpc_call_aux_round_trips_and_v2_still_served() {
+        let (addr, registry) = spawn_listener().await;
+        let shard = ShardId(uuid::Uuid::from_u128(0x0228_0008));
+        registry.inner.insert(shard, stub_raft_dispatch());
+        registry.register_aux(shard, delay_echo_aux());
+
+        let payload = vec![0xAAu8, 0xBB, 0xCC];
+        let resp: Vec<u8> =
+            rpc_call_aux(&addr, shard, "delay_echo", None, &(1u64, payload.clone()))
+                .await
+                .unwrap();
+        assert_eq!(resp, payload);
+
+        // The V2 serial path on the same listener is untouched.
+        let (status, body) = raw_rpc(&addr, shard, "append_entries", &[]).await;
+        assert_eq!(status, DispatchStatus::Ok as u8);
+        let decoded: Vec<u8> = postcard::from_bytes(&body).unwrap();
+        assert_eq!(decoded, b"raft");
     }
 
     // -- test helpers ------------------------------------------------
