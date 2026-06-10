@@ -97,7 +97,7 @@ tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
-pprof = { version = "0.14", features = ["flamegraph"], optional = true }
+pprof = { version = "0.15", features = ["flamegraph"], optional = true }
 dhat = { version = "0.3", optional = true }
 
 [dev-dependencies]
