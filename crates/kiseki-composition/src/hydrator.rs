@@ -502,6 +502,13 @@ impl CompositionHydrator {
             if r.is_ok() {
                 for id in &touched_ids {
                     store.invalidate_cache(*id);
+                    // P4 (#226): the delta for this id is now durable —
+                    // drain the volatile overlay row so a stale pending
+                    // value can't shadow later Update/Delete deltas
+                    // applied through the storage backend. Keyed by
+                    // comp_id (NOT name): a newer pending bind on the
+                    // same name survives (LWW).
+                    store.drain_pending(*id);
                 }
             }
             r
@@ -1589,5 +1596,176 @@ mod tests {
         hydrator.poll(&log).await;
         let v = store.get(comp_id).unwrap().version;
         assert_eq!(v, 2, "version should bump exactly once for two ops");
+    }
+
+    /// P4 (#226) — full ingress flow: volatile create at ack, Create
+    /// delta in the log, hydrator apply materializes the durable row
+    /// AND drains the overlay. The storage-bypass `Staging::view` is
+    /// what makes this work (the overlay is invisible to raw storage,
+    /// so the skip-on-exists check stages the put).
+    #[tokio::test]
+    async fn hydrator_apply_materializes_and_drains_volatile_row() {
+        let store = fresh_store_with_default_ns();
+        let (log, shard_id) = fresh_log();
+        let ns_id = NamespaceId(uuid::Uuid::from_u128(2));
+        let seq = kiseki_log::intent::PerspectiveSeq(kiseki_common::time::HybridLogicalClock {
+            physical_ms: 1,
+            logical: 0,
+            node_id: NodeId(7),
+        });
+
+        // Ingress-side volatile create (what the gateway's async path
+        // does at ack time).
+        let comp_id = store
+            .create_with_name_volatile(ns_id, "obj".to_owned(), None, vec![], 64, Some(seq))
+            .unwrap();
+        assert_eq!(store.pending_len(), 1);
+        // The hydrator's raw-storage view must NOT see the row (the
+        // skip-on-exists bypass that makes durable staging happen).
+        assert!(store
+            .with_storage_locked(|s| s.get(comp_id).unwrap())
+            .is_none());
+
+        // The Create delta the async committer incorporates.
+        let payload =
+            encode_composition_create_payload(comp_id, ns_id, 64, Some("obj"), &[], Some(seq));
+        append_create(&log, shard_id, payload, vec![]).await;
+
+        let mut hydrator = CompositionHydrator::new(Arc::clone(&store), shard_id);
+        assert_eq!(hydrator.poll(&log).await, 1);
+
+        // Durable row materialized through raw storage...
+        assert!(
+            store
+                .with_storage_locked(|s| s.get(comp_id).unwrap())
+                .is_some(),
+            "hydrator apply must durably materialize the volatile row",
+        );
+        // ...and the overlay drained.
+        assert_eq!(
+            store.pending_len(),
+            0,
+            "apply must drain the pending overlay row",
+        );
+        // Reads keep resolving (now from storage).
+        assert_eq!(store.get(comp_id).unwrap().size, 64);
+        assert_eq!(store.lookup_by_name(ns_id, "obj").unwrap(), Some(comp_id));
+    }
+
+    /// P4 (#226) — LWW across the drain: applying the OLDER comp's
+    /// Create delta drains only that comp's overlay entries; a newer
+    /// pending bind on the same name keeps shadowing until its own
+    /// delta applies, after which durable + overlay converge on the
+    /// newer comp.
+    #[tokio::test]
+    async fn hydrator_drain_keeps_newer_pending_bind_then_converges() {
+        let store = fresh_store_with_default_ns();
+        let (log, shard_id) = fresh_log();
+        let ns_id = NamespaceId(uuid::Uuid::from_u128(2));
+        let seq_at = |ms: u64| {
+            kiseki_log::intent::PerspectiveSeq(kiseki_common::time::HybridLogicalClock {
+                physical_ms: ms,
+                logical: 0,
+                node_id: NodeId(7),
+            })
+        };
+
+        let older = store
+            .create_with_name_volatile(ns_id, "obj".to_owned(), None, vec![], 1, Some(seq_at(1)))
+            .unwrap();
+        let newer = store
+            .create_with_name_volatile(ns_id, "obj".to_owned(), None, vec![], 2, Some(seq_at(2)))
+            .unwrap();
+        assert_eq!(store.lookup_by_name(ns_id, "obj").unwrap(), Some(newer));
+
+        // Apply ONLY the older comp's Create delta.
+        let payload =
+            encode_composition_create_payload(older, ns_id, 1, Some("obj"), &[], Some(seq_at(1)));
+        append_create(&log, shard_id, payload, vec![]).await;
+        let mut hydrator = CompositionHydrator::new(Arc::clone(&store), shard_id);
+        assert_eq!(hydrator.poll(&log).await, 1);
+
+        // Older is durable; newer still pending — and its bind must
+        // have survived the drain (LWW by comp_id, not by name).
+        assert!(store
+            .with_storage_locked(|s| s.get(older).unwrap())
+            .is_some());
+        assert_eq!(store.pending_len(), 1);
+        assert_eq!(
+            store.lookup_by_name(ns_id, "obj").unwrap(),
+            Some(newer),
+            "drain of the older comp dropped the newer pending bind",
+        );
+
+        // Now the newer comp's delta applies — full convergence.
+        let payload =
+            encode_composition_create_payload(newer, ns_id, 2, Some("obj"), &[], Some(seq_at(2)));
+        append_create(&log, shard_id, payload, vec![]).await;
+        assert_eq!(hydrator.poll(&log).await, 1);
+
+        assert_eq!(store.pending_len(), 0);
+        assert_eq!(
+            store.lookup_by_name(ns_id, "obj").unwrap(),
+            Some(newer),
+            "durable name index must converge on the newer comp (seq LWW)",
+        );
+        assert_eq!(store.get(newer).unwrap().size, 2);
+    }
+
+    /// P4 (#226) adversarial-review BLOCKER regression: S3 `PutObject`
+    /// sets the Content-Type AFTER the write ack, which on the
+    /// volatile path mutates only the overlay row — no delta carries
+    /// `content_type` (it was ingress-local even pre-P4). The
+    /// hydrator's `stage_create` materializes the durable row with
+    /// `content_type: None`, so a drain that simply dropped the
+    /// overlay row would permanently revert the Content-Type to
+    /// `None` after the hydration lag. The drain-time metadata merge
+    /// must write the overlay-held value through to the durable row.
+    #[tokio::test]
+    async fn hydrator_drain_merges_overlay_content_type_into_durable_row() {
+        let store = fresh_store_with_default_ns();
+        let (log, shard_id) = fresh_log();
+        let ns_id = NamespaceId(uuid::Uuid::from_u128(2));
+        let seq = kiseki_log::intent::PerspectiveSeq(kiseki_common::time::HybridLogicalClock {
+            physical_ms: 1,
+            logical: 0,
+            node_id: NodeId(7),
+        });
+
+        // Ingress: volatile create at ack, then the post-ack
+        // Content-Type set (the s3.rs put_object shape).
+        let comp_id = store
+            .create_with_name_volatile(ns_id, "obj".to_owned(), None, vec![], 64, Some(seq))
+            .unwrap();
+        store
+            .set_content_type(comp_id, Some("application/json".to_owned()))
+            .unwrap();
+
+        // The Create delta the async committer incorporates — it does
+        // NOT carry the content type.
+        let payload =
+            encode_composition_create_payload(comp_id, ns_id, 64, Some("obj"), &[], Some(seq));
+        append_create(&log, shard_id, payload, vec![]).await;
+
+        let mut hydrator = CompositionHydrator::new(Arc::clone(&store), shard_id);
+        assert_eq!(hydrator.poll(&log).await, 1);
+
+        // Overlay drained...
+        assert_eq!(store.pending_len(), 0, "apply must drain the overlay row");
+        // ...and the DURABLE row (raw storage — what every read after
+        // the hydration lag serves) carries the merged Content-Type.
+        let durable = store
+            .with_storage_locked(|s| s.get(comp_id).unwrap())
+            .expect("durable row materialized");
+        assert_eq!(
+            durable.content_type.as_deref(),
+            Some("application/json"),
+            "Content-Type set within the hydration lag reverted to None at drain",
+        );
+        // Read path agrees post-drain.
+        assert_eq!(
+            store.get(comp_id).unwrap().content_type.as_deref(),
+            Some("application/json"),
+        );
     }
 }

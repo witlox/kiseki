@@ -5,6 +5,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use kiseki_common::ids::{ChunkId, CompositionId, NamespaceId, OrgId, ShardId};
+use kiseki_log::intent::PerspectiveSeq;
 use kiseki_log::traits::LogOps;
 use lru::LruCache;
 
@@ -873,7 +874,51 @@ pub struct CompositionStore {
     /// store that hasn't been wired (single-node test fixtures); the
     /// commit path no-ops in that case.
     eviction_sink: parking_lot::RwLock<Option<Arc<dyn ChunkEvictionSink + Send + Sync>>>,
+    /// P4 (#226) — UNEVICTABLE volatile overlay: composition rows
+    /// created at ack time on async-ack surfaces (S3 / Native) via
+    /// `create_volatile` / `create_with_name_volatile`, pending
+    /// durable materialization by the hydrator (which calls
+    /// `drain_pending` after the Create delta's batch commits).
+    ///
+    /// HARD CONSTRAINT: this overlay must NOT be visible through the
+    /// `CompositionStorage` trait (`with_storage_locked`). The
+    /// hydrator's `Staging::view` reads raw storage DELIBERATELY —
+    /// that bypass is what makes the ingress node's own hydrator
+    /// stage the durable fjall put for a row that exists only here.
+    /// If the overlay leaked into `CompositionStorage::get`, the
+    /// idempotency check in `stage_create` would see the row, skip
+    /// the put, and the row would NEVER become durable (and replay
+    /// could not recover it). Pinned by the
+    /// `volatile_overlay_invisible_to_storage_trait` test.
+    ///
+    /// Intentionally overlay-blind readers (besides the storage
+    /// trait): `count()` — a storage gauge, bounded-stale is fine —
+    /// and `list_namespace_compositions()` — feeds the slab-EC
+    /// compactor, which must not pick up a row whose durable
+    /// materialization is still in flight.
+    pending: parking_lot::RwLock<HashMap<CompositionId, Composition>>,
+    /// Name bindings for volatile rows: `(ns, name) → (comp_id,
+    /// perspective_seq)`. Consulted FIRST by `lookup_by_name` /
+    /// `name_for` / `list_names` — a pending bind is strictly newer
+    /// than any durable bind on the same name. Drained by `comp_id`,
+    /// never by name alone, so a newer pending bind on the same name
+    /// survives an older comp's drain (LWW).
+    pending_names: parking_lot::RwLock<PendingNameMap>,
+    /// Cap on `pending` entries (`KISEKI_COMPOSITION_PENDING_MAX`,
+    /// default [`DEFAULT_COMPOSITION_PENDING_MAX`]). At the cap,
+    /// volatile creates fall back to the durable write-through path
+    /// (never reject).
+    pending_max: usize,
+    /// Counter: volatile creates that overflowed to the durable
+    /// write-through path. Exposed via `pending_overflows()`.
+    pending_overflows: std::sync::atomic::AtomicU64,
 }
+
+/// `(ns, name) → (comp_id, perspective_seq)` volatile overlay map
+/// (P4 #226). The optional [`PerspectiveSeq`] is the ingress-minted
+/// seq the eventual Create delta carries — recorded for observability
+/// and LWW reasoning; drains key off the `comp_id` alone.
+type PendingNameMap = HashMap<(NamespaceId, String), (CompositionId, Option<PerspectiveSeq>)>;
 
 /// ADR-048 hook the gateway implements to release a migrated chunk's
 /// hot-tier copy after the cold-tier slab is durable + the
@@ -937,6 +982,22 @@ fn read_cache_capacity() -> NonZeroUsize {
     NonZeroUsize::new(cap.max(1)).expect("capacity at least 1")
 }
 
+/// Default cap on the volatile pending overlay (entries). At ~200
+/// bytes per `Composition` this bounds the overlay at ≈ 12 MiB —
+/// the same sizing rationale as the read cache. The cap exists so an
+/// ingress node whose hydrator falls behind can't grow the overlay
+/// unboundedly; at the cap, volatile creates fall back to the
+/// durable write-through path (they never reject). Override via
+/// `KISEKI_COMPOSITION_PENDING_MAX`.
+pub const DEFAULT_COMPOSITION_PENDING_MAX: usize = 65_536;
+
+fn pending_max_capacity() -> usize {
+    std::env::var("KISEKI_COMPOSITION_PENDING_MAX")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_COMPOSITION_PENDING_MAX)
+}
+
 impl CompositionStore {
     /// Create an empty composition store with the in-memory backend.
     #[must_use]
@@ -963,7 +1024,19 @@ impl CompositionStore {
             log: parking_lot::RwLock::new(None),
             read_cache: parking_lot::Mutex::new(LruCache::new(read_cache_capacity())),
             eviction_sink: parking_lot::RwLock::new(None),
+            pending: parking_lot::RwLock::new(HashMap::new()),
+            pending_names: parking_lot::RwLock::new(HashMap::new()),
+            pending_max: pending_max_capacity(),
+            pending_overflows: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Override the volatile-overlay cap. Test/bench hook — exercising
+    /// the overflow fallback shouldn't require 65 536 inserts.
+    #[must_use]
+    pub fn with_pending_max(mut self, max: usize) -> Self {
+        self.pending_max = max;
+        self
     }
 
     /// ADR-048 — register the gateway-side chunk eviction sink. Called
@@ -1107,7 +1180,25 @@ impl CompositionStore {
         &self,
         ns_id: NamespaceId,
     ) -> Result<Vec<Composition>, CompositionError> {
-        Ok(self.storage.list_in_namespace(ns_id)?)
+        let mut out = self.storage.list_in_namespace(ns_id)?;
+        // P4 (#226): include volatile rows so a fresh async write
+        // shows up in by-id listings within the hydration lag window.
+        // On an id collision (post-apply, pre-drain microwindow) the
+        // pending value wins — RMW methods mutate pending first, so
+        // it is at least as new.
+        let pend = self.pending.read();
+        if !pend.is_empty() {
+            let pending_ids: std::collections::HashSet<CompositionId> = pend
+                .values()
+                .filter(|c| c.namespace_id == ns_id)
+                .map(|c| c.id)
+                .collect();
+            if !pending_ids.is_empty() {
+                out.retain(|c| !pending_ids.contains(&c.id));
+                out.extend(pend.values().filter(|c| c.namespace_id == ns_id).cloned());
+            }
+        }
+        Ok(out)
     }
 
     /// Attach a Content-Type to an existing composition (RFC 6838
@@ -1126,6 +1217,14 @@ impl CompositionStore {
         content_type: Option<String>,
     ) -> Result<(), CompositionError> {
         let _g = self.id_locks[id_shard(id)].lock();
+        // P4 (#226): metadata ops on a fresh (volatile) row mutate the
+        // overlay in place — the durable backend doesn't have the row
+        // yet and a storage-only read would 404 within the hydration
+        // lag window.
+        if let Some(comp) = self.pending.write().get_mut(&id) {
+            comp.content_type = content_type;
+            return Ok(());
+        }
         let mut comp = self
             .storage
             .get(id)?
@@ -1261,6 +1360,16 @@ impl CompositionStore {
         namespace_id: NamespaceId,
         name: &str,
     ) -> Result<Option<CompositionId>, CompositionError> {
+        // P4 (#226): a pending (volatile) bind is strictly newer than
+        // any durable bind on the same name — consult the overlay
+        // first.
+        if let Some(&(id, _)) = self
+            .pending_names
+            .read()
+            .get(&(namespace_id, name.to_owned()))
+        {
+            return Ok(Some(id));
+        }
         Ok(self.storage.name_lookup(namespace_id, name)?)
     }
 
@@ -1273,6 +1382,18 @@ impl CompositionStore {
         &self,
         id: CompositionId,
     ) -> Result<Option<(NamespaceId, String)>, CompositionError> {
+        // P4 (#226): reverse check on the volatile overlay first — a
+        // fresh async write's binding only exists there until the
+        // hydrator materializes it. Linear scan is fine: the overlay
+        // is bounded and small (hydration lag window only).
+        {
+            let pend = self.pending_names.read();
+            for ((ns, n), (cid, _)) in &*pend {
+                if *cid == id {
+                    return Ok(Some((*ns, n.clone())));
+                }
+            }
+        }
         Ok(self.storage.name_for(id)?)
     }
 
@@ -1400,7 +1521,325 @@ impl CompositionStore {
         namespace_id: NamespaceId,
         prefix: Option<&str>,
     ) -> Result<Vec<(String, CompositionId)>, CompositionError> {
-        Ok(self.storage.name_list(namespace_id, prefix)?)
+        let mut out = self.storage.name_list(namespace_id, prefix)?;
+        // P4 (#226): merge the volatile overlay — a pending bind is
+        // strictly newer than any durable bind on the same name, so
+        // it wins on duplicates (LIST coherence within the hydration
+        // lag window).
+        let overlay: Vec<(String, CompositionId)> = {
+            let pend = self.pending_names.read();
+            let mut v = Vec::new();
+            for ((ns, n), (cid, _)) in &*pend {
+                if *ns == namespace_id && prefix.is_none_or(|p| n.starts_with(p)) {
+                    v.push((n.clone(), *cid));
+                }
+            }
+            v
+        };
+        if !overlay.is_empty() {
+            {
+                let shadowed: std::collections::HashSet<&str> =
+                    overlay.iter().map(|(n, _)| n.as_str()).collect();
+                out.retain(|(n, _)| !shadowed.contains(n.as_str()));
+            }
+            out.extend(overlay);
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        Ok(out)
+    }
+
+    // -- P4 (#226): volatile create overlay --------------------------------
+    //
+    // Async-ack surfaces (S3, Native) create the composition row + name
+    // binding here at ack time; the durable fjall materialization rides
+    // the hydrator — when this node's hydrator applies the Create delta
+    // it stages the put against raw storage (the overlay is invisible
+    // there, see the `pending` field doc) and then drains the overlay
+    // row via `drain_pending`.
+
+    /// Create a composition in the volatile pending overlay (no
+    /// storage write). Mirrors [`CompositionOps::create`] except the
+    /// row lands in `pending` instead of the storage backend.
+    ///
+    /// Falls back to the durable write-through path when the overlay
+    /// is at `KISEKI_COMPOSITION_PENDING_MAX` — a volatile create
+    /// never rejects on the bound.
+    ///
+    /// # Errors
+    ///
+    /// Same surface as `create`: `NamespaceNotFound`,
+    /// `ReadOnlyNamespace`; `Storage` only on the overflow fallback.
+    pub fn create_volatile(
+        &self,
+        namespace_id: NamespaceId,
+        chunks: Vec<ChunkId>,
+        size: u64,
+    ) -> Result<CompositionId, CompositionError> {
+        // Snapshot namespace metadata under the read lock without
+        // holding it across the overlay/storage write (same shape as
+        // `create`).
+        let ns_snap = {
+            let nss = self.namespaces.read();
+            let ns = nss
+                .get(&namespace_id)
+                .ok_or(CompositionError::NamespaceNotFound(namespace_id))?;
+            if ns.read_only {
+                return Err(CompositionError::ReadOnlyNamespace(namespace_id));
+            }
+            (ns.tenant_id, ns.shard_id)
+        };
+
+        let id = CompositionId(uuid::Uuid::new_v4());
+        let has_inline_data = chunks.is_empty() && size > 0 && size <= INLINE_DATA_THRESHOLD;
+        let comp = Composition {
+            id,
+            tenant_id: ns_snap.0,
+            namespace_id,
+            shard_id: ns_snap.1,
+            chunks,
+            version: 1,
+            size,
+            has_inline_data,
+            content_type: None,
+            chunk_plaintext_lens: Vec::new(),
+            chunk_locations: Vec::new(),
+        };
+        let mut pend = self.pending.write();
+        if pend.len() >= self.pending_max {
+            // Overlay full — durable write-through (never reject).
+            drop(pend);
+            self.pending_overflows
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.storage.put(comp)?;
+            return Ok(id);
+        }
+        pend.insert(id, comp);
+        Ok(id)
+    }
+
+    /// Atomic volatile create-then-name with an optional S3-style
+    /// conditional check. Mirrors [`Self::create_with_name`] —
+    /// namespace snapshot, the SAME 256-way name-shard critical
+    /// section, identical conditional semantics — except the row +
+    /// binding land in the volatile overlay instead of
+    /// `put_with_name`.
+    ///
+    /// The existing-binding check is `pending_names` ∪
+    /// `storage.name_lookup` (a pending bind is strictly newer, so it
+    /// wins for the conditional evaluation).
+    ///
+    /// `perspective_seq` is the ingress-minted seq the eventual
+    /// Create delta will carry (`Some` on the async path).
+    ///
+    /// Falls back to the durable write-through path when the overlay
+    /// is at `KISEKI_COMPOSITION_PENDING_MAX` (never rejects on the
+    /// bound); in that case any pending bind on this name is dropped
+    /// — it is superseded by the strictly-newer durable bind, and
+    /// leaving it would shadow the durable winner until the older
+    /// comp's drain.
+    ///
+    /// # Errors
+    ///
+    /// Same surface as `create_with_name`: `NamespaceNotFound`,
+    /// `ReadOnlyNamespace`, `PreconditionFailed`; `Storage` on the
+    /// existing-binding lookup or the overflow fallback.
+    pub fn create_with_name_volatile(
+        &self,
+        namespace_id: NamespaceId,
+        name: String,
+        cond: Option<&dyn ConditionalCheck>,
+        chunks: Vec<ChunkId>,
+        size: u64,
+        perspective_seq: Option<PerspectiveSeq>,
+    ) -> Result<CompositionId, CompositionError> {
+        let ns_snap = {
+            let nss = self.namespaces.read();
+            let ns = nss
+                .get(&namespace_id)
+                .ok_or(CompositionError::NamespaceNotFound(namespace_id))?;
+            if ns.read_only {
+                return Err(CompositionError::ReadOnlyNamespace(namespace_id));
+            }
+            (ns.tenant_id, ns.shard_id)
+        };
+
+        let id = CompositionId(uuid::Uuid::new_v4());
+        let has_inline_data = chunks.is_empty() && size > 0 && size <= INLINE_DATA_THRESHOLD;
+        let comp = Composition {
+            id,
+            tenant_id: ns_snap.0,
+            namespace_id,
+            shard_id: ns_snap.1,
+            chunks,
+            version: 1,
+            size,
+            has_inline_data,
+            content_type: None,
+            chunk_plaintext_lens: Vec::new(),
+            chunk_locations: Vec::new(),
+        };
+
+        // SAME per-name shard critical section as `create_with_name`:
+        // existing-check + conditional + publish serialise per name so
+        // `If-None-Match: *` stays race-free — including against
+        // concurrent durable writers on the same name (they contend on
+        // the same shard).
+        let _g = self.name_locks[name_shard(namespace_id, &name)].lock();
+        let key = (namespace_id, name.clone());
+        let pending_existing = self.pending_names.read().get(&key).map(|&(cid, _)| cid);
+        let storage_existing = self.storage.name_lookup(namespace_id, &name)?;
+        // pending ∪ storage with pending (strictly newer) winning —
+        // conditional semantics unchanged from the durable path.
+        let existing = pending_existing.or(storage_existing);
+        if let Some(cond) = cond {
+            cond.check(existing)
+                .map_err(CompositionError::PreconditionFailed)?;
+        }
+        let mut pend = self.pending.write();
+        if pend.len() >= self.pending_max {
+            // Overlay full — durable write-through under the same
+            // shard lock (never reject). `put_with_name`'s prior-id
+            // cascade wants the STORAGE binding: a pending-only bind
+            // has no durable reverse row to cascade-drop.
+            drop(pend);
+            self.pending_overflows
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.storage
+                .put_with_name(comp, namespace_id, name, storage_existing)?;
+            self.pending_names.write().remove(&key);
+            return Ok(id);
+        }
+        // Row before name: a concurrent `lookup_by_name` → `get` must
+        // never observe the name without the row.
+        pend.insert(id, comp);
+        drop(pend);
+        self.pending_names
+            .write()
+            .insert(key, (id, perspective_seq));
+        Ok(id)
+    }
+
+    /// Drop a volatile-created row + its name bindings — the rollback
+    /// path for a failed async fan. Returns `true` when a pending row
+    /// was present; `false` means the create either fell back to the
+    /// durable path on overlay overflow (the caller deletes durably)
+    /// or was already drained by the hydrator.
+    ///
+    /// Name bindings are dropped by `comp_id` only — NOT by name — so
+    /// a newer pending bind on the same name (different `comp_id`)
+    /// survives (LWW).
+    pub fn discard_volatile(&self, id: CompositionId) -> bool {
+        let removed = self.pending.write().remove(&id).is_some();
+        self.pending_names.write().retain(|_, v| v.0 != id);
+        removed
+    }
+
+    /// Hydrator hook: a delta touching `id` just applied durably —
+    /// drop the volatile overlay row + its name bindings so the (now
+    /// stale) overlay can't shadow later Update/Delete deltas applied
+    /// through the storage backend. Same `comp_id`-keyed LWW
+    /// semantics as [`Self::discard_volatile`]: a newer pending bind
+    /// on the same name survives.
+    ///
+    /// Pre-P4-parity metadata merge (#226 adversarial blocker):
+    /// before the overlay row drops, ingress-local metadata it holds
+    /// (`content_type` — see [`Self::merge_drained_overlay_metadata`])
+    /// is written through to the freshly-materialized durable row.
+    /// Without the merge, a Content-Type set within the hydration lag
+    /// window would permanently revert to `None` here — no delta
+    /// carries it.
+    ///
+    /// Locking: takes the per-id shard lock (same order as
+    /// `set_content_type`: id-lock → `pending` → storage →
+    /// `read_cache`), so a concurrent `set_content_type` either
+    /// mutates the overlay before we remove it (we merge its value)
+    /// or misses the overlay after we release and takes the durable
+    /// path itself (its newer value wins). Safe to call from inside
+    /// the hydrator's `with_storage_locked` closure — that closure is
+    /// lock-free post-Mutex-removal (the storage round-trip in the
+    /// merge cannot deadlock against it), and the hydrator holds no
+    /// id-shard locks.
+    pub fn drain_pending(&self, id: CompositionId) {
+        let _g = self.id_locks[id_shard(id)].lock();
+        let overlay = self.pending.write().remove(&id);
+        self.pending_names.write().retain(|_, v| v.0 != id);
+        if let Some(overlay) = overlay {
+            self.merge_drained_overlay_metadata(&overlay);
+        }
+    }
+
+    /// Pre-P4-parity (#226): write ingress-local overlay metadata
+    /// through to the freshly-durable row at drain time.
+    ///
+    /// `content_type` is the only production field today. No delta
+    /// carries it — it was ingress-local even pre-P4 (S3 `PutObject`
+    /// calls `set_object_content_type` AFTER the write ack), so the
+    /// row `stage_create` materializes always has `content_type:
+    /// None` and the overlay row holds the only copy. Pre-P4 the row
+    /// was durable at ack, `set_content_type` wrote storage directly,
+    /// and `stage_create`'s skip-on-exists preserved it; this merge
+    /// restores that parity on the volatile path.
+    ///
+    /// The other overlay-mutating arms need no merge: `update` /
+    /// `delete` convergence rides the Update / Delete deltas the
+    /// callers emit (sequence order beats the Create), and per the P4
+    /// review `update` / `rename` have no production emitters against
+    /// a volatile row today. A future overlay-only (delta-less) field
+    /// joins this merge by extending the comparison below.
+    ///
+    /// Caller must hold the per-id shard lock for `overlay.id`.
+    fn merge_drained_overlay_metadata(&self, overlay: &Composition) {
+        let Some(ct) = overlay.content_type.as_deref() else {
+            // Nothing ingress-local to merge — zero storage I/O on
+            // the common (no Content-Type) drain.
+            return;
+        };
+        let id = overlay.id;
+        match self.storage.get(id) {
+            Ok(Some(mut durable)) => {
+                if durable.content_type.as_deref() == Some(ct) {
+                    // Already merged (replayed drain) — no extra write.
+                    return;
+                }
+                durable.content_type = Some(ct.to_owned());
+                match self.storage.put(durable) {
+                    // Same publish discipline as `set_content_type`:
+                    // drop the cache entry under the id-shard lock.
+                    Ok(()) => {
+                        self.read_cache.lock().pop(&id);
+                    }
+                    Err(e) => tracing::warn!(
+                        comp_id = %id.0, error = %e,
+                        "drain_pending: content-type merge write failed — \
+                         Content-Type reverts to the durable value",
+                    ),
+                }
+            }
+            // The batch that drained this id also removed the row
+            // (Delete in the same poll) — nothing to merge onto.
+            Ok(None) => {}
+            Err(e) => tracing::warn!(
+                comp_id = %id.0, error = %e,
+                "drain_pending: content-type merge read failed — \
+                 Content-Type reverts to the durable value",
+            ),
+        }
+    }
+
+    /// Volatile-overlay size (gauge — rows currently pending durable
+    /// materialization by the hydrator).
+    #[must_use]
+    pub fn pending_len(&self) -> usize {
+        self.pending.read().len()
+    }
+
+    /// How many volatile creates fell back to the durable
+    /// write-through path because the overlay was at
+    /// `KISEKI_COMPOSITION_PENDING_MAX` (counter).
+    #[must_use]
+    pub fn pending_overflows(&self) -> u64 {
+        self.pending_overflows
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Return a snapshot of the parts uploaded for a multipart
@@ -1532,6 +1971,16 @@ impl CompositionOps for CompositionStore {
         if let Some(hit) = self.read_cache.lock().get(&id).cloned() {
             return Ok(hit);
         }
+        // P4 (#226): volatile overlay — rows created at ack on async
+        // surfaces live here until the hydrator materializes them
+        // durably. Checked after the LRU (a cache entry implies the
+        // row was already durable once) and before storage so a fresh
+        // async write doesn't 404 within the hydration lag window.
+        // Pending hits are NOT inserted into the read cache — the
+        // cache invalidation contract is tied to storage mutations.
+        if let Some(hit) = self.pending.read().get(&id).cloned() {
+            return Ok(hit);
+        }
         // Miss: take the per-id shard lock so we don't race with a
         // concurrent mutation on this same id. The shard lock plays
         // the same lock-ordering role the old global storage Mutex
@@ -1553,6 +2002,17 @@ impl CompositionOps for CompositionStore {
         size: u64,
     ) -> Result<u64, CompositionError> {
         let _g = self.id_locks[id_shard(id)].lock();
+        // P4 (#226): RMW on a volatile row mutates the overlay in
+        // place — a storage-only read would 404 a fresh async object
+        // within the hydration lag window. The Update delta the
+        // caller emits converges the durable state after the Create
+        // delta materializes (deltas apply in sequence order).
+        if let Some(comp) = self.pending.write().get_mut(&id) {
+            comp.version += 1;
+            comp.chunks.clone_from(&chunks);
+            comp.size = size;
+            return Ok(comp.version);
+        }
         let mut comp = self
             .storage
             .get(id)?
@@ -1577,6 +2037,25 @@ impl CompositionOps for CompositionStore {
                 .is_some_and(|n| n.versioning_enabled)
         };
         let _g = self.id_locks[id_shard(id)].lock();
+        // P4 (#226): delete of a fresh (volatile) row operates on the
+        // overlay — same versioning semantics as the durable path.
+        // The name bindings drop by comp_id (LWW: a newer pending
+        // bind on the same name survives). The durable state
+        // converges when the Delete delta applies after the Create.
+        {
+            let mut pend = self.pending.write();
+            if let Some(comp) = pend.get_mut(&id) {
+                if versioning_enabled_for(comp.namespace_id) {
+                    comp.version += 1;
+                    return Ok(DeleteResult::DeleteMarker);
+                }
+            }
+            if let Some(comp) = pend.remove(&id) {
+                drop(pend);
+                self.pending_names.write().retain(|_, v| v.0 != id);
+                return Ok(DeleteResult::Removed(comp.chunks));
+            }
+        }
         let mut comp = self
             .storage
             .get(id)?
@@ -1609,6 +2088,22 @@ impl CompositionOps for CompositionStore {
             .ok_or(CompositionError::NamespaceNotFound(target_namespace))?;
 
         let _g = self.id_locks[id_shard(id)].lock();
+        // P4 (#226): rename of a fresh (volatile) row mutates the
+        // overlay in place — same I-L8 cross-shard check as the
+        // durable path.
+        {
+            let mut pend = self.pending.write();
+            if let Some(comp) = pend.get_mut(&id) {
+                if comp.shard_id != target_shard {
+                    return Err(CompositionError::CrossShardRename(
+                        comp.shard_id,
+                        target_shard,
+                    ));
+                }
+                comp.namespace_id = target_namespace;
+                return Ok(());
+            }
+        }
         let mut comp = self
             .storage
             .get(id)?
@@ -2840,5 +3335,666 @@ mod tests {
     fn create_payload_rejects_short_prefix() {
         // Shorter than the fixed 40-byte prefix — structural failure.
         assert!(decode_composition_create_payload(&[0u8; 5]).is_none());
+    }
+
+    /// P4 (#226) — volatile create overlay: rows + name bindings
+    /// created at ack time on async surfaces, durably materialized by
+    /// the hydrator (drain tests live in `hydrator::tests`).
+    mod volatile_overlay {
+        use super::*;
+
+        fn pseq(physical_ms: u64) -> PerspectiveSeq {
+            PerspectiveSeq(kiseki_common::time::HybridLogicalClock {
+                physical_ms,
+                logical: 0,
+                node_id: kiseki_common::ids::NodeId(1),
+            })
+        }
+
+        /// `If-None-Match: *` — rejects when any existing binding is
+        /// visible.
+        struct IfNoneMatchStar;
+        impl ConditionalCheck for IfNoneMatchStar {
+            fn check(&self, existing: Option<CompositionId>) -> Result<(), String> {
+                if existing.is_some() {
+                    Err("precondition failed: object exists".to_owned())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        #[test]
+        fn volatile_create_visible_via_read_paths() {
+            let store = setup();
+            let id = store
+                .create_with_name_volatile(
+                    test_ns(),
+                    "k1".to_owned(),
+                    None,
+                    vec![ChunkId([0x01; 32])],
+                    1024,
+                    Some(pseq(1)),
+                )
+                .unwrap();
+
+            // get
+            let comp = store.get(id).unwrap();
+            assert_eq!(comp.size, 1024);
+            assert_eq!(comp.tenant_id, test_tenant());
+            // lookup_by_name
+            assert_eq!(store.lookup_by_name(test_ns(), "k1").unwrap(), Some(id));
+            // name_for (reverse)
+            assert_eq!(
+                store.name_for(id).unwrap(),
+                Some((test_ns(), "k1".to_owned()))
+            );
+            // list_names (LIST coherence)
+            assert_eq!(
+                store.list_names(test_ns(), None).unwrap(),
+                vec![("k1".to_owned(), id)]
+            );
+            // list_by_namespace (by-id LIST coherence)
+            assert_eq!(store.list_by_namespace(test_ns()).unwrap().len(), 1);
+        }
+
+        /// HARD CONSTRAINT pin: the overlay must NOT be visible
+        /// through the `CompositionStorage` trait. The hydrator's
+        /// `Staging::view` reads raw storage via `with_storage_locked`
+        /// DELIBERATELY — that bypass is what makes the ingress
+        /// node's own hydrator stage the durable put. If the overlay
+        /// leaked into `CompositionStorage::get`, the skip-on-exists
+        /// check in `stage_create` would orphan the row (never
+        /// durable, unrecoverable on replay).
+        #[test]
+        fn volatile_overlay_invisible_to_storage_trait() {
+            let store = setup();
+            let id = store
+                .create_with_name_volatile(
+                    test_ns(),
+                    "k1".to_owned(),
+                    None,
+                    vec![],
+                    64,
+                    Some(pseq(1)),
+                )
+                .unwrap();
+
+            // Visible through the store wrapper...
+            assert!(store.get(id).is_ok());
+            // ...but ABSENT through the raw storage trait (the
+            // hydrator's view).
+            assert!(
+                store.with_storage_locked(|s| s.get(id).unwrap()).is_none(),
+                "volatile row leaked into CompositionStorage::get — \
+                 the hydrator would skip-on-exists and the row would \
+                 never be durably materialized",
+            );
+            assert!(
+                store
+                    .with_storage_locked(|s| s.name_lookup(test_ns(), "k1").unwrap())
+                    .is_none(),
+                "volatile name binding leaked into the storage name index",
+            );
+        }
+
+        #[test]
+        fn discard_volatile_drops_row_and_names() {
+            let store = setup();
+            let id = store
+                .create_with_name_volatile(
+                    test_ns(),
+                    "k1".to_owned(),
+                    None,
+                    vec![],
+                    0,
+                    Some(pseq(1)),
+                )
+                .unwrap();
+
+            assert!(store.discard_volatile(id));
+            assert!(store.get(id).is_err());
+            assert_eq!(store.lookup_by_name(test_ns(), "k1").unwrap(), None);
+            assert_eq!(store.pending_len(), 0);
+            // Second discard: row already gone.
+            assert!(!store.discard_volatile(id));
+        }
+
+        /// LWW: draining an older `comp_id` must NOT drop a newer
+        /// pending bind on the same name.
+        #[test]
+        fn drain_pending_keeps_newer_bind_on_same_name() {
+            let store = setup();
+            let older = store
+                .create_with_name_volatile(
+                    test_ns(),
+                    "k".to_owned(),
+                    None,
+                    vec![],
+                    1,
+                    Some(pseq(1)),
+                )
+                .unwrap();
+            let newer = store
+                .create_with_name_volatile(
+                    test_ns(),
+                    "k".to_owned(),
+                    None,
+                    vec![],
+                    2,
+                    Some(pseq(2)),
+                )
+                .unwrap();
+            assert_eq!(store.lookup_by_name(test_ns(), "k").unwrap(), Some(newer));
+
+            store.drain_pending(older);
+
+            assert_eq!(
+                store.lookup_by_name(test_ns(), "k").unwrap(),
+                Some(newer),
+                "draining the older comp_id dropped the newer pending \
+                 bind on the same name (drain must key off comp_id, \
+                 not name)",
+            );
+            assert!(store.get(newer).is_ok());
+            assert_eq!(store.pending_len(), 1);
+        }
+
+        #[test]
+        fn overflow_falls_back_to_durable() {
+            let store = CompositionStore::new().with_pending_max(1);
+            store.add_namespace(make_ns(10, test_tenant(), test_shard()));
+
+            let first = store.create_volatile(test_ns(), vec![], 0).unwrap();
+            let second = store.create_volatile(test_ns(), vec![], 0).unwrap();
+
+            assert_eq!(store.pending_len(), 1);
+            assert_eq!(store.pending_overflows(), 1);
+            // First is overlay-only; second went durable write-through.
+            assert!(store
+                .with_storage_locked(|s| s.get(first).unwrap())
+                .is_none());
+            assert!(store
+                .with_storage_locked(|s| s.get(second).unwrap())
+                .is_some());
+            // Both are readable through the store wrapper.
+            assert!(store.get(first).is_ok());
+            assert!(store.get(second).is_ok());
+        }
+
+        /// Overflow on the named path: the durable bind supersedes any
+        /// pending bind on that name (the pending entry must drop so
+        /// it can't shadow the strictly-newer durable winner).
+        #[test]
+        fn overflow_with_name_supersedes_pending_bind() {
+            let store = CompositionStore::new().with_pending_max(1);
+            store.add_namespace(make_ns(10, test_tenant(), test_shard()));
+
+            let older = store
+                .create_with_name_volatile(
+                    test_ns(),
+                    "k".to_owned(),
+                    None,
+                    vec![],
+                    1,
+                    Some(pseq(1)),
+                )
+                .unwrap();
+            // Overlay full → durable write-through.
+            let newer = store
+                .create_with_name_volatile(
+                    test_ns(),
+                    "k".to_owned(),
+                    None,
+                    vec![],
+                    2,
+                    Some(pseq(2)),
+                )
+                .unwrap();
+
+            assert_eq!(store.pending_overflows(), 1);
+            assert_eq!(
+                store.lookup_by_name(test_ns(), "k").unwrap(),
+                Some(newer),
+                "the stale pending bind shadows the newer durable bind",
+            );
+            assert_eq!(
+                store.with_storage_locked(|s| s.name_lookup(test_ns(), "k").unwrap()),
+                Some(newer),
+            );
+            // The older row stays readable by id until its drain.
+            assert!(store.get(older).is_ok());
+        }
+
+        /// Conditional semantics unchanged: the existing-check is
+        /// `pending_names` ∪ `storage.name_lookup`, so
+        /// `If-None-Match: *` sees a pending-only binding.
+        #[test]
+        fn conditional_check_sees_pending_binding() {
+            let store = setup();
+            store
+                .create_with_name_volatile(
+                    test_ns(),
+                    "k".to_owned(),
+                    None,
+                    vec![],
+                    0,
+                    Some(pseq(1)),
+                )
+                .unwrap();
+
+            let res = store.create_with_name_volatile(
+                test_ns(),
+                "k".to_owned(),
+                Some(&IfNoneMatchStar),
+                vec![],
+                0,
+                Some(pseq(2)),
+            );
+            assert!(
+                matches!(res, Err(CompositionError::PreconditionFailed(_))),
+                "If-None-Match: * must reject against a pending-only binding",
+            );
+        }
+
+        #[test]
+        fn update_sees_pending_row() {
+            let store = setup();
+            let id = store
+                .create_volatile(test_ns(), vec![ChunkId([0x01; 32])], 64)
+                .unwrap();
+
+            let v = store.update(id, vec![ChunkId([0x02; 32])], 128).unwrap();
+            assert_eq!(v, 2);
+            let comp = store.get(id).unwrap();
+            assert_eq!(comp.size, 128);
+            assert_eq!(comp.chunks, vec![ChunkId([0x02; 32])]);
+            // Still overlay-only — the RMW must not write through.
+            assert!(store.with_storage_locked(|s| s.get(id).unwrap()).is_none());
+        }
+
+        #[test]
+        fn set_content_type_sees_pending_row() {
+            let store = setup();
+            let id = store.create_volatile(test_ns(), vec![], 0).unwrap();
+
+            store
+                .set_content_type(id, Some("text/plain".to_owned()))
+                .unwrap();
+            assert_eq!(
+                store.get(id).unwrap().content_type.as_deref(),
+                Some("text/plain")
+            );
+            assert!(store.with_storage_locked(|s| s.get(id).unwrap()).is_none());
+        }
+
+        #[test]
+        fn delete_sees_pending_row_and_drops_names() {
+            let store = setup();
+            let id = store
+                .create_with_name_volatile(
+                    test_ns(),
+                    "k".to_owned(),
+                    None,
+                    vec![ChunkId([0x03; 32])],
+                    64,
+                    Some(pseq(1)),
+                )
+                .unwrap();
+
+            let res = store.delete(id).unwrap();
+            assert!(
+                matches!(res, DeleteResult::Removed(chunks) if chunks == vec![ChunkId([0x03; 32])])
+            );
+            assert!(store.get(id).is_err());
+            assert_eq!(store.lookup_by_name(test_ns(), "k").unwrap(), None);
+            assert_eq!(store.pending_len(), 0);
+        }
+
+        #[test]
+        fn rename_sees_pending_row() {
+            let store = setup();
+            // Same-shard sibling namespace.
+            store.add_namespace(make_ns(11, test_tenant(), test_shard()));
+            let target = NamespaceId(uuid::Uuid::from_u128(11));
+            let id = store.create_volatile(test_ns(), vec![], 0).unwrap();
+
+            store.rename(id, target).unwrap();
+            assert_eq!(store.get(id).unwrap().namespace_id, target);
+            assert!(store.with_storage_locked(|s| s.get(id).unwrap()).is_none());
+
+            // Cross-shard rename on a pending row → EXDEV (I-L8).
+            store.add_namespace(make_ns(
+                20,
+                test_tenant(),
+                ShardId(uuid::Uuid::from_u128(2)),
+            ));
+            let res = store.rename(id, NamespaceId(uuid::Uuid::from_u128(20)));
+            assert!(matches!(res, Err(CompositionError::CrossShardRename(_, _))));
+        }
+
+        /// `list_names` merge: pending wins on duplicate names; the
+        /// result stays name-sorted (S3 LIST ordering).
+        #[test]
+        fn list_names_merges_overlay_over_durable() {
+            let store = setup();
+            // Durable binds for "a" and "b".
+            let durable_a = store
+                .create_with_name(test_ns(), "a".to_owned(), None, vec![], 0)
+                .unwrap();
+            store
+                .create_with_name(test_ns(), "b".to_owned(), None, vec![], 0)
+                .unwrap();
+            // Pending overwrite of "a" + a fresh pending "c".
+            let pending_a = store
+                .create_with_name_volatile(
+                    test_ns(),
+                    "a".to_owned(),
+                    None,
+                    vec![],
+                    0,
+                    Some(pseq(1)),
+                )
+                .unwrap();
+            let pending_c = store
+                .create_with_name_volatile(
+                    test_ns(),
+                    "c".to_owned(),
+                    None,
+                    vec![],
+                    0,
+                    Some(pseq(2)),
+                )
+                .unwrap();
+
+            let listed = store.list_names(test_ns(), None).unwrap();
+            let names: Vec<&str> = listed.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names, vec!["a", "b", "c"], "sorted, no duplicates");
+            assert_eq!(listed[0].1, pending_a, "pending bind wins on 'a'");
+            assert_ne!(listed[0].1, durable_a);
+            assert_eq!(listed[2].1, pending_c);
+
+            // Prefix filtering applies to the overlay too.
+            let prefixed = store.list_names(test_ns(), Some("c")).unwrap();
+            assert_eq!(prefixed, vec![("c".to_owned(), pending_c)]);
+        }
+
+        /// Regression (#226 review, fix shape 3): a Content-Type set
+        /// on a create that overflowed to the durable write-through
+        /// path (no overlay row) lands durably via `set_content_type`'s
+        /// storage arm, and the hydrator's later `drain_pending` for
+        /// that id (a no-op — no overlay row) must not disturb it.
+        #[test]
+        fn content_type_on_overflowed_row_writes_through_and_survives_drain() {
+            let store = CompositionStore::new().with_pending_max(0);
+            store.add_namespace(make_ns(10, test_tenant(), test_shard()));
+
+            // pending_max = 0 → every volatile create overflows.
+            let id = store.create_volatile(test_ns(), vec![], 0).unwrap();
+            assert_eq!(store.pending_overflows(), 1);
+            assert_eq!(store.pending_len(), 0);
+
+            store
+                .set_content_type(id, Some("text/plain".to_owned()))
+                .unwrap();
+            // Durable immediately (the row went write-through).
+            assert_eq!(
+                store
+                    .with_storage_locked(|s| s.get(id).unwrap())
+                    .expect("write-through row is durable")
+                    .content_type
+                    .as_deref(),
+                Some("text/plain"),
+            );
+
+            // The hydrator still calls drain_pending for every
+            // touched id when the Create delta applies.
+            store.drain_pending(id);
+            assert_eq!(
+                store.get(id).unwrap().content_type.as_deref(),
+                Some("text/plain"),
+                "drain of an overflowed (no-overlay) row disturbed its Content-Type",
+            );
+        }
+
+        /// Storage wrapper counting reads + writes — pins the
+        /// drain-time merge's storage-I/O contract: zero I/O on the
+        /// common no-Content-Type drain, exactly one get + one put on
+        /// a merge, get-only when the durable row already carries the
+        /// identical value.
+        struct CountingStorage {
+            inner: crate::persistent::MemoryStorage,
+            gets: Arc<std::sync::atomic::AtomicU64>,
+            puts: Arc<std::sync::atomic::AtomicU64>,
+        }
+
+        impl CountingStorage {
+            fn new() -> (
+                Self,
+                Arc<std::sync::atomic::AtomicU64>,
+                Arc<std::sync::atomic::AtomicU64>,
+            ) {
+                let gets = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let puts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                (
+                    Self {
+                        inner: crate::persistent::MemoryStorage::new(),
+                        gets: Arc::clone(&gets),
+                        puts: Arc::clone(&puts),
+                    },
+                    gets,
+                    puts,
+                )
+            }
+        }
+
+        impl crate::persistent::CompositionStorage for CountingStorage {
+            fn get(
+                &self,
+                id: CompositionId,
+            ) -> Result<Option<Composition>, crate::persistent::PersistentStoreError> {
+                self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.inner.get(id)
+            }
+            fn count(&self) -> Result<u64, crate::persistent::PersistentStoreError> {
+                self.inner.count()
+            }
+            fn list_in_namespace(
+                &self,
+                ns: NamespaceId,
+            ) -> Result<Vec<Composition>, crate::persistent::PersistentStoreError> {
+                self.inner.list_in_namespace(ns)
+            }
+            fn put(
+                &self,
+                comp: Composition,
+            ) -> Result<(), crate::persistent::PersistentStoreError> {
+                self.puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.inner.put(comp)
+            }
+            fn remove(
+                &self,
+                id: CompositionId,
+            ) -> Result<bool, crate::persistent::PersistentStoreError> {
+                self.inner.remove(id)
+            }
+            fn name_lookup(
+                &self,
+                ns: NamespaceId,
+                name: &str,
+            ) -> Result<Option<CompositionId>, crate::persistent::PersistentStoreError>
+            {
+                self.inner.name_lookup(ns, name)
+            }
+            fn name_for(
+                &self,
+                id: CompositionId,
+            ) -> Result<Option<(NamespaceId, String)>, crate::persistent::PersistentStoreError>
+            {
+                self.inner.name_for(id)
+            }
+            fn name_insert(
+                &self,
+                ns: NamespaceId,
+                name: String,
+                id: CompositionId,
+            ) -> Result<(), crate::persistent::PersistentStoreError> {
+                self.inner.name_insert(ns, name, id)
+            }
+            fn name_seq_lookup(
+                &self,
+                ns: NamespaceId,
+                name: &str,
+            ) -> Result<Option<PerspectiveSeq>, crate::persistent::PersistentStoreError>
+            {
+                self.inner.name_seq_lookup(ns, name)
+            }
+            fn name_seq_record(
+                &self,
+                ns: NamespaceId,
+                name: String,
+                seq: Option<PerspectiveSeq>,
+            ) -> Result<(), crate::persistent::PersistentStoreError> {
+                self.inner.name_seq_record(ns, name, seq)
+            }
+            fn name_remove(
+                &self,
+                ns: NamespaceId,
+                name: &str,
+            ) -> Result<bool, crate::persistent::PersistentStoreError> {
+                self.inner.name_remove(ns, name)
+            }
+            fn name_list(
+                &self,
+                ns: NamespaceId,
+                prefix: Option<&str>,
+            ) -> Result<Vec<(String, CompositionId)>, crate::persistent::PersistentStoreError>
+            {
+                self.inner.name_list(ns, prefix)
+            }
+            fn last_applied_seq(
+                &self,
+                shard_id: ShardId,
+            ) -> Result<kiseki_common::ids::SequenceNumber, crate::persistent::PersistentStoreError>
+            {
+                self.inner.last_applied_seq(shard_id)
+            }
+            fn stuck_state(
+                &self,
+                shard_id: ShardId,
+            ) -> Result<
+                Option<(kiseki_common::ids::SequenceNumber, u32)>,
+                crate::persistent::PersistentStoreError,
+            > {
+                self.inner.stuck_state(shard_id)
+            }
+            fn halted(
+                &self,
+                shard_id: ShardId,
+            ) -> Result<bool, crate::persistent::PersistentStoreError> {
+                self.inner.halted(shard_id)
+            }
+            fn halted_any(&self) -> Result<bool, crate::persistent::PersistentStoreError> {
+                self.inner.halted_any()
+            }
+            fn apply_hydration_batch(
+                &self,
+                batch: crate::persistent::HydrationBatch,
+            ) -> Result<(), crate::persistent::PersistentStoreError> {
+                self.inner.apply_hydration_batch(batch)
+            }
+        }
+
+        fn counting_store() -> (
+            CompositionStore,
+            Arc<std::sync::atomic::AtomicU64>,
+            Arc<std::sync::atomic::AtomicU64>,
+        ) {
+            let (storage, gets, puts) = CountingStorage::new();
+            let store = CompositionStore::with_storage(Box::new(storage));
+            store.add_namespace(make_ns(10, test_tenant(), test_shard()));
+            (store, gets, puts)
+        }
+
+        /// The common drain (no Content-Type ever set) must do ZERO
+        /// storage I/O — the merge fast path returns before touching
+        /// the backend.
+        #[test]
+        fn drain_without_content_type_does_no_storage_io() {
+            let (store, gets, puts) = counting_store();
+            let id = store.create_volatile(test_ns(), vec![], 0).unwrap();
+
+            let (g0, p0) = (
+                gets.load(std::sync::atomic::Ordering::Relaxed),
+                puts.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            store.drain_pending(id);
+            assert_eq!(store.pending_len(), 0, "drain must drop the overlay row");
+            assert_eq!(
+                (
+                    gets.load(std::sync::atomic::Ordering::Relaxed),
+                    puts.load(std::sync::atomic::Ordering::Relaxed),
+                ),
+                (g0, p0),
+                "no-Content-Type drain must not touch storage",
+            );
+        }
+
+        /// A drain that merges does exactly one storage read + one
+        /// storage write; a drain whose durable row already carries
+        /// the identical Content-Type reads but does not write.
+        #[test]
+        fn drain_merge_storage_io_is_one_get_one_put() {
+            let (store, gets, puts) = counting_store();
+            let id = store.create_volatile(test_ns(), vec![], 0).unwrap();
+            store
+                .set_content_type(id, Some("application/json".to_owned()))
+                .unwrap();
+            // Materialize the durable row the way stage_create does:
+            // raw storage put with content_type: None.
+            let mut durable = store.get(id).unwrap();
+            durable.content_type = None;
+            store.with_storage_locked(|s| s.put(durable)).unwrap();
+
+            let (g0, p0) = (
+                gets.load(std::sync::atomic::Ordering::Relaxed),
+                puts.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            store.drain_pending(id);
+            assert_eq!(
+                (
+                    gets.load(std::sync::atomic::Ordering::Relaxed),
+                    puts.load(std::sync::atomic::Ordering::Relaxed),
+                ),
+                (g0 + 1, p0 + 1),
+                "merging drain must do exactly one get + one put",
+            );
+            assert_eq!(
+                store.get(id).unwrap().content_type.as_deref(),
+                Some("application/json"),
+            );
+
+            // Identical-value case: durable row already carries the
+            // CT (defensive replay shape) — read, but no write.
+            let id2 = store.create_volatile(test_ns(), vec![], 0).unwrap();
+            store
+                .set_content_type(id2, Some("text/csv".to_owned()))
+                .unwrap();
+            let durable2 = store.get(id2).unwrap(); // CT already set
+            store.with_storage_locked(|s| s.put(durable2)).unwrap();
+            let (g1, p1) = (
+                gets.load(std::sync::atomic::Ordering::Relaxed),
+                puts.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            store.drain_pending(id2);
+            assert_eq!(
+                (
+                    gets.load(std::sync::atomic::Ordering::Relaxed),
+                    puts.load(std::sync::atomic::Ordering::Relaxed),
+                ),
+                (g1 + 1, p1),
+                "identical-value drain must read once and skip the write",
+            );
+        }
     }
 }

@@ -499,6 +499,9 @@ impl RaftShardStore {
         // including the non-durable refuse path so a degraded shard's
         // refusal time is observable. Post-W12 this measures the
         // submitter's wall time: submission + coalesce wait + flush wall.
+        // Attributed by the coalescer sub-spans (intent_fan_coalescer.rs):
+        // pif.enqueue_wait (submit → batch taken), then pif.flush_total
+        // = pif.local_put + pif.leader_first_hop + pif.topup.
         kiseki_tracing::hot_timer_guard!(_ht_pif_total = "pif.total");
 
         // Non-durable guard FIRST: refuse before any write so an in-memory

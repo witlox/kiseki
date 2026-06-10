@@ -202,8 +202,8 @@ pub fn build_intent_dispatcher(store: Arc<dyn IntentStore>) -> ShardDispatch {
                         // ADR-047 hot-path timer (aux.handle_intent_put_total)
                         // — total server-side processing budget for ONE FAN
                         // (carrying N intents post-W12). Paired with the
-                        // leader-side `pif.leader_first_hop` /
-                        // `pif.parallel_topup` totals so we can split the
+                        // producer-side `pif.leader_first_hop` /
+                        // `pif.topup` totals so we can split the
                         // round trip into (wire + scheduler queue) vs
                         // (server proc). Note: under W12 a higher mean means
                         // bigger batches, NOT slower receivers — pair with

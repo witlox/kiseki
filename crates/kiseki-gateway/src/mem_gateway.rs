@@ -2961,7 +2961,27 @@ impl InMemoryGateway {
         // (e.g., If-None-Match: * → exactly one writer succeeds) is
         // race-free against concurrent writers.
         let composition_record_started = std::time::Instant::now();
-        let (comp_id, log, emit_params) = {
+        // P4 (#226): async-ack-eligible surfaces create the composition
+        // row + name binding in the volatile in-memory overlay at ack
+        // time; the durable fjall materialization rides the hydrator
+        // when the Create delta applies (which drains the overlay row).
+        // POSIX surfaces and the NFS `comp_id_override` arm stay on the
+        // durable write-through path. Volatile additionally requires a
+        // log: with no log there is no Create delta and no hydrator to
+        // materialize the row, so fall back to durable.
+        let log = self.compositions.log();
+        let volatile_created =
+            req.surface.is_async_ack_eligible() && log.is_some() && req.comp_id_override.is_none();
+        // Mint the perspective-seq BEFORE the create so the volatile
+        // name binding carries the same seq the intent (and the Create
+        // delta's hydrator-side LWW guard) will use. `None` on the
+        // durable path — the async branch below mints there.
+        let pre_minted_seq = if volatile_created {
+            Some(self.next_perspective_seq())
+        } else {
+            None
+        };
+        let (comp_id, emit_params) = {
             let comps = self.compositions.as_ref();
             // ----- Create (+ bind name atomically when a key is given) -----
             // The Raft delta below carries the name to followers via
@@ -3014,16 +3034,40 @@ impl InMemoryGateway {
                             .as_ref()
                             .map(|cond| ConditionalCheckAdapter { cond, name });
                         let check_ref = check_owner.as_ref().map(|c| c as &dyn ConditionalCheck);
-                        comps.create_with_name(
-                            req.namespace_id,
-                            name.to_owned(),
-                            check_ref,
-                            chunk_ids.clone(),
-                            final_bytes_written,
-                        )
+                        if volatile_created {
+                            // P4 (#226): volatile overlay create —
+                            // same atomic existing-check + conditional
+                            // semantics, no storage write. Durable
+                            // materialization rides the hydrator.
+                            comps.create_with_name_volatile(
+                                req.namespace_id,
+                                name.to_owned(),
+                                check_ref,
+                                chunk_ids.clone(),
+                                final_bytes_written,
+                                pre_minted_seq,
+                            )
+                        } else {
+                            comps.create_with_name(
+                                req.namespace_id,
+                                name.to_owned(),
+                                check_ref,
+                                chunk_ids.clone(),
+                                final_bytes_written,
+                            )
+                        }
                     }
                     (None, None) => {
-                        comps.create(req.namespace_id, chunk_ids.clone(), final_bytes_written)
+                        if volatile_created {
+                            // P4 (#226): see the named arm above.
+                            comps.create_volatile(
+                                req.namespace_id,
+                                chunk_ids.clone(),
+                                final_bytes_written,
+                            )
+                        } else {
+                            comps.create(req.namespace_id, chunk_ids.clone(), final_bytes_written)
+                        }
                     }
                 }
             };
@@ -3069,8 +3113,7 @@ impl InMemoryGateway {
                 (comp.shard_id, comp.tenant_id)
             };
             let params = (shard_id, tenant_id, req.namespace_id, chunk_ids.clone());
-            let log = comps.log();
-            (comp_id, log, params)
+            (comp_id, params)
         }; // Lock dropped here — before Raft consensus.
            // (B9: dropped "composition created (pre-Raft)" debug.)
 
@@ -3174,7 +3217,12 @@ impl InMemoryGateway {
             // to the client — NO synchronous fallback. The legacy fall-
             // back lost data when min_acks couldn't be satisfied.
             if req.surface.is_async_ack_eligible() {
-                let seq = self.next_perspective_seq();
+                // P4 (#226): reuse the seq minted before the volatile
+                // create so the pending name binding, the Create
+                // payload, and the intent all carry the same value.
+                // The fallback mint covers the comp_id_override arm
+                // (durable create_at — no pre-minted seq).
+                let seq = pre_minted_seq.unwrap_or_else(|| self.next_perspective_seq());
                 // ADR-047 MF-1: encode the seq INTO the Create payload
                 // so the hydrator's LWW guard sees it.
                 // ADR-047 hot-path timer (gw.encode_payload) — covers
@@ -3363,7 +3411,15 @@ impl InMemoryGateway {
                             error = %e,
                             "gateway write: parallel fan failed — write rejected",
                         );
-                        let _ = self.compositions.delete(comp_id).ok();
+                        // P4 (#226): the volatile path created the row
+                        // in the pending overlay — discard it there.
+                        // `discard_volatile` returns false when the
+                        // overlay was at capacity and the create fell
+                        // back to the durable write-through path;
+                        // delete the durable row in that case.
+                        if !volatile_created || !self.compositions.discard_volatile(comp_id) {
+                            let _ = self.compositions.delete(comp_id).ok();
+                        }
                         return Err(e);
                     }
                 }

@@ -349,3 +349,113 @@ async fn fuse_surface_never_decoupled() {
         "FUSE must take the synchronous emit"
     );
 }
+
+// --- P4 (#226): volatile composition overlay on the async path ----------
+
+/// Async PUT: the composition row + name binding are created in the
+/// volatile overlay only — invisible to raw storage (the hydrator
+/// materializes durably later) — yet immediately served on GET-by-id
+/// and S3-style name lookup pre-hydration.
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_volatile_create_served_pre_hydration() {
+    let log = Arc::new(DecoupledSpyLog::with_intent_ok(true));
+    let gw = setup(Arc::clone(&log) as Arc<dyn LogOps + Send + Sync>);
+
+    let plaintext = vec![0x5Au8; 4096];
+    let resp = gw
+        .write(write_req(WriteSurface::S3, plaintext.clone()))
+        .await
+        .expect("S3 write must fast-ack");
+
+    let comps = gw.compositions_handle();
+    // Overlay-only: the raw storage backend (the hydrator's view)
+    // must NOT have the row — durable materialization rides the
+    // hydrator's Create-delta apply.
+    assert!(
+        comps
+            .with_storage_locked(|s| s.get(resp.composition_id).unwrap())
+            .is_none(),
+        "async PUT must not write the composition row through to storage",
+    );
+    assert_eq!(comps.pending_len(), 1, "the row lives in the overlay");
+
+    // GET-by-id pre-hydration.
+    let read = gw
+        .read(ReadRequest {
+            tenant_id: test_tenant(),
+            namespace_id: test_namespace(),
+            composition_id: resp.composition_id,
+            offset: 0,
+            length: plaintext.len() as u64,
+        })
+        .await
+        .expect("GET-by-id must be served from the overlay pre-hydration");
+    assert_eq!(read.data, plaintext);
+
+    // S3-style name lookup pre-hydration (lookup_by_name + get both
+    // consult the overlay).
+    let by_name = gw
+        .lookup_object_by_name(test_tenant(), test_namespace(), "obj")
+        .await
+        .expect("name lookup must not error");
+    assert_eq!(
+        by_name,
+        Some(resp.composition_id),
+        "S3 name lookup must resolve the pending binding pre-hydration",
+    );
+}
+
+/// POSIX surfaces stay durable write-through: an NFS write must land
+/// in raw storage immediately and leave the overlay untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn nfs_write_stays_durable_write_through() {
+    let log = Arc::new(DecoupledSpyLog::with_intent_ok(true));
+    let gw = setup(Arc::clone(&log) as Arc<dyn LogOps + Send + Sync>);
+
+    let resp = gw
+        .write(write_req(WriteSurface::Nfs, vec![0x33u8; 4096]))
+        .await
+        .expect("NFS write");
+
+    let comps = gw.compositions_handle();
+    assert_eq!(
+        comps.pending_len(),
+        0,
+        "POSIX surface must NOT use the volatile overlay"
+    );
+    assert!(
+        comps
+            .with_storage_locked(|s| s.get(resp.composition_id).unwrap())
+            .is_some(),
+        "NFS write must be durable write-through at ack",
+    );
+}
+
+/// Failed fan: the rollback discards the volatile row + name binding
+/// (nothing durable, nothing pending, name unresolvable).
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_fan_discards_volatile_row() {
+    let log = Arc::new(DecoupledSpyLog::with_intent_ok(false));
+    let gw = setup(Arc::clone(&log) as Arc<dyn LogOps + Send + Sync>);
+
+    gw.write(write_req(WriteSurface::S3, vec![0x44u8; 4096]))
+        .await
+        .expect_err("write MUST fail when the intent fan errors");
+
+    let comps = gw.compositions_handle();
+    assert_eq!(
+        comps.pending_len(),
+        0,
+        "rollback must discard the volatile row from the overlay"
+    );
+    assert_eq!(
+        comps.lookup_by_name(test_namespace(), "obj").unwrap(),
+        None,
+        "rollback must drop the pending name binding"
+    );
+    assert_eq!(
+        comps.count().unwrap(),
+        0,
+        "nothing may have been written through to storage"
+    );
+}
