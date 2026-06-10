@@ -5,7 +5,13 @@
 use kiseki_common::ids::{NamespaceId, OrgId, ShardId};
 
 /// Compliance regime tag for a namespace or org.
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+///
+/// Serde derives: rides the control-plane Raft log inside
+/// `ControlCommand::CreateNamespace` (PR #232 — full namespace
+/// fidelity is consensus-replicated so restart replay restores it).
+#[derive(
+    Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
 pub enum ComplianceTag {
     /// US health data.
     Hipaa,
@@ -22,7 +28,7 @@ pub enum ComplianceTag {
 /// chunk-store pool string (`fast` / `bulk` / `cold`) that
 /// `kiseki_chunk::tier_for_pool` maps to a `StorageTier`; kept as a
 /// `String` here so `kiseki-composition` needs no `kiseki-block` dep.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TierQuota {
     /// Device-class tier name (`fast` / `bulk` / `cold`).
     pub tier: String,
@@ -42,7 +48,7 @@ pub struct TierQuota {
 /// `tier_policy` chooses *which device class* a chunk lands on;
 /// `size_band_pools` chooses *which durability strategy* the write
 /// uses (inline / replication / EC).
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct NamespaceSizeBandPools {
     /// Pool name for the inline band (size ≤ `inline_threshold`).
     /// `None` → cluster default inline pool.

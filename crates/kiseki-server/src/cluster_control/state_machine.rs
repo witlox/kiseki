@@ -31,7 +31,7 @@ use openraft::storage::{EntryResponder, RaftStateMachine};
 use openraft::{EntryPayload, OptionalSend, RaftSnapshotBuilder};
 use serde::{Deserialize, Serialize};
 
-use super::commands::{ControlCommand, ShardRecord};
+use super::commands::{ControlCommand, NamespaceFidelity, ShardRecord};
 use super::store::ApplyHook;
 use super::types::{ControlResponse, ControlTypeConfig};
 
@@ -56,6 +56,12 @@ pub struct NamespaceShardMapSnapshot {
     /// retired-but-not-yet-removed shard (post-merge) until the
     /// follow-up `RetireShard` command lands.
     pub shards: Vec<ShardSnapshot>,
+    /// Full gateway-side namespace fidelity captured at creation
+    /// (PR #232). Persisted in the state machine so snapshot install
+    /// and the boot drain pass (`rehydrate_gateway_namespaces`)
+    /// restore the creator's tier policy / size-band pools / flags —
+    /// not defaults.
+    pub fidelity: NamespaceFidelity,
 }
 
 /// One shard's record. `is_retiring` marks the post-merge state
@@ -159,6 +165,7 @@ impl StateMachineInner {
                 namespace_id,
                 tenant_id,
                 shards,
+                fidelity,
             } => {
                 if self.namespaces.contains_key(namespace_id) {
                     // Idempotent on replay: ignore re-creation. The
@@ -181,6 +188,7 @@ impl StateMachineInner {
                         tenant_id: *tenant_id,
                         version: 1,
                         shards,
+                        fidelity: fidelity.clone(),
                     },
                 );
                 ControlResponse::NamespaceCreated { shard_count: count }
@@ -480,6 +488,9 @@ impl ControlStateMachine {
                 namespace_id,
                 tenant_id,
                 shards,
+                // Fidelity drives gateway registration via
+                // `on_namespace_applied`; the shard map only routes.
+                fidelity: _,
             } => {
                 // Use the caller-supplied shards verbatim. The earlier
                 // implementation called `create_namespace(...,
@@ -734,6 +745,7 @@ impl RaftStateMachine<C> for ControlStateMachine {
                         namespace_id: ns_id.clone(),
                         tenant_id: ns_snap.tenant_id,
                         shards,
+                        fidelity: ns_snap.fidelity.clone(),
                     },
                 );
             }
@@ -745,13 +757,16 @@ impl RaftStateMachine<C> for ControlStateMachine {
         // populated shard map but an empty gateway namespace registry
         // and every write 404s with `NamespaceNotFound`. Idempotent
         // (the registrar no-ops on already-registered namespaces).
+        // The snapshot record carries the full creation-time fidelity
+        // (PR #232), so snapshot-driven registration restores the
+        // creator's tier policy / size-band pools, not defaults.
         // Note: per-shard Raft group creation (`on_create_namespace`)
         // is deliberately NOT dispatched here — snapshot install for
         // shard-group state is a separate pre-existing gap tracked
         // with the split/merge BDD scenarios.
         if let Some(hook) = self.apply_hook.as_ref() {
             for (ns_id, ns_snap) in &snap.namespaces {
-                hook.on_namespace_applied(ns_id, ns_snap.tenant_id);
+                hook.on_namespace_applied(ns_id, ns_snap.tenant_id, &ns_snap.fidelity);
             }
         }
         let mut inner = self.inner.lock().await;
@@ -815,25 +830,45 @@ mod tests {
         }
     }
 
+    fn gold_tier_fidelity() -> NamespaceFidelity {
+        NamespaceFidelity {
+            tier_policy: vec![kiseki_composition::namespace::TierQuota {
+                tier: "fast".to_owned(),
+                quota_bytes: 1024,
+            }],
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools {
+                inline: Some("fast".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
     /// GH #192: snapshot-driven catch-up bypasses the per-command
     /// apply path, so `install_snapshot` must fire
     /// `ApplyHook::on_namespace_applied` for every namespace in the
     /// installed snapshot — otherwise a node that catches up via
     /// snapshot has a populated shard map but an empty gateway
-    /// namespace registry.
+    /// namespace registry. PR #232: the dispatched fidelity must be
+    /// the snapshot record's creation-time fidelity, not defaults.
     #[tokio::test]
     async fn install_snapshot_fires_namespace_applied_for_each_namespace() {
         #[derive(Default)]
         struct RecordingHook {
-            namespaces: std::sync::Mutex<Vec<(String, OrgId)>>,
+            namespaces: std::sync::Mutex<Vec<(String, OrgId, NamespaceFidelity)>>,
         }
         impl ApplyHook for RecordingHook {
             fn on_create_namespace(&self, _: &str, _: OrgId, _: ShardId, _: NodeId) {}
-            fn on_namespace_applied(&self, ns: &str, tenant_id: OrgId) {
+            fn on_namespace_applied(
+                &self,
+                ns: &str,
+                tenant_id: OrgId,
+                fidelity: &NamespaceFidelity,
+            ) {
                 self.namespaces
                     .lock()
                     .unwrap()
-                    .push((ns.to_owned(), tenant_id));
+                    .push((ns.to_owned(), tenant_id, fidelity.clone()));
             }
             fn on_split(&self, _: &str, _: ShardId, _: ShardId, _: NodeId) {}
             fn on_merge(&self, _: &str, _: ShardId, _: ShardId) {}
@@ -859,6 +894,7 @@ mod tests {
                     leader_node: NodeId(1),
                     is_retiring: false,
                 }],
+                fidelity: gold_tier_fidelity(),
             },
         );
         let snap = ControlSnapshot {
@@ -877,12 +913,13 @@ mod tests {
 
         assert_eq!(
             hook.namespaces.lock().unwrap().as_slice(),
-            &[(ns(), org())],
-            "on_namespace_applied fires once per namespace on snapshot install",
+            &[(ns(), org(), gold_tier_fidelity())],
+            "on_namespace_applied fires once per namespace on snapshot install, \
+             carrying the snapshot record's creation-time fidelity",
         );
-        // The state itself landed too.
+        // The state itself landed too — fidelity included.
         let post = sm.snapshot().await;
-        assert!(post.namespaces.contains_key(&ns()));
+        assert_eq!(post.namespaces[&ns()].fidelity, gold_tier_fidelity());
     }
 
     #[test]
@@ -892,12 +929,17 @@ mod tests {
             namespace_id: ns(),
             tenant_id: org(),
             shards: vec![full_range(shard(1))],
+            fidelity: gold_tier_fidelity(),
         });
         assert_eq!(resp, ControlResponse::NamespaceCreated { shard_count: 1 });
         let snap = sm.namespaces.get(&ns()).expect("ns inserted");
         assert_eq!(snap.version, 1);
         assert_eq!(snap.shards.len(), 1);
         assert_eq!(snap.shards[0].shard_id, shard(1));
+        // PR #232: the command's fidelity is persisted in the state
+        // machine record (restart replay / snapshot install restore
+        // the creator's policy, not defaults).
+        assert_eq!(snap.fidelity, gold_tier_fidelity());
     }
 
     #[test]
@@ -907,6 +949,7 @@ mod tests {
             namespace_id: ns(),
             tenant_id: org(),
             shards: vec![full_range(shard(1))],
+            fidelity: NamespaceFidelity::default(),
         };
         let _ = sm.apply_command(&cmd);
         let resp2 = sm.apply_command(&cmd);
@@ -926,6 +969,7 @@ mod tests {
             namespace_id: ns(),
             tenant_id: org(),
             shards: vec![full_range(shard(1))],
+            fidelity: NamespaceFidelity::default(),
         });
         let mut midpoint = [0u8; 32];
         midpoint[0] = 0x80;
@@ -959,6 +1003,7 @@ mod tests {
             namespace_id: ns(),
             tenant_id: org(),
             shards: vec![full_range(shard(1))],
+            fidelity: NamespaceFidelity::default(),
         });
         let mut midpoint = [0u8; 32];
         midpoint[0] = 0x80;
@@ -1002,6 +1047,7 @@ mod tests {
             namespace_id: ns(),
             tenant_id: org(),
             shards: vec![s1, s2],
+            fidelity: NamespaceFidelity::default(),
         });
         let resp = sm.apply_command(&ControlCommand::RecordMerge {
             namespace_id: ns(),
@@ -1033,6 +1079,7 @@ mod tests {
             namespace_id: ns(),
             tenant_id: org(),
             shards: vec![full_range(shard(1)), full_range(shard(2))],
+            fidelity: NamespaceFidelity::default(),
         });
         let v_before = sm.namespaces[&ns()].version;
         sm.apply_command(&ControlCommand::RetireShard {
@@ -1057,6 +1104,7 @@ mod tests {
             namespace_id: ns(),
             tenant_id: org(),
             shards: vec![full_range(shard(1))],
+            fidelity: NamespaceFidelity::default(),
         });
         let snap = ControlSnapshot {
             namespaces: sm.namespaces.clone(),
@@ -1219,6 +1267,7 @@ mod tests {
             namespace_id: ns(),
             tenant_id: org(),
             shards: vec![full_range(shard(1))],
+            fidelity: NamespaceFidelity::default(),
         });
         sm.apply_command(&ControlCommand::UpsertNodeInventory {
             node_id: NodeId(7),

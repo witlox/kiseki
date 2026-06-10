@@ -1024,6 +1024,7 @@ mod cluster_info_rev2_tests {
                         tenant_id,
                         version: 1,
                         shards: snapshots,
+                        fidelity: crate::cluster_control::NamespaceFidelity::default(),
                     },
                 );
             }

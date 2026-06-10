@@ -71,9 +71,18 @@ pub trait ApplyHook: Send + Sync + 'static {
     /// `CompositionStore.namespaces` map is re-populated from the
     /// control-plane Raft on restart (log replay) and on
     /// snapshot-driven catch-up, not only from the admin HTTP
-    /// handler. Default no-op for hooks that don't wire a gateway.
-    fn on_namespace_applied(&self, namespace_id: &str, tenant_id: OrgId) {
-        let _ = (namespace_id, tenant_id);
+    /// handler. PR #232: `fidelity` is the command's full
+    /// creation-time namespace fidelity (tier policy, size-band
+    /// pools, flags) so every registration path restores the
+    /// creator's policy, not defaults. Default no-op for hooks that
+    /// don't wire a gateway.
+    fn on_namespace_applied(
+        &self,
+        namespace_id: &str,
+        tenant_id: OrgId,
+        fidelity: &super::commands::NamespaceFidelity,
+    ) {
+        let _ = (namespace_id, tenant_id, fidelity);
     }
 
     /// Called on every node after `RecordSplit` commits. The node
@@ -111,16 +120,25 @@ pub trait ApplyHook: Send + Sync + 'static {
 ///
 /// Implementations MUST be:
 /// * **Idempotent** — re-registering an existing namespace is a
-///   no-op and never clobbers a full-fidelity registration that the
-///   hydrator or admin handler installed (tier policy etc.).
+///   no-op. PR #232: the registration carries the command's full
+///   creation-time fidelity, so keep-first and overwrite converge on
+///   the same record at create time; keep-first additionally
+///   preserves any post-create policy updates a live registration
+///   may carry.
 /// * **Fast and non-blocking** — called from the Raft apply path.
 pub trait NamespaceRegistrar: Send + Sync + 'static {
-    /// Ensure `namespace_id` is registered with the local gateway.
+    /// Ensure `namespace_id` is registered with the local gateway,
+    /// carrying the full creation-time `fidelity` (PR #232).
     /// `namespace_id` is the control-plane string id (a UUID for
     /// every namespace the CLI / bench / admin API creates); non-UUID
     /// legacy ids are skipped by the production impl, matching the
     /// admin handler's behavior.
-    fn register_namespace(&self, namespace_id: &str, tenant_id: OrgId);
+    fn register_namespace(
+        &self,
+        namespace_id: &str,
+        tenant_id: OrgId,
+        fidelity: &super::commands::NamespaceFidelity,
+    );
 }
 
 /// No-op apply hook — used by unit tests and single-node setups
@@ -343,9 +361,14 @@ impl ApplyHook for ShardStoreApplyHook {
         }
     }
 
-    fn on_namespace_applied(&self, namespace_id: &str, tenant_id: OrgId) {
+    fn on_namespace_applied(
+        &self,
+        namespace_id: &str,
+        tenant_id: OrgId,
+        fidelity: &super::commands::NamespaceFidelity,
+    ) {
         if let Some(registrar) = self.namespace_registrar.get() {
-            registrar.register_namespace(namespace_id, tenant_id);
+            registrar.register_namespace(namespace_id, tenant_id, fidelity);
         } else {
             // Pre-attach window (boot replay racing gateway
             // construction). Safe to skip: the runtime's
@@ -729,7 +752,10 @@ impl OpenRaftControlStore {
     ) -> usize {
         let snap = self.state.snapshot().await;
         for (ns_id, ns) in &snap.namespaces {
-            registrar.register_namespace(ns_id, ns.tenant_id);
+            // PR #232: the state-machine record carries the full
+            // creation-time fidelity, so the drain pass restores the
+            // creator's tier policy / size-band pools, not defaults.
+            registrar.register_namespace(ns_id, ns.tenant_id, &ns.fidelity);
             for shard in &ns.shards {
                 register_shard(shard.shard_id);
             }
@@ -747,6 +773,7 @@ impl OpenRaftControlStore {
                 namespace_id,
                 tenant_id,
                 shards,
+                fidelity,
             } => {
                 for s in shards {
                     hook.on_create_namespace(namespace_id, *tenant_id, s.shard_id, s.leader_node);
@@ -756,8 +783,10 @@ impl OpenRaftControlStore {
                 // are registered. Fires on live submit AND on log
                 // replay at restart, which is what re-populates the
                 // gateway's volatile namespace map without an
-                // operator re-running namespace-create.
-                hook.on_namespace_applied(namespace_id, *tenant_id);
+                // operator re-running namespace-create. PR #232: the
+                // command's full fidelity rides along so the
+                // registration is policy-exact on every path.
+                hook.on_namespace_applied(namespace_id, *tenant_id, fidelity);
             }
             ControlCommand::RecordSplit {
                 namespace_id,
@@ -829,6 +858,7 @@ mod tests {
                 range_end: [0xFFu8; 32],
                 leader_node: NodeId(1),
             }],
+            fidelity: NamespaceFidelity::default(),
         };
         let resp = store.submit(cmd).await.expect("submit ok");
         assert!(matches!(
@@ -840,19 +870,44 @@ mod tests {
         assert_eq!(snap.namespaces[&ns_id].shards.len(), 1);
     }
 
+    use super::super::commands::NamespaceFidelity;
+
+    /// A non-default fidelity (tier policy + inline pool) so tests
+    /// can assert the full creation-time policy survives every
+    /// registration path (PR #232).
+    fn gold_tier_fidelity() -> NamespaceFidelity {
+        NamespaceFidelity {
+            tier_policy: vec![kiseki_composition::namespace::TierQuota {
+                tier: "fast".to_owned(),
+                quota_bytes: 4096,
+            }],
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools {
+                inline: Some("fast".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
     /// Recording `NamespaceRegistrar` — captures every
-    /// `register_namespace` call for assertions.
+    /// `register_namespace` call (including the carried fidelity)
+    /// for assertions.
     #[derive(Default)]
     struct RecordingRegistrar {
-        calls: std::sync::Mutex<Vec<(String, OrgId)>>,
+        calls: std::sync::Mutex<Vec<(String, OrgId, NamespaceFidelity)>>,
     }
 
     impl NamespaceRegistrar for RecordingRegistrar {
-        fn register_namespace(&self, namespace_id: &str, tenant_id: OrgId) {
+        fn register_namespace(
+            &self,
+            namespace_id: &str,
+            tenant_id: OrgId,
+            fidelity: &NamespaceFidelity,
+        ) {
             self.calls
                 .lock()
                 .unwrap()
-                .push((namespace_id.to_owned(), tenant_id));
+                .push((namespace_id.to_owned(), tenant_id, fidelity.clone()));
         }
     }
 
@@ -861,18 +916,18 @@ mod tests {
     #[derive(Default)]
     struct RecordingHook {
         creates: std::sync::Mutex<Vec<(String, ShardId)>>,
-        namespaces: std::sync::Mutex<Vec<(String, OrgId)>>,
+        namespaces: std::sync::Mutex<Vec<(String, OrgId, NamespaceFidelity)>>,
     }
 
     impl ApplyHook for RecordingHook {
         fn on_create_namespace(&self, ns: &str, _t: OrgId, shard_id: ShardId, _l: NodeId) {
             self.creates.lock().unwrap().push((ns.to_owned(), shard_id));
         }
-        fn on_namespace_applied(&self, ns: &str, tenant_id: OrgId) {
+        fn on_namespace_applied(&self, ns: &str, tenant_id: OrgId, fidelity: &NamespaceFidelity) {
             self.namespaces
                 .lock()
                 .unwrap()
-                .push((ns.to_owned(), tenant_id));
+                .push((ns.to_owned(), tenant_id, fidelity.clone()));
         }
         fn on_split(&self, _: &str, _: ShardId, _: ShardId, _: NodeId) {}
         fn on_merge(&self, _: &str, _: ShardId, _: ShardId) {}
@@ -897,6 +952,7 @@ mod tests {
                     leader_node: NodeId(2),
                 },
             ],
+            fidelity: gold_tier_fidelity(),
         }
     }
 
@@ -918,8 +974,9 @@ mod tests {
         let namespaces = hook.namespaces.lock().unwrap();
         assert_eq!(
             namespaces.as_slice(),
-            &[("ns-192".to_owned(), tenant)],
-            "exactly one on_namespace_applied per CreateNamespace command",
+            &[("ns-192".to_owned(), tenant, gold_tier_fidelity())],
+            "exactly one on_namespace_applied per CreateNamespace command, \
+             carrying the command's full fidelity (PR #232)",
         );
     }
 
@@ -969,9 +1026,13 @@ mod tests {
             .rehydrate_gateway_namespaces(&recorder, |sid| shards_seen.push(sid))
             .await;
         assert_eq!(n, 1, "one namespace enumerated");
+        // PR #232: the drain pass restores the creation-time fidelity
+        // (tier policy + size-band pools), not defaults — this is the
+        // restart-replay path that previously re-registered with
+        // defaults-only.
         assert_eq!(
             recorder.calls.lock().unwrap().as_slice(),
-            &[(ns_id.to_owned(), tenant)],
+            &[(ns_id.to_owned(), tenant, gold_tier_fidelity())],
         );
         shards_seen.sort_by_key(|s| s.0);
         assert_eq!(
@@ -1003,15 +1064,15 @@ mod tests {
 
         let tenant = OrgId(Uuid::from_u128(3));
         // Pre-attach: must not panic, must not record anywhere.
-        hook.on_namespace_applied("ns-pre-attach", tenant);
+        hook.on_namespace_applied("ns-pre-attach", tenant, &gold_tier_fidelity());
 
         let recorder = Arc::new(RecordingRegistrar::default());
         hook.attach_namespace_registrar(Arc::clone(&recorder) as Arc<dyn NamespaceRegistrar>);
-        hook.on_namespace_applied("ns-post-attach", tenant);
+        hook.on_namespace_applied("ns-post-attach", tenant, &gold_tier_fidelity());
         assert_eq!(
             recorder.calls.lock().unwrap().as_slice(),
-            &[("ns-post-attach".to_owned(), tenant)],
-            "pre-attach call skipped; post-attach call forwarded",
+            &[("ns-post-attach".to_owned(), tenant, gold_tier_fidelity())],
+            "pre-attach call skipped; post-attach call forwarded with fidelity",
         );
     }
 }
