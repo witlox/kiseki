@@ -983,6 +983,53 @@ mod tests {
         );
     }
 
+    /// #212 (#133 residue): the registry's poll loop must drain a
+    /// multi-window backlog in one busy streak, sleeping only once
+    /// caught up. Pre-#212 it slept the full interval between every
+    /// 1000-delta window, so with the 4 s interval forced here a
+    /// 3-window burst needed ≥ 8 s of sleeps; drain-while-busy
+    /// finishes in pure apply time (the in-memory SLA test above
+    /// budgets 5 s for 5 000 deltas).
+    #[tokio::test]
+    async fn registry_drains_multi_window_burst_without_interval_sleeps() {
+        const N: u64 = 3_000; // 3 poll windows of 1 000
+        std::env::set_var("KISEKI_HYDRATOR_POLL_MS", "4000");
+        let store = fresh_store_with_default_ns();
+        let (log, shard_id) = fresh_log();
+        let ns_id = NamespaceId(uuid::Uuid::from_u128(2));
+        for i in 0..N {
+            let comp_id = CompositionId(uuid::Uuid::from_u128(u128::from(i) + 1));
+            let payload = enc_create(comp_id, ns_id, 64);
+            append_create(&log, shard_id, payload, vec![ChunkId([0u8; 32])]).await;
+        }
+        let registry = crate::hydrator_registry::HydratorRegistry::new(
+            Arc::clone(&store),
+            Arc::new(log),
+            None,
+        );
+        std::env::remove_var("KISEKI_HYDRATOR_POLL_MS");
+        let started = std::time::Instant::now();
+        registry.register(shard_id);
+        let deadline = started + std::time::Duration::from_secs(6);
+        loop {
+            let applied = store
+                .with_storage_locked(|s| s.last_applied_seq(shard_id))
+                .unwrap_or(SequenceNumber(0));
+            if applied.0 >= N {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "registry drained only {}/{N} deltas in {:.2}s — the poll loop \
+                 is sleeping the interval mid-backlog instead of draining \
+                 while busy (#212)",
+                applied.0,
+                started.elapsed().as_secs_f64(),
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
     #[tokio::test]
     async fn hydrator_installs_composition_from_create_delta() {
         let store = fresh_store_with_default_ns();

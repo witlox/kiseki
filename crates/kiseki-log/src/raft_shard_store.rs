@@ -155,45 +155,9 @@ pub struct RaftShardStore {
 type IntentFanCoalescerMap =
     Mutex<HashMap<ShardId, crate::intent_fan_coalescer::IntentFanCoalescer>>;
 
-/// Optional DIAGNOSTIC group-commit for the durable intent store, gated by
-/// `KISEKI_INTENT_FLUSH_INTERVAL_MS`. The intent store is the lone per-PUT
-/// *synchronous* fsync — the chunk (runtime.rs), composition, and Raft-log
-/// stores all relax to a ~100 ms periodic flush. When the env is set we
-/// relax inline fsync and spawn the periodic flusher that
-/// [`FjallIntentStore::flush`]'s doc already anticipated, so the write-path
-/// fsync tax can be A/B-measured.
-///
-/// CAVEAT: relaxing inline fsync opens a ≤interval loss window AT ACK,
-/// trading the ADR-047 C1 no-loss-at-ack contract — this is an experiment
-/// knob, NOT a ship default (a shipped form needs the gateway
-/// `fsync_pending` hook the chunk store uses). Unset ⇒ per-write fsync.
-fn maybe_spawn_intent_flusher(store: &Arc<FjallIntentStore>) {
-    let Some(ms) = std::env::var("KISEKI_INTENT_FLUSH_INTERVAL_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&n| n > 0)
-    else {
-        return;
-    };
-    store.set_sync_per_write(false);
-    let flush_store = Arc::clone(store);
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_millis(ms));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            let s = Arc::clone(&flush_store);
-            if tokio::task::spawn_blocking(move || s.flush())
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .is_none()
-            {
-                tracing::warn!("intent store group-commit flush failed; retry next tick");
-            }
-        }
-    });
-}
+/// Default flush cadence for the intent store's group commit (#212).
+/// Matches `KISEKI_CHUNK_FLUSH_INTERVAL_MS` / the composition flusher.
+const DEFAULT_INTENT_FLUSH_INTERVAL_MS: u64 = 100;
 
 impl RaftShardStore {
     /// Create a new (empty) Raft shard store.
@@ -748,9 +712,12 @@ impl RaftShardStore {
                             e,
                         )
                     }));
-                    // Optional DIAGNOSTIC group-commit (`KISEKI_INTENT_FLUSH_INTERVAL_MS`)
-                    // — see `maybe_spawn_intent_flusher`. Unset ⇒ per-write fsync (safe).
-                    maybe_spawn_intent_flusher(&store);
+                    // Group commit is THE default (#212, ADR-047 rev-2 O4 /
+                    // I-L5): the ack durability point is page-cache on
+                    // `min_acks` replicas; the periodic flusher bounds the
+                    // power-loss window. `KISEKI_INTENT_FLUSH_INTERVAL_MS=0`
+                    // opts back into strict per-write fsync.
+                    self.spawn_intent_flusher(&store);
                     let store: Arc<dyn IntentStore> = store;
                     (store, true)
                 }
@@ -807,6 +774,82 @@ impl RaftShardStore {
             // `put_intent_and_fan` outright in the public API).
             self.spawn_intent_fan_coalescer(shard_id, &store, intent_store);
         }
+    }
+
+    /// Group commit for the durable intent store (#212). Relaxes the
+    /// per-write fsync to `PersistMode::Buffer` (OS page cache — the
+    /// ADR-047 rev-2 O4 / I-L5 ack durability point given `min_acks`
+    /// replication) and spawns a periodic `SyncAll` flusher on the Raft
+    /// runtime that bounds the power-loss window to the interval.
+    ///
+    /// `KISEKI_INTENT_FLUSH_INTERVAL_MS` tunes the cadence (default
+    /// [`DEFAULT_INTENT_FLUSH_INTERVAL_MS`]); `0` opts back into strict
+    /// per-write fsync for operators with single-node power-loss
+    /// requirements (the I-L5 escape hatch). POSIX `fsync(2)` stays
+    /// exact either way: the gateway's `fsync_pending` hook chain calls
+    /// [`RaftShardStore::flush_intent_stores`].
+    fn spawn_intent_flusher(&self, store: &Arc<FjallIntentStore>) {
+        let ms = std::env::var("KISEKI_INTENT_FLUSH_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_INTENT_FLUSH_INTERVAL_MS);
+        if ms == 0 {
+            tracing::info!(
+                "intent store: strict per-write fsync (KISEKI_INTENT_FLUSH_INTERVAL_MS=0)"
+            );
+            return;
+        }
+        store.set_sync_per_write(false);
+        tracing::info!(
+            interval_ms = ms,
+            "intent store: group commit (page-cache per write + periodic fsync, #212)"
+        );
+        let flush_store = Arc::clone(store);
+        self.rt.handle().spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(ms));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let s = Arc::clone(&flush_store);
+                if tokio::task::spawn_blocking(move || s.flush())
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .is_none()
+                {
+                    tracing::warn!("intent store group-commit flush failed; retry next tick");
+                }
+            }
+        });
+    }
+
+    /// Durability barrier across every hosted shard's intent store —
+    /// the gateway `fsync_pending` hook target (#212). Forces buffered
+    /// intent writes to stable storage so explicit POSIX `fsync(2)`
+    /// keeps its contract while the per-write path runs at the I-L5
+    /// group-commit point.
+    ///
+    /// # Errors
+    /// First flush failure encountered (remaining stores are still
+    /// attempted).
+    pub fn flush_intent_stores(&self) -> Result<(), crate::intent::IntentError> {
+        let stores: Vec<Arc<dyn IntentStore>> = self
+            .intent_stores
+            .lock()
+            .lock_or_die("raft_shard_store.intent_stores")
+            .values()
+            .cloned()
+            .collect();
+        let mut first_err = None;
+        for store in stores {
+            if let Err(e) = store.flush() {
+                tracing::warn!(error = %e, "intent store fsync hook flush failed");
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        first_err.map_or(Ok(()), Err)
     }
 
     /// W12 (2026-06-02): spawn the per-shard intent-fan coalescer task on

@@ -19,11 +19,36 @@ pub trait InlineStore: Send + Sync {
     /// if dedup hit.
     fn put(&self, key: &[u8; 32], data: &[u8]) -> io::Result<bool>;
 
+    /// Batched variant of [`InlineStore::put`] — the Raft state
+    /// machine submits every inline payload of one applied entry in
+    /// a single call so a durable backend amortises one commit
+    /// across the batch instead of N independent puts (#212).
+    /// Returns the number of newly-stored entries (dedup hits are
+    /// skipped, mirroring `put`'s `false`).
+    fn put_many(&self, items: &[(&[u8; 32], &[u8])]) -> io::Result<u64> {
+        let mut new_count = 0;
+        for (key, data) in items {
+            if self.put(key, data)? {
+                new_count += 1;
+            }
+        }
+        Ok(new_count)
+    }
+
     /// Retrieve inline content. Returns `None` if not found.
     fn get(&self, key: &[u8; 32]) -> io::Result<Option<Vec<u8>>>;
 
     /// Delete inline content. Returns `true` if entry existed.
     fn delete(&self, key: &[u8; 32]) -> io::Result<bool>;
+
+    /// Durability barrier: force buffered writes to stable storage.
+    /// The Raft state machine calls this in `build_snapshot` so no
+    /// log entry can be purged (snapshot-gated) while an inline put
+    /// it produced is still un-fsynced (#212). No-op for in-memory
+    /// backends.
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Canonical inline-store key derivation (I-SF5).

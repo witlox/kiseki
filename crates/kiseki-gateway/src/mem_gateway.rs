@@ -2801,7 +2801,13 @@ impl InMemoryGateway {
                     GatewayError::Upstream(e.to_string())
                 })?;
                 if let Some(ref store) = self.small_store {
-                    match store.put(&chunk_id.0, &env_bytes) {
+                    // #212: timed — this put was the untimed serial
+                    // fsync on the ack path (pre-group-commit); the
+                    // histogram is the A/B witness for the relax.
+                    let inline_put_started = std::time::Instant::now();
+                    let inline_put_res = store.put(&chunk_id.0, &env_bytes);
+                    self.observe_put_phase("inline_store_put", inline_put_started.elapsed());
+                    match inline_put_res {
                         Ok(_) => {
                             tracing::debug!(
                                 ?chunk_id,
