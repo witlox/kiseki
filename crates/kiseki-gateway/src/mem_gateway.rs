@@ -2322,10 +2322,9 @@ impl GatewayOps for InMemoryGateway {
                     // every peer's local store can reclaim. `false`
                     // means another composition still references the
                     // chunk — leave it alone.
-                    let tombstoned = log
-                        .decrement_chunk_refcount(shard_id, tenant_id, *chunk_id)
-                        .await
-                        .unwrap_or(false);
+                    let tombstoned = self
+                        .decrement_cluster_refcount(log.as_ref(), shard_id, tenant_id, *chunk_id)
+                        .await;
                     if tombstoned {
                         let _ = self.chunks.delete_distributed(chunk_id, tenant_id).await;
                     }
@@ -2481,6 +2480,75 @@ impl GatewayOps for InMemoryGateway {
 }
 
 impl InMemoryGateway {
+    /// I-C2 (#111, delete half): commit one released chunk's
+    /// `cluster_chunk_state` refcount decrement, forwarding to the
+    /// shard leader when this node is a follower. Returns the
+    /// tombstone signal (`true` iff the entry transitioned to
+    /// refcount 0).
+    ///
+    /// The decrement is a Raft `client_write` — it can ONLY commit on
+    /// the shard leader. When the DELETE lands on a follower (the BDD
+    /// singleton's leadership churns under CI load; real clusters
+    /// route DELETEs to any node), the typed `ForwardToLeader` hint is
+    /// re-issued via the #111 forwarder, exactly like the Delete delta
+    /// emit. Silently dropping it (the pre-2026-06-11 `unwrap_or(false)`)
+    /// leaked the refcount forever: the chunk never tombstoned and the
+    /// GC scrub had no signal. Residual failures (no forwarder wired,
+    /// election in flight on both hops) return `false` and log at
+    /// ERROR — a dropped decrement is a permanent leak until an
+    /// operator audit, so it must never be quiet.
+    async fn decrement_cluster_refcount(
+        &self,
+        log: &(dyn kiseki_log::traits::LogOps + Send + Sync),
+        shard_id: kiseki_common::ids::ShardId,
+        tenant_id: kiseki_common::ids::OrgId,
+        chunk_id: kiseki_common::ids::ChunkId,
+    ) -> bool {
+        match log
+            .decrement_chunk_refcount(shard_id, tenant_id, chunk_id)
+            .await
+        {
+            Ok(t) => t,
+            Err(kiseki_log::error::LogError::ForwardToLeader {
+                shard_id: fwd_shard,
+                leader_node_id,
+            }) => {
+                let Some(fwd) = self.forwarder.as_deref() else {
+                    tracing::error!(
+                        leader = leader_node_id.0,
+                        chunk_id = %chunk_id,
+                        "gateway delete: cluster refcount decrement needs the shard \
+                         leader but no append-forwarder is wired — I-C2 refcount leak",
+                    );
+                    return false;
+                };
+                fwd.forward_decrement_chunk_refcount(leader_node_id, fwd_shard, tenant_id, chunk_id)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::error!(
+                            error = %e,
+                            leader = leader_node_id.0,
+                            chunk_id = %chunk_id,
+                            "gateway delete: forwarded cluster refcount decrement \
+                             FAILED — I-C2 refcount leak (chunk will never tombstone \
+                             without operator action)",
+                        );
+                        false
+                    })
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    chunk_id = %chunk_id,
+                    "gateway delete: cluster refcount decrement FAILED — I-C2 \
+                     refcount leak (chunk will never tombstone without operator \
+                     action)",
+                );
+                false
+            }
+        }
+    }
+
     /// Shared `write` body. The `with_forwarding` flag toggles the
     /// `LogOps` call used to emit the composition delta: when `true`,
     /// the route through `*_with_forwarding` returns

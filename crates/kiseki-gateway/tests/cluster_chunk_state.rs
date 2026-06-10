@@ -50,6 +50,11 @@ struct RecordingLog {
     /// Phase 16c: what the mock decrement should report. Tests that
     /// want to exercise the fan-out branch set this to `true`.
     tombstone_response: Mutex<bool>,
+    /// I-C2 (#111, delete half): when `Some(leader)`, the mock
+    /// decrement refuses with `ForwardToLeader` — simulating a
+    /// follower-ingress DELETE whose cluster refcount decrement can
+    /// only commit on the shard leader.
+    decrement_forward_to: Mutex<Option<u64>>,
 }
 
 #[async_trait::async_trait]
@@ -130,6 +135,15 @@ impl LogOps for RecordingLog {
             .lock()
             .unwrap()
             .push((shard_id, tenant_id, chunk_id));
+        // I-C2 follower simulation: the decrement is a Raft
+        // `client_write` — on a follower it surfaces the typed
+        // forward hint instead of committing.
+        if let Some(leader) = *self.decrement_forward_to.lock().unwrap() {
+            return Err(LogError::ForwardToLeader {
+                shard_id,
+                leader_node_id: NodeId(leader),
+            });
+        }
         // Test default: no tombstone. Specific tests override via a
         // separate field (see tombstone_responder below) when they
         // want the gateway to take the fan-out branch.
@@ -678,6 +692,87 @@ async fn tombstone_decrement_triggers_delete_distributed() {
     assert_eq!(fanouts[0].1, test_tenant());
 }
 
+/// I-C2 regression (chunk-storage.feature:141, bdd.yml run
+/// 27310159008): a DELETE landing on a node that does NOT lead the
+/// shard used to silently DROP the cluster refcount decrement — the
+/// raw `client_write` fails `ForwardToLeader` on a follower and the
+/// old `unwrap_or(false)` swallowed it, so the leader's
+/// `cluster_chunk_state` refcount never dropped and the chunk never
+/// tombstoned. The fix forwards the decrement via the #111
+/// `AppendForwarder` exactly like the Delete delta itself; this pins
+/// that path end to end: forwarded once, to the hinted leader, with
+/// the right ids, and the leader's tombstone signal still drives the
+/// `delete_distributed` fan-out.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_on_follower_forwards_refcount_decrement_to_leader() {
+    let log = Arc::new(RecordingLog::default());
+    *log.decrement_forward_to.lock().unwrap() = Some(2);
+    let chunks = RecordingChunks::new();
+    let forwarder = Arc::new(MockForwarder {
+        dec_tombstoned: true,
+        ..MockForwarder::default()
+    });
+    let gw = setup_with_chunks(
+        Arc::clone(&log) as Arc<dyn LogOps + Send + Sync>,
+        Arc::clone(&chunks) as Arc<dyn AsyncChunkOps>,
+        vec![1, 2, 3],
+    )
+    .with_append_forwarder(Arc::clone(&forwarder) as Arc<dyn AppendForwarder>);
+
+    let resp = gw
+        .write(kiseki_gateway::WriteRequest {
+            tenant_id: test_tenant(),
+            namespace_id: test_namespace(),
+            data: vec![0xC1u8; 4096],
+            name: None,
+            conditional: None,
+            workflow_ref: None,
+            idempotency_key: None,
+
+            forwarded_from_node: None,
+            comp_id_override: None,
+            tier: None,
+            surface: kiseki_gateway::WriteSurface::S3,
+            base_composition_id: None,
+            base_bytes: 0,
+        })
+        .await
+        .expect("write");
+    let chunk_id = log.chunk_and_delta_calls.lock().unwrap()[0].new_chunks[0].chunk_id;
+
+    gw.delete(test_tenant(), test_namespace(), resp.composition_id)
+        .await
+        .expect("delete");
+
+    // The local attempt was made (and refused with the forward hint)...
+    assert_eq!(
+        log.decrement_calls.lock().unwrap().len(),
+        1,
+        "local decrement attempted once"
+    );
+    // ...then forwarded to the hinted leader with the same ids.
+    let dec = forwarder.dec_calls.lock().unwrap();
+    assert_eq!(
+        dec.len(),
+        1,
+        "follower DELETE must forward the refcount decrement to the leader, \
+         not drop it"
+    );
+    let (leader, shard, tenant, cid) = dec[0];
+    assert_eq!(leader, 2, "forwarded to the hinted leader node-2");
+    assert_eq!(shard, test_shard());
+    assert_eq!(tenant, test_tenant());
+    assert_eq!(cid.0, chunk_id, "decrement targets the released chunk");
+    // The leader's tombstone signal still drives the fan-out.
+    let fanouts = chunks.fanout_calls.lock().unwrap();
+    assert_eq!(
+        fanouts.len(),
+        1,
+        "forwarded tombstone signal must trigger the DeleteFragment fan-out"
+    );
+    assert_eq!(fanouts[0].0 .0, chunk_id);
+}
+
 /// RED: when the log reports `tombstoned=false` (another composition
 /// still references the chunk), the gateway must NOT fan out — that
 /// would reclaim a still-live chunk and break I-C2.
@@ -889,6 +984,10 @@ impl LogOps for ForwardToLeaderLog {
 #[derive(Default)]
 struct MockForwarder {
     calls: Mutex<Vec<(u64, usize)>>, // (leader_node, new_chunks count)
+    /// I-C2 (#111, delete half): forwarded refcount decrements.
+    dec_calls: Mutex<Vec<(u64, ShardId, OrgId, ChunkId)>>,
+    /// Canned tombstone signal for forwarded decrements.
+    dec_tombstoned: bool,
 }
 
 #[async_trait::async_trait]
@@ -903,6 +1002,20 @@ impl AppendForwarder for MockForwarder {
             .unwrap()
             .push((leader_node.0, req.new_chunks.len()));
         Ok(SequenceNumber(42))
+    }
+
+    async fn forward_decrement_chunk_refcount(
+        &self,
+        leader_node: NodeId,
+        shard_id: ShardId,
+        tenant_id: OrgId,
+        chunk_id: ChunkId,
+    ) -> Result<bool, LogError> {
+        self.dec_calls
+            .lock()
+            .unwrap()
+            .push((leader_node.0, shard_id, tenant_id, chunk_id));
+        Ok(self.dec_tombstoned)
     }
 }
 

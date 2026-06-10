@@ -726,7 +726,7 @@ impl OpenRaftLogStore {
         self.raft
             .client_write(cmd)
             .await
-            .map_err(|_| LogError::Unavailable)?;
+            .map_err(|e| map_raft_error_with_forwarding(e, self.shard_id))?;
         Ok(())
     }
 
@@ -743,11 +743,16 @@ impl OpenRaftLogStore {
             tenant_id_bytes: *tenant_id.0.as_bytes(),
             chunk_id: chunk_id.0,
         };
+        // I-C2: surface `ForwardToLeader` typed (not flattened to
+        // `Unavailable`) — a follower-ingress DELETE forwards the
+        // decrement to the leader via `AppendForwarder` (#111, delete
+        // half). Flattening it silently dropped the cluster-track
+        // decrement whenever the DELETE landed on a non-leader node.
         let resp = self
             .raft
             .client_write(cmd)
             .await
-            .map_err(|_| LogError::Unavailable)?;
+            .map_err(|e| map_raft_error_with_forwarding(e, self.shard_id))?;
         match resp.response() {
             LogResponse::DecrementOutcome(tomb) => Ok(*tomb),
             // Older path / unrelated responses: treat as not-tombstoned;

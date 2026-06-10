@@ -1649,11 +1649,7 @@ impl StorageAdminGrpc {
         let resp = client
             .split_shard(req.get_ref().clone())
             .await
-            .map_err(|s| {
-                Status::unavailable(format!(
-                    "SplitShard: forward to leader node-{leader_id} ({leader_addr}): {s}",
-                ))
-            })?;
+            .map_err(|s| forwarded_admin_status("SplitShard", leader_id, &leader_addr, &s))?;
         Ok(Some(resp))
     }
 
@@ -1678,11 +1674,7 @@ impl StorageAdminGrpc {
         let resp = client
             .merge_shards(req.get_ref().clone())
             .await
-            .map_err(|s| {
-                Status::unavailable(format!(
-                    "MergeShards: forward to leader node-{leader_id} ({leader_addr}): {s}",
-                ))
-            })?;
+            .map_err(|s| forwarded_admin_status("MergeShards", leader_id, &leader_addr, &s))?;
         Ok(Some(resp))
     }
 
@@ -1743,6 +1735,33 @@ impl StorageAdminGrpc {
             entry_count: 0,
         }
     }
+}
+
+/// Re-wrap a downstream `Status` from a forwarded admin RPC while
+/// PRESERVING its gRPC code. The leader's typed refusal (e.g.
+/// `FAILED_PRECONDITION` for `DeltaLogPruned`, GH #223/#237) must
+/// reach the originating client unchanged — blanket-rewrapping as
+/// `Unavailable` destroys the error contract at the admin boundary
+/// and turns a permanent refusal into a retry-forever signal.
+///
+/// Only genuine transport faults become `Unavailable`: tonic
+/// surfaces client-side transport failures mid-RPC as
+/// `Code::Unknown` (h2 / hyper errors carry no gRPC status), and
+/// connect failures are already mapped in `open_admin_channel`. Our
+/// admin handlers never return `Unknown` deliberately — every typed
+/// error maps to a specific code (`kiseki_log::grpc::to_status`).
+fn forwarded_admin_status(op: &str, leader_id: u64, leader_addr: &str, s: &Status) -> Status {
+    let code = match s.code() {
+        Code::Unknown => Code::Unavailable,
+        c => c,
+    };
+    Status::new(
+        code,
+        format!(
+            "{op}: forward to leader node-{leader_id} ({leader_addr}): {}",
+            s.message(),
+        ),
+    )
 }
 
 /// Build a plaintext tonic gRPC channel to a peer's data-port and
@@ -2179,6 +2198,75 @@ mod tests {
         assert_eq!(hdd.replication_copies, 3);
         assert_eq!(hdd.ec_data_shards, 0);
         assert_eq!(hdd.ec_parity_shards, 0);
+    }
+
+    // ====================================================================
+    // Leader-forwarding status preservation (GH #223/#237 boundary)
+    // ====================================================================
+
+    /// The leader's typed refusal must survive the forward: a
+    /// downstream `FAILED_PRECONDITION` (e.g. `DeltaLogPruned`) stays
+    /// `FAILED_PRECONDITION` at the originating node's boundary —
+    /// blanket `Unavailable` rewrapping broke the #237 refusal
+    /// scenario even though the refusal itself worked end-to-end.
+    #[test]
+    fn forwarded_failed_precondition_keeps_its_code() {
+        let downstream = Status::failed_precondition(
+            "delta log pruned: SplitShard on shard X refused (DeltaLogPruned)",
+        );
+        let s = forwarded_admin_status("SplitShard", 2, "127.0.0.1:7001", &downstream);
+        assert_eq!(
+            s.code(),
+            Code::FailedPrecondition,
+            "forwarded refusal must keep the downstream code; got {:?}: {}",
+            s.code(),
+            s.message(),
+        );
+        assert!(
+            s.message().contains("pruned"),
+            "downstream message preserved: {}",
+            s.message(),
+        );
+        assert!(
+            s.message().contains("forward to leader node-2"),
+            "forwarding context retained: {}",
+            s.message(),
+        );
+    }
+
+    /// Other typed codes pass through unchanged too (the fix is
+    /// code-agnostic, not a `FAILED_PRECONDITION` special case).
+    #[test]
+    fn forwarded_typed_codes_pass_through() {
+        for code in [
+            Code::NotFound,
+            Code::InvalidArgument,
+            Code::ResourceExhausted,
+            Code::Unavailable,
+        ] {
+            let s = forwarded_admin_status(
+                "MergeShards",
+                3,
+                "127.0.0.1:7002",
+                &Status::new(code, "typed downstream error"),
+            );
+            assert_eq!(s.code(), code, "{code:?} must pass through the forward");
+        }
+    }
+
+    /// Client-side transport faults (tonic surfaces them as `Unknown`
+    /// — no gRPC status came back) are the one case that SHOULD map
+    /// to `Unavailable`: retry-friendly, honest about the cause.
+    #[test]
+    fn forwarded_transport_fault_becomes_unavailable() {
+        let s = forwarded_admin_status(
+            "SplitShard",
+            2,
+            "127.0.0.1:7001",
+            &Status::unknown("transport error: connection reset"),
+        );
+        assert_eq!(s.code(), Code::Unavailable);
+        assert!(s.message().contains("transport error"));
     }
 
     #[tokio::test]

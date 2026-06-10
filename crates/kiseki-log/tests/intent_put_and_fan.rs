@@ -33,8 +33,8 @@
 //! `intent_sync_transport.rs` / `multi_shard_transport.rs`.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use kiseki_common::ids::{ChunkId, NodeId, OrgId, ShardId};
 use kiseki_common::time::{ClockQuality, DeltaTimestamp, HybridLogicalClock, WallTime};
@@ -42,7 +42,7 @@ use kiseki_log::delta::OperationType;
 use kiseki_log::intent::{IdempotencyKey, PerspectiveSeq, WriteIntent};
 use kiseki_log::raft_store::NewChunkMeta;
 use kiseki_log::shard::ShardConfig;
-use kiseki_log::traits::{AppendChunkAndDeltaRequest, AppendDeltaRequest};
+use kiseki_log::traits::{AppendChunkAndDeltaRequest, AppendDeltaRequest, LogOps};
 use kiseki_log::RaftShardStore;
 
 /// Serializes the tests that mutate the process-global `KISEKI_MIN_ACKS` env
@@ -50,6 +50,132 @@ use kiseki_log::RaftShardStore;
 /// mid-construction (the var is read once in `RaftShardStore::new`). Held for
 /// the whole body of each env-sensitive test.
 static MIN_ACKS_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// CI-hang forensics (bdd.yml run 27310159008 + the 06-06 / 06-09 history):
+/// `put_intent_and_fan_reaches_quorum_on_three_nodes` TIMED OUT at nextest's
+/// 720 s terminate budget with ZERO captured output — libtest buffers panics
+/// and prints until test COMPLETION, so a wedge anywhere (including teardown
+/// drops during a panic's unwind) leaves nothing to diagnose when nextest
+/// SIGTERMs the process. Locally the wedge reproduced exactly once in ~70
+/// 2-core `taskset` runs (479 s+, matching the CI signature) and never with a
+/// debugger attached.
+///
+/// The watchdog makes the NEXT occurrence diagnosable from the CI log alone:
+/// phase markers stream to stderr as the test progresses (nextest prints the
+/// captured stream on timeout/abort), and if the test has not finished inside
+/// the budget the watchdog dumps every thread's name + state + kernel wait
+/// channel (`/proc/self/task` — readable without ptrace) and ABORTS, so the
+/// run fails fast with evidence instead of silently eating the full 720 s.
+///
+/// Declare it FIRST in the test body so its disarm (`Drop`) runs LAST —
+/// after every store/runtime drop — covering teardown wedges too.
+struct Watchdog {
+    disarm: Arc<(Mutex<bool>, Condvar)>,
+    phase: Arc<Mutex<&'static str>>,
+}
+
+impl Watchdog {
+    fn arm(test: &'static str, budget: Duration) -> Self {
+        let disarm = Arc::new((Mutex::new(false), Condvar::new()));
+        let phase = Arc::new(Mutex::new("start"));
+        let disarm2 = Arc::clone(&disarm);
+        let phase2 = Arc::clone(&phase);
+        std::thread::Builder::new()
+            .name("test-watchdog".into())
+            .spawn(move || {
+                let (lock, cv) = &*disarm2;
+                let deadline = Instant::now() + budget;
+                let mut done = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !*done {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    let (guard, _) = cv
+                        .wait_timeout(done, deadline - now)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    done = guard;
+                }
+                if !*done {
+                    let ph = *phase2
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    eprintln!(
+                        "[watchdog] {test} exceeded {budget:?} wedged in phase '{ph}' — \
+                         per-thread dump follows, then abort (fail fast with evidence \
+                         instead of nextest's silent 720 s SIGTERM):",
+                    );
+                    dump_threads();
+                    std::process::abort();
+                }
+            })
+            .expect("watchdog thread spawn");
+        Self { disarm, phase }
+    }
+
+    /// Record + print a progress marker (visible in the CI log on a
+    /// timeout/abort, since nextest prints the captured stderr).
+    fn phase(&self, p: &'static str) {
+        eprintln!("[pif-test] phase: {p}");
+        *self
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = p;
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        let (lock, cv) = &*self.disarm;
+        *lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        cv.notify_all();
+    }
+}
+
+/// Dump every thread's name, scheduler state, and kernel wait channel.
+/// `/proc/self/task` needs no ptrace capability, so this works inside
+/// the CI sandbox where attaching gdb would not.
+fn dump_threads() {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        eprintln!("[watchdog] /proc/self/task unreadable — no thread dump");
+        return;
+    };
+    for t in tasks.flatten() {
+        let tid = t.file_name();
+        let comm = std::fs::read_to_string(t.path().join("comm")).unwrap_or_default();
+        let stat = std::fs::read_to_string(t.path().join("stat")).unwrap_or_default();
+        let state = stat.split_whitespace().nth(2).unwrap_or("?").to_owned();
+        let wchan = std::fs::read_to_string(t.path().join("wchan")).unwrap_or_default();
+        eprintln!(
+            "[watchdog]   tid={} state={state} wchan={} name={}",
+            tid.to_string_lossy(),
+            wchan.trim(),
+            comm.trim(),
+        );
+    }
+}
+
+/// #234 pattern (mirrors `intent_sync_transport.rs`): the Raft RPC listener
+/// lazy-inits on the store's Raft runtime — under suite load that spawn can
+/// lag past the test's first use of the address. Probe-connect until the
+/// listener accepts (10 ms backoff, 5 s cap); a zero-byte connection is a
+/// benign disconnect to the listener.
+fn wait_listening(addr: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match std::net::TcpStream::connect(addr) {
+            Ok(_) => return,
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("listener at {addr} never came up: {e}"),
+        }
+    }
+}
 
 fn test_shard() -> ShardId {
     ShardId(uuid::Uuid::from_u128(0x0475_b0fa_u128))
@@ -146,6 +272,10 @@ fn spawn_durable_node(
         ShardConfig::default(),
         Some(addr),
     );
+    // #234: don't hand the node back until its listener actually accepts —
+    // otherwise the seed's election votes (and the intent fan) race the
+    // lazy listener spawn under load.
+    wait_listening(addr);
     (store, dir)
 }
 
@@ -153,16 +283,31 @@ fn spawn_durable_node(
 /// default 2 = local + >= 1 peer) and the intent is present on the LOCAL store
 /// plus at least one peer's store.
 ///
-/// Slow: 4-second sleep for Raft leader election then an intent fan-out. Runs
-/// in ~4 s on a dev box but starves to 240 s+ under CI's 4-vCPU workspace-
-/// parallel load (the 4 s sleep is not enough for election under contention).
-/// Picked up by Tier 2 (`make test-slow`) and the BDD smoke gate, where the
-/// same invariant (intent fan reaches quorum on a real 3-node shard) is
-/// exercised end-to-end against spawned `kiseki-server` children with their
-/// own runtimes — no test-thread oversubscription.
+/// Slow: 3-node Raft election (bounded leader-elected poll, up to 120 s under
+/// CI's 4-vCPU workspace-parallel starvation — observed 240 s+ historically
+/// with the old blind 4 s sleep) then an intent fan-out. Runs in ~1-4 s on a
+/// dev box. Picked up by Tier 2 (`make test-slow`) and the BDD smoke gate,
+/// where the same invariant (intent fan reaches quorum on a real 3-node
+/// shard) is exercised end-to-end against spawned `kiseki-server` children
+/// with their own runtimes — no test-thread oversubscription.
+///
+/// Wedge forensics: this test timed out at nextest's 720 s terminate budget
+/// on CI (2/2 on 2026-06-10's bdd.yml runs, sporadic 06-06/06-09) with no
+/// captured output; locally it wedged once in ~70 2-core taskset runs. The
+/// [`Watchdog`] + phase markers exist so the next occurrence reports WHERE
+/// it stuck (named-thread dump) instead of a silent SIGTERM.
 #[test]
 #[ignore = "slow: 3-node Raft election + intent fan-out; flakes under CI workspace-parallel load"]
 fn put_intent_and_fan_reaches_quorum_on_three_nodes() {
+    // FIRST declaration → LAST drop: the watchdog stays armed through every
+    // store/runtime teardown drop (where a silent wedge is least
+    // diagnosable). Budget 600 s — comfortably past the worst observed
+    // CI starvation (240 s+) and comfortably before nextest's 720 s
+    // terminate, so a wedge fails fast WITH the thread dump.
+    let wd = Watchdog::arm(
+        "put_intent_and_fan_reaches_quorum_on_three_nodes",
+        Duration::from_secs(600),
+    );
     let _env = MIN_ACKS_ENV_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -171,20 +316,42 @@ fn put_intent_and_fan_reaches_quorum_on_three_nodes() {
     let peers = peers_map(&ports);
     let addrs: Vec<String> = (0..3).map(|i| format!("127.0.0.1:{}", ports[i])).collect();
 
+    wd.phase("spawning 3 durable nodes");
     let (n1, _d1) = spawn_durable_node(1, &addrs[0], &peers);
     let (n2, _d2) = spawn_durable_node(2, &addrs[1], &peers);
     let (n3, _d3) = spawn_durable_node(3, &addrs[2], &peers);
 
-    // Initialize membership on the seed; wait for election so voter_ids() is
-    // populated (the set put_intent_and_fan resolves its fan targets from).
+    // Initialize membership on the seed, then wait for the election to
+    // actually converge instead of a blind 4 s sleep: under CI's 4-vCPU
+    // workspace-parallel load the election has been observed to take
+    // 240 s+, and a put issued mid-election fails `QuorumLost` — whose
+    // `.expect` panic then tears down three starved stores during
+    // unwind, the least diagnosable path in this test. Polling the
+    // shard's own health metric keeps the invariant the PUT pins
+    // untouched (the fan + min_acks floor are still exercised for real).
+    wd.phase("initializing membership");
     n1.initialize_shard(test_shard()).expect("init membership");
-    std::thread::sleep(Duration::from_secs(4));
-
-    let intent = rich_intent(seq(10, 0, 1), Some([0xa1u8; 16]));
+    wd.phase("waiting for leader election");
     let rt = make_runtime();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        match rt.block_on(n1.shard_health(test_shard())) {
+            Ok(info) if info.leader.is_some() => break,
+            _ => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no shard leader elected within 120s",
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    wd.phase("put_intent_and_fan");
+    let intent = rich_intent(seq(10, 0, 1), Some([0xa1u8; 16]));
     rt.block_on(n1.put_intent_and_fan(test_shard(), intent.clone()))
         .expect("quorum intent-write should succeed (local + >= 1 peer)");
 
+    wd.phase("asserting copies");
     // Local copy is present.
     let local = n1.intent_store(test_shard()).unwrap().pending().unwrap();
     assert_eq!(local.len(), 1, "local intent store has the intent");
@@ -200,6 +367,7 @@ fn put_intent_and_fan_reaches_quorum_on_three_nodes() {
         on_n2.len(),
         on_n3.len(),
     );
+    wd.phase("teardown (store + runtime drops)");
 }
 
 /// With no reachable peers (single-node durable shard, `min_acks = 2`), only the

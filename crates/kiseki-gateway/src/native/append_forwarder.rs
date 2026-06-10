@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use kiseki_common::ids::{NodeId, SequenceNumber};
+use kiseki_common::ids::{ChunkId, NodeId, OrgId, SequenceNumber, ShardId};
 use kiseki_log::error::LogError;
 use kiseki_log::traits::{AppendChunkAndDeltaRequest, AppendForwarder};
 use kiseki_proto::v1::log_service_client::LogServiceClient;
@@ -62,5 +62,49 @@ impl AppendForwarder for ProxyAppendForwarder {
                 LogError::Unavailable
             })?;
         Ok(SequenceNumber(resp.into_inner().sequence))
+    }
+
+    // Phase 16c / I-C2 (#111, delete half): re-issue the cluster
+    // refcount decrement against the shard leader's `LogService` over
+    // the same channel pool. Loop-safe — the leader commits locally
+    // (its handler does not chain another forward).
+    async fn forward_decrement_chunk_refcount(
+        &self,
+        leader_node: NodeId,
+        shard_id: ShardId,
+        tenant_id: OrgId,
+        chunk_id: ChunkId,
+    ) -> Result<bool, LogError> {
+        let channel = self.proxy.acquire_channel(leader_node).await.map_err(|e| {
+            tracing::warn!(
+                error = %e,
+                leader = leader_node.0,
+                "decrement-forward (#111): could not reach shard leader",
+            );
+            LogError::Unavailable
+        })?;
+        let proto = kiseki_proto::v1::DecrementChunkRefcountRequest {
+            shard_id: Some(kiseki_proto::v1::ShardId {
+                value: shard_id.0.to_string(),
+            }),
+            tenant_id: Some(kiseki_proto::v1::OrgId {
+                value: tenant_id.0.to_string(),
+            }),
+            chunk_id: Some(kiseki_proto::v1::ChunkId {
+                value: chunk_id.0.to_vec(),
+            }),
+        };
+        let resp = LogServiceClient::new(channel)
+            .decrement_chunk_refcount(proto)
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    error = %e,
+                    leader = leader_node.0,
+                    "decrement-forward (#111): leader LogService.DecrementChunkRefcount failed",
+                );
+                LogError::Unavailable
+            })?;
+        Ok(resp.into_inner().tombstoned)
     }
 }

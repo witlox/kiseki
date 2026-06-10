@@ -7,8 +7,9 @@ use kiseki_common::ids::{ChunkId, OrgId, SequenceNumber, ShardId};
 use kiseki_proto::v1::log_service_server::LogService;
 use kiseki_proto::v1::{
     AppendChunkAndDeltaRequest as ProtoChunkAppendReq, AppendDeltaRequest as ProtoAppendReq,
-    AppendDeltaResponse, ReadDeltasRequest as ProtoReadReq, ReadDeltasResponse,
-    SetMaintenanceRequest, SetMaintenanceResponse, ShardHealthRequest, ShardHealthResponse,
+    AppendDeltaResponse, DecrementChunkRefcountRequest, DecrementChunkRefcountResponse,
+    ReadDeltasRequest as ProtoReadReq, ReadDeltasResponse, SetMaintenanceRequest,
+    SetMaintenanceResponse, ShardHealthRequest, ShardHealthResponse,
 };
 use tonic::{Request, Response, Status};
 
@@ -546,5 +547,39 @@ impl LogService for LogGrpc {
             .map_err(|e| to_status(&e))?;
 
         Ok(Response::new(SetMaintenanceResponse {}))
+    }
+
+    // Phase 16c / I-C2 — leader-side commit of a forwarded cluster
+    // refcount decrement (#111, delete half). The follower gateway
+    // whose local `client_write` hit `ForwardToLeader` re-issues the
+    // decrement here; this node (the shard leader) `client_write`s it
+    // locally and replicates to all members. Loop-safe: if THIS node
+    // also lost leadership, the typed error maps to `unavailable` via
+    // `to_status` — the caller does NOT chain another forward.
+    async fn decrement_chunk_refcount(
+        &self,
+        request: Request<DecrementChunkRefcountRequest>,
+    ) -> Result<Response<DecrementChunkRefcountResponse>, Status> {
+        let _s = kiseki_tracing::span("LogService.DecrementChunkRefcount");
+        let req = request.into_inner();
+        let shard_id = extract_shard_id(req.shard_id)?;
+        let tenant_id = req
+            .tenant_id
+            .ok_or_else(|| Status::invalid_argument("tenant_id required"))?;
+        let org_id = uuid::Uuid::parse_str(&tenant_id.value)
+            .map_err(|e| Status::invalid_argument(format!("invalid tenant_id: {e}")))?;
+        let chunk_id: [u8; 32] = req
+            .chunk_id
+            .ok_or_else(|| Status::invalid_argument("chunk_id required"))?
+            .value
+            .try_into()
+            .map_err(|_| Status::invalid_argument("chunk_id must be 32 bytes"))?;
+
+        let tombstoned = self
+            .ops
+            .decrement_chunk_refcount(shard_id, OrgId(org_id), ChunkId(chunk_id))
+            .await
+            .map_err(|e| to_status(&e))?;
+        Ok(Response::new(DecrementChunkRefcountResponse { tombstoned }))
     }
 }
