@@ -1221,7 +1221,7 @@ impl StorageAdminService for StorageAdminGrpc {
             // advancing between this check and step 3).
             // FAILED_PRECONDITION mirrors `kiseki_log::grpc::
             // to_status` — retrying cannot un-prune history; the
-            // compacted-replay unlock is #223/#230 follow-up.
+            // compacted-replay unlock is #223/#220 follow-up.
             let boundary = log.gc_boundary(shard).await.map_or(0, |b| b.0);
             if boundary > 1 {
                 return Err(Status::failed_precondition(

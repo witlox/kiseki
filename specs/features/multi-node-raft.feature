@@ -502,7 +502,7 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
   # watermark-advance GC prunes a shard's delta log (gc boundary > 1),
   # full-replay lifecycle ops — split redistribution, merge copy —
   # REFUSE with the typed `DeltaLogPruned` error (refusal over silent
-  # key loss; the compacted-replay unlock is the #223/#230 follow-up).
+  # key loss; the compacted-replay unlock is the #223/#220 follow-up).
   # The cluster harness pins KISEKI_WATERMARK_ADVANCE_INTERVAL_MS high
   # on spawned nodes so unrelated suite traffic on this long-lived
   # singleton never advances the bootstrap shard's boundary mid-suite:
