@@ -1094,6 +1094,15 @@ impl InMemoryGateway {
     /// Namespaces are created by the Control Plane and must be registered
     /// with the gateway before any write/read operations can target them.
     pub async fn add_namespace(&self, ns: kiseki_composition::namespace::Namespace) {
+        self.add_namespace_sync(ns);
+    }
+
+    /// Synchronous body of [`Self::add_namespace`]. GH #192: callable
+    /// from non-async contexts — the control-plane Raft apply hook
+    /// re-registers namespaces through this seam when the topology
+    /// log replays on restart (the registration is two short
+    /// `parking_lot` writes, no await points).
+    pub fn add_namespace_sync(&self, ns: kiseki_composition::namespace::Namespace) {
         // Snapshot the hot-path fields into the lock-free metadata
         // cache BEFORE inserting into the composition store. This
         // ordering guarantees that a writer that sees the namespace

@@ -63,6 +63,19 @@ pub trait ApplyHook: Send + Sync + 'static {
         leader_node: NodeId,
     );
 
+    /// Called once per `CreateNamespace` command (after the per-shard
+    /// `on_create_namespace` calls) AND once per namespace on
+    /// `install_snapshot`. GH #192: this is the gateway-side
+    /// registration seam — the runtime bridges it to
+    /// `InMemoryGateway::add_namespace` so the volatile
+    /// `CompositionStore.namespaces` map is re-populated from the
+    /// control-plane Raft on restart (log replay) and on
+    /// snapshot-driven catch-up, not only from the admin HTTP
+    /// handler. Default no-op for hooks that don't wire a gateway.
+    fn on_namespace_applied(&self, namespace_id: &str, tenant_id: OrgId) {
+        let _ = (namespace_id, tenant_id);
+    }
+
     /// Called on every node after `RecordSplit` commits. The node
     /// locally creates the new shard's Raft group with the same id;
     /// the multiplexed listener picks it up automatically.
@@ -82,6 +95,32 @@ pub trait ApplyHook: Send + Sync + 'static {
     /// Called on every node after `RetireShard` commits. The node
     /// drops the per-shard Raft group locally.
     fn on_retire(&self, namespace_id: &str, shard_id: ShardId);
+}
+
+/// GH #192: gateway-side namespace registration seam.
+///
+/// The control-plane Raft is the durable source of truth for the
+/// namespace set, but the gateway's `CompositionStore.namespaces`
+/// map (the thing `compositions.create` checks before every write)
+/// is volatile — it used to be populated only by the admin HTTP
+/// handler (`POST /admin/topology/namespaces`, issue #93 block) and
+/// by the per-shard `NamespaceCreate` delta, which the hydrator
+/// consumes exactly once (durable `last_applied_seq`). After a node
+/// restart neither path re-fires, so every write returned
+/// `NamespaceNotFound` until an operator re-ran setup-shards.
+///
+/// Implementations MUST be:
+/// * **Idempotent** — re-registering an existing namespace is a
+///   no-op and never clobbers a full-fidelity registration that the
+///   hydrator or admin handler installed (tier policy etc.).
+/// * **Fast and non-blocking** — called from the Raft apply path.
+pub trait NamespaceRegistrar: Send + Sync + 'static {
+    /// Ensure `namespace_id` is registered with the local gateway.
+    /// `namespace_id` is the control-plane string id (a UUID for
+    /// every namespace the CLI / bench / admin API creates); non-UUID
+    /// legacy ids are skipped by the production impl, matching the
+    /// admin handler's behavior.
+    fn register_namespace(&self, namespace_id: &str, tenant_id: OrgId);
 }
 
 /// No-op apply hook — used by unit tests and single-node setups
@@ -138,6 +177,13 @@ pub struct ShardStoreApplyHook {
     /// registry step (no shards are committed before boot reaches
     /// the attach point in any normal flow).
     hydrator_registry: std::sync::OnceLock<Arc<kiseki_composition::HydratorRegistry>>,
+    /// GH #192: gateway namespace registrar. Same late-attachment
+    /// shape as `hydrator_registry` (the gateway is constructed
+    /// after the control-plane Raft). Pre-attach applies (restart
+    /// log replay racing boot) are recovered by the explicit
+    /// `rehydrate_gateway_namespaces` drain pass the runtime runs
+    /// right after attaching — attach-then-drain leaves no window.
+    namespace_registrar: std::sync::OnceLock<Arc<dyn NamespaceRegistrar>>,
     /// Raft runtime handle. GH #101: when this node is the assigned
     /// `leader_node` for a freshly-created shard, the apply hook
     /// spawns `initialize_shard` for it onto this runtime so per-shard
@@ -165,6 +211,7 @@ impl ShardStoreApplyHook {
             self_node_id,
             config: kiseki_log::ShardConfig::default(),
             hydrator_registry: std::sync::OnceLock::new(),
+            namespace_registrar: std::sync::OnceLock::new(),
             raft_runtime,
         }
     }
@@ -214,6 +261,15 @@ impl ShardStoreApplyHook {
     /// registry.
     pub fn attach_hydrator_registry(&self, registry: Arc<kiseki_composition::HydratorRegistry>) {
         let _ = self.hydrator_registry.set(registry);
+    }
+
+    /// GH #192: attach the gateway namespace registrar. Once
+    /// attached, every applied `CreateNamespace` (live submit, log
+    /// replay after restart, snapshot install) registers the
+    /// namespace with the local gateway's composition store.
+    /// Idempotent — calling twice keeps the first registrar.
+    pub fn attach_namespace_registrar(&self, registrar: Arc<dyn NamespaceRegistrar>) {
+        let _ = self.namespace_registrar.set(registrar);
     }
 
     fn create_shard_idempotent(&self, shard_id: ShardId, tenant_id: OrgId) {
@@ -284,6 +340,23 @@ impl ApplyHook for ShardStoreApplyHook {
         // adding it here would double-init the same group.
         if leader_node.0 == self.self_node_id {
             self.spawn_initialize_as_leader(shard_id);
+        }
+    }
+
+    fn on_namespace_applied(&self, namespace_id: &str, tenant_id: OrgId) {
+        if let Some(registrar) = self.namespace_registrar.get() {
+            registrar.register_namespace(namespace_id, tenant_id);
+        } else {
+            // Pre-attach window (boot replay racing gateway
+            // construction). Safe to skip: the runtime's
+            // attach-then-drain pass (`rehydrate_gateway_namespaces`)
+            // re-enumerates the state machine's namespace set right
+            // after attaching the registrar.
+            tracing::debug!(
+                namespace_id,
+                "apply hook: namespace registrar not attached yet — \
+                 boot drain pass will cover this namespace (GH #192)",
+            );
         }
     }
 
@@ -625,6 +698,45 @@ impl OpenRaftControlStore {
         }
     }
 
+    /// GH #192: re-hydrate gateway-side namespace wiring from the
+    /// control-plane state machine's current namespace set.
+    ///
+    /// The runtime calls this once at boot, AFTER (a) the gateway +
+    /// composition store exist and (b) the namespace registrar and
+    /// hydrator registry are attached to the apply hook. Ordering
+    /// contract: **attach first, then drain** — an apply that fires
+    /// before the attach is recovered here (it already mutated the
+    /// state machine we enumerate), and an apply that fires after
+    /// the attach goes through the hook directly. Both paths are
+    /// idempotent, so the overlap is harmless.
+    ///
+    /// `register_shard` is invoked for every shard of every known
+    /// namespace so the per-shard composition hydrators restart too
+    /// (their in-memory registry has the same volatile-on-restart
+    /// problem; `HydratorRegistry::register` is idempotent and
+    /// concurrency-safe).
+    ///
+    /// Returns the number of namespaces enumerated. If the local
+    /// Raft hasn't finished replaying its persisted log yet (e.g.
+    /// leader election still in flight on a full-cluster restart),
+    /// the enumeration is small or empty — that's fine, the now-
+    /// attached apply hook covers everything the replay applies
+    /// later.
+    pub async fn rehydrate_gateway_namespaces(
+        &self,
+        registrar: &dyn NamespaceRegistrar,
+        mut register_shard: impl FnMut(ShardId),
+    ) -> usize {
+        let snap = self.state.snapshot().await;
+        for (ns_id, ns) in &snap.namespaces {
+            registrar.register_namespace(ns_id, ns.tenant_id);
+            for shard in &ns.shards {
+                register_shard(shard.shard_id);
+            }
+        }
+        snap.namespaces.len()
+    }
+
     /// Dispatch a control-plane apply hook for a single command.
     /// Called from the state machine's `apply` method on every
     /// node (not just the leader) so cluster-wide side effects
@@ -639,6 +751,13 @@ impl OpenRaftControlStore {
                 for s in shards {
                     hook.on_create_namespace(namespace_id, *tenant_id, s.shard_id, s.leader_node);
                 }
+                // GH #192: gateway-side namespace registration —
+                // once per command, after the per-shard Raft groups
+                // are registered. Fires on live submit AND on log
+                // replay at restart, which is what re-populates the
+                // gateway's volatile namespace map without an
+                // operator re-running namespace-create.
+                hook.on_namespace_applied(namespace_id, *tenant_id);
             }
             ControlCommand::RecordSplit {
                 namespace_id,
@@ -719,5 +838,180 @@ mod tests {
         let snap = store.state().snapshot().await;
         assert!(snap.namespaces.contains_key(&ns_id));
         assert_eq!(snap.namespaces[&ns_id].shards.len(), 1);
+    }
+
+    /// Recording `NamespaceRegistrar` — captures every
+    /// `register_namespace` call for assertions.
+    #[derive(Default)]
+    struct RecordingRegistrar {
+        calls: std::sync::Mutex<Vec<(String, OrgId)>>,
+    }
+
+    impl NamespaceRegistrar for RecordingRegistrar {
+        fn register_namespace(&self, namespace_id: &str, tenant_id: OrgId) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((namespace_id.to_owned(), tenant_id));
+        }
+    }
+
+    /// Recording `ApplyHook` — captures per-shard creates and
+    /// per-command namespace registrations.
+    #[derive(Default)]
+    struct RecordingHook {
+        creates: std::sync::Mutex<Vec<(String, ShardId)>>,
+        namespaces: std::sync::Mutex<Vec<(String, OrgId)>>,
+    }
+
+    impl ApplyHook for RecordingHook {
+        fn on_create_namespace(&self, ns: &str, _t: OrgId, shard_id: ShardId, _l: NodeId) {
+            self.creates.lock().unwrap().push((ns.to_owned(), shard_id));
+        }
+        fn on_namespace_applied(&self, ns: &str, tenant_id: OrgId) {
+            self.namespaces
+                .lock()
+                .unwrap()
+                .push((ns.to_owned(), tenant_id));
+        }
+        fn on_split(&self, _: &str, _: ShardId, _: ShardId, _: NodeId) {}
+        fn on_merge(&self, _: &str, _: ShardId, _: ShardId) {}
+        fn on_retire(&self, _: &str, _: ShardId) {}
+    }
+
+    fn two_shard_create(ns_id: &str, tenant: OrgId) -> ControlCommand {
+        ControlCommand::CreateNamespace {
+            namespace_id: ns_id.to_owned(),
+            tenant_id: tenant,
+            shards: vec![
+                super::super::commands::ShardRecord {
+                    shard_id: ShardId(Uuid::from_u128(0x10)),
+                    range_start: [0u8; 32],
+                    range_end: [0x7Fu8; 32],
+                    leader_node: NodeId(1),
+                },
+                super::super::commands::ShardRecord {
+                    shard_id: ShardId(Uuid::from_u128(0x11)),
+                    range_start: [0x80u8; 32],
+                    range_end: [0xFFu8; 32],
+                    leader_node: NodeId(2),
+                },
+            ],
+        }
+    }
+
+    /// GH #192: `dispatch_hook` must fire `on_namespace_applied`
+    /// exactly once per `CreateNamespace` command (the gateway-side
+    /// registration), in addition to one `on_create_namespace` per
+    /// shard (the per-shard Raft group registration).
+    #[test]
+    fn dispatch_hook_fires_namespace_applied_once_per_create() {
+        let hook = RecordingHook::default();
+        let tenant = OrgId(Uuid::from_u128(7));
+        let cmd = two_shard_create("ns-192", tenant);
+        OpenRaftControlStore::dispatch_hook(&hook, &cmd);
+        assert_eq!(
+            hook.creates.lock().unwrap().len(),
+            2,
+            "one on_create_namespace per shard",
+        );
+        let namespaces = hook.namespaces.lock().unwrap();
+        assert_eq!(
+            namespaces.as_slice(),
+            &[("ns-192".to_owned(), tenant)],
+            "exactly one on_namespace_applied per CreateNamespace command",
+        );
+    }
+
+    /// GH #192 regression (the restart bug): control-plane log
+    /// replay at boot fires apply hooks BEFORE the gateway exists —
+    /// the registrar is not attached yet, so those applies register
+    /// nothing gateway-side. The explicit boot drain pass
+    /// (`rehydrate_gateway_namespaces`) must recover every namespace
+    /// (and every shard, for hydrator re-registration) from the
+    /// state machine's current set.
+    #[tokio::test]
+    async fn rehydration_pass_recovers_namespaces_applied_before_registrar_attach() {
+        let listener = kiseki_raft::tcp_transport::RaftRpcListener::new("127.0.0.1:0".into(), None);
+        let registry = listener.registry();
+        let mut peers = BTreeMap::new();
+        peers.insert(1, "127.0.0.1:1".to_owned());
+        // NoopApplyHook stands in for the pre-attach window: the
+        // production hook's registrar OnceLock is empty during boot
+        // replay, so the apply is a gateway-side no-op exactly like
+        // this.
+        let store = OpenRaftControlStore::new(
+            1,
+            &peers,
+            None,
+            &registry,
+            Arc::new(NoopApplyHook),
+            true,
+            None,
+            None,
+        )
+        .await
+        .expect("control store init");
+
+        let tenant = OrgId(Uuid::from_u128(0xBEEF));
+        let ns_id = "6658810a-0000-0000-0000-000000000192";
+        store
+            .submit(two_shard_create(ns_id, tenant))
+            .await
+            .expect("submit ok");
+
+        // Boot drain pass: attach-then-drain. The registrar sees the
+        // namespace that was applied while nothing was attached, and
+        // the shard callback sees every shard (hydrator re-registration).
+        let recorder = RecordingRegistrar::default();
+        let mut shards_seen: Vec<ShardId> = Vec::new();
+        let n = store
+            .rehydrate_gateway_namespaces(&recorder, |sid| shards_seen.push(sid))
+            .await;
+        assert_eq!(n, 1, "one namespace enumerated");
+        assert_eq!(
+            recorder.calls.lock().unwrap().as_slice(),
+            &[(ns_id.to_owned(), tenant)],
+        );
+        shards_seen.sort_by_key(|s| s.0);
+        assert_eq!(
+            shards_seen,
+            vec![
+                ShardId(Uuid::from_u128(0x10)),
+                ShardId(Uuid::from_u128(0x11)),
+            ],
+            "every shard of the namespace is re-offered to the hydrator registry",
+        );
+
+        // Idempotency of the drain: a second pass re-offers the same
+        // set (the production registrar / hydrator registry no-op on
+        // already-registered entries).
+        let n2 = store.rehydrate_gateway_namespaces(&recorder, |_| {}).await;
+        assert_eq!(n2, 1);
+    }
+
+    /// GH #192: the production apply hook forwards
+    /// `on_namespace_applied` to the registrar once attached, and
+    /// safely skips (no panic) before attachment.
+    #[test]
+    fn shard_store_apply_hook_forwards_namespace_applied_after_attach() {
+        let mut peers = BTreeMap::new();
+        peers.insert(1u64, "127.0.0.1:1".to_owned());
+        let raft_store = Arc::new(kiseki_log::RaftShardStore::new(1, peers, None));
+        let hook =
+            ShardStoreApplyHook::new(Arc::clone(&raft_store), 1, raft_store.raft_runtime_handle());
+
+        let tenant = OrgId(Uuid::from_u128(3));
+        // Pre-attach: must not panic, must not record anywhere.
+        hook.on_namespace_applied("ns-pre-attach", tenant);
+
+        let recorder = Arc::new(RecordingRegistrar::default());
+        hook.attach_namespace_registrar(Arc::clone(&recorder) as Arc<dyn NamespaceRegistrar>);
+        hook.on_namespace_applied("ns-post-attach", tenant);
+        assert_eq!(
+            recorder.calls.lock().unwrap().as_slice(),
+            &[("ns-post-attach".to_owned(), tenant)],
+            "pre-attach call skipped; post-attach call forwarded",
+        );
     }
 }

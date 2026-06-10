@@ -477,6 +477,67 @@ impl kiseki_gateway::mem_gateway::NamespaceProvisioner for ControlPlaneProvision
     }
 }
 
+/// GH #192: `NamespaceRegistrar` impl that bridges control-plane
+/// `CreateNamespace` applies (live submit, restart log replay,
+/// snapshot install) into the gateway's volatile namespace registry.
+///
+/// Mirrors the local-registration half of what the admin handler
+/// (`api_create_sharded_namespace`, issue #93 block) and
+/// `ensure_namespace_exists` do: register the namespace in the
+/// composition store + the gateway's lock-free `namespace_meta`
+/// cache. Unlike those paths it does NOT emit a `NamespaceCreate`
+/// delta — the apply hook fires on EVERY node, so each node
+/// registers locally and no cross-node replication is needed (and
+/// re-emitting on every restart replay would be wrong).
+///
+/// Fidelity note: `ControlCommand::CreateNamespace` doesn't carry
+/// `tier_policy` / `size_band_pools`, so a restart re-registers
+/// namespaces with default policy. The full-fidelity registration
+/// (admin handler → `NamespaceCreate` delta → hydrator) wins when it
+/// exists: this registrar no-ops on any already-registered namespace.
+pub(crate) struct GatewayNamespaceRegistrar {
+    pub(crate) gw: Arc<kiseki_gateway::InMemoryGateway>,
+}
+
+impl crate::cluster_control::NamespaceRegistrar for GatewayNamespaceRegistrar {
+    fn register_namespace(&self, namespace_id: &str, tenant_id: kiseki_common::ids::OrgId) {
+        // The control-plane keys namespaces by string id; the
+        // composition store by `NamespaceId(Uuid)`. The CLI / bench /
+        // admin API pass UUID strings; legacy non-UUID ids skip
+        // gateway registration — same contract as the admin handler.
+        let Ok(ns_uuid) = uuid::Uuid::parse_str(namespace_id) else {
+            return;
+        };
+        let ns_id = kiseki_common::ids::NamespaceId(ns_uuid);
+        // Idempotent: never clobber an existing registration (the
+        // hydrator / admin handler may have installed one with real
+        // tier policy; ours would be defaults-only).
+        if self.gw.compositions_handle().namespace(ns_id).is_some() {
+            return;
+        }
+        let ns = kiseki_composition::namespace::Namespace {
+            id: ns_id,
+            tenant_id,
+            // Primary/fallback shard pointer — same convention as the
+            // admin handler and `ensure_namespace_exists`. Actual
+            // write routing goes through the shard_map (`route_to_shard`),
+            // which the control-plane apply hydrates independently.
+            shard_id: kiseki_common::ids::ShardId(uuid::Uuid::from_u128(1)),
+            read_only: false,
+            versioning_enabled: false,
+            compliance_tags: Vec::new(),
+            tier_policy: Vec::new(),
+            size_band_pools: kiseki_composition::namespace::NamespaceSizeBandPools::default(),
+        };
+        self.gw.add_namespace_sync(ns);
+        tracing::info!(
+            namespace_id,
+            tenant_id = %tenant_id.0,
+            "gateway namespace registry: re-hydrated from control-plane topology (GH #192)",
+        );
+    }
+}
+
 /// Recursive directory size in bytes. Tolerates I/O errors (returns
 /// the partial sum). Used by the periodic composition-store gauge —
 /// fjall is a keyspace directory rather than a single file.
@@ -2200,6 +2261,45 @@ pub async fn run_main(
     }
     let gw = Arc::new(gw_builder);
 
+    // GH #192: gateway namespace registry re-hydration from the
+    // control-plane topology Raft. Two halves:
+    //
+    // 1. Attach the registrar to the apply hook, so every
+    //    `CreateNamespace` applied FROM NOW ON (live submits, the
+    //    tail of a restart's log replay, snapshot installs)
+    //    registers the namespace with this gateway.
+    // 2. Drain the state machine's CURRENT namespace set, covering
+    //    every apply that fired BEFORE the attach (boot-time log
+    //    replay races runtime construction; pre-attach the hook's
+    //    registrar `OnceLock` is empty and skips).
+    //
+    // Attach-then-drain ordering leaves no window; both paths are
+    // idempotent so the overlap is harmless. This runs BEFORE any
+    // protocol listener (S3 / native / NFS) spawns, so a restarted
+    // node never serves `NamespaceNotFound` for a namespace the
+    // control plane has already replayed. Without this block, a
+    // `docker compose restart` left `compositions.namespaces` empty
+    // (it is volatile; the per-shard `NamespaceCreate` delta was
+    // already consumed pre-restart per the durable
+    // `last_applied_seq`) and 100% of writes failed until an admin
+    // re-ran the namespace-create flow.
+    let gw_namespace_registrar = Arc::new(GatewayNamespaceRegistrar {
+        gw: Arc::clone(&gw),
+    });
+    if let Some(hook) = apply_hook_for_registry.as_ref() {
+        hook.attach_namespace_registrar(Arc::clone(&gw_namespace_registrar)
+            as Arc<dyn crate::cluster_control::NamespaceRegistrar>);
+    }
+    if let Some(ctrl_store) = cluster_control_store.as_ref() {
+        let rehydrated = ctrl_store
+            .rehydrate_gateway_namespaces(gw_namespace_registrar.as_ref(), |_shard| {})
+            .await;
+        tracing::info!(
+            namespaces = rehydrated,
+            "gateway namespace registry: boot re-hydration pass complete (GH #192)",
+        );
+    }
+
     // ADR-048 boot wiring — for every pool flagged
     // `requires_migration`, construct a `FabricSlabStore`, register
     // the per-pool backlog tracker, and spawn the slab-EC compactor
@@ -2916,6 +3016,23 @@ pub async fn run_main(
         if let Some(hook) = apply_hook_for_registry.as_ref() {
             hook.attach_hydrator_registry(Arc::clone(&registry));
         }
+        // GH #192 (hydrator half): a restart's control-plane log
+        // replay can fire `on_create_namespace` BEFORE the attach
+        // above — the hook's registry `OnceLock` was empty, so those
+        // shards' Raft groups exist but have no hydrator poll loop
+        // (followers would silently stop installing Create deltas
+        // for tenant namespaces). Drain the state machine's current
+        // namespace set and register every known shard. Idempotent
+        // and concurrency-safe against applies racing this pass.
+        // The namespace registrar half already drained right after
+        // gateway construction; re-running it here is a no-op.
+        if let Some(ctrl_store) = cluster_control_store.as_ref() {
+            ctrl_store
+                .rehydrate_gateway_namespaces(gw_namespace_registrar.as_ref(), |shard_id| {
+                    registry.register(shard_id);
+                })
+                .await;
+        }
         tracing::info!(
             "composition hydrator registry spawned (bootstrap shard pre-registered; \
              apply hook will register per-namespace shards)",
@@ -3533,6 +3650,63 @@ pub async fn run_advisory(
 mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
+
+    /// GH #192: the gateway namespace registrar (a) registers a
+    /// control-plane namespace into the gateway's composition store
+    /// so writes stop failing with `NamespaceNotFound` after a
+    /// restart, (b) is idempotent and never clobbers an existing
+    /// full-fidelity registration (hydrator / admin handler may have
+    /// installed one with real tier policy), and (c) skips legacy
+    /// non-UUID namespace ids like the admin handler does.
+    #[tokio::test]
+    async fn gateway_namespace_registrar_wires_and_is_idempotent() {
+        use crate::cluster_control::NamespaceRegistrar;
+
+        let gw = std::sync::Arc::new(kiseki_gateway::InMemoryGateway::new(
+            kiseki_composition::composition::CompositionStore::new(),
+            kiseki_chunk::arc_async(kiseki_chunk::store::ChunkStore::new()),
+            kiseki_crypto::keys::SystemMasterKey::new(
+                [0xAB; 32],
+                kiseki_common::tenancy::KeyEpoch(1),
+            ),
+        ));
+        let registrar = super::GatewayNamespaceRegistrar {
+            gw: std::sync::Arc::clone(&gw),
+        };
+
+        let tenant = kiseki_common::ids::OrgId(uuid::Uuid::from_u128(42));
+        let ns_uuid = uuid::Uuid::from_u128(0x192);
+        let ns_id = kiseki_common::ids::NamespaceId(ns_uuid);
+
+        // Restart-shaped: the namespace exists in the control-plane
+        // Raft but not in the (volatile) gateway registry.
+        assert!(gw.compositions_handle().namespace(ns_id).is_none());
+        registrar.register_namespace(&ns_uuid.to_string(), tenant);
+        let ns = gw
+            .compositions_handle()
+            .namespace(ns_id)
+            .expect("registrar registered the namespace");
+        assert_eq!(ns.tenant_id, tenant);
+        assert!(!ns.read_only);
+
+        // Never clobbers: install a full-fidelity registration
+        // (read_only flipped as the marker), re-run the registrar,
+        // and assert the existing registration is preserved.
+        let mut full = ns.clone();
+        full.read_only = true;
+        gw.add_namespace_sync(full);
+        registrar.register_namespace(&ns_uuid.to_string(), tenant);
+        assert!(
+            gw.compositions_handle()
+                .namespace(ns_id)
+                .expect("still registered")
+                .read_only,
+            "re-registration must be a no-op on an existing namespace",
+        );
+
+        // Legacy non-UUID ids: skipped without panicking.
+        registrar.register_namespace("not-a-uuid", tenant);
+    }
 
     /// The 5 canonical persistent store paths that the runtime constructs
     /// under `data_dir`. Three are fjall keyspaces (directories), one is
