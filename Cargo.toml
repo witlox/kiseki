@@ -132,7 +132,7 @@ flate2 = "1"
 serde_json = "1"
 x509-parser = "0.18"
 libc = "0.2"
-openraft = { version = "0.10.0-alpha.17", features = ["serde", "type-alias"] }
+openraft = { version = "0.10.0-alpha.21", features = ["serde", "type-alias"] }
 # Persistent metadata stores (ADR-040): redb is reused from kiseki-chunk;
 # postcard provides deterministic encoding; lru is the hot-tail cache.
 redb = "4"
