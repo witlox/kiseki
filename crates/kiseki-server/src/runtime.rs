@@ -2897,6 +2897,11 @@ pub async fn run_main(
         let hyd_log = Arc::clone(&log_store);
         let hyd_compositions = gw.compositions_handle();
         let hyd_metrics = composition_metrics_for_hydrator;
+        // P3 / I-L4: each hydrator poll reports this node's position
+        // via the local `report_consumer_position` seam; the shard
+        // leader's supervisor gathers all voters' reports and proposes
+        // `min` as the replicated `hydrator` watermark, so delta-log
+        // pruning can never outrun the slowest node.
         let registry = Arc::new(kiseki_composition::HydratorRegistry::new(
             hyd_compositions,
             hyd_log,

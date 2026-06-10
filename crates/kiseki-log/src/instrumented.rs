@@ -203,6 +203,11 @@ impl LogOps for InstrumentedLogOps {
     }
 
     #[tracing::instrument(level = "debug", skip(self), fields(shard_id = %shard_id.0))]
+    async fn gc_boundary(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError> {
+        self.inner.gc_boundary(shard_id).await
+    }
+
+    #[tracing::instrument(level = "debug", skip(self), fields(shard_id = %shard_id.0))]
     async fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError> {
         let shard = shard_id.0.to_string();
         let started = Instant::now();
@@ -286,6 +291,22 @@ impl LogOps for InstrumentedLogOps {
                 .record_watermark_advance(&shard_id.0.to_string(), consumer);
         }
         result
+    }
+
+    /// Node-local position report (P3 / I-L4) — delegate to the inner
+    /// store so a wrapped [`crate::RaftShardStore`] /
+    /// [`crate::MemShardStore`] still reaches its real implementation
+    /// (the trait default would silently drop the report). Not
+    /// metered: a per-poll map insert is too cheap to be worth a
+    /// histogram slot.
+    fn report_consumer_position(
+        &self,
+        shard_id: ShardId,
+        consumer: &str,
+        position: SequenceNumber,
+    ) {
+        self.inner
+            .report_consumer_position(shard_id, consumer, position);
     }
 
     async fn cluster_chunk_state_get(

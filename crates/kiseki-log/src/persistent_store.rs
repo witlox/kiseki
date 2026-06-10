@@ -258,6 +258,23 @@ impl LogOps for PersistentShardStore {
         self.mem.truncate_log(shard_id).await
     }
 
+    async fn gc_boundary(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError> {
+        self.mem.gc_boundary(shard_id).await
+    }
+
+    /// Delegate to the inner mem store so a node-local position
+    /// report reaches the real watermark machinery (the trait default
+    /// would silently drop it).
+    fn report_consumer_position(
+        &self,
+        shard_id: ShardId,
+        consumer: &str,
+        position: SequenceNumber,
+    ) {
+        self.mem
+            .report_consumer_position(shard_id, consumer, position);
+    }
+
     async fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError> {
         self.mem.compact_shard(shard_id).await
     }

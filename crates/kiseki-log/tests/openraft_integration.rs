@@ -188,17 +188,21 @@ async fn watermark_advancement() {
         store.append_delta(make_append_req(i * 10)).await.unwrap();
     }
 
-    // Register and advance watermarks.
+    // Register BOTH consumers before advancing: the state machine
+    // prunes deltas below the consumer GC boundary on every applied
+    // `AdvanceWatermark` (P3a), and the boundary is the min over the
+    // consumers registered SO FAR — registering a slower consumer
+    // after a faster one advanced cannot resurrect pruned deltas.
     store
         .register_consumer("view-nfs", SequenceNumber(1))
         .await
         .unwrap();
     store
-        .advance_watermark("view-nfs", SequenceNumber(3))
+        .register_consumer("audit", SequenceNumber(2))
         .await
         .unwrap();
     store
-        .register_consumer("audit", SequenceNumber(2))
+        .advance_watermark("view-nfs", SequenceNumber(3))
         .await
         .unwrap();
 
@@ -281,5 +285,54 @@ async fn read_deltas_range_binary_search_boundaries() {
             .map(|d| d.header.sequence.0)
             .collect();
         assert_eq!(got, expected, "read_deltas range [{from}, {to}]");
+    }
+}
+
+// --- P3 adversary BLOCKER: membership-add gate under delta GC -------------
+
+/// `guard_replica_add` refuses once the consumer GC boundary passes 1
+/// — a fresh replica's hydrator could no longer replay history from
+/// sequence 1 and would halt permanently (ADR-040 §D6.3) — and passes
+/// at bootstrap (no consumers, boundary 0) and at boundary 1 (full
+/// history intact).
+#[tokio::test]
+async fn guard_replica_add_refuses_once_history_pruned() {
+    let store = bootstrap_single(None).await;
+
+    // Bootstrap shape: no consumer registered → boundary 0 → allowed.
+    store
+        .guard_replica_add()
+        .await
+        .expect("bootstrap-time membership-add must pass (boundary 0)");
+
+    for i in 0u8..5 {
+        store.append_delta(make_append_req(i)).await.unwrap();
+    }
+
+    // Boundary exactly 1: prune is `sequence < 1` — nothing dropped,
+    // a fresh replica still replays everything → allowed.
+    store
+        .advance_watermark("hydrator", SequenceNumber(1))
+        .await
+        .unwrap();
+    store
+        .guard_replica_add()
+        .await
+        .expect("boundary 1 keeps full history — membership-add must pass");
+
+    // Boundary 4 (> 1): deltas 1-3 pruned → REFUSE with DeltaLogPruned.
+    store
+        .advance_watermark("hydrator", SequenceNumber(4))
+        .await
+        .unwrap();
+    match store.guard_replica_add().await {
+        Err(kiseki_log::LogError::DeltaLogPruned {
+            shard_id,
+            gc_boundary,
+        }) => {
+            assert_eq!(gc_boundary, 4);
+            assert_eq!(shard_id, test_shard());
+        }
+        other => panic!("expected DeltaLogPruned refusal, got {other:?}"),
     }
 }

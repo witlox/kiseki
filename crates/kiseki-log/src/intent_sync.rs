@@ -66,6 +66,25 @@ pub const INTENT_GATHER_PENDING_TAG: &str = "intent_gather_pending";
 /// MUST equal this string verbatim (the asserts in the tests below catch drift).
 pub const INTENT_PUT_TAG: &str = "intent_put";
 
+/// Aux tag: "your node-local reported consumer positions for this shard"
+/// (P3 delta pruning, I-L4). The shard leader's watermark-advance round
+/// gathers these from every voter and proposes `min` over the `hydrator`
+/// positions as ONE replicated `AdvanceWatermark` — so the SM prune can
+/// never outrun the slowest node's hydrator. Read-only: request body is
+/// `()`, response is `postcard(Vec<(String, u64)>)`. MUST NOT collide
+/// with the Raft tags or the intent tags.
+///
+/// Wire-compat coupling: `kiseki_raft::transport_metrics::op::CONSUMER_POSITIONS`
+/// MUST equal this string verbatim (the asserts in the tests below catch drift).
+pub const CONSUMER_POSITIONS_TAG: &str = "consumer_positions";
+
+/// Source of this node's locally-reported consumer positions for ONE
+/// shard, as `(consumer, position)` pairs — what the
+/// [`CONSUMER_POSITIONS_TAG`] arm serves. A closure (not a map handle)
+/// so the dispatcher stays decoupled from
+/// [`crate::RaftShardStore`]'s storage shape.
+pub type ConsumerPositionsFn = Arc<dyn Fn() -> Vec<(String, u64)> + Send + Sync>;
+
 /// Wire form of a [`WriteIntent`] — used both for the `gather_pending`
 /// response (server → committer) and the `intent_put` fan (producer → peer).
 ///
@@ -263,6 +282,49 @@ pub fn build_intent_dispatcher(store: Arc<dyn IntentStore>) -> ShardDispatch {
             })
         },
     )
+}
+
+/// Build the FULL per-shard aux dispatcher: the two ADR-047 intent tags
+/// (via [`build_intent_dispatcher`]) plus the P3 [`CONSUMER_POSITIONS_TAG`]
+/// read. `RaftShardStore::create_shard` registers this one closure per
+/// shard (the listener holds a single aux dispatcher per shard, so the
+/// ops compose here rather than via multiple `register_aux` calls).
+///
+/// `positions` is invoked fresh per request — the response always
+/// reflects the node's current local report state.
+#[must_use]
+pub fn build_shard_aux_dispatcher(
+    store: Arc<dyn IntentStore>,
+    positions: ConsumerPositionsFn,
+) -> ShardDispatch {
+    let intents = build_intent_dispatcher(store);
+    Arc::new(
+        move |tag: &str, payload: &[u8]| -> BoxFuture<'_, DispatchOutcome> {
+            if tag == CONSUMER_POSITIONS_TAG {
+                let positions = Arc::clone(&positions);
+                return Box::pin(async move { encode_ok(&positions()) });
+            }
+            intents(tag, payload)
+        },
+    )
+}
+
+/// Client half of [`CONSUMER_POSITIONS_TAG`]: fetch one peer's
+/// node-local reported consumer positions for `shard_id` over the
+/// multiplexed Raft transport. The caller (the shard leader's
+/// watermark-advance round) treats ANY error as "voter did not answer"
+/// and skips the round — safety first, a missed gather only delays
+/// pruning.
+///
+/// # Errors
+/// Transport/connect failure, a non-`Ok` wire status, or a postcard
+/// decode fault.
+pub async fn fetch_consumer_positions(
+    addr: &str,
+    shard_id: ShardId,
+    tls_config: Option<&Arc<rustls::ClientConfig>>,
+) -> std::io::Result<Vec<(String, u64)>> {
+    rpc_call(addr, shard_id, CONSUMER_POSITIONS_TAG, tls_config, &()).await
 }
 
 /// Postcard-encode an `Ok` response body, degrading an encode fault to
@@ -464,6 +526,11 @@ mod tests {
             kiseki_raft::transport_metrics::op::INTENT_GATHER_PENDING,
             "intent_gather_pending tag drift — metric label out of sync"
         );
+        assert_eq!(
+            CONSUMER_POSITIONS_TAG,
+            kiseki_raft::transport_metrics::op::CONSUMER_POSITIONS,
+            "consumer_positions tag drift — metric label out of sync"
+        );
     }
 
     /// A non-trivial append: real `chunk_refs`, payload, operation, and a
@@ -636,20 +703,73 @@ mod tests {
         assert!(matches!(outcome, DispatchOutcome::UnknownTag));
     }
 
-    /// The two intent tags do not collide with the Raft tags or each other.
+    /// The aux tags do not collide with the Raft tags or each other.
     #[test]
     fn intent_tags_distinct_from_raft_tags() {
-        let intent_tags = [INTENT_GATHER_PENDING_TAG, INTENT_PUT_TAG];
+        let aux_tags = [
+            INTENT_GATHER_PENDING_TAG,
+            INTENT_PUT_TAG,
+            CONSUMER_POSITIONS_TAG,
+        ];
         for raft_tag in ["append_entries", "vote", "full_snapshot"] {
-            for it in intent_tags {
+            for it in aux_tags {
                 assert_ne!(it, raft_tag);
             }
         }
-        // The intent tags are pairwise distinct.
-        for i in 0..intent_tags.len() {
-            for j in (i + 1)..intent_tags.len() {
-                assert_ne!(intent_tags[i], intent_tags[j]);
+        // The aux tags are pairwise distinct.
+        for i in 0..aux_tags.len() {
+            for j in (i + 1)..aux_tags.len() {
+                assert_ne!(aux_tags[i], aux_tags[j]);
             }
         }
+    }
+
+    /// P3 — the composed shard aux dispatcher serves `consumer_positions`
+    /// (postcard round-trip of `Vec<(String, u64)>`, re-invoking the
+    /// source per request) AND still falls through to the intent arms /
+    /// `UnknownTag` for everything else.
+    #[tokio::test]
+    async fn shard_aux_dispatcher_serves_consumer_positions_round_trip() {
+        let store: Arc<dyn IntentStore> = Arc::new(InMemIntentStore::new());
+        let positions = Arc::new(std::sync::Mutex::new(vec![("hydrator".to_owned(), 42u64)]));
+        let source = Arc::clone(&positions);
+        let dispatch = build_shard_aux_dispatcher(
+            Arc::clone(&store),
+            Arc::new(move || source.lock().unwrap().clone()),
+        );
+
+        // Round-trip: request body is `()` (empty postcard), response
+        // decodes to exactly the source pairs.
+        let outcome = dispatch(CONSUMER_POSITIONS_TAG, &postcard::to_stdvec(&()).unwrap()).await;
+        let DispatchOutcome::Ok(bytes) = outcome else {
+            panic!("expected Ok");
+        };
+        let decoded: Vec<(String, u64)> = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, vec![("hydrator".to_owned(), 42)]);
+
+        // The source is re-read per request — a fresher report is
+        // visible on the next dispatch.
+        positions.lock().unwrap()[0].1 = 99;
+        let DispatchOutcome::Ok(bytes) =
+            dispatch(CONSUMER_POSITIONS_TAG, &postcard::to_stdvec(&()).unwrap()).await
+        else {
+            panic!("expected Ok");
+        };
+        let decoded: Vec<(String, u64)> = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded, vec![("hydrator".to_owned(), 99)]);
+
+        // The intent arms still work through the composed dispatcher...
+        let intent = rich_intent(seq(1, 0, 1), None);
+        store.put(intent.clone()).unwrap();
+        let DispatchOutcome::Ok(bytes) = dispatch(INTENT_GATHER_PENDING_TAG, &[]).await else {
+            panic!("expected Ok from intent arm");
+        };
+        let wire: Vec<WireIntent> = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(wire.len(), 1);
+        // ...and unknown tags still fall through.
+        assert!(matches!(
+            dispatch("not_an_aux_tag", &[]).await,
+            DispatchOutcome::UnknownTag
+        ));
     }
 }

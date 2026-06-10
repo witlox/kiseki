@@ -9,8 +9,9 @@ use kiseki_common::ids::SequenceNumber;
 
 /// Tracks the consumption position of all downstream consumers.
 ///
-/// The GC boundary is `min(all watermarks) - 1`: deltas at or below
-/// this position are eligible for truncation.
+/// The GC boundary is `min(all watermarks)`: deltas strictly below it
+/// (`sequence < boundary`) are eligible for truncation; the delta at
+/// `sequence == boundary` survives.
 #[derive(Clone, Debug, Default)]
 pub struct ConsumerWatermarks {
     /// Named consumer → last consumed sequence number.
@@ -50,6 +51,14 @@ impl ConsumerWatermarks {
     #[must_use]
     pub fn gc_boundary(&self) -> Option<SequenceNumber> {
         self.watermarks.values().min().copied()
+    }
+
+    /// A single consumer's watermark, `None` if it never registered.
+    /// The shard leader's watermark-advance round reads this to skip
+    /// proposals that wouldn't move the boundary (I-L4).
+    #[must_use]
+    pub fn get(&self, consumer: &str) -> Option<SequenceNumber> {
+        self.watermarks.get(consumer).copied()
     }
 
     /// Check if a specific consumer is stalled (its watermark is far

@@ -125,6 +125,21 @@ pub async fn execute_split<L: LogOps + ?Sized>(
     log: &L,
     plan: &SplitPlan,
 ) -> Result<(), crate::error::LogError> {
+    // Refuse when the source's delta log has been pruned (gc boundary
+    // > 1): the redistribution below replays the FULL history from
+    // sequence 0 and would silently lose every key whose only deltas
+    // were dropped by watermark-advance GC (P3a / I-SF6).
+    // TODO(compacted-replay): replay a compacted per-key image
+    // (latest delta per hashed_key) instead of raw history, then
+    // lift this refusal.
+    let boundary = log.gc_boundary(plan.original_shard).await?;
+    if boundary.0 > 1 {
+        return Err(crate::error::LogError::DeltaLogPruned {
+            shard_id: plan.original_shard,
+            gc_boundary: boundary.0,
+        });
+    }
+
     // Create new shard for the upper range.
     log.create_shard(
         plan.new_shard,
@@ -274,5 +289,74 @@ mod tests {
         // New shard should exist.
         let health = store.shard_health(plan.new_shard).await;
         assert!(health.is_ok());
+    }
+
+    /// P3a gate — a source shard whose delta log has been pruned
+    /// (gc boundary > 1) refuses to split: the redistribution replays
+    /// the full history and would silently lose every key whose only
+    /// deltas were pruned. See `LogError::DeltaLogPruned` and its
+    /// compacted-replay TODO.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn execute_split_refused_when_delta_log_pruned() {
+        use crate::store::MemShardStore;
+        use crate::traits::AppendDeltaRequest;
+        use kiseki_common::ids::SequenceNumber;
+
+        let store = MemShardStore::new();
+        let info = full_range_info(200, 500);
+        store.create_shard(
+            info.shard_id,
+            info.tenant_id,
+            NodeId(1),
+            ShardConfig::default(),
+        );
+
+        for i in 0u8..3 {
+            store
+                .append_delta(AppendDeltaRequest {
+                    shard_id: info.shard_id,
+                    tenant_id: info.tenant_id,
+                    operation: crate::delta::OperationType::Create,
+                    timestamp: test_timestamp(),
+                    hashed_key: [i; 32],
+                    chunk_refs: vec![],
+                    payload: vec![0xAA; 8],
+                    has_inline_data: false,
+                })
+                .await
+                .unwrap();
+        }
+        // Consumer past seq 3 + truncate → log pruned at boundary 3.
+        store
+            .register_consumer(info.shard_id, "hydrator", SequenceNumber(3))
+            .unwrap();
+        store.truncate_log(info.shard_id).await.unwrap();
+
+        let plan = plan_split(&info).unwrap();
+        let err = execute_split(&store, &plan)
+            .await
+            .expect_err("pruned delta log must refuse a full-replay split");
+        assert!(
+            matches!(
+                err,
+                crate::error::LogError::DeltaLogPruned { gc_boundary: 3, .. }
+            ),
+            "expected DeltaLogPruned, got {err:?}"
+        );
+    }
+
+    fn test_timestamp() -> kiseki_common::time::DeltaTimestamp {
+        kiseki_common::time::DeltaTimestamp {
+            hlc: kiseki_common::time::HybridLogicalClock {
+                physical_ms: 0,
+                logical: 0,
+                node_id: NodeId(0),
+            },
+            wall: kiseki_common::time::WallTime {
+                millis_since_epoch: 0,
+                timezone: "UTC".into(),
+            },
+            quality: kiseki_common::time::ClockQuality::Ntp,
+        }
     }
 }

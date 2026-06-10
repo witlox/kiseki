@@ -479,6 +479,16 @@ impl LogOps for MemShardStore {
         Ok(gc_boundary)
     }
 
+    async fn gc_boundary(&self, shard_id: ShardId) -> Result<SequenceNumber, LogError> {
+        let shards = self.shards.lock().lock_or_die("store.shards");
+        let shard = shards
+            .get(&shard_id)
+            .ok_or(LogError::ShardNotFound(shard_id))?;
+        // `gc_floor` is the boundary `truncate_log` actually pruned at
+        // — the precise refusal signal for full-replay lifecycle ops.
+        Ok(shard.gc_floor)
+    }
+
     async fn compact_shard(&self, shard_id: ShardId) -> Result<u64, LogError> {
         let mut shards = self.shards.lock().lock_or_die("store.shards");
         let shard = shards
@@ -612,6 +622,28 @@ impl LogOps for MemShardStore {
         position: SequenceNumber,
     ) -> Result<(), LogError> {
         Self::advance_watermark(self, shard_id, consumer, position)
+    }
+
+    /// Single-node: the local position IS the global position, so a
+    /// node-local report advances the shard's watermark machinery
+    /// directly (register-if-absent + monotonic advance — the same
+    /// `ConsumerWatermarks::advance` the async path uses). Infallible
+    /// by contract: an unknown shard or the buffered-write sentinel
+    /// (which `advance_watermark` rejects as `InvalidRange`) is a
+    /// silent no-op.
+    fn report_consumer_position(
+        &self,
+        shard_id: ShardId,
+        consumer: &str,
+        position: SequenceNumber,
+    ) {
+        if position.is_buffered_sentinel() {
+            return;
+        }
+        let mut shards = self.shards.lock().lock_or_die("store.shards");
+        if let Some(shard) = shards.get_mut(&shard_id) {
+            shard.watermarks.advance(consumer, position);
+        }
     }
 }
 

@@ -48,6 +48,12 @@ pub mod op {
     /// (cold path; one round per election). Tag string defined in
     /// `kiseki_log::intent_sync::INTENT_GATHER_PENDING_TAG`.
     pub const INTENT_GATHER_PENDING: &str = "intent_gather_pending";
+    /// P3 aux tag `consumer_positions` — the shard leader's
+    /// watermark-advance round reading a voter's node-local reported
+    /// consumer positions (cold path; one fan per round, ~5 s). Tag
+    /// string defined in
+    /// `kiseki_log::intent_sync::CONSUMER_POSITIONS_TAG`.
+    pub const CONSUMER_POSITIONS: &str = "consumer_positions";
     /// Unknown / unrecognized tag.
     pub const UNKNOWN: &str = "unknown";
 }

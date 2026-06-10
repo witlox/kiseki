@@ -31,7 +31,11 @@ impl LogGrpc {
 fn to_status(e: &LogError) -> Status {
     match e {
         LogError::ShardNotFound(_) => Status::not_found(e.to_string()),
-        LogError::MaintenanceMode(_) => Status::failed_precondition(e.to_string()),
+        // DeltaLogPruned (P3a) — full-replay lifecycle op refused on a
+        // pruned delta log. Not retriable: history doesn't come back.
+        LogError::MaintenanceMode(_) | LogError::DeltaLogPruned { .. } => {
+            Status::failed_precondition(e.to_string())
+        }
         LogError::ShardSplitting(_)
         | LogError::LeaderUnavailable(_)
         | LogError::ForwardToLeader { .. }
