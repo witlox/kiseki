@@ -245,12 +245,15 @@ pub fn build_intent_dispatcher(store: Arc<dyn IntentStore>) -> ShardDispatch {
                             }
                         }
                         let n = intents.len();
-                        // ADR-047 hot-path timer (aux.store_put) — local fjall
-                        // IntentStore write on the peer. Now wraps the whole
-                        // batch commit, mirroring `put_batch`'s one-WAL-sync
-                        // shape on the producer side.
+                        // ADR-047 hot-path timer (aux.store_put) — local
+                        // IntentStore write on the peer, submit-to-complete.
+                        // GH #228: routed through `submit_batch` so the fjall
+                        // commit runs on the store's dedicated commit thread
+                        // and group-commits with the producer-side coalescer's
+                        // local puts (same per-shard store Arc) instead of
+                        // blocking a tokio worker for the WAL sync.
                         let put_res = kiseki_tracing::hot_span!("aux.store_put", {
-                            store.put_batch(intents)
+                            store.submit_batch(intents).await
                         });
                         match put_res {
                             // Recorded OR Duplicate both mean the intent is

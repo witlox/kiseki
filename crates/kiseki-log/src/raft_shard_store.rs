@@ -951,6 +951,7 @@ impl RaftShardStore {
                 cap_max: crate::intent_fan_coalescer::batch_max_from_env(),
                 cap_timeout: crate::intent_fan_coalescer::batch_timeout_from_env(),
                 peer_rpc_timeout: INTENT_FAN_PEER_TIMEOUT,
+                topup_rpc_timeout: crate::intent_fan_coalescer::topup_timeout_from_env(),
             },
         );
         self.intent_fan_coalescers
