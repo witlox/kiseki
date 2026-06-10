@@ -9,7 +9,21 @@
 //! This redesign attacks that floor by removing the spawned task
 //! entirely. The first submitter to find no active flusher *becomes*
 //! the flusher: it does the timeout-wait inline in its own task, then
-//! runs the local `put_batch` + fan + ack distribution synchronously.
+//! runs the local put + fan + ack distribution synchronously.
+//!
+//! GH #228 (2026-06-10) revised the flush itself:
+//! - The local durable copy goes through `IntentStore::submit_batch`
+//!   (the store's dedicated commit thread): UNDER CONTENTION the fjall
+//!   commit moves off the tokio worker and cross-flush group commit
+//!   kicks in; the uncontended fast path still commits inline on the
+//!   caller (identical to pre-#228 — the hop is only paid when there
+//!   is something to batch with, per the task-hop regression ledger).
+//! - The min-acks top-up is TARGETED: leader-first (unchanged), then
+//!   ONE rotation-picked candidate at a time under the short
+//!   `KISEKI_INTENT_TOPUP_TIMEOUT_MS` budget with fallback to the next
+//!   candidate — replacing the all-peers broadcast whose cancelled
+//!   in-flight RPCs measured 39 % redundant `intent_put` traffic and
+//!   ~1.9 k/s/ingress TCP redial churn.
 //!
 //! ## Submitter paths
 //!
@@ -19,7 +33,7 @@
 //!   3. `select!` between `sleep(deadline)` and `cap_reached.notified()`.
 //!   4. Re-acquire mutex, take pending batch, clear `flusher_running`.
 //!   5. Drop mutex.
-//!   6. Run local `put_batch` + fan; per-input ack via each
+//!   6. Run local `submit_batch` + fan; per-input ack via each
 //!      submitter's oneshot.
 //!   7. Await own oneshot for the result. (Note: the flusher sends
 //!      itself an ack as part of step 6.)
@@ -43,11 +57,13 @@
 //!
 //! ## Crash safety
 //!
-//! Unchanged from W12. `put_batch` is atomic; the local copy commits
-//! before the fan starts. A panic mid-flush leaves submitters'
+//! Unchanged from W12. The local batch commit is atomic and the local
+//! copy commits before the fan starts (`submit_batch` resolves only
+//! after the durable commit). A panic mid-flush leaves submitters'
 //! oneshots dropped → they see `Err(Unavailable)`; the gateway
 //! retries.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -103,6 +119,12 @@ struct CoalescerInner {
     /// brings pending up to `cap_max`. The flusher's `select!`
     /// listens on this to break out of the deadline `sleep` early.
     cap_reached: Notify,
+    /// GH #228 — per-flush rotation counter for the targeted top-up.
+    /// `fetch_add` per top-up round picks the starting candidate among
+    /// the non-leader voters, so steady-state top-up load spreads
+    /// evenly instead of always hammering the first peer in the
+    /// resolver's order.
+    topup_seq: AtomicU64,
 }
 
 /// Per-shard resolver closure: returns the current voter peer set
@@ -130,8 +152,16 @@ pub struct CoalescerConfig {
     /// Max wait from first submission to flush
     /// (`KISEKI_INTENT_FAN_BATCH_TIMEOUT_US`).
     pub cap_timeout: Duration,
-    /// Per-peer RPC timeout.
+    /// Per-peer RPC timeout for the leader-first hop (MF-3) — the
+    /// generous budget (3 s at the `RaftShardStore` wiring site).
     pub peer_rpc_timeout: Duration,
+    /// GH #228 — per-attempt timeout for the targeted top-up
+    /// (`KISEKI_INTENT_TOPUP_TIMEOUT_MS`, default 100 ms — deliberately
+    /// SHORT relative to `peer_rpc_timeout`'s 3 s): a slow candidate
+    /// costs one short stall before the walk falls back to the NEXT
+    /// candidate, preserving the `min_acks` guarantee without the old
+    /// broadcast's redundant RPCs.
+    pub topup_rpc_timeout: Duration,
 }
 
 /// Create a new coalescer for `cfg`. Unlike W12 there is **no spawned
@@ -147,6 +177,7 @@ pub fn spawn(_runtime: &tokio::runtime::Handle, cfg: CoalescerConfig) -> IntentF
             cfg,
             state: Mutex::new(State::default()),
             cap_reached: Notify::new(),
+            topup_seq: AtomicU64::new(0),
         }),
     }
 }
@@ -239,11 +270,11 @@ async fn run_flush_cycle(inner: Arc<CoalescerInner>) {
         "intent fan coalescer: batch taken for flush",
     );
 
-    flush_batch(&inner.cfg, batch).await;
+    flush_batch(&inner, batch).await;
 }
 
-async fn flush_batch(cfg: &CoalescerConfig, batch: Vec<CoalesceReq>) {
-    use futures::StreamExt;
+async fn flush_batch(inner: &CoalescerInner, batch: Vec<CoalesceReq>) {
+    let cfg = &inner.cfg;
 
     // ADR-047 hot-path timer (pif.flush_total) — wall time of the whole
     // flush: local put + leader-first hop + top-up + ack distribution.
@@ -253,10 +284,16 @@ async fn flush_batch(cfg: &CoalescerConfig, batch: Vec<CoalesceReq>) {
     kiseki_tracing::hot_timer_guard!(_ht_pif_flush_total = "pif.flush_total");
 
     // 1. Local durable copy (one fjall batch, one WAL sync).
-    // ADR-047 hot-path timer (pif.local_put) — the synchronous fjall
-    // put_batch (WAL append + fsync) on the submitting node.
+    // ADR-047 hot-path timer (pif.local_put) — submit-to-complete on the
+    // submitting node. GH #228: routed through `submit_batch`, so the
+    // fjall commit runs on the store's dedicated commit thread and
+    // group-commits with the inbound `intent_put` handler's batches
+    // (same per-shard store Arc) instead of blocking this tokio worker
+    // for the WAL sync. The span still measures the honest ack-path
+    // cost: the future resolves only after the durable commit.
     let intents: Vec<WriteIntent> = batch.iter().map(|r| r.intent.clone()).collect();
-    let put_res = kiseki_tracing::hot_span!("pif.local_put", { cfg.store.put_batch(intents) });
+    let put_res =
+        kiseki_tracing::hot_span!("pif.local_put", { cfg.store.submit_batch(intents).await });
     if let Err(e) = put_res {
         tracing::warn!(
             shard_id = %cfg.shard_id.0,
@@ -314,32 +351,56 @@ async fn flush_batch(cfg: &CoalescerConfig, batch: Vec<CoalesceReq>) {
         }
     }
 
-    // 5. Parallel top-up to remaining voter peers.
-    // ADR-047 hot-path timer (pif.topup) — from launching the parallel
-    // fan to flush exit (quorum return, drain, or shortfall; RAII drops
-    // at every path). The shortfall tail adds only a warn! + ack sends.
+    // 5. Targeted top-up (GH #228). The pre-#228 shape fanned to EVERY
+    // remaining voter in parallel and returned at quorum, cancelling the
+    // still-in-flight RPCs — measured on the 2026-06-10 GCP runs at 39 %
+    // redundant intent_put RPCs (2.64 store-applies/write vs the 2.0
+    // min_acks needs) plus ~1.9 k/s/ingress TCP redial churn from the
+    // cancelled pooled streams. Instead: walk ONE candidate at a time in
+    // a per-flush rotation (so steady-state load spreads evenly across
+    // the non-leader voters), each under the SHORT
+    // `KISEKI_INTENT_TOPUP_TIMEOUT_MS` budget, falling back to the NEXT
+    // candidate on timeout/error — the min_acks guarantee and most of
+    // the tail benefit survive a slow peer at a fraction of the RPC
+    // load. Steady-state RPC cancellation is gone; the SLOW-PEER
+    // fallback still drops its timed-out in-flight future (one
+    // cancelled pooled stream per timeout, and the timed-out peer may
+    // still apply server-side — applies/write can exceed 2.0 under
+    // sustained peer pressure; watch kiseki_intent_commit_batch_size
+    // and the applies/write ratio on instrumented runs).
+    //
+    // ADR-047 hot-path timer (pif.topup) — from entering the top-up walk
+    // to flush exit (quorum return or shortfall; RAII drops at every
+    // path). The shortfall tail adds only a warn! + ack sends.
     kiseki_tracing::hot_timer_guard!(_ht_pif_topup = "pif.topup");
-    let mut fan = futures::stream::FuturesUnordered::new();
-    for (node_id, addr) in peers {
-        if !leader_is_local && leader_id == Some(node_id.0) {
-            continue;
-        }
-        fan.push(fan_one_batch(
-            node_id,
-            addr,
-            cfg.shard_id,
-            wire_batch.clone(),
-            cfg.peer_rpc_timeout,
-        ));
-    }
-    while let Some(acked) = fan.next().await {
-        if acked {
-            peer_acks += 1;
-            if local_acks + peer_acks >= cfg.min_acks {
-                for req in batch {
-                    let _ = req.ack.send(Ok(()));
+    let mut candidates: Vec<(NodeId, String)> = peers
+        .into_iter()
+        // The leader was already tried by the leader-first hop above —
+        // don't re-try it. (When the leader IS local it never appears
+        // in `peers`, which excludes the local node.)
+        .filter(|(node_id, _)| leader_is_local || leader_id != Some(node_id.0))
+        .collect();
+    if !candidates.is_empty() {
+        let start = usize::try_from(inner.topup_seq.fetch_add(1, Ordering::Relaxed)).unwrap_or(0)
+            % candidates.len();
+        candidates.rotate_left(start);
+        for (node_id, addr) in candidates {
+            let acked = fan_one_batch(
+                node_id,
+                addr,
+                cfg.shard_id,
+                wire_batch.clone(),
+                cfg.topup_rpc_timeout,
+            )
+            .await;
+            if acked {
+                peer_acks += 1;
+                if local_acks + peer_acks >= cfg.min_acks {
+                    for req in batch {
+                        let _ = req.ack.send(Ok(()));
+                    }
+                    return;
                 }
-                return;
             }
         }
     }
@@ -405,6 +466,24 @@ pub fn batch_timeout_from_env() -> Duration {
     Duration::from_micros(us)
 }
 
+/// Read the targeted top-up per-attempt timeout from
+/// `KISEKI_INTENT_TOPUP_TIMEOUT_MS` (GH #228).
+///
+/// Defaults to **100 ms** — deliberately SHORT next to the 3 s
+/// leader-first per-RPC budget (`INTENT_FAN_PEER_TIMEOUT` at the
+/// `RaftShardStore` wiring site): the top-up walk falls back to the
+/// next candidate on expiry, so the timeout bounds the added tail when
+/// one peer is slow rather than bounding the whole flush.
+#[must_use]
+pub fn topup_timeout_from_env() -> Duration {
+    let ms = std::env::var("KISEKI_INTENT_TOPUP_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &u64| *n >= 1)
+        .unwrap_or(100);
+    Duration::from_millis(ms)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -467,6 +546,7 @@ mod tests {
                 cap_max: 16,
                 cap_timeout: Duration::from_micros(100),
                 peer_rpc_timeout: Duration::from_secs(1),
+                topup_rpc_timeout: Duration::from_millis(100),
             },
         );
         let mut handles = Vec::new();
@@ -499,6 +579,7 @@ mod tests {
                 cap_max: 4,
                 cap_timeout: Duration::from_secs(10),
                 peer_rpc_timeout: Duration::from_secs(1),
+                topup_rpc_timeout: Duration::from_millis(100),
             },
         );
         let mut handles = Vec::new();
@@ -536,6 +617,7 @@ mod tests {
                 cap_max: 16,
                 cap_timeout: Duration::from_micros(50),
                 peer_rpc_timeout: Duration::from_secs(1),
+                topup_rpc_timeout: Duration::from_millis(100),
             },
         );
         for i in 0..3u32 {
@@ -565,6 +647,7 @@ mod tests {
                 cap_max: 3,
                 cap_timeout: Duration::from_micros(100),
                 peer_rpc_timeout: Duration::from_secs(1),
+                topup_rpc_timeout: Duration::from_millis(100),
             },
         );
         let mut handles = Vec::new();

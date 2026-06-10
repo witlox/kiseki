@@ -15,15 +15,17 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode};
+use futures::future::BoxFuture;
 use kiseki_common::ids::NodeId;
 use kiseki_common::locks::LockOrDie;
 use kiseki_common::time::HybridLogicalClock;
 use kiseki_proto::v1::AppendChunkAndDeltaRequest as ProtoChunkAppendReq;
 use prost::Message;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::grpc::{append_chunk_and_delta_request_to_proto, proto_to_append_chunk_and_delta};
 use crate::traits::AppendChunkAndDeltaRequest;
@@ -153,6 +155,29 @@ pub trait IntentStore: Send + Sync {
             out.push(self.put(intent)?);
         }
         Ok(out)
+    }
+
+    /// Async submission variant of [`IntentStore::put_batch`] for the
+    /// two hot call sites (the producer-side intent-fan coalescer's
+    /// local put and the inbound peer `intent_put` handler). The default
+    /// runs [`IntentStore::put_batch`] inline before returning a ready
+    /// future — foundational/test impls stay synchronous with zero task
+    /// hops. [`FjallIntentStore`] overrides it to route through its
+    /// dedicated commit thread (GH #228) so concurrently-submitted
+    /// flushes group-commit into ONE fjall batch + ONE WAL sync.
+    ///
+    /// Resolves with one [`PutOutcome`] per input intent in input order,
+    /// exactly like [`IntentStore::put_batch`]; the future completes
+    /// only once the batch is durably committed (the honest ack point).
+    ///
+    /// # Errors
+    /// Backing-store I/O or codec failure (durable impls only).
+    fn submit_batch(
+        &self,
+        intents: Vec<WriteIntent>,
+    ) -> BoxFuture<'_, Result<Vec<PutOutcome>, IntentError>> {
+        let res = self.put_batch(intents);
+        Box::pin(std::future::ready(res))
     }
 
     /// Pending (un-incorporated) intents, ascending by perspective seq — the
@@ -568,15 +593,231 @@ struct PendingIndex {
     by_idem: HashMap<IdempotencyKey, PerspectiveSeq>,
 }
 
-/// Per-element state for the [`FjallIntentStore::put_batch`] middle pass.
-/// Kept as a module-private struct (not a tuple) so the type signature
-/// stays inside the `type_complexity` clippy budget.
+/// Pre-encoded per-intent state for the durable write path: the
+/// order-preserving seq-key + the encoded value frame, computed BEFORE
+/// the `mutations` mutex is taken (and, for the
+/// [`IntentStore::submit_batch`] path, on the submitter's task rather
+/// than the commit thread). Kept as a module-private struct (not a
+/// tuple) so the type signature stays inside the `type_complexity`
+/// clippy budget.
 struct FjallBatchedRecord {
     seq: PerspectiveSeq,
     idem: Option<IdempotencyKey>,
     seq_key: [u8; SEQ_KEY_LEN],
     value: Vec<u8>,
     intent: WriteIntent,
+}
+
+/// Pre-encode a batch of intents into [`FjallBatchedRecord`]s — the
+/// CPU half of a durable put (proto encode + key encode). Dedup
+/// classification deliberately does NOT happen here: it must run under
+/// the `mutations` mutex (see [`StoreCore::commit_groups_locked`]); a
+/// duplicate's pre-encoded bytes are simply discarded there.
+fn encode_records(intents: Vec<WriteIntent>) -> Vec<FjallBatchedRecord> {
+    intents
+        .into_iter()
+        .map(|intent| FjallBatchedRecord {
+            seq: intent.perspective_seq,
+            idem: intent.idempotency_key,
+            seq_key: encode_seq_key(intent.perspective_seq),
+            value: encode_value(&intent),
+            intent,
+        })
+        .collect()
+}
+
+/// One pre-encoded submission awaiting the dedicated commit thread
+/// (GH #228). `done` resolves AFTER the shared fjall commit that covers
+/// this job's records — the submitter's await spans the true durability
+/// point.
+struct CommitJob {
+    records: Vec<FjallBatchedRecord>,
+    done: oneshot::Sender<Result<Vec<PutOutcome>, IntentError>>,
+}
+
+/// Bound on the commit thread's submission queue. Submissions are whole
+/// flush batches (≤ `KISEKI_INTENT_FAN_BATCH_MAX` intents each), so 64
+/// queued jobs is deep buffering already; past it, `submit_batch`'s
+/// `send().await` parks the submitter until the thread drains a slot —
+/// the backpressure is "wait", never an error.
+const COMMIT_QUEUE_DEPTH: usize = 64;
+
+/// GH #228 — the dedicated commit-thread loop. Parks on the channel,
+/// then drains EVERYTHING available and commits the union as ONE fjall
+/// batch + ONE WAL sync, completing every submitter's oneshot after the
+/// shared commit. This is the cross-flush group commit: N concurrent
+/// ~0.8–2 ms inline commits collapse into one amortised commit. (The
+/// task-hop regression ledger says a bare channel hop loses — the hop
+/// is only paid when the queue is non-empty or the store is contended,
+/// i.e. exactly when there is something to batch WITH; see
+/// `FjallIntentStore::submit_batch`'s inline fast path.)
+///
+/// Exits when the channel is closed AND drained (`blocking_recv`
+/// returns `None` only then), so a dropping store never strands a
+/// queued ack.
+fn commit_thread_loop(core: &StoreCore, rx: &mut mpsc::Receiver<CommitJob>) {
+    while let Some(first) = rx.blocking_recv() {
+        let mut jobs = vec![first];
+        while let Ok(more) = rx.try_recv() {
+            jobs.push(more);
+        }
+        crate::intent_metrics::observe_commit_batch_size(jobs.len());
+        let groups: Vec<Vec<FjallBatchedRecord>> = jobs
+            .iter_mut()
+            .map(|j| std::mem::take(&mut j.records))
+            .collect();
+        let result = {
+            let _guard = core
+                .mutations
+                .lock()
+                .lock_or_die("intent_store.fjall.mutations");
+            core.commit_groups_locked(groups)
+        };
+        match result {
+            Ok(outcomes) => {
+                for (job, out) in jobs.into_iter().zip(outcomes) {
+                    // A dropped receiver (submitter cancelled) is fine —
+                    // the commit is durable either way.
+                    let _ = job.done.send(Ok(out));
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                for job in jobs {
+                    let _ = job.done.send(Err(IntentError::Fjall(msg.clone())));
+                }
+            }
+        }
+    }
+}
+
+/// The shared heart of [`FjallIntentStore`]: every field both the
+/// public facade and the dedicated commit thread (GH #228) need. Split
+/// out behind an `Arc` so the thread holds the store internals without
+/// a reference cycle keeping the facade alive — the facade's `Drop`
+/// closes the submission queue and the thread drains + exits.
+struct StoreCore {
+    db: Database,
+    intents_ks: Keyspace,
+    idem_ks: Keyspace,
+    /// Per-write fsync vs buffered durability. Defaults to `true`
+    /// (POSIX-immediate) so a freshly-opened store is durable until the
+    /// runtime explicitly relaxes it for the group-commit perf path.
+    sync_per_write: AtomicBool,
+    /// Serializes the check-then-insert in the put paths and the
+    /// read-then-delete in `prune` so they are atomic against each
+    /// other — fjall has no transaction across a `get` and a later
+    /// batch commit, so without this two concurrent same-
+    /// `idempotency_key` puts could both miss the dedup pointer and
+    /// both record (regressing O3 vs the mutex-atomic in-memory store).
+    /// Both the synchronous facade methods AND the commit thread take
+    /// this, so the two write paths are mutually atomic.
+    mutations: Mutex<()>,
+    /// W11 (2026-06-02): in-memory mirror of pending state — see
+    /// [`PendingIndex`]. Updated AFTER successful fjall commits (under
+    /// `mutations`), rebuilt from fjall on `open()`.
+    pending_index: Mutex<PendingIndex>,
+    /// Successful intent-record fjall commits (put / `put_batch` /
+    /// `submit_batch`; prune-side commits are not counted) — the
+    /// denominator of the GH #228 group-commit amortisation. Relaxed
+    /// ordering: observability + test hook only.
+    commits: AtomicU64,
+}
+
+impl StoreCore {
+    /// Build a batch whose durability follows `sync_per_write`.
+    /// Relaxed = `PersistMode::Buffer`, NOT `None`: `None` parks the
+    /// committed bytes in fjall's user-space `BufWriter`, where a plain
+    /// process crash loses an *acked* intent — beyond the I-L5 window.
+    /// `Buffer` flushes to OS page cache, the durability point ADR-047
+    /// rev-2 O4 approves for the quorum-intent ack floor (survives
+    /// process crash; the periodic flusher bounds the power-loss
+    /// window; `min_acks` replicas bound correlated loss).
+    fn batch_for_write(&self) -> OwnedWriteBatch {
+        let durability = if self.sync_per_write.load(Ordering::Relaxed) {
+            PersistMode::SyncAll
+        } else {
+            PersistMode::Buffer
+        };
+        self.db.batch().durability(Some(durability))
+    }
+
+    /// GH #228 — classify + commit one or more pre-encoded record
+    /// groups as ONE fjall batch + ONE commit, returning per-group
+    /// outcomes in group order (one [`PutOutcome`] per record, record
+    /// order). The single-group call is the synchronous `put` /
+    /// `put_batch` path and the `submit_batch` inline fast path; the
+    /// multi-group call is the commit thread's drain cycle — the
+    /// cross-flush group commit that amortises the WAL sync across
+    /// every concurrently-submitted flush.
+    ///
+    /// Caller MUST hold the `mutations` mutex — the dedup
+    /// check-then-insert below is only atomic under it.
+    fn commit_groups_locked(
+        &self,
+        groups: Vec<Vec<FjallBatchedRecord>>,
+    ) -> Result<Vec<Vec<PutOutcome>>, IntentError> {
+        // Pass 1 (under the index lock): classify Recorded vs Duplicate
+        // against the committed mirror PLUS the idem keys claimed
+        // earlier in this same call — two same-key submissions drained
+        // into one cycle must dedup against each other (ADR-047 §5 /
+        // O3), not both record.
+        let mut per_group: Vec<Vec<PutOutcome>> = Vec::with_capacity(groups.len());
+        let mut to_record: Vec<FjallBatchedRecord> = Vec::new();
+        {
+            let idx = self
+                .pending_index
+                .lock()
+                .lock_or_die("intent_store.fjall.pending_index");
+            let mut claimed: HashMap<IdempotencyKey, PerspectiveSeq> = HashMap::new();
+            for group in groups {
+                let mut outcomes = Vec::with_capacity(group.len());
+                for r in group {
+                    if let Some(key) = r.idem {
+                        if let Some(&existing) = idx.by_idem.get(&key).or_else(|| claimed.get(&key))
+                        {
+                            outcomes.push(PutOutcome::Duplicate(existing));
+                            continue;
+                        }
+                        claimed.insert(key, r.seq);
+                    }
+                    outcomes.push(PutOutcome::Recorded);
+                    to_record.push(r);
+                }
+                per_group.push(outcomes);
+            }
+        }
+        if to_record.is_empty() {
+            return Ok(per_group);
+        }
+
+        // Pass 2: ONE batch carrying every Recorded intent + dedup
+        // pointer across every group. fjall commits the whole batch
+        // atomically — a crash never leaves a dedup pointer without
+        // its intent (or vice-versa).
+        let mut batch = self.batch_for_write();
+        for r in &to_record {
+            batch.insert(&self.intents_ks, r.seq_key.to_vec(), r.value.clone());
+            if let Some(key) = r.idem {
+                batch.insert(&self.idem_ks, key.to_vec(), r.seq_key.to_vec());
+            }
+        }
+        batch.commit()?;
+        self.commits.fetch_add(1, Ordering::Relaxed);
+
+        // Pass 3: durable commit landed — update the mirror once.
+        let mut idx = self
+            .pending_index
+            .lock()
+            .lock_or_die("intent_store.fjall.pending_index");
+        for r in to_record {
+            if let Some(key) = r.idem {
+                idx.by_idem.insert(key, r.seq);
+            }
+            idx.by_seq.insert(r.seq, r.intent);
+        }
+        Ok(per_group)
+    }
 }
 
 /// Durable, fjall-backed [`IntentStore`] (ADR-047 phase 2).
@@ -600,25 +841,32 @@ struct FjallBatchedRecord {
 /// memtable for every snapshot entry. fjall remains the durable
 /// authority; the mirror is rebuilt on `open()`.
 pub struct FjallIntentStore {
-    db: Database,
-    intents_ks: Keyspace,
-    idem_ks: Keyspace,
-    /// Per-write fsync vs buffered durability. Defaults to `true`
-    /// (POSIX-immediate) so a freshly-opened store is durable until the
-    /// runtime explicitly relaxes it for the group-commit perf path.
-    sync_per_write: AtomicBool,
-    /// Serializes the check-then-insert in `put` and the read-then-delete
-    /// in `prune` so they are atomic against each other — fjall has no
-    /// transaction across a `get` and a later batch commit, so without
-    /// this two concurrent same-`idempotency_key` puts could both miss the
-    /// dedup pointer and both record (regressing O3 vs the mutex-atomic
-    /// in-memory store). Coarse but correct for the single-node store; the
-    /// quorum-write phase revisits granularity.
-    mutations: Mutex<()>,
-    /// W11 (2026-06-02): in-memory mirror of pending state — see
-    /// [`PendingIndex`]. Updated AFTER successful fjall commits (under
-    /// `mutations`), rebuilt from fjall on `open()`.
-    pending_index: Mutex<PendingIndex>,
+    /// Shared internals — see [`StoreCore`]. Behind an `Arc` because the
+    /// dedicated commit thread holds a clone.
+    core: Arc<StoreCore>,
+    /// Submission queue into the dedicated commit thread (GH #228).
+    /// `Option` only so [`Drop`] can close the channel BEFORE joining
+    /// the thread; it is `Some` for the store's entire usable life.
+    commit_tx: Option<mpsc::Sender<CommitJob>>,
+    /// The dedicated commit thread's join handle, taken by [`Drop`]
+    /// (drain-then-exit: the closed queue is fully committed first).
+    commit_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for FjallIntentStore {
+    /// Drain-then-exit (GH #228): close the submission queue, then join
+    /// the commit thread. `blocking_recv` returns `None` only once the
+    /// channel is closed AND empty, so every queued job is committed +
+    /// acked before the thread exits — a dropping store never strands
+    /// an ack.
+    fn drop(&mut self) {
+        drop(self.commit_tx.take());
+        if let Some(handle) = self.commit_thread.take() {
+            if handle.join().is_err() {
+                tracing::warn!("intent commit thread panicked during shutdown");
+            }
+        }
+    }
 }
 
 impl FjallIntentStore {
@@ -685,20 +933,38 @@ impl FjallIntentStore {
             );
         }
 
-        Ok(Self {
+        let core = Arc::new(StoreCore {
             db,
             intents_ks,
             idem_ks,
             sync_per_write: AtomicBool::new(true),
             mutations: Mutex::new(()),
             pending_index: Mutex::new(PendingIndex { by_seq, by_idem }),
+            commits: AtomicU64::new(0),
+        });
+
+        // GH #228 — the dedicated commit thread. One per store (= one
+        // per shard); both hot call sites (the producer coalescer's
+        // local put AND the inbound peer `intent_put` handler) share
+        // this shard's store Arc, so their flushes group-commit here.
+        let (commit_tx, mut commit_rx) = mpsc::channel(COMMIT_QUEUE_DEPTH);
+        let thread_core = Arc::clone(&core);
+        let commit_thread = std::thread::Builder::new()
+            .name("kiseki-intent-commit".to_string())
+            .spawn(move || commit_thread_loop(&thread_core, &mut commit_rx))
+            .map_err(|e| IntentError::Fjall(format!("intent commit thread spawn: {e}")))?;
+
+        Ok(Self {
+            core,
+            commit_tx: Some(commit_tx),
+            commit_thread: Some(commit_thread),
         })
     }
 
     /// Toggle inline-fsync vs buffered durability. Defaults to `true`.
     /// Mirrors `kiseki_chunk`'s `FjallMetaStore::set_sync_per_write`.
     pub fn set_sync_per_write(&self, enabled: bool) {
-        self.sync_per_write.store(enabled, Ordering::Relaxed);
+        self.core.sync_per_write.store(enabled, Ordering::Relaxed);
     }
 
     /// Force an fsync of the WAL. Used by the runtime's periodic flusher
@@ -707,157 +973,113 @@ impl FjallIntentStore {
     /// # Errors
     /// [`IntentError::Fjall`] if the persist call fails.
     pub fn flush(&self) -> Result<(), IntentError> {
-        self.db.persist(PersistMode::SyncAll)?;
+        self.core.db.persist(PersistMode::SyncAll)?;
         Ok(())
     }
 
-    /// Build a batch whose durability follows `sync_per_write`.
-    /// Relaxed = `PersistMode::Buffer`, NOT `None`: `None` parks the
-    /// committed bytes in fjall's user-space `BufWriter`, where a plain
-    /// process crash loses an *acked* intent — beyond the I-L5 window.
-    /// `Buffer` flushes to OS page cache, the durability point ADR-047
-    /// rev-2 O4 approves for the quorum-intent ack floor (survives
-    /// process crash; the periodic flusher bounds the power-loss
-    /// window; `min_acks` replicas bound correlated loss).
-    fn batch_for_write(&self) -> OwnedWriteBatch {
-        let durability = if self.sync_per_write.load(Ordering::Relaxed) {
-            PersistMode::SyncAll
-        } else {
-            PersistMode::Buffer
-        };
-        self.db.batch().durability(Some(durability))
+    /// Number of successful intent-record fjall commits so far (put /
+    /// `put_batch` / `submit_batch`; prune-side commits not counted) —
+    /// the denominator of the GH #228 group-commit amortisation.
+    /// Observability + test hook: the commit-thread tests assert N
+    /// concurrent submissions collapse into a few commits.
+    #[must_use]
+    pub fn commit_count(&self) -> u64 {
+        self.core.commits.load(Ordering::Relaxed)
     }
 }
 
 impl IntentStore for FjallIntentStore {
     fn put(&self, intent: WriteIntent) -> Result<PutOutcome, IntentError> {
-        // Hold the mutation lock across the check + commit so the dedup
-        // check-then-insert is atomic (fjall has no get→batch transaction).
-        let _guard = self
-            .mutations
-            .lock()
-            .lock_or_die("intent_store.fjall.mutations");
-        // W11: dedup via the in-memory mirror. The mirror reflects fjall
-        // (rebuilt on open + maintained under `mutations`), so this check
-        // is consistent with the durable state.
-        if let Some(key) = intent.idempotency_key {
-            let idx = self
-                .pending_index
-                .lock()
-                .lock_or_die("intent_store.fjall.pending_index");
-            if let Some(&existing) = idx.by_idem.get(&key) {
-                return Ok(PutOutcome::Duplicate(existing));
-            }
-        }
-
-        let seq = intent.perspective_seq;
-        let idem = intent.idempotency_key;
-        let seq_key = encode_seq_key(seq);
-        let value = encode_value(&intent);
-
-        // One batch: the intent row and (if keyed) its dedup pointer
-        // commit atomically. A crash mid-commit replays the WAL all-or-
-        // nothing, so a dedup pointer never outlives its intent.
-        let mut batch = self.batch_for_write();
-        batch.insert(&self.intents_ks, seq_key.to_vec(), value);
-        if let Some(key) = idem {
-            batch.insert(&self.idem_ks, key.to_vec(), seq_key.to_vec());
-        }
-        batch.commit()?;
-
-        // W11: durable commit succeeded — update the mirror to match.
-        let mut idx = self
-            .pending_index
-            .lock()
-            .lock_or_die("intent_store.fjall.pending_index");
-        if let Some(key) = idem {
-            idx.by_idem.insert(key, seq);
-        }
-        idx.by_seq.insert(seq, intent);
-        Ok(PutOutcome::Recorded)
+        // One-element batch through the same classify+commit core as
+        // `put_batch` — single source of truth for the dedup-then-commit
+        // atomicity (`mutations` held across both).
+        self.put_batch(vec![intent])?
+            .pop()
+            .ok_or_else(|| IntentError::Codec("put_batch yielded no outcome".to_string()))
     }
 
     fn put_batch(&self, intents: Vec<WriteIntent>) -> Result<Vec<PutOutcome>, IntentError> {
-        // W12 (2026-06-02): batched durable record. The producer's intent-fan
-        // coalescer (and the receiver's `intent_put` handler) submit up to
-        // KISEKI_INTENT_FAN_BATCH_MAX intents per call so the durable backing
-        // store amortises one `mutations` mutex + one fjall batch + one WAL
-        // sync across the whole batch, and the in-memory mirror updates in
-        // one lock acquisition.
+        // W12 (2026-06-02): batched durable record — one `mutations`
+        // mutex + one fjall batch + one WAL sync per call.
+        //
+        // GH #228: this is the SYNCHRONOUS direct path (recovery
+        // restores, supervisor helpers, tests). The two async hot sites
+        // (producer coalescer + inbound `intent_put` handler) use
+        // `submit_batch` instead and group-commit on the dedicated
+        // thread. Both paths serialize on `mutations`, so they are
+        // mutually atomic.
         if intents.is_empty() {
             return Ok(Vec::new());
         }
+        let records = encode_records(intents);
         let _guard = self
+            .core
             .mutations
             .lock()
             .lock_or_die("intent_store.fjall.mutations");
+        Ok(self
+            .core
+            .commit_groups_locked(vec![records])?
+            .pop()
+            .unwrap_or_default())
+    }
 
-        // First pass under the index lock: classify Recorded vs Duplicate
-        // using the in-memory idem mirror (no fjall reads). The mirror
-        // reflects committed state; under the held `mutations` mutex no
-        // concurrent writer can race in between.
-        let mut outcomes: Vec<PutOutcome> = Vec::with_capacity(intents.len());
-        let mut to_record: Vec<FjallBatchedRecord> = Vec::with_capacity(intents.len());
-        {
-            let idx = self
-                .pending_index
-                .lock()
-                .lock_or_die("intent_store.fjall.pending_index");
-            for intent in intents {
-                if let Some(key) = intent.idempotency_key {
-                    if let Some(&existing) = idx.by_idem.get(&key) {
-                        outcomes.push(PutOutcome::Duplicate(existing));
-                        continue;
-                    }
+    fn submit_batch(
+        &self,
+        intents: Vec<WriteIntent>,
+    ) -> BoxFuture<'_, Result<Vec<PutOutcome>, IntentError>> {
+        Box::pin(async move {
+            if intents.is_empty() {
+                return Ok(Vec::new());
+            }
+            // Pre-encode on the submitter's task — the commit thread
+            // only classifies + commits.
+            let records = encode_records(intents);
+            let Some(tx) = self.commit_tx.as_ref() else {
+                // Unreachable in practice (`commit_tx` is `Some` until
+                // Drop, and Drop requires no outstanding borrows), but
+                // refuse loudly rather than panic.
+                return Err(IntentError::Fjall(
+                    "intent commit thread is shut down".to_string(),
+                ));
+            };
+            // Inline fast path: empty queue AND uncontended store →
+            // commit here, with no channel hop and no thread wake. The
+            // task-hop regression ledger (client mpsc-writer −45 %,
+            // L1/L3) says a bare hop loses; the queue path below is
+            // only taken when there is something to batch WITH (queued
+            // jobs, or a concurrent committer holding `mutations`).
+            if tx.capacity() == tx.max_capacity() {
+                if let Ok(_guard) = self.core.mutations.try_lock() {
+                    crate::intent_metrics::observe_commit_batch_size(1);
+                    return Ok(self
+                        .core
+                        .commit_groups_locked(vec![records])?
+                        .pop()
+                        .unwrap_or_default());
                 }
-                let seq = intent.perspective_seq;
-                let idem = intent.idempotency_key;
-                let seq_key = encode_seq_key(seq);
-                let value = encode_value(&intent);
-                outcomes.push(PutOutcome::Recorded);
-                to_record.push(FjallBatchedRecord {
-                    seq,
-                    idem,
-                    seq_key,
-                    value,
-                    intent,
-                });
             }
-        }
-
-        if to_record.is_empty() {
-            return Ok(outcomes);
-        }
-
-        // Second pass: one batch carrying every Recorded intent + dedup
-        // pointer. fjall commits the whole batch atomically.
-        let mut batch = self.batch_for_write();
-        for r in &to_record {
-            batch.insert(&self.intents_ks, r.seq_key.to_vec(), r.value.clone());
-            if let Some(key) = r.idem {
-                batch.insert(&self.idem_ks, key.to_vec(), r.seq_key.to_vec());
-            }
-        }
-        batch.commit()?;
-
-        // Third pass: durable commit landed — update the mirror once.
-        let mut idx = self
-            .pending_index
-            .lock()
-            .lock_or_die("intent_store.fjall.pending_index");
-        for r in to_record {
-            if let Some(key) = r.idem {
-                idx.by_idem.insert(key, r.seq);
-            }
-            idx.by_seq.insert(r.seq, r.intent);
-        }
-        Ok(outcomes)
+            let (done_tx, done_rx) = oneshot::channel();
+            // Bounded queue: `send().await` IS the backpressure — it
+            // parks until the thread drains a slot; it never errors on
+            // a full queue.
+            tx.send(CommitJob {
+                records,
+                done: done_tx,
+            })
+            .await
+            .map_err(|_| IntentError::Fjall("intent commit thread is shut down".to_string()))?;
+            done_rx.await.map_err(|_| {
+                IntentError::Fjall("intent commit thread dropped the ack".to_string())
+            })?
+        })
     }
 
     fn pending(&self) -> Result<Vec<WriteIntent>, IntentError> {
         // W11: pure memory read. BTreeMap iterates ascending by seq, which
         // matches the IntentStore::pending contract.
         let idx = self
+            .core
             .pending_index
             .lock()
             .lock_or_die("intent_store.fjall.pending_index");
@@ -867,6 +1089,7 @@ impl IntentStore for FjallIntentStore {
     fn next_pending_seq(&self) -> Result<Option<PerspectiveSeq>, IntentError> {
         // W11: pure memory read — BTreeMap::keys().next() is the lowest.
         let idx = self
+            .core
             .pending_index
             .lock()
             .lock_or_die("intent_store.fjall.pending_index");
@@ -877,6 +1100,7 @@ impl IntentStore for FjallIntentStore {
         // Serialize against `put` (and concurrent prunes) so the
         // intent/dedup-pointer pair is mutated atomically.
         let _guard = self
+            .core
             .mutations
             .lock()
             .lock_or_die("intent_store.fjall.mutations");
@@ -885,6 +1109,7 @@ impl IntentStore for FjallIntentStore {
         // scan over the durable keyspace.
         let work: Vec<(PerspectiveSeq, Option<IdempotencyKey>)> = {
             let idx = self
+                .core
                 .pending_index
                 .lock()
                 .lock_or_die("intent_store.fjall.pending_index");
@@ -898,18 +1123,19 @@ impl IntentStore for FjallIntentStore {
         }
         // Drop the intent rows and dedup pointers in one batch so a crash
         // mid-prune never leaves a pointer without its intent.
-        let mut batch = self.batch_for_write();
+        let mut batch = self.core.batch_for_write();
         for (seq, idem) in &work {
             let seq_key = encode_seq_key(*seq);
-            batch.remove(&self.intents_ks, seq_key.to_vec());
+            batch.remove(&self.core.intents_ks, seq_key.to_vec());
             if let Some(k) = idem {
-                batch.remove(&self.idem_ks, k.to_vec());
+                batch.remove(&self.core.idem_ks, k.to_vec());
             }
         }
         batch.commit()?;
 
         // Durable commit succeeded — bring the mirror into line.
         let mut idx = self
+            .core
             .pending_index
             .lock()
             .lock_or_die("intent_store.fjall.pending_index");
@@ -926,6 +1152,7 @@ impl IntentStore for FjallIntentStore {
         // PART 8 §T — per-seq prune. Same atomicity contract as `prune`:
         // intent row + dedup pointer commit in one batch.
         let _guard = self
+            .core
             .mutations
             .lock()
             .lock_or_die("intent_store.fjall.mutations");
@@ -933,6 +1160,7 @@ impl IntentStore for FjallIntentStore {
         // touching fjall (was the bulk of the 70 % CPU hit pre-W11).
         let idem = {
             let idx = self
+                .core
                 .pending_index
                 .lock()
                 .lock_or_die("intent_store.fjall.pending_index");
@@ -942,23 +1170,24 @@ impl IntentStore for FjallIntentStore {
             }
         };
         let seq_key = encode_seq_key(seq);
-        let mut batch = self.batch_for_write();
-        batch.remove(&self.intents_ks, seq_key.to_vec());
+        let mut batch = self.core.batch_for_write();
+        batch.remove(&self.core.intents_ks, seq_key.to_vec());
         if let Some(k) = idem {
             // Only drop the dedup pointer if it still points at THIS seq.
             // The mirror's invariant (an idem-pointed seq is always live)
             // means in the common case the pointer matches; we still
             // re-check fjall so the durable state stays consistent if a
             // future change relaxes the mirror's coupling.
-            if let Some(pointer) = self.idem_ks.get(k)? {
+            if let Some(pointer) = self.core.idem_ks.get(k)? {
                 if pointer.as_ref() == seq_key.as_slice() {
-                    batch.remove(&self.idem_ks, k.to_vec());
+                    batch.remove(&self.core.idem_ks, k.to_vec());
                 }
             }
         }
         batch.commit()?;
 
         let mut idx = self
+            .core
             .pending_index
             .lock()
             .lock_or_die("intent_store.fjall.pending_index");
@@ -981,6 +1210,7 @@ impl IntentStore for FjallIntentStore {
             return Ok(());
         }
         let _guard = self
+            .core
             .mutations
             .lock()
             .lock_or_die("intent_store.fjall.mutations");
@@ -989,6 +1219,7 @@ impl IntentStore for FjallIntentStore {
         // absent seqs are skipped at zero LSM cost.
         let work: Vec<(PerspectiveSeq, Option<IdempotencyKey>)> = {
             let idx = self
+                .core
                 .pending_index
                 .lock()
                 .lock_or_die("intent_store.fjall.pending_index");
@@ -1004,14 +1235,14 @@ impl IntentStore for FjallIntentStore {
             return Ok(());
         }
 
-        let mut batch = self.batch_for_write();
+        let mut batch = self.core.batch_for_write();
         for (seq, idem) in &work {
             let seq_key = encode_seq_key(*seq);
-            batch.remove(&self.intents_ks, seq_key.to_vec());
+            batch.remove(&self.core.intents_ks, seq_key.to_vec());
             if let Some(k) = idem {
-                if let Some(pointer) = self.idem_ks.get(*k)? {
+                if let Some(pointer) = self.core.idem_ks.get(*k)? {
                     if pointer.as_ref() == seq_key.as_slice() {
-                        batch.remove(&self.idem_ks, k.to_vec());
+                        batch.remove(&self.core.idem_ks, k.to_vec());
                     }
                 }
             }
@@ -1019,6 +1250,7 @@ impl IntentStore for FjallIntentStore {
         batch.commit()?;
 
         let mut idx = self
+            .core
             .pending_index
             .lock()
             .lock_or_die("intent_store.fjall.pending_index");
@@ -1036,6 +1268,7 @@ impl IntentStore for FjallIntentStore {
     fn pending_len(&self) -> Result<usize, IntentError> {
         // W11: pure memory read.
         let idx = self
+            .core
             .pending_index
             .lock()
             .lock_or_die("intent_store.fjall.pending_index");
@@ -1693,5 +1926,213 @@ mod tests {
         store.remove_seq(seq(1, 0, 1)).unwrap();
         store.remove_seq(seq(1, 0, 1)).unwrap();
         assert_eq!(store.pending_len().unwrap(), 0);
+    }
+
+    // -- GH #228: dedicated commit thread ---------------------------------
+
+    fn make_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// N concurrent `submit_batch` calls stalled behind a held
+    /// `mutations` mutex all queue on the commit thread; on release the
+    /// thread DRAINS them into very few cycles — the cross-flush group
+    /// commit (N submissions sharing 1–2 fjall commits, not N).
+    #[test]
+    fn commit_thread_batches_concurrent_submits_into_few_commits() {
+        const N: u32 = 32;
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(FjallIntentStore::open(&dir.path().join("intents")).unwrap());
+        let rt = make_runtime();
+
+        let baseline = store.commit_count();
+        // Stall the commit thread (and the inline fast path's try_lock)
+        // so every submission takes the queue path.
+        let stall = store.core.mutations.lock().unwrap();
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let s = std::sync::Arc::clone(&store);
+            handles.push(
+                rt.spawn(async move { s.submit_batch(vec![intent(seq(1, i, 1), None)]).await }),
+            );
+        }
+        // Let every submission enqueue while the thread is stalled.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(stall);
+
+        for h in handles {
+            let out = rt.block_on(h).unwrap().expect("every submitter sees Ok");
+            assert_eq!(out, vec![PutOutcome::Recorded]);
+        }
+        let commits = store.commit_count() - baseline;
+        assert!(
+            (1..=4).contains(&commits),
+            "{N} concurrent submissions must group-commit into a few cycles, got {commits}",
+        );
+        assert_eq!(store.pending_len().unwrap(), N as usize);
+    }
+
+    /// More submissions than the queue bound: senders past the bound
+    /// AWAIT queue space (backpressure is "wait", never an error), and
+    /// every submission completes once the thread drains.
+    #[test]
+    fn commit_thread_backpressure_awaits_queue_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(FjallIntentStore::open(&dir.path().join("intents")).unwrap());
+        let rt = make_runtime();
+        let n = u32::try_from(COMMIT_QUEUE_DEPTH).unwrap() + 16;
+
+        let stall = store.core.mutations.lock().unwrap();
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let s = std::sync::Arc::clone(&store);
+            handles.push(
+                rt.spawn(async move { s.submit_batch(vec![intent(seq(2, i, 1), None)]).await }),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(stall);
+        for h in handles {
+            assert!(
+                rt.block_on(h).unwrap().is_ok(),
+                "an over-bound submission must wait for space, never error",
+            );
+        }
+        assert_eq!(store.pending_len().unwrap(), n as usize);
+    }
+
+    /// Drop with jobs in the queue: `Drop` closes the channel and JOINS
+    /// the thread, which drains + commits everything first — no lost
+    /// acks, and the intents are durable across reopen.
+    #[test]
+    fn commit_thread_drains_queue_on_drop_without_losing_acks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intents");
+        let mut rxs = Vec::new();
+        {
+            let store = FjallIntentStore::open(&path).unwrap();
+            // Stall the thread so the jobs pile up in the queue.
+            let stall = store.core.mutations.lock().unwrap();
+            for i in 0..5u32 {
+                let (done_tx, done_rx) = oneshot::channel();
+                store
+                    .commit_tx
+                    .as_ref()
+                    .unwrap()
+                    .try_send(CommitJob {
+                        records: encode_records(vec![intent(seq(3, i, 1), None)]),
+                        done: done_tx,
+                    })
+                    .expect("queue has space");
+                rxs.push(done_rx);
+            }
+            drop(stall);
+            // `store` drops HERE — possibly with jobs still queued.
+        }
+        for rx in rxs {
+            let out = rx.blocking_recv().expect("ack must not be lost on drop");
+            assert_eq!(out.unwrap(), vec![PutOutcome::Recorded]);
+        }
+        let store = FjallIntentStore::open(&path).unwrap();
+        assert_eq!(store.pending_len().unwrap(), 5, "drained jobs are durable");
+    }
+
+    /// Two same-idempotency-key submissions that may share ONE commit
+    /// cycle dedup against each other (the in-cycle `claimed` map):
+    /// first Recorded, second Duplicate(first's seq) — O3 holds across
+    /// the group commit, in arrival order.
+    #[test]
+    fn commit_thread_dedups_same_key_across_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallIntentStore::open(&dir.path().join("intents")).unwrap();
+        let key = [0x77u8; 16];
+        let stall = store.core.mutations.lock().unwrap();
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        let tx = store.commit_tx.as_ref().unwrap();
+        tx.try_send(CommitJob {
+            records: encode_records(vec![intent(seq(4, 0, 1), Some(key))]),
+            done: tx1,
+        })
+        .unwrap();
+        tx.try_send(CommitJob {
+            records: encode_records(vec![intent(seq(4, 1, 1), Some(key))]),
+            done: tx2,
+        })
+        .unwrap();
+        drop(stall);
+        assert_eq!(
+            rx1.blocking_recv().unwrap().unwrap(),
+            vec![PutOutcome::Recorded],
+            "first arrival records",
+        );
+        assert_eq!(
+            rx2.blocking_recv().unwrap().unwrap(),
+            vec![PutOutcome::Duplicate(seq(4, 0, 1))],
+            "second arrival dedups to the first, whether same-cycle or not",
+        );
+        assert_eq!(store.pending_len().unwrap(), 1);
+    }
+
+    /// Sequential submissions from one task take the inline fast path
+    /// (uncontended store, empty queue): one commit each — no channel
+    /// hop — and per-submitter ordering is preserved.
+    #[test]
+    fn submit_batch_fast_path_commits_inline_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallIntentStore::open(&dir.path().join("intents")).unwrap();
+        let rt = make_runtime();
+        let baseline = store.commit_count();
+        rt.block_on(async {
+            let a = store
+                .submit_batch(vec![intent(seq(5, 0, 1), None), intent(seq(5, 1, 1), None)])
+                .await
+                .unwrap();
+            assert_eq!(a, vec![PutOutcome::Recorded, PutOutcome::Recorded]);
+            let b = store
+                .submit_batch(vec![intent(seq(5, 2, 1), None)])
+                .await
+                .unwrap();
+            assert_eq!(b, vec![PutOutcome::Recorded]);
+        });
+        assert_eq!(
+            store.commit_count() - baseline,
+            2,
+            "uncontended fast path = one inline commit per submission",
+        );
+        let ordered: Vec<_> = store
+            .pending()
+            .unwrap()
+            .iter()
+            .map(|i| i.perspective_seq)
+            .collect();
+        assert_eq!(ordered, vec![seq(5, 0, 1), seq(5, 1, 1), seq(5, 2, 1)]);
+    }
+
+    /// The default-trait `submit_batch` (`InMemIntentStore`) runs `put_batch` inline
+    /// with identical outcomes — sync impls stay hop-free.
+    #[test]
+    fn submit_batch_default_impl_matches_put_batch() {
+        let store: std::sync::Arc<dyn IntentStore> = std::sync::Arc::new(InMemIntentStore::new());
+        let rt = make_runtime();
+        let key = [0x21u8; 16];
+        let out = rt
+            .block_on(store.submit_batch(vec![
+                intent(seq(6, 0, 1), Some(key)),
+                intent(seq(6, 1, 1), Some(key)),
+            ]))
+            .unwrap();
+        // NB: the InMem put_batch dedup checks the committed map only, so
+        // the in-batch duplicate behaviour matches put_batch (both record
+        // through `put`-equivalent semantics: second same-key entry dedups).
+        assert_eq!(out[0], PutOutcome::Recorded);
+        assert_eq!(store.pending_len().unwrap(), 1);
+        assert_eq!(out[1], PutOutcome::Duplicate(seq(6, 0, 1)));
     }
 }

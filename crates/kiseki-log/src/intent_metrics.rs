@@ -30,6 +30,9 @@ pub const BATCH_SIZE_METRIC_NAME: &str = "kiseki_intent_put_batch_size";
 /// `kiseki_intent_coalesce_wait_seconds` — exposed on `/metrics`.
 pub const COALESCE_WAIT_METRIC_NAME: &str = "kiseki_intent_coalesce_wait_seconds";
 
+/// `kiseki_intent_commit_batch_size` — exposed on `/metrics`.
+pub const COMMIT_BATCH_SIZE_METRIC_NAME: &str = "kiseki_intent_commit_batch_size";
+
 /// Batch-size buckets — powers-of-two from 1 → 128. `KISEKI_INTENT_FAN_BATCH_MAX`
 /// defaults to 16, so the 1, 2, 4, 8, 16 buckets capture the steady-state
 /// distribution; higher buckets are for capacity/headroom analysis.
@@ -45,6 +48,7 @@ const COALESCE_WAIT_BUCKETS: &[f64] = &[
 
 static BATCH_SIZE: OnceLock<Histogram> = OnceLock::new();
 static COALESCE_WAIT: OnceLock<Histogram> = OnceLock::new();
+static COMMIT_BATCH_SIZE: OnceLock<Histogram> = OnceLock::new();
 
 /// Register the W12 intent-coalescing histograms into the given
 /// Prometheus [`Registry`]. Idempotent: a second call after the
@@ -82,6 +86,19 @@ pub fn register(registry: &Registry) -> Result<(), prometheus::Error> {
         registry.register(Box::new(h.clone()))?;
         let _ = COALESCE_WAIT.set(h);
     }
+    if COMMIT_BATCH_SIZE.get().is_none() {
+        let h = Histogram::with_opts(
+            HistogramOpts::new(
+                COMMIT_BATCH_SIZE_METRIC_NAME,
+                "Submissions per intent-store fjall commit (GH #228 dedicated commit thread; \
+                 the pif.commit_batch_size drain-size distribution). 1 = the inline fast path \
+                 or a lone drain; >1 = cross-flush group commit amortising the WAL sync.",
+            )
+            .buckets(BATCH_SIZE_BUCKETS.to_vec()),
+        )?;
+        registry.register(Box::new(h.clone()))?;
+        let _ = COMMIT_BATCH_SIZE.set(h);
+    }
     Ok(())
 }
 
@@ -110,6 +127,21 @@ pub fn observe_coalesce_wait(d: Duration) {
     }
 }
 
+/// Observe one commit cycle's drain size (GH #228): the number of
+/// submissions sharing one fjall batch + WAL sync. Called by the
+/// dedicated commit thread per drain cycle, and by `submit_batch`'s
+/// inline fast path with `1`.
+pub fn observe_commit_batch_size(n: usize) {
+    if let Some(h) = COMMIT_BATCH_SIZE.get() {
+        // Bounded by COMMIT_QUEUE_DEPTH + 1 in practice; clamp is
+        // defensive only (mirrors observe_intent_put_batch_size).
+        let clamped = u64::try_from(n).unwrap_or(u64::MAX).min(1u64 << 52);
+        #[allow(clippy::cast_precision_loss)]
+        let v = clamped as f64;
+        h.observe(v);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -128,5 +160,6 @@ mod tests {
         // No-op when the global isn't latched — the assertion is "no panic".
         observe_intent_put_batch_size(8);
         observe_coalesce_wait(Duration::from_micros(250));
+        observe_commit_batch_size(3);
     }
 }
