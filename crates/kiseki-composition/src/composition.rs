@@ -903,7 +903,7 @@ pub struct CompositionStore {
     /// than any durable bind on the same name. Drained by `comp_id`,
     /// never by name alone, so a newer pending bind on the same name
     /// survives an older comp's drain (LWW).
-    pending_names: parking_lot::RwLock<PendingNameMap>,
+    pending_names: parking_lot::RwLock<PendingNames>,
     /// Cap on `pending` entries (`KISEKI_COMPOSITION_PENDING_MAX`,
     /// default [`DEFAULT_COMPOSITION_PENDING_MAX`]). At the cap,
     /// volatile creates fall back to the durable write-through path
@@ -914,11 +914,83 @@ pub struct CompositionStore {
     pending_overflows: std::sync::atomic::AtomicU64,
 }
 
-/// `(ns, name) → (comp_id, perspective_seq)` volatile overlay map
-/// (P4 #226). The optional [`PerspectiveSeq`] is the ingress-minted
-/// seq the eventual Create delta carries — recorded for observability
-/// and LWW reasoning; drains key off the `comp_id` alone.
-type PendingNameMap = HashMap<(NamespaceId, String), (CompositionId, Option<PerspectiveSeq>)>;
+/// Volatile overlay name bindings (P4 #226), indexed both ways.
+///
+/// `by_name`: `(ns, name) → (comp_id, perspective_seq)` — the lookup
+/// direction (`lookup_by_name`, conditional checks, LIST merge). The
+/// optional [`PerspectiveSeq`] is the ingress-minted seq the eventual
+/// Create delta carries — recorded for observability and LWW
+/// reasoning; drains key off the `comp_id` alone.
+///
+/// `by_id`: `comp_id → (ns, name)` — the removal direction. Exists so
+/// per-id removal (`drain_pending` / `discard_volatile` / volatile
+/// delete) and `name_for` are O(1) instead of a full-map scan under
+/// the write lock. The scan was #256: every hydrator drain held the
+/// lock for O(overlay) per drained id, quantizing every ack-path bind
+/// behind drain activity (measured −71% PUT on GCP at the P4
+/// boundary).
+///
+/// Invariant: `by_id[id] == key` ⇔ `by_name[key].0 == id`. A newer
+/// bind overwriting `key` evicts the older owner's `by_id` entry in
+/// the same critical section (`bind`), so a stale older `comp_id` can
+/// never remove the newer bind (LWW preserved).
+#[derive(Default)]
+struct PendingNames {
+    by_name: HashMap<(NamespaceId, String), (CompositionId, Option<PerspectiveSeq>)>,
+    by_id: HashMap<CompositionId, (NamespaceId, String)>,
+}
+
+impl PendingNames {
+    /// Bind `key → id` (newest wins). If the key was bound to an
+    /// older comp, that comp's reverse entry is evicted here — after
+    /// this, `remove_by_id(old)` is a no-op on `by_name`.
+    fn bind(&mut self, key: (NamespaceId, String), id: CompositionId, seq: Option<PerspectiveSeq>) {
+        debug_assert!(
+            !self.by_id.contains_key(&id),
+            "volatile comp bound twice — no production emitter re-binds a pending row"
+        );
+        if let Some((old_id, _)) = self.by_name.insert(key.clone(), (id, seq)) {
+            if old_id != id {
+                self.by_id.remove(&old_id);
+            }
+        }
+        // Self-heal the (unreachable-today) re-bind-to-a-different-key
+        // case the debug_assert above flags: if `id` previously owned
+        // another key, drop that key's `by_name` entry while it still
+        // points at `id` — otherwise it would shadow durable reads on
+        // that name forever (adversary review of #256, finding 1).
+        if let Some(prev_key) = self.by_id.insert(id, key) {
+            // `key` moved into the map; read it back for the
+            // same-key (re-bind) comparison — rare branch only.
+            let rebound_same_key = self.by_id.get(&id) == Some(&prev_key);
+            if !rebound_same_key && self.by_name.get(&prev_key).map(|v| v.0) == Some(id) {
+                self.by_name.remove(&prev_key);
+            }
+        }
+    }
+
+    /// Remove whatever binding owns `key` (the durable write-through
+    /// overflow path: the durable bind is strictly newer, the pending
+    /// one is superseded).
+    fn remove_by_name(&mut self, key: &(NamespaceId, String)) {
+        if let Some((old_id, _)) = self.by_name.remove(key) {
+            self.by_id.remove(&old_id);
+        }
+    }
+
+    /// Remove `id`'s binding — O(1). LWW: only removes the `by_name`
+    /// entry if `id` still owns it (a newer bind on the same name
+    /// already evicted us from `by_id` in `bind`, making this a
+    /// no-op, but the ownership re-check keeps the invariant locally
+    /// obvious).
+    fn remove_by_id(&mut self, id: CompositionId) {
+        if let Some(key) = self.by_id.remove(&id) {
+            if self.by_name.get(&key).map(|v| v.0) == Some(id) {
+                self.by_name.remove(&key);
+            }
+        }
+    }
+}
 
 /// ADR-048 hook the gateway implements to release a migrated chunk's
 /// hot-tier copy after the cold-tier slab is durable + the
@@ -1025,7 +1097,7 @@ impl CompositionStore {
             read_cache: parking_lot::Mutex::new(LruCache::new(read_cache_capacity())),
             eviction_sink: parking_lot::RwLock::new(None),
             pending: parking_lot::RwLock::new(HashMap::new()),
-            pending_names: parking_lot::RwLock::new(HashMap::new()),
+            pending_names: parking_lot::RwLock::new(PendingNames::default()),
             pending_max: pending_max_capacity(),
             pending_overflows: std::sync::atomic::AtomicU64::new(0),
         }
@@ -1366,6 +1438,7 @@ impl CompositionStore {
         if let Some(&(id, _)) = self
             .pending_names
             .read()
+            .by_name
             .get(&(namespace_id, name.to_owned()))
         {
             return Ok(Some(id));
@@ -1384,15 +1457,11 @@ impl CompositionStore {
     ) -> Result<Option<(NamespaceId, String)>, CompositionError> {
         // P4 (#226): reverse check on the volatile overlay first — a
         // fresh async write's binding only exists there until the
-        // hydrator materializes it. Linear scan is fine: the overlay
-        // is bounded and small (hydration lag window only).
-        {
-            let pend = self.pending_names.read();
-            for ((ns, n), (cid, _)) in &*pend {
-                if *cid == id {
-                    return Ok(Some((*ns, n.clone())));
-                }
-            }
+        // hydrator materializes it. O(1) via the `by_id` index
+        // (#256: the previous full scan held the lock for O(overlay)
+        // per call).
+        if let Some((ns, n)) = self.pending_names.read().by_id.get(&id) {
+            return Ok(Some((*ns, n.clone())));
         }
         Ok(self.storage.name_for(id)?)
     }
@@ -1529,7 +1598,7 @@ impl CompositionStore {
         let overlay: Vec<(String, CompositionId)> = {
             let pend = self.pending_names.read();
             let mut v = Vec::new();
-            for ((ns, n), (cid, _)) in &*pend {
+            for ((ns, n), (cid, _)) in &pend.by_name {
                 if *ns == namespace_id && prefix.is_none_or(|p| n.starts_with(p)) {
                     v.push((n.clone(), *cid));
                 }
@@ -1686,7 +1755,12 @@ impl CompositionStore {
         // the same shard).
         let _g = self.name_locks[name_shard(namespace_id, &name)].lock();
         let key = (namespace_id, name.clone());
-        let pending_existing = self.pending_names.read().get(&key).map(|&(cid, _)| cid);
+        let pending_existing = self
+            .pending_names
+            .read()
+            .by_name
+            .get(&key)
+            .map(|&(cid, _)| cid);
         let storage_existing = self.storage.name_lookup(namespace_id, &name)?;
         // pending ∪ storage with pending (strictly newer) winning —
         // conditional semantics unchanged from the durable path.
@@ -1706,16 +1780,14 @@ impl CompositionStore {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.storage
                 .put_with_name(comp, namespace_id, name, storage_existing)?;
-            self.pending_names.write().remove(&key);
+            self.pending_names.write().remove_by_name(&key);
             return Ok(id);
         }
         // Row before name: a concurrent `lookup_by_name` → `get` must
         // never observe the name without the row.
         pend.insert(id, comp);
         drop(pend);
-        self.pending_names
-            .write()
-            .insert(key, (id, perspective_seq));
+        self.pending_names.write().bind(key, id, perspective_seq);
         Ok(id)
     }
 
@@ -1730,7 +1802,7 @@ impl CompositionStore {
     /// survives (LWW).
     pub fn discard_volatile(&self, id: CompositionId) -> bool {
         let removed = self.pending.write().remove(&id).is_some();
-        self.pending_names.write().retain(|_, v| v.0 != id);
+        self.pending_names.write().remove_by_id(id);
         removed
     }
 
@@ -1762,7 +1834,7 @@ impl CompositionStore {
     pub fn drain_pending(&self, id: CompositionId) {
         let _g = self.id_locks[id_shard(id)].lock();
         let overlay = self.pending.write().remove(&id);
-        self.pending_names.write().retain(|_, v| v.0 != id);
+        self.pending_names.write().remove_by_id(id);
         if let Some(overlay) = overlay {
             self.merge_drained_overlay_metadata(&overlay);
         }
@@ -2052,7 +2124,7 @@ impl CompositionOps for CompositionStore {
             }
             if let Some(comp) = pend.remove(&id) {
                 drop(pend);
-                self.pending_names.write().retain(|_, v| v.0 != id);
+                self.pending_names.write().remove_by_id(id);
                 return Ok(DeleteResult::Removed(comp.chunks));
             }
         }
@@ -3498,6 +3570,56 @@ mod tests {
             );
             assert!(store.get(newer).is_ok());
             assert_eq!(store.pending_len(), 1);
+        }
+
+        /// #256: `name_for` resolves through the `by_id` index (O(1))
+        /// and the index never serves a stale binding — a superseded
+        /// older comp falls through to storage, exactly like the
+        /// pre-index full-scan (which matched by current map VALUE).
+        #[test]
+        fn name_for_overlay_index_consistency() {
+            let store = setup();
+            let older = store
+                .create_with_name_volatile(
+                    test_ns(),
+                    "k".to_owned(),
+                    None,
+                    vec![],
+                    1,
+                    Some(pseq(1)),
+                )
+                .unwrap();
+            assert_eq!(
+                store.name_for(older).unwrap(),
+                Some((test_ns(), "k".to_owned()))
+            );
+
+            let newer = store
+                .create_with_name_volatile(
+                    test_ns(),
+                    "k".to_owned(),
+                    None,
+                    vec![],
+                    2,
+                    Some(pseq(2)),
+                )
+                .unwrap();
+            // The newer bind owns the name; the older comp's binding
+            // is gone from the overlay in BOTH directions.
+            assert_eq!(
+                store.name_for(newer).unwrap(),
+                Some((test_ns(), "k".to_owned()))
+            );
+            assert_eq!(
+                store.name_for(older).unwrap(),
+                None,
+                "superseded comp must not resolve via a stale by_id entry",
+            );
+
+            // Drain the newer comp: both directions clear.
+            store.drain_pending(newer);
+            assert_eq!(store.name_for(newer).unwrap(), None);
+            assert_eq!(store.lookup_by_name(test_ns(), "k").unwrap(), None);
         }
 
         #[test]
