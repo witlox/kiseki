@@ -77,6 +77,22 @@ where
         Ok(inner.log.range(range).map(|(_, v)| v.clone()).collect())
     }
 
+    /// GH #255 — cap replication batches at 64 entries. This store is
+    /// test/dev-only (production Raft groups run on
+    /// [`crate::FjallRaftLogStore`], whose override is BYTE-budgeted);
+    /// a count cap is size-unaware but keeps the in-memory store's
+    /// replication shape from diverging wildly from production's
+    /// prefix-returning behavior.
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<C::Entry>, io::Error> {
+        const MAX_ENTRIES: u64 = 64;
+        let end = end.min(start.saturating_add(MAX_ENTRIES));
+        self.try_get_log_entries(start..end).await
+    }
+
     async fn read_vote(&mut self) -> Result<Option<VoteOf<C>>, io::Error> {
         let inner = self.inner.lock().await;
         Ok(inner.vote.clone())

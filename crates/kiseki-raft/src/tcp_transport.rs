@@ -59,7 +59,59 @@ use crate::node::KisekiNode;
 
 /// Maximum Raft RPC message size (128 MB). Prevents OOM from
 /// malicious peers (ADV-S1, ADV-S6).
+///
+/// This is the **default**; the runtime checks go through
+/// [`max_raft_rpc_size`], which honors `KISEKI_RAFT_MAX_RPC_BYTES` so
+/// a wedged cluster has an operational escape hatch (GH #255 — a
+/// deployed cluster previously could not be recovered by config when
+/// a replication batch exceeded the cap on both sides).
 pub const MAX_RAFT_RPC_SIZE: usize = 128 * 1024 * 1024;
+
+/// Runtime Raft RPC frame cap: `KISEKI_RAFT_MAX_RPC_BYTES` override of
+/// [`MAX_RAFT_RPC_SIZE`]. Read once per process via `OnceLock` —
+/// changing the env var requires a restart (both sides of a connection
+/// must agree anyway). Unset / `0` / unparseable → the 128 MiB default,
+/// so behavior is unchanged when the knob is absent.
+///
+/// GH #255: operational escape hatch for the append-path frame-cap
+/// collision. The structural fix is the byte-budgeted replication read
+/// ([`replication_byte_budget`] + `FjallRaftLogStore::
+/// limited_get_log_entries`); this knob exists so an already-wedged
+/// cluster can be unwedged without a binary roll.
+pub fn max_raft_rpc_size() -> usize {
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("KISEKI_RAFT_MAX_RPC_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(MAX_RAFT_RPC_SIZE)
+    })
+}
+
+/// Byte budget for ONE replication batch read
+/// (`RaftLogReader::limited_get_log_entries`). Defaults to a quarter
+/// of [`max_raft_rpc_size`] (32 MiB at the default cap) so a full
+/// catch-up batch — entries + the postcard envelope + the
+/// `AppendEntriesRequest` framing — sits comfortably under the frame
+/// cap even with several oversized entries at the boundary. Override
+/// with `KISEKI_RAFT_REPLICATION_BYTE_BUDGET` (read once, `OnceLock`).
+///
+/// GH #255: openraft batches replication by entry count only
+/// (`max_payload_entries`); committer `IncorporateIntents` entries
+/// embed inline payloads, so 300 catch-up entries reached 178–190 MB,
+/// over the 128 MiB frame cap — the receiver closed, the leader
+/// retried the same batch forever, and the cluster wedged permanently.
+pub fn replication_byte_budget() -> usize {
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("KISEKI_RAFT_REPLICATION_BYTE_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or_else(|| max_raft_rpc_size() / 4)
+    })
+}
 
 /// Wire-format version for the multiplexed transport. Schema version
 /// is the first byte of every framed payload, per ADR-004. Bumped to
@@ -106,11 +158,13 @@ pub const RAFT_TRANSPORT_AUX_VERSION_V3: u8 = 3;
 /// value in this set.
 pub const RESERVED_VERSION_BYTES: [u8; 3] = [0x5b, 0x7b, 0x22];
 
-/// Headroom reserved on top of `MAX_RAFT_RPC_SIZE` for the version
-/// byte + status byte + shard_id + tag JSON envelope. Snapshot
+/// Headroom reserved on top of the frame cap for the version
+/// byte + status byte + shard_id + tag envelope. Snapshot
 /// builders should cap their output at
-/// `MAX_RAFT_RPC_SIZE - WIRE_FRAME_OVERHEAD_RESERVED` so a snapshot
-/// at the cap fits the framed wire (ADR-041 gate-1 F-M3).
+/// `max_raft_rpc_size() - WIRE_FRAME_OVERHEAD_RESERVED` so a snapshot
+/// at the cap fits the framed wire (ADR-041 gate-1 F-M3). Use the
+/// runtime [`max_raft_rpc_size`] (not the [`MAX_RAFT_RPC_SIZE`]
+/// default) so the GH #255 escape hatch stays consistent end-to-end.
 pub const WIRE_FRAME_OVERHEAD_RESERVED: usize = 1024;
 
 /// Default maximum concurrent inbound TCP connections per peer cert
@@ -430,10 +484,11 @@ where
             "empty response (peer dropped connection)",
         ));
     }
-    if resp_len > MAX_RAFT_RPC_SIZE {
+    let max_rpc = max_raft_rpc_size();
+    if resp_len > max_rpc {
         return Err(network_error(
             NetworkErrorKind::Transport,
-            format!("response too large: {resp_len} bytes (max {MAX_RAFT_RPC_SIZE})"),
+            format!("response too large: {resp_len} bytes (max {max_rpc})"),
         ));
     }
 
@@ -884,7 +939,7 @@ where
         // An aux response is at minimum status(1) + request_id(8); a
         // multiplexed stream cannot be resynchronised, so close on any
         // out-of-bounds length.
-        if !(9..=MAX_RAFT_RPC_SIZE).contains(&resp_len) {
+        if !(9..=max_raft_rpc_size()).contains(&resp_len) {
             break;
         }
         let mut buf = vec![0u8; resp_len];
@@ -1055,7 +1110,7 @@ impl AuxMuxPool {
         }
 
         let body = encode_aux_request_body(request_id, shard_id, tag, req)?;
-        if body.len() > MAX_RAFT_RPC_SIZE {
+        if body.len() > max_raft_rpc_size() {
             return Err(network_error(
                 NetworkErrorKind::Transport,
                 "aux request too large",
@@ -1746,8 +1801,32 @@ where
             return Ok(()); // peer closed
         }
         let req_len = u32::from_be_bytes(len_buf) as usize;
-        if req_len > MAX_RAFT_RPC_SIZE {
-            tracing::warn!(req_len, max = MAX_RAFT_RPC_SIZE, "Raft RPC oversized");
+        if req_len > max_raft_rpc_size() {
+            tracing::warn!(req_len, max = max_raft_rpc_size(), "Raft RPC oversized");
+            // GH #255 — drain and DISCARD exactly `req_len` bytes with
+            // a bounded buffer (never allocate `req_len`: that's the
+            // ADV-S1 OOM vector this cap exists to block), then reject
+            // with a typed per-RPC failure and KEEP the connection.
+            // Pre-fix we closed without draining; the stream desynced,
+            // the leader retried the same oversized batch forever, and
+            // catch-up replication wedged permanently (1,591 rejections
+            // in 3 min on the 2026-06-11 GCP run). With the byte-
+            // budgeted `limited_get_log_entries` this path should never
+            // fire — the warn above is the regression tripwire.
+            let mut remaining = req_len;
+            // Heap-allocated (not a stack array): the buffer would
+            // otherwise dominate this future's size for every
+            // connection, oversized or not (clippy::large_futures).
+            let mut sink = vec![0u8; 64 * 1024];
+            while remaining > 0 {
+                let take = remaining.min(sink.len());
+                if read_half.read_exact(&mut sink[..take]).await.is_err() {
+                    // Peer died mid-frame — nothing left to keep alive.
+                    return Ok(());
+                }
+                remaining -= take;
+            }
+            drop(sink);
             write_response_locked(&write_half, DispatchStatus::ParseError, Vec::new()).await?;
             if let Some(m) = &metrics {
                 m.record_rpc(
@@ -1757,9 +1836,9 @@ where
                     started.elapsed(),
                 );
             }
-            // We did NOT drain the oversized body — the stream is
-            // desynced; close rather than keep-alive.
-            return Ok(());
+            // Frame fully consumed — the stream is synced; serve the
+            // next frame instead of closing.
+            continue;
         }
         let mut req_buf = vec![0u8; req_len];
         if read_half.read_exact(&mut req_buf).await.is_err() {
@@ -2143,6 +2222,90 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
         let oversized = (MAX_RAFT_RPC_SIZE + 1) as u32;
         client.write_all(&oversized.to_be_bytes()).await.unwrap();
+    }
+
+    /// GH #255 — the REAL listener drains an oversized request body,
+    /// answers `ParseError`, and KEEPS the connection: a follow-up
+    /// valid frame on the same connection gets a real response.
+    /// Pre-fix the listener closed without draining (stream desync),
+    /// which turned an oversized catch-up batch into a permanent
+    /// leader-retry wedge (1,591 rejections / 3 min on the 2026-06-11
+    /// GCP run).
+    #[tokio::test]
+    async fn oversized_request_drained_rejected_connection_survives() {
+        let (addr, registry) = spawn_listener().await;
+        let shard = ShardId(uuid::Uuid::from_u128(0x0255_0001));
+        registry.inner.insert(shard, stub_raft_dispatch());
+
+        let mut client = TcpStream::connect(&addr).await.unwrap();
+
+        // Oversized frame: cap + 1 bytes, streamed in bounded chunks
+        // (the test must not allocate the whole body either).
+        let body_len = max_raft_rpc_size() + 1;
+        client
+            .write_all(&u32::try_from(body_len).unwrap().to_be_bytes())
+            .await
+            .unwrap();
+        let chunk = vec![0u8; 64 * 1024];
+        let mut remaining = body_len;
+        while remaining > 0 {
+            let take = remaining.min(chunk.len());
+            client.write_all(&chunk[..take]).await.unwrap();
+            remaining -= take;
+        }
+        client.flush().await.unwrap();
+
+        // Typed per-RPC failure, not a close: a ParseError response
+        // frame arrives on the same connection.
+        let mut len_buf = [0u8; 4];
+        client.read_exact(&mut len_buf).await.unwrap();
+        let resp_len = u32::from_be_bytes(len_buf) as usize;
+        assert_eq!(resp_len, 1, "ParseError response is the status byte only");
+        let mut resp = vec![0u8; resp_len];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(
+            resp[0],
+            DispatchStatus::ParseError as u8,
+            "oversized request must answer ParseError"
+        );
+
+        // The connection is still frame-synced: a valid Raft-tag frame
+        // on the SAME connection gets the stub dispatcher's Ok.
+        let body = encode_request_body(shard, "vote", &Vec::<u8>::new()).unwrap();
+        client
+            .write_all(&u32::try_from(body.len()).unwrap().to_be_bytes())
+            .await
+            .unwrap();
+        client.write_all(&body).await.unwrap();
+        client.flush().await.unwrap();
+
+        client.read_exact(&mut len_buf).await.unwrap();
+        let resp_len = u32::from_be_bytes(len_buf) as usize;
+        let mut resp = vec![0u8; resp_len];
+        client.read_exact(&mut resp).await.unwrap();
+        assert_eq!(
+            resp[0],
+            DispatchStatus::Ok as u8,
+            "valid frame after the rejected oversized one must be served \
+             — the connection survived"
+        );
+        let marker: Vec<u8> = postcard::from_bytes(&resp[1..]).unwrap();
+        assert_eq!(marker, b"raft");
+    }
+
+    /// GH #255 — with the env knobs UNSET, the runtime cap and the
+    /// replication byte budget must equal their documented defaults
+    /// (128 MiB / 32 MiB): the escape hatch must not change behavior
+    /// when absent.
+    #[test]
+    fn frame_cap_and_budget_defaults_when_env_unset() {
+        assert!(
+            std::env::var("KISEKI_RAFT_MAX_RPC_BYTES").is_err()
+                && std::env::var("KISEKI_RAFT_REPLICATION_BYTE_BUDGET").is_err(),
+            "test requires the GH #255 env knobs to be unset"
+        );
+        assert_eq!(max_raft_rpc_size(), MAX_RAFT_RPC_SIZE);
+        assert_eq!(replication_byte_budget(), MAX_RAFT_RPC_SIZE / 4);
     }
 
     /// Reserved version bytes (start of a JSON value) must produce

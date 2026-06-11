@@ -67,8 +67,9 @@ pub use fjall_log_store::FjallLogStore;
 pub use network::{StubNetwork, StubNetworkFactory};
 pub use node::{KisekiNode, Topology};
 pub use tcp_transport::{
-    classify_network_error, run_single_raft_group_listener, DispatchOutcome, DispatchStatus,
-    NetworkErrorKind, RaftRpcListener, RegistryHandle, TcpNetwork, TcpNetworkFactory,
-    MAX_RAFT_RPC_SIZE, RAFT_TRANSPORT_PER_PEER_MAX_DEFAULT, RAFT_TRANSPORT_VERSION_V1,
-    RESERVED_VERSION_BYTES, WIRE_FRAME_OVERHEAD_RESERVED,
+    classify_network_error, max_raft_rpc_size, replication_byte_budget,
+    run_single_raft_group_listener, DispatchOutcome, DispatchStatus, NetworkErrorKind,
+    RaftRpcListener, RegistryHandle, TcpNetwork, TcpNetworkFactory, MAX_RAFT_RPC_SIZE,
+    RAFT_TRANSPORT_PER_PEER_MAX_DEFAULT, RAFT_TRANSPORT_VERSION_V1, RESERVED_VERSION_BYTES,
+    WIRE_FRAME_OVERHEAD_RESERVED,
 };

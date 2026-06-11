@@ -41,11 +41,17 @@ const DEFAULT_ENTRY_CACHE_CAP: usize = 4096;
 /// ## GH #199: in-memory entry LRU
 ///
 /// `entry_cache` holds the most-recent N (default 4096) entries as
-/// already-deserialized `Arc<C::Entry>`, populated on `append` (the
-/// leader has the typed entry in hand before we ever serialize it).
-/// Reads on the apply / replication paths look up the cache first,
-/// falling back to fjall + postcard decode only on miss. The cache
-/// is invalidated on `truncate_after` / `purge`.
+/// already-deserialized `(Arc<C::Entry>, serialized_byte_len)` pairs,
+/// populated on `append` (the leader has the typed entry in hand
+/// before we ever serialize it; `append_batch` reports the encoded
+/// size for free). Reads on the apply / replication paths look up the
+/// cache first, falling back to fjall + postcard decode only on miss.
+/// The cache is invalidated on `truncate_after` / `purge`.
+///
+/// The serialized size rides along so the GH #255 byte-budgeted
+/// replication read (`limited_get_log_entries`) can account cached
+/// entries against [`crate::tcp_transport::replication_byte_budget`]
+/// without re-serializing them.
 ///
 /// The values are wrapped in `Arc` so cache populate (`append` and
 /// `try_get_log_entries` miss-fill) is a refcount bump, not a deep
@@ -61,9 +67,13 @@ const DEFAULT_ENTRY_CACHE_CAP: usize = 4096;
 #[derive(Clone)]
 pub struct FjallRaftLogStore<C: RaftTypeConfig> {
     inner: Arc<FjallLogStore>,
-    entry_cache: Arc<Mutex<LruCache<u64, Arc<C::Entry>>>>,
+    entry_cache: Arc<Mutex<SizedEntryCache<C>>>,
     _phantom: std::marker::PhantomData<C>,
 }
+
+/// GH #199 entry LRU value shape: the deserialized entry plus its
+/// serialized record length (GH #255 byte-budget accounting).
+type SizedEntryCache<C> = LruCache<u64, (Arc<<C as RaftTypeConfig>::Entry>, usize)>;
 
 impl<C: RaftTypeConfig> FjallRaftLogStore<C> {
     /// Open or create a persistent Raft log store at `path`. The
@@ -151,7 +161,7 @@ where
                 let mut out = Vec::with_capacity(usize::try_from(want).unwrap_or(0));
                 let mut all_hit = true;
                 for i in start..=end {
-                    if let Some(arc) = cache.get(&i) {
+                    if let Some((arc, _size)) = cache.get(&i) {
                         out.push(Arc::clone(arc));
                     } else {
                         all_hit = false;
@@ -174,22 +184,122 @@ where
         // adjacent read is hot. Building the result list by cloning
         // each entry once before moving the original into the cache
         // avoids the double-clone the original implementation paid.
-        let entries: Vec<(u64, C::Entry)> = self.inner.range(start, end)?;
-        let result: Vec<C::Entry> = entries.iter().map(|(_, e)| e.clone()).collect();
+        // The unbudgeted sized read (`usize::MAX`) keeps the GH #199
+        // semantics while carrying each entry's serialized size into
+        // the cache for the GH #255 budget accounting.
+        let entries: Vec<(u64, C::Entry, usize)> =
+            self.inner.range_budgeted(start, end, usize::MAX)?;
+        let result: Vec<C::Entry> = entries.iter().map(|(_, e, _)| e.clone()).collect();
         {
             let mut cache = self
                 .entry_cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (idx, entry) in entries {
-                cache.put(idx, Arc::new(entry));
+            for (idx, entry, size) in entries {
+                cache.put(idx, (Arc::new(entry), size));
             }
         }
         Ok(result)
     }
 
+    /// GH #255 — byte-budgeted replication read. openraft's
+    /// replication stream calls this (NOT `try_get_log_entries`) when
+    /// building an `AppendEntries` batch, and explicitly tolerates a
+    /// PREFIX of `[start, end)`; the contract only forbids returning
+    /// empty for a non-empty range. The default impl delegates to
+    /// `try_get_log_entries` — unbudgeted, which is exactly how
+    /// catch-up batches of 300 fat `IncorporateIntents` entries
+    /// reached 178–190 MB > the 128 MiB frame cap and wedged the
+    /// 2026-06-11 GCP cluster permanently.
+    ///
+    /// Budget: [`crate::tcp_transport::replication_byte_budget`]
+    /// (default frame cap / 4 = 32 MiB).
+    ///
+    /// Walks the GH #199 cache from `start` while every index hits and
+    /// the budget holds — steady-state replication (hot tail, small
+    /// entries) keeps its cache win. On a miss at the FIRST index
+    /// (catch-up = cold), falls through to the budgeted fjall read; on
+    /// a miss after a non-empty accumulation, returns the accumulated
+    /// prefix (valid per the contract — openraft re-requests the rest).
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<C::Entry>, io::Error> {
+        self.limited_get_with_budget(start, end, crate::tcp_transport::replication_byte_budget())
+    }
+
     async fn read_vote(&mut self) -> Result<Option<VoteOf<C>>, io::Error> {
         self.inner.get_meta("vote")
+    }
+}
+
+impl<C: RaftTypeConfig> FjallRaftLogStore<C>
+where
+    C::Entry: DeserializeOwned + Clone,
+{
+    /// [`RaftLogReader::limited_get_log_entries`] body with an
+    /// explicit `budget` — the trait method passes the env-backed
+    /// [`crate::tcp_transport::replication_byte_budget`]; tests pass
+    /// explicit budgets so they don't race on the process-global
+    /// `OnceLock`.
+    fn limited_get_with_budget(
+        &self,
+        start: u64,
+        end: u64,
+        budget: usize,
+    ) -> Result<Vec<C::Entry>, io::Error> {
+        if start >= end {
+            return Ok(Vec::new());
+        }
+
+        // Cache walk: collect Arcs under the mutex (refcount bumps),
+        // deep-clone for openraft's by-value API after release.
+        let (arcs, first_missed) = {
+            let mut cache = self
+                .entry_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut out: Vec<Arc<C::Entry>> = Vec::new();
+            let mut used = 0usize;
+            let mut first_missed = false;
+            for i in start..end {
+                let Some((arc, size)) = cache.get(&i) else {
+                    first_missed = out.is_empty();
+                    break;
+                };
+                if !out.is_empty() && used.saturating_add(*size) > budget {
+                    break;
+                }
+                if out.is_empty() && *size > budget {
+                    tracing::warn!(
+                        index = i,
+                        size,
+                        budget,
+                        "single cached Raft log entry exceeds the replication \
+                         byte budget — returning it alone (never-empty \
+                         contract, GH #255)",
+                    );
+                    out.push(Arc::clone(arc));
+                    break;
+                }
+                used = used.saturating_add(*size);
+                out.push(Arc::clone(arc));
+            }
+            (out, first_missed)
+        };
+        if !arcs.is_empty() && !first_missed {
+            return Ok(arcs.iter().map(|a| (**a).clone()).collect());
+        }
+
+        // Cold path (first index not cached — the catch-up shape):
+        // budgeted read straight from fjall. The early-stop inside
+        // `range_budgeted` means the oversized tail is never even
+        // decoded. Don't populate the cache here — catch-up ranges
+        // are historical and would evict the hot tail.
+        let entries: Vec<(u64, C::Entry, usize)> =
+            self.inner.range_budgeted(start, end - 1, budget)?;
+        Ok(entries.into_iter().map(|(_, e, _)| e).collect())
     }
 }
 
@@ -257,16 +367,18 @@ where
         // and clone-walked it, which was visible as ~14 % regression
         // on the local 3-node profile run.
         let entries: Vec<C::Entry> = entries.into_iter().collect();
-        self.inner
+        let sizes = self
+            .inner
             .append_batch(entries.iter().map(|e| (e.index(), e)))?;
+        debug_assert_eq!(sizes.len(), entries.len());
         {
             let mut cache = self
                 .entry_cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for entry in entries {
-                let idx = entry.index();
-                cache.put(idx, Arc::new(entry));
+            for (entry, (idx, size)) in entries.into_iter().zip(sizes) {
+                debug_assert_eq!(entry.index(), idx);
+                cache.put(idx, (Arc::new(entry), size));
             }
         }
         // #151 (W6) — when the coalescer is on, `append_batch` only
@@ -359,6 +471,143 @@ mod tests {
             Node = crate::node::KisekiNode,
             SnapshotData = std::io::Cursor<Vec<u8>>,
     );
+
+    use openraft::alias::CommittedLeaderIdOf;
+    use openraft::vote::RaftLeaderId;
+    use openraft::{EntryPayload, LogId};
+
+    type TestEntry = <TestConfig as RaftTypeConfig>::Entry;
+
+    fn lid(index: u64) -> LogIdOf<TestConfig> {
+        LogId::new(CommittedLeaderIdOf::<TestConfig>::new(1, 1), index)
+    }
+
+    /// A normal entry whose `TestCmd` payload is `payload_len` bytes —
+    /// the serialized record is payload + small framing overhead, so
+    /// byte-budget arithmetic in the tests can treat `payload_len` as
+    /// the entry's approximate size.
+    fn fat_entry(index: u64, payload_len: usize) -> TestEntry {
+        RaftEntry::new(
+            lid(index),
+            EntryPayload::Normal(TestCmd("x".repeat(payload_len))),
+        )
+    }
+
+    fn noop() -> IOFlushed<TestConfig> {
+        IOFlushed::<TestConfig>::noop()
+    }
+
+    /// One ~1 MiB payload per entry — the production shape that wedged
+    /// the 2026-06-11 GCP cluster (committer `IncorporateIntents`
+    /// entries embedding inline payloads).
+    const MIB: usize = 1024 * 1024;
+
+    /// GH #255 (cold path) — a fresh store instance (empty GH #199
+    /// cache, the follower-catch-up shape) must return a budget-bounded
+    /// PREFIX from fjall when entries are large, and the full range
+    /// when the budget is generous.
+    #[tokio::test]
+    async fn limited_get_budgets_cold_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budgeted-cold");
+
+        {
+            let mut store = FjallRaftLogStore::<TestConfig>::open(&path).unwrap();
+            let entries: Vec<TestEntry> = (1..=5).map(|i| fat_entry(i, MIB)).collect();
+            store.append(entries, noop()).await.unwrap();
+        }
+
+        // Reopen → empty entry cache → the fjall `range_budgeted` path.
+        let store = FjallRaftLogStore::<TestConfig>::open(&path).unwrap();
+
+        // ~2.5 MiB budget cuts 5 × ~1 MiB entries to a 2-entry prefix.
+        let got = store
+            .limited_get_with_budget(1, 6, 2 * MIB + MIB / 2)
+            .unwrap();
+        assert_eq!(
+            got.len(),
+            2,
+            "cold budgeted read must return a 2-entry prefix, got {}",
+            got.len()
+        );
+        assert_eq!(got[0].index(), 1);
+        assert_eq!(got[1].index(), 2);
+
+        // Generous budget → full range.
+        let all = store.limited_get_with_budget(1, 6, usize::MAX).unwrap();
+        assert_eq!(all.len(), 5);
+
+        // Budget below the first entry → never-empty contract: exactly
+        // the first entry comes back.
+        let one = store.limited_get_with_budget(1, 6, 16).unwrap();
+        assert_eq!(one.len(), 1, "never-empty contract violated");
+        assert_eq!(one[0].index(), 1);
+
+        // Empty range stays empty.
+        assert!(store
+            .limited_get_with_budget(3, 3, usize::MAX)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// GH #255 (hot path) — entries appended on this instance are in
+    /// the GH #199 cache; the cache walk must honor the byte budget
+    /// exactly like the cold path (pre-fix the cache had no sizes, so
+    /// any budgeting would have forced a re-serialize).
+    #[tokio::test]
+    async fn limited_get_budgets_cache_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store =
+            FjallRaftLogStore::<TestConfig>::open(&dir.path().join("budgeted-hot")).unwrap();
+        let entries: Vec<TestEntry> = (1..=5).map(|i| fat_entry(i, MIB)).collect();
+        store.append(entries, noop()).await.unwrap();
+
+        // All 5 are cache-resident (append populates the LRU).
+        let got = store
+            .limited_get_with_budget(1, 6, 2 * MIB + MIB / 2)
+            .unwrap();
+        assert_eq!(
+            got.len(),
+            2,
+            "cache-hit budgeted read must return a 2-entry prefix, got {}",
+            got.len()
+        );
+        assert_eq!(got[0].index(), 1);
+        assert_eq!(got[1].index(), 2);
+
+        // Generous budget → full range straight from cache.
+        let all = store.limited_get_with_budget(1, 6, usize::MAX).unwrap();
+        assert_eq!(all.len(), 5);
+
+        // First cached entry alone over-budget → returned alone.
+        let one = store.limited_get_with_budget(2, 6, 16).unwrap();
+        assert_eq!(one.len(), 1, "never-empty contract violated on cache hit");
+        assert_eq!(one[0].index(), 2);
+    }
+
+    /// GH #255 — small entries (steady-state replication shape) pass
+    /// through the default budget untouched on both paths.
+    #[tokio::test]
+    async fn limited_get_small_entries_full_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budgeted-small");
+        {
+            let mut store = FjallRaftLogStore::<TestConfig>::open(&path).unwrap();
+            let entries: Vec<TestEntry> = (1..=20).map(|i| fat_entry(i, 256)).collect();
+            store.append(entries, noop()).await.unwrap();
+            // Hot: full range from cache.
+            let hot = store
+                .limited_get_with_budget(1, 21, crate::tcp_transport::replication_byte_budget())
+                .unwrap();
+            assert_eq!(hot.len(), 20);
+        }
+        // Cold: full range from fjall.
+        let store = FjallRaftLogStore::<TestConfig>::open(&path).unwrap();
+        let cold = store
+            .limited_get_with_budget(1, 21, crate::tcp_transport::replication_byte_budget())
+            .unwrap();
+        assert_eq!(cold.len(), 20);
+    }
 
     #[tokio::test]
     async fn vote_roundtrip() {

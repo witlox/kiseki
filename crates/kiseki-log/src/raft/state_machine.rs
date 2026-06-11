@@ -76,11 +76,15 @@ fn snapshot_over_cap_counter() -> &'static IntCounterVec {
 }
 
 /// Snapshot size budget: the multiplexed Raft transport rejects any
-/// framed RPC above [`kiseki_raft::MAX_RAFT_RPC_SIZE`]; reserve the
+/// framed RPC above [`kiseki_raft::max_raft_rpc_size`] (default
+/// [`kiseki_raft::MAX_RAFT_RPC_SIZE`], overridable via
+/// `KISEKI_RAFT_MAX_RPC_BYTES` — GH #255 escape hatch); reserve the
 /// envelope headroom so a snapshot at the cap still frames (ADR-041
-/// gate-1 F-M3, GH #220).
-const SNAPSHOT_SIZE_CAP: usize =
-    kiseki_raft::MAX_RAFT_RPC_SIZE - kiseki_raft::WIRE_FRAME_OVERHEAD_RESERVED;
+/// gate-1 F-M3, GH #220). A fn (not a const) so the over-cap alarm
+/// tracks the runtime cap.
+fn snapshot_size_cap() -> usize {
+    kiseki_raft::max_raft_rpc_size().saturating_sub(kiseki_raft::WIRE_FRAME_OVERHEAD_RESERVED)
+}
 
 /// Read the entry-cap from `KISEKI_DEDUP_WINDOW_ENTRIES`, defaulting to
 /// [`DEFAULT_DEDUP_WINDOW_ENTRIES`]. Used by `ShardSmInner::new` so every fresh
@@ -826,7 +830,7 @@ impl ShardSmInner {
     /// gets identical bytes. (Pre-unification, `get_current_snapshot`
     /// skipped the readback and shipped empty ciphertexts.)
     ///
-    /// Postcard-encoded; if the result exceeds [`SNAPSHOT_SIZE_CAP`]
+    /// Postcard-encoded; if the result exceeds [`snapshot_size_cap`]
     /// we log + count but STILL return it (GH #220 — loud, not
     /// wedged: refusing would block log purge and local recovery,
     /// while only the cross-node transfer is actually doomed).
@@ -859,14 +863,14 @@ impl ShardSmInner {
             recent_incorporated: self.recent_incorporated.iter().copied().collect(),
         };
         let data = postcard::to_stdvec(&snap).map_err(io::Error::other)?;
-        if data.len() > SNAPSHOT_SIZE_CAP {
+        if data.len() > snapshot_size_cap() {
             snapshot_over_cap_counter()
                 .with_label_values(&[&self.shard_id.0.to_string()])
                 .inc();
             tracing::error!(
                 shard = %self.shard_id.0,
                 size = data.len(),
-                cap = SNAPSHOT_SIZE_CAP,
+                cap = snapshot_size_cap(),
                 "shard snapshot exceeds Raft RPC frame budget — cross-node \
                  snapshot install WILL fail; split the shard (GH #220)",
             );
