@@ -40,6 +40,18 @@
 //!   (`KISEKI_COMMITTER_PIPELINE_DEPTH`, default
 //!   [`DEFAULT_PIPELINE_DEPTH`]). `0` opts back into the legacy
 //!   serial `drain_local` path (the revert lever).
+//! - **Batch-aware submission (GH #253).** When ≥ 1 round is already
+//!   in flight, an additional round is only submitted if it carries at
+//!   least `KISEKI_COMMITTER_MIN_PIPELINE_BATCH` intents (default
+//!   [`DEFAULT_MIN_PIPELINE_BATCH`]); smaller leftovers hold and
+//!   accumulate across ticks, restoring the serial drain's natural
+//!   batching. When NO round is in flight the drain always submits —
+//!   the pipeline never stalls. Without this, production arrival
+//!   patterns (a few intents per tick, not a saturating backlog)
+//!   flooded 2.6× more incorporate rounds at the same ~190 ms
+//!   per-round cost, starving follower apply capacity until #228 topup
+//!   acks missed their window → sustained `QuorumLost` on acked writes
+//!   (the 2026-06-11 A/B halt).
 //! - **In-flight seq filter.** The drain re-reads ALL pending each
 //!   tick (PART 8 drain-all — no floor). Intents already submitted
 //!   but not yet applied are filtered out so they are not re-appended
@@ -91,6 +103,34 @@ pub const DEFAULT_PIPELINE_DEPTH: usize = 2;
 /// start to matter for follower memory and AE round sizes.
 pub const MAX_PIPELINE_DEPTH: usize = 8;
 
+/// GH #253 — minimum batch size for an ADDITIONAL in-flight round.
+///
+/// The original #230 drain submitted whatever was pending every tick
+/// up to `depth` rounds. Under production arrival patterns (a few
+/// intents per 50 ms tick per shard, not a pre-built saturating
+/// backlog) that floods sub-batch incorporate rounds — the 2026-06-11
+/// local A/B measured 2.6× more `sink_incorporate` rounds at the SAME
+/// ~190 ms per-round cost, monopolizing follower apply capacity until
+/// #228's 100 ms topup acks started missing the window → sustained
+/// `QuorumLost` on ACKED writes (~0.2–0.45 % and scaling with run
+/// length).
+///
+/// The fix: when ≥ 1 round is already in flight, only submit another
+/// if the batch holds at least this many intents — otherwise hold and
+/// let the backlog accumulate exactly as the serial drain did. When NO
+/// round is in flight the drain always submits (the pipeline never
+/// stalls; visibility latency is bounded by one round + one tick).
+/// Deep backlogs still split into full `DRAIN_BATCH_CAP` rounds that
+/// all clear the threshold, so depth-2's latency overlap is preserved
+/// where it pays.
+pub const DEFAULT_MIN_PIPELINE_BATCH: usize = DRAIN_BATCH_CAP / 4;
+
+// Compile-time guard: the default must be a real fraction of the round
+// cap — 0 would resurrect the #253 flood; > cap would hold even full
+// rounds and silently serialize the pipeline.
+const _: () =
+    assert!(DEFAULT_MIN_PIPELINE_BATCH > 0 && DEFAULT_MIN_PIPELINE_BATCH <= DRAIN_BATCH_CAP);
+
 /// Consecutive leader drains with strictly-growing backlog before the
 /// throttled WARN fires.
 pub const BACKLOG_TREND_WINDOW: usize = 10;
@@ -108,6 +148,20 @@ pub fn pipeline_depth_from_env() -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(DEFAULT_PIPELINE_DEPTH)
         .min(MAX_PIPELINE_DEPTH)
+}
+
+/// Read `KISEKI_COMMITTER_MIN_PIPELINE_BATCH` (GH #253): the minimum
+/// pending-batch size required to submit an ADDITIONAL round while one
+/// is already in flight. `0` = always submit (the pre-#253 flooding
+/// behavior). Clamped to `DRAIN_BATCH_CAP` — above that no batch could
+/// ever qualify and the pipeline would degrade to serial.
+#[must_use]
+pub fn min_pipeline_batch_from_env() -> usize {
+    std::env::var("KISEKI_COMMITTER_MIN_PIPELINE_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MIN_PIPELINE_BATCH)
+        .min(DRAIN_BATCH_CAP)
 }
 
 /// Convert one durable [`WriteIntent`] into the wire-side
@@ -302,6 +356,9 @@ pub struct PipelinedCommitter<A: PipelinedIntentAppender> {
     store: Arc<dyn IntentStore>,
     appender: A,
     depth: usize,
+    /// GH #253 — minimum batch size to submit an ADDITIONAL round
+    /// while ≥ 1 round is in flight. See [`DEFAULT_MIN_PIPELINE_BATCH`].
+    min_batch: usize,
     in_flight: VecDeque<InFlightRound>,
     in_flight_seqs: HashSet<PerspectiveSeq>,
     trend: BacklogTrend,
@@ -312,7 +369,9 @@ pub struct PipelinedCommitter<A: PipelinedIntentAppender> {
 impl<A: PipelinedIntentAppender> PipelinedCommitter<A> {
     /// Build a drain over the shard's local intent store and the Raft
     /// submit seam. `depth >= 1` (callers map `0` to the legacy serial
-    /// path before constructing).
+    /// path before constructing). The #253 min-batch threshold comes
+    /// from [`min_pipeline_batch_from_env`]; tests pin it via
+    /// [`Self::with_min_batch`].
     #[must_use]
     pub fn new(
         store: Arc<dyn IntentStore>,
@@ -324,12 +383,22 @@ impl<A: PipelinedIntentAppender> PipelinedCommitter<A> {
             store,
             appender,
             depth: depth.max(1),
+            min_batch: min_pipeline_batch_from_env(),
             in_flight: VecDeque::new(),
             in_flight_seqs: HashSet::new(),
             trend: BacklogTrend::new(BACKLOG_TREND_WINDOW),
             shard_label,
             last_backlog_warn: None,
         }
+    }
+
+    /// Builder seam pinning the #253 min-batch threshold — tests use
+    /// this instead of process-wide env mutation. `0` = always submit
+    /// (the pre-#253 behavior); clamps to [`DRAIN_BATCH_CAP`].
+    #[must_use]
+    pub fn with_min_batch(mut self, min_batch: usize) -> Self {
+        self.min_batch = min_batch.min(DRAIN_BATCH_CAP);
+        self
     }
 
     /// Rounds currently in flight.
@@ -421,9 +490,18 @@ impl<A: PipelinedIntentAppender> PipelinedCommitter<A> {
     ///    flight. Returns with up to `depth` rounds still in flight —
     ///    they overlap the supervisor's tick sleep.
     ///
+    /// Batch-aware submission (GH #253): when ≥ 1 round is already in
+    /// flight, a batch smaller than the min-batch threshold
+    /// ([`min_pipeline_batch_from_env`]) is HELD — it stays pending
+    /// and accumulates across ticks, exactly as the serial drain's
+    /// natural batching did, instead of flooding sub-batch rounds that
+    /// monopolize follower apply capacity. When NO round is in flight
+    /// the drain always submits, so the pipeline never stalls: held
+    /// intents go out at the latest when the in-flight round completes.
+    ///
     /// # Returns
     /// The number of intents SUBMITTED this tick (not necessarily yet
-    /// applied).
+    /// applied). Held intents are not counted.
     ///
     /// # Errors
     /// Propagates [`IntentError`] from [`IntentStore::pending`] or a
@@ -449,6 +527,15 @@ impl<A: PipelinedIntentAppender> PipelinedCommitter<A> {
 
         let mut submitted = 0usize;
         for batch in pending.chunks(DRAIN_BATCH_CAP) {
+            // GH #253 — batch-aware submission: with a round already
+            // in flight, hold sub-min-batch leftovers and let them
+            // accumulate (only the LAST chunk can be under the cap, so
+            // this breaks at most once, at the tail). Never holds when
+            // the pipeline is idle — submission is guaranteed at the
+            // latest one tick after the in-flight rounds complete.
+            if !self.in_flight.is_empty() && batch.len() < self.min_batch {
+                break;
+            }
             while self.in_flight.len() >= self.depth {
                 self.await_oldest().await;
             }
@@ -665,6 +752,10 @@ mod tests {
         }
     }
 
+    /// Test committer with the min-batch threshold PINNED to the
+    /// shipped default (no process-wide env dependence). Tests that
+    /// exercise the in-flight machinery with tiny batches override via
+    /// `.with_min_batch(0)` (the pre-#253 always-submit behavior).
     fn committer(
         store: &Arc<InMemIntentStore>,
         appender: &ManualAppender,
@@ -676,10 +767,14 @@ mod tests {
             depth,
             "test-shard".into(),
         )
+        .with_min_batch(DEFAULT_MIN_PIPELINE_BATCH)
     }
 
     /// Depth 2: a tick submits the whole backlog as one round and
-    /// leaves it in flight (no blocking on an idle pipeline).
+    /// leaves it in flight (no blocking on an idle pipeline). Also the
+    /// #253 policy's first leg: NO round in flight → always submit,
+    /// even far below the min-batch threshold (2 ≪ 250) — the pipeline
+    /// never stalls on an idle shard.
     #[tokio::test]
     async fn drain_submits_without_awaiting_when_below_depth() {
         let store = Arc::new(InMemIntentStore::new());
@@ -697,15 +792,83 @@ mod tests {
         );
     }
 
+    /// #253 policy, second leg: a round in flight + sub-min-batch
+    /// pending → HOLD. Nothing submits; the backlog accumulates for a
+    /// later, bigger round instead of flooding sub-batch rounds.
+    #[tokio::test]
+    async fn inflight_plus_small_pending_holds() {
+        let store = Arc::new(InMemIntentStore::new());
+        fill(&store, &[seq(1, 0, 1)]);
+        let appender = ManualAppender::default();
+        let mut pc = committer(&store, &appender, 2).with_min_batch(4);
+
+        assert_eq!(pc.drain_tick().await.unwrap(), 1);
+        assert_eq!(pc.in_flight_len(), 1);
+        // Three new intents arrive — below the min-batch of 4.
+        fill(&store, &[seq(2, 0, 1), seq(3, 0, 1), seq(4, 0, 1)]);
+        assert_eq!(pc.drain_tick().await.unwrap(), 0, "held, not submitted");
+        assert_eq!(appender.batches().len(), 1, "no second round");
+        assert_eq!(pc.in_flight_len(), 1);
+    }
+
+    /// #253 policy, third leg: a round in flight + pending ≥ min-batch
+    /// → submit (depth-2 latency overlap preserved for real backlogs).
+    #[tokio::test]
+    async fn inflight_plus_big_pending_submits() {
+        let store = Arc::new(InMemIntentStore::new());
+        fill(&store, &[seq(1, 0, 1)]);
+        let appender = ManualAppender::default();
+        let mut pc = committer(&store, &appender, 2).with_min_batch(4);
+
+        assert_eq!(pc.drain_tick().await.unwrap(), 1);
+        // Four new intents — exactly the min-batch.
+        fill(
+            &store,
+            &[seq(2, 0, 1), seq(3, 0, 1), seq(4, 0, 1), seq(5, 0, 1)],
+        );
+        assert_eq!(pc.drain_tick().await.unwrap(), 4, "min-batch met, submits");
+        assert_eq!(appender.batches().len(), 2);
+        assert_eq!(pc.in_flight_len(), 2);
+    }
+
+    /// #253 liveness: held intents are NOT starved — once the
+    /// in-flight round completes (reaped at the next tick), the
+    /// accumulated backlog submits even though it is still below the
+    /// min-batch threshold (idle pipeline → always submit).
+    #[tokio::test]
+    async fn held_intents_submit_once_pipeline_idles() {
+        let store = Arc::new(InMemIntentStore::new());
+        fill(&store, &[seq(1, 0, 1)]);
+        let appender = ManualAppender::default();
+        let mut pc = committer(&store, &appender, 2).with_min_batch(4);
+
+        assert_eq!(pc.drain_tick().await.unwrap(), 1);
+        fill(&store, &[seq(2, 0, 1), seq(3, 0, 1)]);
+        assert_eq!(pc.drain_tick().await.unwrap(), 0, "held while in flight");
+        // Round 0 completes; its seq is pruned off-band.
+        appender.resolve(0, Ok(()));
+        tokio::task::yield_now().await;
+        store.remove_seqs(&[seq(1, 0, 1)]).unwrap();
+
+        assert_eq!(
+            pc.drain_tick().await.unwrap(),
+            2,
+            "idle pipeline submits the held backlog despite < min_batch"
+        );
+        assert_eq!(appender.batches()[1], vec![seq(2, 0, 1).0, seq(3, 0, 1).0]);
+    }
+
     /// The in-flight filter: while a round is unresolved, a re-drain
     /// does NOT resubmit its seqs; NEW seqs still go out (in a new
     /// round), so nothing is starved behind the in-flight round.
+    /// (`min_batch = 0` so the #253 hold doesn't mask the filter
+    /// behavior under test.)
     #[tokio::test]
     async fn in_flight_seqs_are_not_resubmitted() {
         let store = Arc::new(InMemIntentStore::new());
         fill(&store, &[seq(1, 0, 1), seq(2, 0, 1)]);
         let appender = ManualAppender::default();
-        let mut pc = committer(&store, &appender, 3);
+        let mut pc = committer(&store, &appender, 3).with_min_batch(0);
 
         assert_eq!(pc.drain_tick().await.unwrap(), 2);
         // Round 0 unresolved; two new intents arrive (one OLDER-seq
@@ -889,5 +1052,19 @@ mod tests {
         // NOTE: no env mutation here (process-wide) — exercise the
         // constants' relationship instead.
         assert_eq!(DEFAULT_PIPELINE_DEPTH.clamp(1, MAX_PIPELINE_DEPTH), 2);
+    }
+
+    /// #253 — the builder seam must clamp oversized thresholds to the
+    /// round cap (bounds of the DEFAULT are a compile-time `const`
+    /// assert next to the constant).
+    #[test]
+    fn default_min_batch_within_bounds_and_clamped() {
+        let store = Arc::new(InMemIntentStore::new());
+        let appender = ManualAppender::default();
+        let pc = committer(&store, &appender, 2).with_min_batch(usize::MAX);
+        assert_eq!(
+            pc.min_batch, DRAIN_BATCH_CAP,
+            "oversized threshold clamps to the round cap"
+        );
     }
 }

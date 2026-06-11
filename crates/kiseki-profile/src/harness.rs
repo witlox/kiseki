@@ -109,17 +109,31 @@ impl PortReservation {
 /// root instead (unique per-run subdir, still removed on drop) so
 /// the data path hits a real disk.
 pub fn profile_data_dir(label: &str) -> Result<tempfile::TempDir, String> {
-    match std::env::var("KISEKI_PROFILE_DATA_ROOT") {
+    let dir = match std::env::var("KISEKI_PROFILE_DATA_ROOT") {
         Ok(root) if !root.is_empty() => {
             std::fs::create_dir_all(&root)
                 .map_err(|e| format!("create KISEKI_PROFILE_DATA_ROOT {root}: {e}"))?;
             tempfile::Builder::new()
                 .prefix(&format!("kiseki-profile-{label}-"))
                 .tempdir_in(&root)
-                .map_err(|e| format!("tempdir under KISEKI_PROFILE_DATA_ROOT {root}: {e}"))
+                .map_err(|e| format!("tempdir under KISEKI_PROFILE_DATA_ROOT {root}: {e}"))?
         }
-        _ => tempfile::tempdir().map_err(|e| format!("tempdir ({label}): {e}")),
-    }
+        _ => tempfile::tempdir().map_err(|e| format!("tempdir ({label}): {e}"))?,
+    };
+    // Pre-seed an EMPTY ADR-049 pointer file so the spawned server's
+    // `first_boot_local_resolve` skips device discovery and every
+    // fjall tier falls back to its data_dir-relative convention path.
+    // Without this, localhost multi-node clusters on hosts where
+    // /proc/mounts exposes a writable `/dev/`-sourced mount (e.g.
+    // sandbox bind mounts) all resolve SmallObject/IntentStore/... to
+    // the SAME shared `<mount>/kiseki/<tier>` path — the first node
+    // takes the fjall journal lock and every other node dies at boot
+    // with `FjallError: Locked`. An empty `paths` map is a valid
+    // pointer (load → Some), `has_resolved()` stays false, and
+    // `compare_tier` treats every tier as first-boot Ok.
+    std::fs::write(dir.path().join("kiseki-tier-paths.json"), b"{\"paths\":{}}")
+        .map_err(|e| format!("seed kiseki-tier-paths.json ({label}): {e}"))?;
+    Ok(dir)
 }
 
 pub struct ProfileServer {
@@ -209,6 +223,15 @@ impl ProfileServer {
             // Forwarded so a bench run can size the store to its
             // intended write volume.
             "KISEKI_CHUNK_DEVICE_BYTES",
+            // #230/#253 committer drain levers — mirrors the
+            // multi-node Cluster forward list.
+            "KISEKI_COMMITTER_PIPELINE_DEPTH",
+            "KISEKI_COMMITTER_MIN_PIPELINE_BATCH",
+            // #228 fan levers + #231 hydrator window — mirrors the
+            // multi-node Cluster forward list.
+            "KISEKI_INTENT_TOPUP_TIMEOUT_MS",
+            "KISEKI_AUX_MUX_CONNS_PER_PEER",
+            "KISEKI_HYDRATOR_BATCH",
         ] {
             if let Ok(v) = std::env::var(var) {
                 cmd.env(var, v);
@@ -635,7 +658,14 @@ impl Cluster {
                     // garbage.
                     let retryable = e.contains("forward request to")
                         || e.contains("HTTP 421")
-                        || e.contains("HTTP 503");
+                        || e.contains("HTTP 503")
+                        // EAGAIN from the admin CLI's socket read
+                        // timeout while the leader is busy carving
+                        // out the per-shard Raft groups. The create
+                        // is idempotent ("already exists" → success
+                        // above), so retrying is safe.
+                        || e.contains("Resource temporarily unavailable")
+                        || e.contains("read failed");
                     if !retryable {
                         return Err(format!("kiseki-admin namespace-create failed: {e}"));
                     }
@@ -866,6 +896,18 @@ fn spawn_cluster_node(
         // group-commit default (finding C-5a).
         "KISEKI_SMALL_OBJECT_FLUSH_INTERVAL_MS",
         "KISEKI_INTENT_FLUSH_INTERVAL_MS",
+        // #230/#253 committer drain levers — pipeline depth (0 =
+        // legacy serial drain) and the min-batch threshold for an
+        // additional in-flight round. Forwarded so A/B cells can
+        // sweep the submission policy without a recompile.
+        "KISEKI_COMMITTER_PIPELINE_DEPTH",
+        "KISEKI_COMMITTER_MIN_PIPELINE_BATCH",
+        // #228 fan levers — the targeted-topup per-candidate window
+        // and the aux-mux connection count; #231 hydrator window.
+        // Forwarded for the same A/B-without-recompile reason.
+        "KISEKI_INTENT_TOPUP_TIMEOUT_MS",
+        "KISEKI_AUX_MUX_CONNS_PER_PEER",
+        "KISEKI_HYDRATOR_BATCH",
     ] {
         if let Ok(v) = std::env::var(var) {
             if var == "DHAT_OUTPUT_FILE" {
