@@ -32,7 +32,18 @@ from typing import Generator
 
 import pytest
 
+from conftest import skip_on_ci_small
 from helpers.cluster import ClusterInfo, start_cluster, stop_cluster
+
+# Release run 27322282644: all four tests in this module ERRORed at
+# fixture setup on a standard 2-vCPU GitHub runner — privileged-container
+# kernel NFS mounts against a 3-node compose are infrastructure the small
+# runner can't provide, not a semantic failure (the suite is dev-box
+# ground truth). Runner-class gate, applied module-wide because every
+# test here goes through the same pnfs_cluster + kernel-mount path.
+pytestmark = skip_on_ci_small(
+    "kernel NFS/pNFS mounts in privileged containers over a 3-node compose"
+)
 
 
 # ---------------------------------------------------------------------------
