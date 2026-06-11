@@ -86,7 +86,27 @@ EOF
 if [ ! -f /root/.ssh/id_ed25519 ]; then
   ssh-keygen -t ed25519 -N "" -f /root/.ssh/id_ed25519 2>/dev/null
 fi
-gcloud compute os-login ssh-keys add --key-file=/root/.ssh/id_ed25519.pub --ttl=30d 2>/dev/null || true
+# Retry with backoff: at boot the metadata token service / OS Login
+# API is not always ready, and a swallowed failure here strands the
+# whole bench run later ("Permission denied (publickey)" from every
+# phase fan-out — burned the 2026-06-11 run twice). Loud non-zero
+# tail in the startup log when all attempts fail.
+key_registered=0
+for attempt in 1 2 3 4 5; do
+  if gcloud compute os-login ssh-keys add \
+    --key-file=/root/.ssh/id_ed25519.pub --ttl=30d >/dev/null 2>&1; then
+    key_registered=1
+    break
+  fi
+  echo "os-login ssh-keys add failed (attempt $attempt/5) — retrying in $((attempt * 5))s"
+  sleep $((attempt * 5))
+done
+if [ "$key_registered" -ne 1 ]; then
+  echo "ERROR: OS Login key registration FAILED after 5 attempts." >&2
+  echo "       ctrl→node SSH (all bench phases) will not work until an" >&2
+  echo "       operator runs: sudo gcloud compute os-login ssh-keys add \\" >&2
+  echo "         --key-file=/root/.ssh/id_ed25519.pub --ttl=30d" >&2
+fi
 
 # Store the OS Login username for the perf-suite's node_ssh wrapper.
 OS_USER=$(gcloud compute os-login describe-profile --format='value(posixAccounts[0].username)' 2>/dev/null || echo root)

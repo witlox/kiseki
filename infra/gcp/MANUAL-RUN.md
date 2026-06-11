@@ -409,6 +409,61 @@ while ops are 500ing). A halted cell invalidates the whole arm sweep
 until the cause is understood, because an error-rate change between
 arms means the arms are no longer measuring the same workload.
 
+## Operational traps (burned on the 2026-06-11 run)
+
+1. **Run bench phases with `sudo`.** The ctrl→node SSH key lives at
+   `/root/.ssh/id_ed25519`; as a non-root login user `perf-common.sh`'s
+   `[ -f /root/.ssh/... ]` is silently false, `SSH_KEY` goes empty and
+   every phase fan-out dies with `Permission denied (publickey)` /
+   "no kiseki-client with 'bench' subcommand". Invoke as:
+   `sudo env BENCH_...=... ./bench run <phase>`.
+2. **`kiseki-ctrl` is a 7th CLUSTER MEMBER**, not just a driver box. It
+   runs `kiseki-server` and votes in the control-plane group. Any
+   state wipe or binary swap that touches only the 6 storage nodes
+   leaves ctrl re-seeding the old control-plane state (namespaces
+   reappear after a "full" wipe) and runs a **mixed-version control
+   plane**. To deploy a different binary, stage it at the canonical
+   bucket path and `terraform destroy && apply` so ALL SEVEN nodes
+   boot it.
+3. **Do NOT restart nodes after significant write volume** (GH #255):
+   catch-up replication batches up to 300 `IncorporateIntents`
+   entries with no byte budget; past ~10⁵ inline writes the batch
+   exceeds the 128 MiB transport frame cap and replication wedges
+   permanently (`Raft RPC oversized` log storm). Until #255 lands,
+   arm swaps via `/etc/kiseki/perf-arm.env` + restart are only safe
+   on a fresh (low-volume) cluster — write the arm file BEFORE
+   driving load.
+4. **Version-match `kiseki-admin` to the server** for
+   `topology namespace-create`: a newer admin against an older server
+   (or vice versa) fails with misleading errors (`malformed HTTP
+   response`, rc=1) and — on pre-#232 servers — the bench then
+   silently writes into a **first-touch single-shard namespace**,
+   producing void (degenerate-topology) numbers. After any namespace
+   create, verify `kiseki-admin shards` shows the expected shard
+   count with distributed leaders before benching.
+5. **Cross-day GCP numbers carry ~±20%** (measured: the same binary,
+   same cells, 22,272 op/s on 2026-06-10 vs 17,669 on 2026-06-11).
+   Within-run and same-day ladders are the trustworthy comparisons;
+   never bisect across days without a same-day re-baseline of the
+   reference binary.
+6. **Bisect binaries build from git worktrees** — recipe (the naive
+   docker invocation fails three different ways):
+   ```bash
+   git worktree add .gcp-build/wt-<sha> <sha>
+   mkdir -p .gcp-build/wt-<sha>/.gcp-build
+   cp .gcp-build/build.sh .gcp-build/wt-<sha>/.gcp-build/   # gitignored, absent in worktrees
+   cp "$(command -v protoc)" .gcp-build/protoc-host          # /tmp + $HOME are tmpfs: docker can't mount from them
+   docker run --rm -v $PWD/.gcp-build/wt-<sha>:/src \
+     -v $PWD/.git:$PWD/.git \                                # worktree .git file points at the main repo path
+     -v $PWD/.gcp-build/cache-cargo:/root/.cargo \
+     -v $PWD/.gcp-build/cache-target:/cargo-target \
+     -v $PWD/.gcp-build/dist-<sha>:/out \
+     -v $PWD/.gcp-build/protoc-host:/usr/local/bin/protoc:ro \
+     -e CARGO_TARGET_DIR=/cargo-target \
+     -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e 'GIT_CONFIG_VALUE_0=*' \
+     rockylinux:9 bash /src/.gcp-build/build.sh              # git config via env: git isn't installed until build.sh runs dnf
+   ```
+
 ## 5. Tear down IMMEDIATELY when done (~$13-18/hr)
 ```bash
 cd infra/gcp && terraform destroy -auto-approve
