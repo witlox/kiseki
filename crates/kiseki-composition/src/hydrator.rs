@@ -263,6 +263,17 @@ impl CompositionHydrator {
         }
     }
 
+    /// Test seam: pin the poll-window size directly, bypassing the
+    /// `KISEKI_HYDRATOR_BATCH` env read. Env mutation in tests races
+    /// under plain `cargo test` threads (the Coverage lane runs
+    /// llvm-cov without nextest's process-per-test isolation) — use
+    /// this instead of `std::env::set_var`. Clamped like the env path.
+    #[must_use]
+    pub fn with_batch_window(mut self, window: u64) -> Self {
+        self.batch_window = window.clamp(1, MAX_HYDRATOR_BATCH);
+        self
+    }
+
     /// Attach the §D10 metrics surface. Subsequent polls emit
     /// `apply_duration` / `last_applied_seq{shard}` /
     /// `skip_total{reason}` / `stalled`. The runtime constructs one
@@ -1043,11 +1054,6 @@ mod tests {
     #[tokio::test]
     async fn registry_drains_multi_window_burst_without_interval_sleeps() {
         const N: u64 = 3_000; // 3 poll windows of 1 000
-        std::env::set_var("KISEKI_HYDRATOR_POLL_MS", "4000");
-        // Pin the window to 1 000 — the default is 4 000 post-#231,
-        // which would fit the whole burst into one window and stop
-        // exercising the multi-window drain this test pins.
-        std::env::set_var("KISEKI_HYDRATOR_BATCH", "1000");
         let store = fresh_store_with_default_ns();
         let (log, shard_id) = fresh_log();
         let ns_id = NamespaceId(uuid::Uuid::from_u128(2));
@@ -1056,12 +1062,18 @@ mod tests {
             let payload = enc_create(comp_id, ns_id, 64);
             append_create(&log, shard_id, payload, vec![ChunkId([0u8; 32])]).await;
         }
+        // Builder seams, NOT env vars (env mutation races sibling test
+        // threads under plain `cargo test` — the Coverage llvm-cov
+        // lane). Window pinned to 1 000: the post-#231 default of
+        // 4 000 would fit the whole burst into one window and stop
+        // exercising the multi-window drain this test pins.
         let registry = crate::hydrator_registry::HydratorRegistry::new(
             Arc::clone(&store),
             Arc::new(log),
             None,
-        );
-        std::env::remove_var("KISEKI_HYDRATOR_POLL_MS");
+        )
+        .with_poll_interval(std::time::Duration::from_secs(4))
+        .with_batch_window(1_000);
         let started = std::time::Instant::now();
         registry.register(shard_id);
         let deadline = started + std::time::Duration::from_secs(6);
@@ -1082,7 +1094,6 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        std::env::remove_var("KISEKI_HYDRATOR_BATCH");
     }
 
     /// #231 — `KISEKI_HYDRATOR_BATCH` parsing: default, explicit
@@ -1121,7 +1132,6 @@ mod tests {
     async fn hydrator_drains_backlog_in_window_sized_atomic_batches() {
         const N: u64 = 5_000;
         const WINDOW: u64 = 2_000;
-        std::env::set_var("KISEKI_HYDRATOR_BATCH", WINDOW.to_string());
 
         let store = fresh_store_with_default_ns();
         let (log, shard_id) = fresh_log();
@@ -1132,8 +1142,11 @@ mod tests {
             append_create(&log, shard_id, payload, vec![ChunkId([0u8; 32])]).await;
         }
 
-        let mut hydrator = CompositionHydrator::new(Arc::clone(&store), shard_id);
-        std::env::remove_var("KISEKI_HYDRATOR_BATCH");
+        // with_batch_window, NOT std::env::set_var: env mutation races
+        // sibling test threads under plain `cargo test` (the Coverage
+        // llvm-cov lane), which is exactly how this test failed there.
+        let mut hydrator =
+            CompositionHydrator::new(Arc::clone(&store), shard_id).with_batch_window(WINDOW);
 
         for (expected, batch) in [(2_000u64, 2_000u64), (4_000, 2_000), (5_000, 1_000)] {
             let applied = hydrator.poll(&log).await;

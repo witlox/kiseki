@@ -44,6 +44,9 @@ pub struct HydratorRegistry {
     /// double-spawn under concurrent calls from the apply hook.
     active: Mutex<HashSet<ShardId>>,
     poll_interval: std::time::Duration,
+    /// Test seam (`with_batch_window`); `None` = the spawned
+    /// hydrators read `KISEKI_HYDRATOR_BATCH` themselves.
+    batch_window: Option<u64>,
 }
 
 impl HydratorRegistry {
@@ -69,7 +72,27 @@ impl HydratorRegistry {
             metrics,
             active: Mutex::new(HashSet::new()),
             poll_interval: std::time::Duration::from_millis(poll_ms),
+            batch_window: None,
         }
+    }
+
+    /// Test seam: pin the poll interval directly, bypassing the
+    /// `KISEKI_HYDRATOR_POLL_MS` env read in `new`. Env mutation in
+    /// tests races sibling threads under plain `cargo test` (the
+    /// Coverage llvm-cov lane has no process-per-test isolation).
+    #[must_use]
+    pub fn with_poll_interval(mut self, interval: std::time::Duration) -> Self {
+        self.poll_interval = interval;
+        self
+    }
+
+    /// Test seam: pin the per-poll batch window forwarded to every
+    /// spawned hydrator (same rationale as
+    /// [`HydratorRegistry::with_poll_interval`]).
+    #[must_use]
+    pub fn with_batch_window(mut self, window: u64) -> Self {
+        self.batch_window = Some(window);
+        self
     }
 
     /// Register a shard for hydration. Spawns a new tokio task that
@@ -93,10 +116,14 @@ impl HydratorRegistry {
         let log = Arc::clone(&self.log);
         let metrics = self.metrics.clone();
         let interval = self.poll_interval;
+        let batch_window = self.batch_window;
         tokio::spawn(async move {
             let mut hydrator = CompositionHydrator::new(compositions, shard_id);
             if let Some(m) = metrics {
                 hydrator = hydrator.with_metrics(m);
+            }
+            if let Some(w) = batch_window {
+                hydrator = hydrator.with_batch_window(w);
             }
             tracing::info!(
                 shard_id = %shard_id.0,
