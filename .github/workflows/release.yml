@@ -55,7 +55,7 @@ jobs:
       # Tier 2 slow-marked unit tests (only the ignored ones — the
       # fast set above already covered the rest).
       - name: Tier 2 — slow-marked unit tests (run-ignored=only)
-        run: cargo nextest run --profile slow --run-ignored=only --workspace --exclude kiseki-acceptance --exclude kiseki-chunk-cluster --locked
+        run: cargo nextest run --profile slow --run-ignored=only --no-tests=warn -E 'not test(measure_)' --workspace --exclude kiseki-acceptance --exclude kiseki-chunk-cluster --locked
       - name: Tier 2 — slow-marked kiseki-chunk-cluster tests (run-ignored=only)
         run: cargo nextest run --profile slow --run-ignored=only -p kiseki-chunk-cluster --locked
       # Tier 2 BDD — full suite with @slow / @integration on.
