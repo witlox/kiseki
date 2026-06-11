@@ -333,8 +333,9 @@ reads the value from before the failed batch. If the process
 crashes between `commit` and the LRU update, the next read pays a
 redb miss and re-hydrates the cache — correct, just slightly slow.
 
-Bound on lost work: at most one batch (default 1000 deltas) per
-crash. The hydrator picks up where it left off on restart.
+Bound on lost work: at most one batch (default 4000 deltas,
+`KISEKI_HYDRATOR_BATCH`, #231) per crash. The hydrator picks up
+where it left off on restart.
 
 #### D5.1. Transient skip vs permanent skip
 
@@ -848,10 +849,12 @@ the small change first, layer in complexity when needed" call.
 ### Negative
 
 - Single-writer constraint: the hydrator is the bottleneck for
-  composition application. At 1000 deltas/batch / 100 ms poll =
-  10k deltas/sec. For most clusters this is several PUT/sec, well
-  above the per-node S3 ceiling. If a future workload exceeds it,
-  the hydrator can be sharded by composition_id-prefix.
+  composition application. Post-#212 the loop drains while busy
+  (no inter-window sleep mid-backlog) and post-#231 the window is
+  `KISEKI_HYDRATOR_BATCH` (default 4000) deltas per atomic
+  commit+fsync — measured ~78k deltas/sec catch-up on local NVMe.
+  If a future workload exceeds it, the hydrator can be sharded by
+  composition_id-prefix.
 - Read-after-write on the leader pays ~125 ms p99 from the polling
   delay. Documented; absorbed by the gateway retry.
 - A schema breaking change forces a node restart with the upgrade

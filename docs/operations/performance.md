@@ -236,6 +236,22 @@ storms.
 
 ---
 
+## Hydrator apply batching (#231)
+
+The composition hydrator applies each poll window of replicated
+deltas in ONE atomic fjall commit followed by ONE fsync (the
+`last_applied_seq` durability barrier — never removed, only
+amortized). The barrier costs a constant ~5-7 ms per batch on NVMe
+regardless of batch size, so bigger windows amortize it across more
+deltas during backlog catch-up.
+
+| Parameter | Default | Recommendation |
+|-----------|---------|----------------|
+| `KISEKI_HYDRATOR_BATCH` | 4000 (clamped to 1..20000) | Deltas per poll window = per atomic commit + fsync. Raise toward the 20 000 cap for faster deep-backlog catch-up on fast disks; lower only if single-commit latency spikes matter more than drain rate. Measured ~1.7-1.9× per-delta drain-cost reduction going 1000 → 4000 (the ~5-7 ms fjall fsync per batch is size-constant and amortizes; absolute µs/delta varies run-to-run — e.g. 23.9→12.75 and 9.99→5.84 on the same NVMe). |
+| `KISEKI_HYDRATOR_POLL_MS` | 100 | Idle poll cadence. The loop drains while busy (#212), so this only bounds hydration lag when caught up. |
+
+---
+
 ## Cache tuning (ADR-031)
 
 ### L1 cache (in-memory)
