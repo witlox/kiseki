@@ -1761,7 +1761,21 @@ impl CompositionStore {
             .by_name
             .get(&key)
             .map(|&(cid, _)| cid);
-        let storage_existing = self.storage.name_lookup(namespace_id, &name)?;
+        // #226 100k attempt — LAZY durable lookup. The storage
+        // name_lookup is a point read against a growing fjall
+        // keyspace ON THE ACK PATH of every named PUT, yet its result
+        // is only consumed by (a) a conditional check when the
+        // overlay has no (strictly newer) bind, and (b) the rare
+        // overflow write-through (fetched there). Unconditional
+        // creates — the dominant shape — never need it: durable
+        // prior-binding replacement happens at hydrator apply via the
+        // seq-guarded LWW name_insert (persistent/fjall.rs), exactly
+        // as it always did.
+        let storage_existing = if cond.is_some() && pending_existing.is_none() {
+            self.storage.name_lookup(namespace_id, &name)?
+        } else {
+            None
+        };
         // pending ∪ storage with pending (strictly newer) winning —
         // conditional semantics unchanged from the durable path.
         let existing = pending_existing.or(storage_existing);
@@ -1774,10 +1788,15 @@ impl CompositionStore {
             // Overlay full — durable write-through under the same
             // shard lock (never reject). `put_with_name`'s prior-id
             // cascade wants the STORAGE binding: a pending-only bind
-            // has no durable reverse row to cascade-drop.
+            // has no durable reverse row to cascade-drop. Fetch it
+            // here (the lazy fast path above skipped it).
             drop(pend);
             self.pending_overflows
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let storage_existing = match storage_existing {
+                Some(s) => Some(s),
+                None => self.storage.name_lookup(namespace_id, &name)?,
+            };
             self.storage
                 .put_with_name(comp, namespace_id, name, storage_existing)?;
             self.pending_names.write().remove_by_name(&key);

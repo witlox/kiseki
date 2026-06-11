@@ -253,6 +253,41 @@ impl SmallObjectStore {
         Ok(true)
     }
 
+    /// Batched delete — ONE fjall batch commit for the whole set
+    /// (#226 100k attempt). The watermark-advance prune previously
+    /// called [`Self::delete`] per inline delta entry: one point read
+    /// plus one journal commit EACH, serialized inside the SM apply
+    /// lock — ~100k+ commits per advance at 23k PUT/s. The existence
+    /// reads stay (they keep `approx_len` honest) but the commit
+    /// amortizes to one journal write.
+    ///
+    /// # Errors
+    /// Returns the underlying `io::Error` on read or commit failure.
+    pub fn delete_many(&self, keys: &[[u8; 32]]) -> io::Result<u64> {
+        let mut batch = self.db.batch().durability(Some(self.batch_durability()));
+        let mut removed: u64 = 0;
+        for key in keys {
+            let existed = self
+                .objects
+                .get(key.as_slice())
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .is_some();
+            if !existed {
+                continue;
+            }
+            batch.remove(&self.objects, key.to_vec());
+            removed += 1;
+        }
+        if removed == 0 {
+            return Ok(0);
+        }
+        batch
+            .commit()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        self.approx_len.fetch_sub(removed, Ordering::Relaxed);
+        Ok(removed)
+    }
+
     /// Check if a chunk exists in the inline store.
     ///
     /// # Errors
@@ -300,6 +335,10 @@ impl kiseki_common::inline_store::InlineStore for SmallObjectStore {
 
     fn delete(&self, key: &[u8; 32]) -> io::Result<bool> {
         self.delete(&ChunkId(*key))
+    }
+
+    fn delete_many(&self, keys: &[[u8; 32]]) -> io::Result<u64> {
+        Self::delete_many(self, keys)
     }
 
     fn flush(&self) -> io::Result<()> {

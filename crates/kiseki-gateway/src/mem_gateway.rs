@@ -22,6 +22,38 @@ use kiseki_common::ids::{CompositionId, NamespaceId};
 use kiseki_common::tenancy::DedupPolicy;
 use kiseki_composition::composition::{CompositionOps, CompositionStore, ConditionalCheck};
 
+/// Pre-resolved children of the put-phase `HistogramVec` — one
+/// `prometheus::Histogram` per fixed write-path phase label, so the
+/// hot path observes without label hashing or prometheus's internal
+/// `MetricVec` lock (#226 100k attempt: up to 9 observes per PUT).
+struct PutPhaseChildren {
+    encrypt: prometheus::Histogram,
+    chunk_write: prometheus::Histogram,
+    raft_commit: prometheus::Histogram,
+    composition_record: prometheus::Histogram,
+    inline_cache_insert: prometheus::Histogram,
+    inline_store_put: prometheus::Histogram,
+    chunk_fan_inner: prometheus::Histogram,
+    intent_fan_inner: prometheus::Histogram,
+    parallel_fan_wall: prometheus::Histogram,
+}
+
+impl PutPhaseChildren {
+    fn resolve(vec: &prometheus::HistogramVec) -> Self {
+        Self {
+            encrypt: vec.with_label_values(&["encrypt"]),
+            chunk_write: vec.with_label_values(&["chunk_write"]),
+            raft_commit: vec.with_label_values(&["raft_commit"]),
+            composition_record: vec.with_label_values(&["composition_record"]),
+            inline_cache_insert: vec.with_label_values(&["inline_cache_insert"]),
+            inline_store_put: vec.with_label_values(&["inline_store_put"]),
+            chunk_fan_inner: vec.with_label_values(&["chunk_fan_inner"]),
+            intent_fan_inner: vec.with_label_values(&["intent_fan_inner"]),
+            parallel_fan_wall: vec.with_label_values(&["parallel_fan_wall"]),
+        }
+    }
+}
+
 /// Per-chunk landing record used by `MemGateway::write` to track each
 /// piece of a multi-chunk composition for the post-write Raft delta.
 struct ChunkLanded {
@@ -376,6 +408,10 @@ pub struct InMemoryGateway {
     /// (#126) so the multi-node write bottleneck decomposes from metrics.
     /// Symmetric to `get_phase_duration_metric` for the write path.
     put_phase_duration_metric: std::sync::RwLock<Option<Arc<prometheus::HistogramVec>>>,
+    /// Pre-resolved per-phase children of `put_phase_duration_metric`
+    /// (#226 100k attempt) — `with_label_values` per observe costs a
+    /// label hash + prometheus-internal lock, ×9 phases per PUT.
+    put_phase_children: std::sync::RwLock<Option<Arc<PutPhaseChildren>>>,
     /// Candidate cluster nodes used by the placement function
     /// (Phase 16b step 2). The full set of node ids; the actual
     /// per-chunk placement is the rendezvous-hashing-selected
@@ -718,6 +754,7 @@ impl InMemoryGateway {
             chunk_read_bytes_metric: std::sync::RwLock::new(None),
             get_phase_duration_metric: std::sync::RwLock::new(None),
             put_phase_duration_metric: std::sync::RwLock::new(None),
+            put_phase_children: std::sync::RwLock::new(None),
             cluster_placement: Vec::new(),
             target_copies: 0,
             retry_metrics: None,
@@ -863,6 +900,18 @@ impl InMemoryGateway {
         get_phase: Arc<prometheus::HistogramVec>,
         put_phase: Arc<prometheus::HistogramVec>,
     ) {
+        // #226 100k attempt: resolve the per-phase Histogram children
+        // ONCE here. `with_label_values` costs a label hash + an
+        // internal lock per call inside prometheus, and the write
+        // path observes up to 9 phases PER PUT — at 100k op/s that
+        // is ~1M label resolutions/s of pure overhead. The observe
+        // helpers below hit the pre-resolved children via a string
+        // match (length + memcmp, no lock, no hash).
+        *self
+            .put_phase_children
+            .write()
+            .lock_or_die("mem_gateway.unknown") =
+            Some(Arc::new(PutPhaseChildren::resolve(&put_phase)));
         *self
             .get_phase_duration_metric
             .write()
@@ -885,13 +934,37 @@ impl InMemoryGateway {
     }
 
     fn observe_put_phase(&self, phase: &str, dur: std::time::Duration) {
-        if let Some(h) = self
-            .put_phase_duration_metric
+        if let Some(c) = self
+            .put_phase_children
             .read()
-            .lock_or_die("mem_gateway.put_phase_duration_metric")
+            .lock_or_die("mem_gateway.put_phase_children")
             .as_ref()
         {
-            h.with_label_values(&[phase]).observe(dur.as_secs_f64());
+            let secs = dur.as_secs_f64();
+            match phase {
+                "encrypt" => c.encrypt.observe(secs),
+                "chunk_write" => c.chunk_write.observe(secs),
+                "raft_commit" => c.raft_commit.observe(secs),
+                "composition_record" => c.composition_record.observe(secs),
+                "inline_cache_insert" => c.inline_cache_insert.observe(secs),
+                "inline_store_put" => c.inline_store_put.observe(secs),
+                "chunk_fan_inner" => c.chunk_fan_inner.observe(secs),
+                "intent_fan_inner" => c.intent_fan_inner.observe(secs),
+                "parallel_fan_wall" => c.parallel_fan_wall.observe(secs),
+                // Unknown label (future phase added without a child):
+                // fall through to the generic vec so data is never
+                // dropped silently.
+                other => {
+                    if let Some(h) = self
+                        .put_phase_duration_metric
+                        .read()
+                        .lock_or_die("mem_gateway.put_phase_duration_metric")
+                        .as_ref()
+                    {
+                        h.with_label_values(&[other]).observe(secs);
+                    }
+                }
+            }
         }
     }
 
@@ -2795,6 +2868,32 @@ impl InMemoryGateway {
                 })?
             };
 
+            // Inline-eligibility is decided up front (hoisted from
+            // the inline branch below; routing-neutral — all pool
+            // inputs are loop-invariant). NOTE: the dedup preflight
+            // below must run for inline-bound pieces TOO — the
+            // adversary review of the #226 100k attempt refuted the
+            // "inline content never enters the chunk store" premise
+            // via the ADR-030 spillover arm in this very function
+            // (small tier over budget → inline-eligible bytes land in
+            // the chunk tier). Skipping the preflight then breaks
+            // refcount symmetry: a later inline comp referencing the
+            // same chunk_id never increments, and ITS delete
+            // decrements an unowned count → GC frees another
+            // object's data. A lock-free presence probe (bloom /
+            // negative cache) is the sanctioned way to cut this cost.
+            let piece_len = piece.len() as u64;
+            let pool_selector_ran = !pool_snapshot.is_empty();
+            let shard_inline_threshold = ns_for_pool.as_ref().map_or(self.inline_threshold, |ns| {
+                self.effective_inline_threshold(ns.shard_id)
+            });
+            let inline_eligible = if pool_selector_ran {
+                pool_is_inline
+            } else {
+                piece_len <= shard_inline_threshold
+            };
+            let will_inline = pieces_len == 1 && inline_eligible && self.small_store.is_some();
+
             // Dedup short-circuit: if the chunk already exists, skip
             // the per-write HKDF + AEAD seal + nonce-RNG and just
             // bump the refcount. `try_increment_if_exists` does this
@@ -2830,11 +2929,16 @@ impl InMemoryGateway {
             self.observe_put_phase("encrypt", encrypt_started.elapsed());
             let ciphertext_len = env.ciphertext.len() as u64;
 
-            let piece_len = piece.len() as u64;
             // Inline path eligibility is per-chunk: a multi-chunk PUT
             // never goes inline (each chunk is large by definition).
             // Single-chunk PUTs ≤ inline_threshold still take the
             // fast path so small-object storage is unchanged.
+            //
+            // ADR-048 §"Decision" + ADR-024 amendment §"three-tier"
+            // routing and the ADR-030 §3 per-shard threshold are
+            // decided in `will_inline` ABOVE the dedup preflight (so
+            // inline-bound pieces skip the global-mutex probe that
+            // can only miss for them).
             let mut chunk_was_new = false;
             // (`chunk_write_started` removed — `chunk_write` phase is
             // now timed at the parallel-fan call site below for
@@ -2845,37 +2949,7 @@ impl InMemoryGateway {
             // chunk tier rather than failing the write — the small tier
             // is an optimization, not the only home for the bytes.
             let mut took_inline = false;
-            // ADR-048 §"Decision" + ADR-024 amendment §"three-tier":
-            // route to the small_store inline path when EITHER
-            //   (a) the band-aware pool selector picked an
-            //       Inline-durability pool (`pool_is_inline`), OR
-            //   (b) we're in the pre-amendment fallback mode (no
-            //       pool registered, `pool == "default"`) AND the
-            //       legacy per-shard / global `inline_threshold`
-            //       gate fires.
-            // The strict inversion — "pool selector returned a
-            // Replicated/EC pool → never inline, even for small
-            // chunks" — is what makes the three-tier routing
-            // actually behavior-changing instead of a relabel.
-            //
-            // ADR-030 §3: the threshold consulted in (b) is the
-            // **per-shard** value the leader committed via
-            // `SetShardConfig`. The Phase 4 recompute task pushes
-            // updates into `per_shard_inline_threshold`; the
-            // gateway reads through `effective_inline_threshold`
-            // which falls back to the global default for shards
-            // that haven't been recomputed yet (cold start,
-            // tests).
-            let pool_selector_ran = !pool_snapshot.is_empty();
-            let shard_inline_threshold = ns_for_pool.as_ref().map_or(self.inline_threshold, |ns| {
-                self.effective_inline_threshold(ns.shard_id)
-            });
-            let inline_eligible = if pool_selector_ran {
-                pool_is_inline
-            } else {
-                piece_len <= shard_inline_threshold
-            };
-            if pieces_len == 1 && inline_eligible && self.small_store.is_some() {
+            if will_inline {
                 // GH #196: postcard, not JSON. The inline path's
                 // `env_bytes` rides into SmallObjectStore AND fans
                 // out via the Raft delta; JSON used to inflate each

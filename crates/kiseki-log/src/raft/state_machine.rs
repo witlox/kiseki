@@ -807,14 +807,30 @@ impl ShardSmInner {
             return;
         }
         if let Some(ref store) = self.inline_store {
-            for d in &self.deltas[..cut] {
-                if d.header.has_inline_data {
-                    // Best-effort: a leaked inline entry is recoverable
-                    // (scrub), a stalled prune isn't.
-                    let _ = store.delete(&derive_inline_key(
-                        &d.header.hashed_key,
-                        d.header.sequence.0,
-                    ));
+            // #226 100k attempt — ONE batched backend commit for the
+            // whole prune. The per-entry `delete` loop paid one
+            // journal commit PER inline delta inside this apply-lock
+            // critical section: ~100k+ serialized commits per advance
+            // at 23k PUT/s, stalling every apply (and everything else
+            // behind the SM mutex) for seconds — the measured
+            // with-volume throughput decay. Best-effort either way: a
+            // leaked inline entry is recoverable (scrub), a stalled
+            // prune isn't.
+            let keys: Vec<[u8; 32]> = self.deltas[..cut]
+                .iter()
+                .filter(|d| d.header.has_inline_data)
+                .map(|d| derive_inline_key(&d.header.hashed_key, d.header.sequence.0))
+                .collect();
+            if !keys.is_empty() {
+                if let Err(e) = store.delete_many(&keys) {
+                    // One failed batch now leaks the WHOLE range
+                    // (adversary finding 4) — loud, so scrub debt is
+                    // visible instead of silent.
+                    tracing::warn!(
+                        leaked = keys.len(),
+                        error = %e,
+                        "inline-offload prune batch failed — entries leak until scrub",
+                    );
                 }
             }
         }

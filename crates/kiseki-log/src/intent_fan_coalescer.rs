@@ -81,7 +81,6 @@ use std::time::{Duration, Instant};
 use futures::stream::{FuturesUnordered, StreamExt};
 use kiseki_common::ids::{NodeId, ShardId};
 use kiseki_common::locks::LockOrDie;
-use kiseki_raft::tcp_transport::rpc_call_aux;
 use tokio::sync::{oneshot, Notify};
 
 use crate::error::LogError;
@@ -307,7 +306,41 @@ async fn flush_batch(inner: &CoalescerInner, batch: Vec<CoalesceReq>) {
     // (same per-shard store Arc) instead of blocking this tokio worker
     // for the WAL sync. The span still measures the honest ack-path
     // cost: the future resolves only after the durable commit.
-    let intents: Vec<WriteIntent> = batch.iter().map(|r| r.intent.clone()).collect();
+    // #226 100k attempt — split the batch into owned intents (moved
+    // into the store, no clone) + ack senders, and encode the wire
+    // form ONCE per flush. The previous shape paid, PER FLUSH: one
+    // full intent clone per op (for submit_batch), one WireIntent
+    // conversion per op, then one wire_batch.clone() + one postcard
+    // body encode PER PEER ATTEMPT (leader + each topup candidate +
+    // every rescue fan). Now: one WireIntent conversion + one
+    // postcard encode per flush, shared read-only across attempts.
+    let (intents, acks): (Vec<WriteIntent>, Vec<_>) =
+        batch.into_iter().map(|r| (r.intent, r.ack)).unzip();
+    // The wire form must be built BEFORE the store consumes the
+    // intents — but only multi-node configs (min_acks > 1) ever fan.
+    let outer_bytes: Option<Vec<u8>> = if cfg.min_acks > 1 {
+        let wire_batch: Vec<WireIntent> = intents.iter().map(WireIntent::from).collect();
+        match kiseki_raft::tcp_transport::encode_aux_outer_tuple(
+            cfg.shard_id,
+            INTENT_PUT_TAG,
+            &wire_batch,
+        ) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::warn!(
+                    shard_id = %cfg.shard_id.0,
+                    error = %e,
+                    "intent fan coalescer: wire encode failed; refusing batch",
+                );
+                for ack in acks {
+                    let _ = ack.send(Err(LogError::Unavailable));
+                }
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let put_res =
         kiseki_tracing::hot_span!("pif.local_put", { cfg.store.submit_batch(intents).await });
     if let Err(e) = put_res {
@@ -316,8 +349,8 @@ async fn flush_batch(inner: &CoalescerInner, batch: Vec<CoalesceReq>) {
             error = %e,
             "intent fan coalescer: local put_batch failed; refusing batch",
         );
-        for req in batch {
-            let _ = req.ack.send(Err(LogError::Unavailable));
+        for ack in acks {
+            let _ = ack.send(Err(LogError::Unavailable));
         }
         return;
     }
@@ -325,8 +358,8 @@ async fn flush_batch(inner: &CoalescerInner, batch: Vec<CoalesceReq>) {
 
     // 2. Fast path — single-copy quorum.
     if local_acks >= cfg.min_acks {
-        for req in batch {
-            let _ = req.ack.send(Ok(()));
+        for ack in acks {
+            let _ = ack.send(Ok(()));
         }
         return;
     }
@@ -334,7 +367,7 @@ async fn flush_batch(inner: &CoalescerInner, batch: Vec<CoalesceReq>) {
     // 3. Resolve peers + leader.
     let (peers, leader_id) = (cfg.resolver)();
     let leader_is_local = leader_id == Some(cfg.local_node.0);
-    let wire_batch: Vec<WireIntent> = batch.iter().map(|r| WireIntent::from(&r.intent)).collect();
+    let outer_bytes = outer_bytes.expect("encoded above: min_acks > 1");
 
     // 4. Leader-first (MF-3 no-orphan).
     let mut peer_acks: usize = 0;
@@ -352,7 +385,7 @@ async fn flush_batch(inner: &CoalescerInner, batch: Vec<CoalesceReq>) {
                         node_id,
                         addr.clone(),
                         cfg.shard_id,
-                        wire_batch.clone(),
+                        &outer_bytes,
                         cfg.peer_rpc_timeout,
                     )
                     .await
@@ -360,8 +393,8 @@ async fn flush_batch(inner: &CoalescerInner, batch: Vec<CoalesceReq>) {
                 if acked {
                     peer_acks += 1;
                     if local_acks + peer_acks >= cfg.min_acks {
-                        for req in batch {
-                            let _ = req.ack.send(Ok(()));
+                        for ack in acks {
+                            let _ = ack.send(Ok(()));
                         }
                         return;
                     }
@@ -412,15 +445,15 @@ async fn flush_batch(inner: &CoalescerInner, batch: Vec<CoalesceReq>) {
                 node_id,
                 addr.clone(),
                 cfg.shard_id,
-                wire_batch.clone(),
+                &outer_bytes,
                 cfg.topup_rpc_timeout,
             )
             .await;
             if acked {
                 peer_acks += 1;
                 if local_acks + peer_acks >= cfg.min_acks {
-                    for req in batch {
-                        let _ = req.ack.send(Ok(()));
+                    for ack in acks {
+                        let _ = ack.send(Ok(()));
                     }
                     return;
                 }
@@ -456,15 +489,15 @@ async fn flush_batch(inner: &CoalescerInner, batch: Vec<CoalesceReq>) {
         peer_acks += rescue_fan_until(
             rescue_pool,
             cfg.shard_id,
-            &wire_batch,
+            &outer_bytes,
             cfg.peer_rpc_timeout,
             needed,
         )
         .await;
         if local_acks + peer_acks >= cfg.min_acks {
             intent_metrics::inc_topup_rescue_saved();
-            for req in batch {
-                let _ = req.ack.send(Ok(()));
+            for ack in acks {
+                let _ = ack.send(Ok(()));
             }
             return;
         }
@@ -477,8 +510,8 @@ async fn flush_batch(inner: &CoalescerInner, batch: Vec<CoalesceReq>) {
         min_acks = cfg.min_acks,
         "intent fan coalescer: quorum shortfall — refusing to ack",
     );
-    for req in batch {
-        let _ = req.ack.send(Err(LogError::QuorumLost(cfg.shard_id)));
+    for ack in acks {
+        let _ = ack.send(Err(LogError::QuorumLost(cfg.shard_id)));
     }
 }
 
@@ -492,7 +525,7 @@ async fn flush_batch(inner: &CoalescerInner, batch: Vec<CoalesceReq>) {
 async fn rescue_fan_until(
     rescue_pool: Vec<(NodeId, String)>,
     shard_id: ShardId,
-    wire_batch: &[WireIntent],
+    outer_bytes: &[u8],
     timeout: Duration,
     needed: usize,
 ) -> usize {
@@ -500,7 +533,7 @@ async fn rescue_fan_until(
     kiseki_tracing::hot_timer_guard!(_ht_pif_rescue = "pif.rescue_fan");
     let mut rescue_fans: FuturesUnordered<_> = rescue_pool
         .into_iter()
-        .map(|(node_id, addr)| fan_one_batch(node_id, addr, shard_id, wire_batch.to_vec(), timeout))
+        .map(|(node_id, addr)| fan_one_batch(node_id, addr, shard_id, outer_bytes, timeout))
         .collect();
     let mut acks = 0usize;
     while let Some(acked) = rescue_fans.next().await {
@@ -527,10 +560,15 @@ async fn fan_one_batch(
     node_id: NodeId,
     addr: String,
     shard_id: ShardId,
-    wire_batch: Vec<WireIntent>,
+    outer_bytes: &[u8],
     timeout: Duration,
 ) -> bool {
-    let call = rpc_call_aux::<_, Vec<bool>>(&addr, shard_id, INTENT_PUT_TAG, None, &wire_batch);
+    let call = kiseki_raft::tcp_transport::rpc_call_aux_raw::<Vec<bool>>(
+        &addr,
+        shard_id,
+        None,
+        outer_bytes,
+    );
     match tokio::time::timeout(timeout, call).await {
         Ok(Ok(acks)) => !acks.is_empty() && acks.iter().all(|b| *b),
         Ok(Err(e)) => {
@@ -545,14 +583,25 @@ async fn fan_one_batch(
 }
 
 /// Read the coalescer batch-max from `KISEKI_INTENT_FAN_BATCH_MAX`.
-/// Defaults to 16.
+///
+/// Defaults to **64** (#226 100k attempt; was 16). The cap only
+/// short-circuits the 500 µs flush timer — `run_flush_cycle` takes
+/// ALL pending regardless — so the default governs how early a
+/// burst flushes, and 16 caused 4× more flush cycles (each with its
+/// per-batch fixed costs: local group-commit submit, per-peer RPC,
+/// quorum walk) than necessary at saturation. 64 was unsafe before
+/// the GH #228 PR-1c aux mux (per-peer connection blowout at
+/// batch=128, 2026-06-10). The wire bound on a fan frame is
+/// `max_raft_rpc_size` (enforced in the aux send path) — and note
+/// the cap never bounds batch SIZE anyway (`run_flush_cycle` takes
+/// ALL pending); it only short-circuits the flush timer.
 #[must_use]
 pub fn batch_max_from_env() -> usize {
     std::env::var("KISEKI_INTENT_FAN_BATCH_MAX")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|n: &usize| *n >= 1)
-        .unwrap_or(16)
+        .unwrap_or(64)
 }
 
 /// Read the coalescer batch-timeout from `KISEKI_INTENT_FAN_BATCH_TIMEOUT_US`.
