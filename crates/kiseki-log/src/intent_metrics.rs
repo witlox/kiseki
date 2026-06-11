@@ -22,7 +22,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use prometheus::{Histogram, HistogramOpts, Registry};
+use prometheus::{Histogram, HistogramOpts, IntCounter, Registry};
 
 /// `kiseki_intent_put_batch_size` — exposed on `/metrics`.
 pub const BATCH_SIZE_METRIC_NAME: &str = "kiseki_intent_put_batch_size";
@@ -32,6 +32,12 @@ pub const COALESCE_WAIT_METRIC_NAME: &str = "kiseki_intent_coalesce_wait_seconds
 
 /// `kiseki_intent_commit_batch_size` — exposed on `/metrics`.
 pub const COMMIT_BATCH_SIZE_METRIC_NAME: &str = "kiseki_intent_commit_batch_size";
+
+/// `kiseki_intent_topup_rescue_total` — exposed on `/metrics`.
+pub const TOPUP_RESCUE_METRIC_NAME: &str = "kiseki_intent_topup_rescue_total";
+
+/// `kiseki_intent_topup_rescue_saved_total` — exposed on `/metrics`.
+pub const TOPUP_RESCUE_SAVED_METRIC_NAME: &str = "kiseki_intent_topup_rescue_saved_total";
 
 /// Batch-size buckets — powers-of-two from 1 → 128. `KISEKI_INTENT_FAN_BATCH_MAX`
 /// defaults to 16, so the 1, 2, 4, 8, 16 buckets capture the steady-state
@@ -49,6 +55,8 @@ const COALESCE_WAIT_BUCKETS: &[f64] = &[
 static BATCH_SIZE: OnceLock<Histogram> = OnceLock::new();
 static COALESCE_WAIT: OnceLock<Histogram> = OnceLock::new();
 static COMMIT_BATCH_SIZE: OnceLock<Histogram> = OnceLock::new();
+static TOPUP_RESCUE: OnceLock<IntCounter> = OnceLock::new();
+static TOPUP_RESCUE_SAVED: OnceLock<IntCounter> = OnceLock::new();
 
 /// Register the W12 intent-coalescing histograms into the given
 /// Prometheus [`Registry`]. Idempotent: a second call after the
@@ -99,6 +107,26 @@ pub fn register(registry: &Registry) -> Result<(), prometheus::Error> {
         registry.register(Box::new(h.clone()))?;
         let _ = COMMIT_BATCH_SIZE.set(h);
     }
+    if TOPUP_RESCUE.get().is_none() {
+        let c = IntCounter::new(
+            TOPUP_RESCUE_METRIC_NAME,
+            "Times the #228 targeted top-up walk ended short of min_acks and the flush \
+             escalated to the GH #253 parallel rescue broadcast (full peer_rpc_timeout \
+             budget). Sustained growth = followers are missing the short topup window — \
+             the cluster is near its ingest wall.",
+        )?;
+        registry.register(Box::new(c.clone()))?;
+        let _ = TOPUP_RESCUE.set(c);
+    }
+    if TOPUP_RESCUE_SAVED.get().is_none() {
+        let c = IntCounter::new(
+            TOPUP_RESCUE_SAVED_METRIC_NAME,
+            "Rescue broadcasts (GH #253) that reached min_acks — each one is an acked \
+             write that the pre-#253 walk would have spuriously failed with QuorumLost.",
+        )?;
+        registry.register(Box::new(c.clone()))?;
+        let _ = TOPUP_RESCUE_SAVED.set(c);
+    }
     Ok(())
 }
 
@@ -142,6 +170,22 @@ pub fn observe_commit_batch_size(n: usize) {
     }
 }
 
+/// Count one entry into the GH #253 rescue broadcast (the targeted
+/// top-up walk ended short of `min_acks`).
+pub fn inc_topup_rescue() {
+    if let Some(c) = TOPUP_RESCUE.get() {
+        c.inc();
+    }
+}
+
+/// Count one rescue broadcast that reached `min_acks` — a write the
+/// pre-#253 walk would have spuriously failed.
+pub fn inc_topup_rescue_saved() {
+    if let Some(c) = TOPUP_RESCUE_SAVED.get() {
+        c.inc();
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -161,5 +205,7 @@ mod tests {
         observe_intent_put_batch_size(8);
         observe_coalesce_wait(Duration::from_micros(250));
         observe_commit_batch_size(3);
+        inc_topup_rescue();
+        inc_topup_rescue_saved();
     }
 }

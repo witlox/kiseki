@@ -1575,7 +1575,9 @@ async fn gather_voter_hydrator_positions(
 ///    `KISEKI_COMMITTER_PIPELINE_DEPTH` (default 2) rounds in flight across
 ///    the tick sleep so a round's replication/apply wait overlaps the next
 ///    round's append. `KISEKI_COMMITTER_PIPELINE_DEPTH=0` opts back into the
-///    legacy serial `drain_local()`.
+///    legacy serial `drain_local()`. Submission is batch-aware (GH #253):
+///    with a round already in flight, sub-`KISEKI_COMMITTER_MIN_PIPELINE_BATCH`
+///    leftovers hold and accumulate instead of flooding sub-batch rounds.
 /// 5. **Watermark-advance round (leader only, every
 ///    `watermark.every_ticks` ticks — P3 / I-L4):** gather every
 ///    voter's node-local `hydrator` position and propose `min` as ONE

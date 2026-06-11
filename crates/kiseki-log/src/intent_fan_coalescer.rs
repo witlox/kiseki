@@ -25,6 +25,17 @@
 //!   in-flight RPCs measured 39 % redundant `intent_put` traffic and
 //!   ~1.9 k/s/ingress TCP redial churn.
 //!
+//! GH #253 (2026-06-11) added the RESCUE stage: when the targeted walk
+//! ends short of `min_acks`, the flush does NOT declare `QuorumLost`
+//! yet — it re-fans to every non-acked peer in PARALLEL under the full
+//! `peer_rpc_timeout` budget first. The 2026-06-11 local 3-node A/B
+//! showed the short sequential windows alone (≤ 2 × 100 ms of total
+//! quorum budget) spuriously fail 0.2–0.45 % of PUTs under follower
+//! fsync pressure, with the errors scaling with run length; the rescue
+//! restores the pre-#228 broadcast's robustness while paying its RPC
+//! cost only on the rare shortfall path. `kiseki_intent_topup_rescue_
+//! total` / `_saved_total` count entries and saves.
+//!
 //! ## Submitter paths
 //!
 //! - **Flusher path** (first arrival in a fresh batch):
@@ -67,6 +78,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use kiseki_common::ids::{NodeId, ShardId};
 use kiseki_common::locks::LockOrDie;
 use kiseki_raft::tcp_transport::rpc_call_aux;
@@ -273,6 +285,10 @@ async fn run_flush_cycle(inner: Arc<CoalescerInner>) {
     flush_batch(&inner, batch).await;
 }
 
+// One flush is one linear quorum walk (local put → leader-first →
+// targeted top-up → rescue → shortfall); splitting the stages would
+// scatter the ack/return bookkeeping each stage shares.
+#[allow(clippy::too_many_lines)]
 async fn flush_batch(inner: &CoalescerInner, batch: Vec<CoalesceReq>) {
     let cfg = &inner.cfg;
 
@@ -322,6 +338,9 @@ async fn flush_batch(inner: &CoalescerInner, batch: Vec<CoalesceReq>) {
 
     // 4. Leader-first (MF-3 no-orphan).
     let mut peer_acks: usize = 0;
+    // GH #253 — peers that did NOT ack their first attempt go into the
+    // rescue pool (step 5b) instead of being written off for the flush.
+    let mut rescue_pool: Vec<(NodeId, String)> = Vec::new();
     if !leader_is_local {
         if let Some(lid) = leader_id {
             if let Some((node_id, addr)) = peers.iter().find(|(n, _)| n.0 == lid).cloned() {
@@ -331,7 +350,7 @@ async fn flush_batch(inner: &CoalescerInner, batch: Vec<CoalesceReq>) {
                 let acked = kiseki_tracing::hot_span!("pif.leader_first_hop", {
                     fan_one_batch(
                         node_id,
-                        addr,
+                        addr.clone(),
                         cfg.shard_id,
                         wire_batch.clone(),
                         cfg.peer_rpc_timeout,
@@ -346,6 +365,8 @@ async fn flush_batch(inner: &CoalescerInner, batch: Vec<CoalesceReq>) {
                         }
                         return;
                     }
+                } else {
+                    rescue_pool.push((node_id, addr));
                 }
             }
         }
@@ -389,7 +410,7 @@ async fn flush_batch(inner: &CoalescerInner, batch: Vec<CoalesceReq>) {
         for (node_id, addr) in candidates {
             let acked = fan_one_batch(
                 node_id,
-                addr,
+                addr.clone(),
                 cfg.shard_id,
                 wire_batch.clone(),
                 cfg.topup_rpc_timeout,
@@ -403,7 +424,49 @@ async fn flush_batch(inner: &CoalescerInner, batch: Vec<CoalesceReq>) {
                     }
                     return;
                 }
+            } else {
+                rescue_pool.push((node_id, addr));
             }
+        }
+    }
+
+    // 5b. Rescue broadcast (GH #253). The targeted walk gives each
+    // candidate ONE short `topup_rpc_timeout` window — on a 3-node
+    // cluster that is ≤ 2 × 100 ms of total quorum budget against
+    // followers whose fsync stalls are CORRELATED (same load wave,
+    // and locally the same disk). The 2026-06-11 A/B traced sustained
+    // `QuorumLost` on acked-able writes to exactly this: both probes
+    // miss, the write is refused, yet both peers go on to apply it.
+    // Falsified alternatives from that run: committer round flooding
+    // (#230 — errors persisted at PIPELINE_DEPTH=0) and the #231
+    // hydrator window (errors persisted at KISEKI_HYDRATOR_BATCH=1000);
+    // raising the topup window to 1 s produced 0 errors.
+    //
+    // So before declaring shortfall, re-fan to every non-acked
+    // candidate IN PARALLEL under the full `peer_rpc_timeout` budget —
+    // the pre-#228 broadcast's robustness, paid ONLY on the rare path
+    // (steady-state keeps #228's targeted-walk RPC savings).
+    // `QuorumLost` then honestly means "peers unreachable or slower
+    // than the generous budget", not "two short probes missed". The
+    // re-sent batch is idempotent on the receiver (per-seq store dedup)
+    // and a timed-out probe's late server-side apply was already
+    // possible pre-#253 (documented above).
+    if local_acks + peer_acks < cfg.min_acks && !rescue_pool.is_empty() {
+        let needed = cfg.min_acks - (local_acks + peer_acks);
+        peer_acks += rescue_fan_until(
+            rescue_pool,
+            cfg.shard_id,
+            &wire_batch,
+            cfg.peer_rpc_timeout,
+            needed,
+        )
+        .await;
+        if local_acks + peer_acks >= cfg.min_acks {
+            intent_metrics::inc_topup_rescue_saved();
+            for req in batch {
+                let _ = req.ack.send(Ok(()));
+            }
+            return;
         }
     }
 
@@ -417,6 +480,38 @@ async fn flush_batch(inner: &CoalescerInner, batch: Vec<CoalesceReq>) {
     for req in batch {
         let _ = req.ack.send(Err(LogError::QuorumLost(cfg.shard_id)));
     }
+}
+
+/// GH #253 — the parallel rescue broadcast: fan `wire_batch` to every
+/// peer in `rescue_pool` concurrently under the (generous) `timeout`,
+/// reaping acks as they land and returning as soon as `needed` acks
+/// arrive (or the pool is exhausted). Returns the number of acks
+/// gathered (`<= needed`). Counts entries via
+/// `kiseki_intent_topup_rescue_total`; the CALLER counts saves (it
+/// knows whether quorum was reached).
+async fn rescue_fan_until(
+    rescue_pool: Vec<(NodeId, String)>,
+    shard_id: ShardId,
+    wire_batch: &[WireIntent],
+    timeout: Duration,
+    needed: usize,
+) -> usize {
+    intent_metrics::inc_topup_rescue();
+    kiseki_tracing::hot_timer_guard!(_ht_pif_rescue = "pif.rescue_fan");
+    let mut rescue_fans: FuturesUnordered<_> = rescue_pool
+        .into_iter()
+        .map(|(node_id, addr)| fan_one_batch(node_id, addr, shard_id, wire_batch.to_vec(), timeout))
+        .collect();
+    let mut acks = 0usize;
+    while let Some(acked) = rescue_fans.next().await {
+        if acked {
+            acks += 1;
+            if acks >= needed {
+                break;
+            }
+        }
+    }
+    acks
 }
 
 /// Fan ONE `intent_put` RPC to one peer, carrying the whole batch.
