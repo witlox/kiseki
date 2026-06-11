@@ -967,11 +967,27 @@ async fn given_sharded_ns_for_s3(w: &mut KisekiWorld, shards: u32, bucket: Strin
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut accepted = false;
     let mut last = String::new();
+    let mut shard_ids: Vec<String> = Vec::new();
     'outer: loop {
         for (nid, port) in &ports {
             let url = format!("http://127.0.0.1:{port}/admin/topology/namespaces");
             match http.post(&url).json(&body).send().await {
                 Ok(r) if r.status().is_success() => {
+                    // GH #255: keep the created shard ids so volume /
+                    // catch-up scenarios can assert per-shard
+                    // convergence via /cluster/shards/{id}/leader.
+                    let json: serde_json::Value = r.json().await.unwrap_or_default();
+                    shard_ids = json
+                        .get("shards")
+                        .and_then(|s| s.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|s| {
+                                    s.get("shard_id").and_then(|v| v.as_str()).map(String::from)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     accepted = true;
                     break 'outer;
                 }
@@ -993,6 +1009,9 @@ async fn given_sharded_ns_for_s3(w: &mut KisekiWorld, shards: u32, bucket: Strin
     w.cluster
         .name_index_state
         .insert("fwd_bucket".into(), bucket);
+    w.cluster
+        .name_index_state
+        .insert("fwd_shard_ids".into(), shard_ids.join(","));
 }
 
 #[when(regex = r"^(\d+) distinct (\d+)KB objects are written via S3 to node-(\d+)$")]

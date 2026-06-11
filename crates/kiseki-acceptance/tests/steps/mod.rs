@@ -35,6 +35,7 @@ pub mod operational;
 pub mod pnfs;
 pub mod protocol;
 pub mod raft;
+pub mod restart_recovery;
 pub mod small_file;
 pub mod smoke;
 pub mod view;

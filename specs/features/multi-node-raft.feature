@@ -571,6 +571,40 @@ Feature: Multi-node Raft — replication, failover, and consistency (ADR-026)
     When the admin creates a 6-shard namespace via admin HTTP
     Then every shard of that namespace elects a raft leader distributed across the cluster within 20s
 
+  # === Catch-up replication under write volume (GH #255) ===
+  #
+  # GH #255: catch-up replication wedged PERMANENTLY when an
+  # append_entries batch exceeded the hardcoded 128 MiB frame cap.
+  # Committer `IncorporateIntents` entries embed full inline payloads
+  # (up to DRAIN_BATCH_CAP=1000 intents × 4 KiB per entry); openraft
+  # batches replication by entry COUNT only (max_payload_entries=300),
+  # so a follower restarting after sustained inline-write volume
+  # received catch-up frames of 178–190 MB. The receiver could not
+  # drain the oversized body (stream desync) and closed; the leader
+  # retried the SAME batch forever — no quorum ever recovered
+  # (2026-06-11 GCP run, 1,591 rejections in 3 min, cluster destroyed).
+  #
+  # The fix byte-budgets replication reads
+  # (`FjallRaftLogStore::limited_get_log_entries`, default 32 MiB per
+  # batch) and converts the receiver to drain-and-reject (typed
+  # per-RPC failure, connection survives). This scenario drives the
+  # production shape end to end: high-volume 4 KiB inline writes, one
+  # follower stopped mid-volume, more volume while it is down (the
+  # leader's log grows ahead), restart — then asserts the follower
+  # genuinely catches up (per-shard committed tip convergence) and
+  # that NO node ever rejected an oversized Raft RPC.
+  @integration @multi-node @cross-node @restart-recovery
+  Scenario: Follower restarted under inline-write volume catches up without oversized Raft RPCs (GH #255)
+    Given a 6-node kiseki cluster
+    And the oversized Raft RPC rejection baseline is recorded
+    And a 3-shard namespace "vol255" with leaders distributed across the cluster
+    When 12000 distinct 4KB objects are written via S3 across the cluster
+    And a follower member of the volume namespace is killed
+    And 12000 more distinct 4KB objects are written via S3 across the cluster
+    Then the killed node is restarted and rejoins the cluster
+    And the restarted node catches up on every volume shard within 120s
+    And no node recorded an oversized Raft RPC rejection
+
   # GH #102 (multi-shard native read AEAD-fail): not reproducible in this
   # harness — the native proxy assumes a uniform per-node data port
   # (`runtime.rs:2203`) but the harness binds random per-node ports, so

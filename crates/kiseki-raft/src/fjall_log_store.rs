@@ -240,28 +240,35 @@ impl FjallLogStore {
     /// the entries to be durable when the `IOFlushed` callback fires
     /// and forbids holes in the log.
     ///
+    /// Returns `(index, serialized_byte_len)` per appended entry — the
+    /// encoding already happens here, so the sizes are free; the
+    /// caller (`FjallRaftLogStore::append`) feeds them into the GH
+    /// #199 entry cache so the GH #255 byte-budgeted replication read
+    /// can account cached entries without re-serializing.
+    ///
     /// PUT-perf: per-payload fold removes the per-entry fsync that
     /// dominated the multi-node Raft commit ceiling (issue #66). At
     /// ~50 µs/fsync on `NVMe`, a 16-entry replication payload drops
     /// from ~800 µs of pure fsync to ~50 µs.
-    pub fn append_batch<T, I>(&self, entries: I) -> io::Result<()>
+    pub fn append_batch<T, I>(&self, entries: I) -> io::Result<Vec<(u64, usize)>>
     where
         T: Serialize,
         I: IntoIterator<Item = (u64, T)>,
     {
         let mut batch = self.commit_batch();
-        let mut count = 0usize;
+        let mut sizes = Vec::new();
         for (index, entry) in entries {
             let bytes = encode(&entry)?;
+            sizes.push((index, bytes.len()));
             batch.insert(&self.log_ks, index.to_be_bytes().to_vec(), bytes);
-            count += 1;
         }
-        if count == 0 {
+        if sizes.is_empty() {
             // Empty payload — nothing to commit. Skip the empty batch
             // so we don't burn a no-op fsync.
-            return Ok(());
+            return Ok(sizes);
         }
-        batch.commit().map_err(io_err)
+        batch.commit().map_err(io_err)?;
+        Ok(sizes)
     }
 
     /// Read a log entry by index.
@@ -291,6 +298,69 @@ impl FjallLogStore {
             let key = u64::from_be_bytes(buf);
             let val: T = decode(v.as_ref())?;
             out.push((key, val));
+        }
+        Ok(out)
+    }
+
+    /// Read entries in `[from, to]` inclusive, stopping BEFORE the
+    /// cumulative serialized size would exceed `byte_budget` (GH #255
+    /// — byte-budgeted replication batches). Returns
+    /// `(index, entry, serialized_byte_len)` triples.
+    ///
+    /// Contract (mirrors openraft's `limited_get_log_entries`):
+    /// * Always returns at least the FIRST entry of a non-empty range,
+    ///   even when that single entry exceeds `byte_budget` — returning
+    ///   empty for a non-empty range violates the openraft API and
+    ///   degrades the replication stream to a sleep-retry loop. A
+    ///   single entry over the budget logs a `warn` (with
+    ///   `DRAIN_BATCH_CAP` × inline-threshold ≤ 64 MiB < the frame
+    ///   cap, this should be unreachable; non-zero means an entry
+    ///   producer outgrew the framing assumptions).
+    /// * The iterator early-stops at the budget — the oversized tail
+    ///   is never read or decoded.
+    pub fn range_budgeted<T: DeserializeOwned>(
+        &self,
+        from: u64,
+        to: u64,
+        byte_budget: usize,
+    ) -> io::Result<Vec<(u64, T, usize)>> {
+        let start = from.to_be_bytes();
+        let end = to.to_be_bytes();
+        let mut out: Vec<(u64, T, usize)> = Vec::new();
+        let mut used = 0usize;
+        for entry in self.log_ks.range(start.as_slice()..=end.as_slice()) {
+            let (k, v) = entry.into_inner().map_err(io_err)?;
+            let kbytes = k.as_ref();
+            if kbytes.len() != 8 {
+                continue;
+            }
+            let size = v.as_ref().len();
+            if !out.is_empty() && used.saturating_add(size) > byte_budget {
+                // Adding this entry would blow the budget — return the
+                // accumulated prefix (valid per the openraft contract).
+                break;
+            }
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(kbytes);
+            let key = u64::from_be_bytes(buf);
+            if out.is_empty() && size > byte_budget {
+                tracing::warn!(
+                    index = key,
+                    size,
+                    byte_budget,
+                    "single Raft log entry exceeds the replication byte \
+                     budget — returning it alone (never-empty contract); \
+                     check DRAIN_BATCH_CAP × inline threshold vs the \
+                     frame cap (GH #255)",
+                );
+            }
+            let val: T = decode(v.as_ref())?;
+            used = used.saturating_add(size);
+            out.push((key, val, size));
+            if used > byte_budget {
+                // Only reachable via the single-oversized-entry case.
+                break;
+            }
         }
         Ok(out)
     }
@@ -534,6 +604,102 @@ mod tests {
         assert_eq!(range.len(), 3);
         assert_eq!(range[0], (2, "entry-2".to_string()));
         assert_eq!(range[2], (4, "entry-4".to_string()));
+    }
+
+    /// GH #255 — `range_budgeted` stops BEFORE the cumulative
+    /// serialized size exceeds the budget and reports per-entry sizes.
+    #[test]
+    fn range_budgeted_stops_at_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallLogStore::open(&dir.path().join("log")).unwrap();
+
+        // 5 entries of ~1000 serialized bytes each.
+        for i in 1..=5u64 {
+            store.append(i, &vec![0xAAu8; 1000]).unwrap();
+        }
+        // Budget for ~2.5 entries → exactly 2 come back.
+        let got: Vec<(u64, Vec<u8>, usize)> = store.range_budgeted(1, 5, 2500).unwrap();
+        assert_eq!(
+            got.iter().map(|(i, _, _)| *i).collect::<Vec<_>>(),
+            vec![1, 2],
+            "budget of 2500 bytes must cut the range after 2 ~1000-byte entries"
+        );
+        let total: usize = got.iter().map(|(_, _, s)| s).sum();
+        assert!(
+            total <= 2500,
+            "returned prefix ({total} bytes) must fit the budget"
+        );
+        for (_, v, s) in &got {
+            assert_eq!(v.len(), 1000);
+            assert!(
+                *s > 1000,
+                "reported size must be the serialized record length \
+                 (version byte + postcard), got {s}"
+            );
+        }
+
+        // A generous budget returns the full range with sizes.
+        let all: Vec<(u64, Vec<u8>, usize)> = store.range_budgeted(1, 5, usize::MAX).unwrap();
+        assert_eq!(all.len(), 5);
+    }
+
+    /// GH #255 — the never-empty contract: even a budget smaller than
+    /// the first entry returns that entry alone (returning empty for a
+    /// non-empty range degrades openraft's replication stream to a
+    /// sleep-retry loop).
+    #[test]
+    fn range_budgeted_always_returns_first_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallLogStore::open(&dir.path().join("log")).unwrap();
+
+        store.append(1, &vec![0xBBu8; 4096]).unwrap();
+        store.append(2, &vec![0xCCu8; 4096]).unwrap();
+
+        let got: Vec<(u64, Vec<u8>, usize)> = store.range_budgeted(1, 2, 16).unwrap();
+        assert_eq!(
+            got.len(),
+            1,
+            "a 16-byte budget must still return the (oversized) first entry"
+        );
+        assert_eq!(got[0].0, 1);
+        assert_eq!(got[0].1.len(), 4096);
+    }
+
+    /// GH #255 — empty range stays empty (the contract only forbids
+    /// empty results for NON-empty ranges).
+    #[test]
+    fn range_budgeted_empty_range_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallLogStore::open(&dir.path().join("log")).unwrap();
+        let got: Vec<(u64, String, usize)> = store.range_budgeted(10, 20, 1 << 20).unwrap();
+        assert!(got.is_empty());
+    }
+
+    /// GH #255 — `append_batch` reports `(index, serialized_len)` per
+    /// entry; the sizes must match what a subsequent budgeted read
+    /// observes on disk.
+    #[test]
+    fn append_batch_returns_sizes_matching_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallLogStore::open(&dir.path().join("log")).unwrap();
+
+        let sizes = store
+            .append_batch((1..=3u64).map(|i| (i, vec![0u8; 100 * i as usize])))
+            .unwrap();
+        assert_eq!(sizes.len(), 3);
+        assert_eq!(
+            sizes.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        let disk: Vec<(u64, Vec<u8>, usize)> = store.range_budgeted(1, 3, usize::MAX).unwrap();
+        for ((ai, asize), (di, _, dsize)) in sizes.iter().zip(disk.iter()) {
+            assert_eq!(ai, di);
+            assert_eq!(
+                asize, dsize,
+                "append-time size and disk record size must agree (index {ai})"
+            );
+        }
     }
 
     #[test]

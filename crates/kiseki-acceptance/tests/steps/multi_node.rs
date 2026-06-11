@@ -1047,7 +1047,7 @@ async fn leader_id_via(node: &NodeHandle) -> Option<u64> {
 }
 
 /// Scrape `/metrics` from a node and return the raw text.
-async fn scrape_metrics(node: &NodeHandle) -> String {
+pub(crate) async fn scrape_metrics(node: &NodeHandle) -> String {
     let url = format!("http://127.0.0.1:{}/metrics", node.ports.metrics);
     let resp = node
         .http
@@ -1063,7 +1063,7 @@ async fn scrape_metrics(node: &NodeHandle) -> String {
 /// alphabetical order, which would foil a single substring filter
 /// expecting a different order). Each fragment is a `key="value"`
 /// substring — e.g. `[r#"op="put""#, r#"peer="node-2""#]`.
-fn sum_counter_matching_all(text: &str, name: &str, label_fragments: &[&str]) -> f64 {
+pub(crate) fn sum_counter_matching_all(text: &str, name: &str, label_fragments: &[&str]) -> f64 {
     let mut total = 0.0;
     for line in text.lines() {
         let line = line.trim();
