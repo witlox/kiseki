@@ -1,0 +1,37 @@
+# Perf-floor gate baseline pin (GH #256 follow-up).
+#
+# `scripts/perf-gate.sh` (also `make perf-gate`) builds kiseki-server
+# at `pin` and asserts the CURRENT tree's reference cell stays within
+# `min_ratio` of it on the local 3-node harness. Bump `pin` to the new
+# main HEAD whenever a deliberate perf change lands (and record the
+# measured ratio in the bump commit message).
+#
+# What this gate catches locally (proven classes):
+#   - structural throughput regressions ≥ ~20% on the loopback path
+#   - sustained-load error/stability regressions (#253 quorum-loss
+#     class: the 60s cell with halt-on-error)
+#   - sustained-throughput decay (#256 showed −27% over 60s on main
+#     vs −10% pre-regression)
+# What it CANNOT catch (documented limitation, not a gap to "fix"):
+#   - network-latency-bound waits. #256's −71% on GCP measured −2.4%
+#     (inside noise) on loopback — RTT-quantized stalls need either
+#     real network RTTs or unit-level scaling probes (see
+#     crates/kiseki-composition/tests/pending_overlay_scaling.rs for
+#     the pattern: assert the SCALING SHAPE, not wall-clock).
+
+# Last-known-good main. 2026-06-11: post-#254. Bump after #256's fix
+# (the pending-names index) merges.
+pin = "5317a36"
+
+# current/baseline median-of-3 floor. 0.80 tolerates the measured
+# dev-box spread (medians of 3 interleaved runs; raw run spread up to
+# ~30%) while catching any 2x-class structural regression decisively.
+min_ratio = "0.80"
+
+# Reference cell (mirrors the GCP phase-11 reference cell shape).
+concurrency = "64"
+object_size = "4096"
+nodes = "3"
+measured_secs = "20"
+sustained_secs = "60"
+runs = "3"

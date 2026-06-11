@@ -33,7 +33,7 @@
 #     new tags needed.
 
 .PHONY: all verify verify-full \
-        test test-fast test-slow test-full e2e \
+        test test-fast test-slow test-full e2e perf-gate \
         rust-fmt rust-fmt-check rust-clippy rust-deny rust-build \
         check fmt build clean help arch-check \
         check-tools
@@ -184,6 +184,9 @@ test-slow: test-fast ## Tier 2: Tier 1 + slow-marked unit + full BDD
 test-full: test-slow e2e ## Tier 3: Tier 2 + Python e2e via docker compose
 
 test: test-fast ## Alias for `test-fast` — the pre-commit standard
+
+perf-gate: ## Perf floor: current tree vs pinned baseline on the local 3-node harness (run before merging write-path/perf PRs)
+	bash scripts/perf-gate.sh
 
 # ---------------------------------------------------------------------
 # Architecture enforcement (ADV-3)

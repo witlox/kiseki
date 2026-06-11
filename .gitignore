@@ -71,3 +71,4 @@ tests/e2e/.tls/
 .gcp-build/
 infra/gcp/benchmarks/results/
 .claude/worktrees/
+.perf-gate/
