@@ -19,9 +19,9 @@
 #     crates/kiseki-composition/tests/pending_overlay_scaling.rs for
 #     the pattern: assert the SCALING SHAPE, not wall-clock).
 
-# Last-known-good main. 2026-06-11: post-#254. Bump after #256's fix
-# (the pending-names index) merges.
-pin = "5317a36"
+# Last-known-good main. 2026-06-11: post-#256 fix (the pending-names
+# O(1) index, PR #259).
+pin = "e00c9e5"
 
 # current/baseline median-of-3 floor. 0.80 tolerates the measured
 # dev-box spread (medians of 3 interleaved runs; raw run spread up to
