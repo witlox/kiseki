@@ -2860,6 +2860,7 @@ async fn api_admin_config(State(state): State<UiState>) -> impl IntoResponse {
         "KISEKI_RAFT_FLUSH_INTERVAL_MS",
         "KISEKI_COMPOSITION_FLUSH_INTERVAL_MS",
         "KISEKI_CHUNK_FLUSH_INTERVAL_MS",
+        "KISEKI_COMMITTER_PIPELINE_DEPTH",
         "KISEKI_PEER_DATA_ADDRS",
         "KISEKI_NATIVE_GATEWAY_POOL",
         "KISEKI_BACKUP_BACKEND",
