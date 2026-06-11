@@ -139,7 +139,23 @@ ships those numbers per-binding; this doc cites them.
 | S3 PUT aggregate 3 clients | — | 7.8 GB/s ÷ EC-1.5 = **5.2 GB/s** | — | 🚧 GH #38 |
 | S3 GET aggregate 3 clients | — | 16 GB/s (no replication overhead on reads) | — | 🚧 |
 | NFSv4.1 (pNFS) write aggregate | — | 6 nodes × 2.6 ÷ EC-1.5 = **10 GB/s** | — | 🚧 |
-| Native TCP-framed PUT aggregate | — | 6 × 60 k = **360 k op/s** | — | 🚧 |
+| Native TCP-framed PUT aggregate | — | ~~6 × 60 k = **360 k op/s**~~ **INVALID DERIVATION** — see below | — | ❌ |
+
+> **360 k retraction (2026-06-11 hostile audit, GH #226):** the 60 k/node
+> figure is ADR-042 §14's SINGLE-HOST number (no quorum, no replication,
+> Ryzen workstation); multiplying it by 6 was never a distributed per-op
+> budget. The audited budget for the CURRENT protocol on this profile:
+> per-op ingress CPU floor ≈13 µs (crypto 3.5 µs FIPS-irreducible) →
+> **100–200 k is inside the architecture's envelope**, but: burst-100k
+> needs the named engineering levers (blind-write existence checks,
+> fjall block-cache/KV-separation, apply-mutex decoupling, #135
+> route-to-leader, committer-round gap RCA); SUSTAINED-100k additionally
+> needs two ADR-grade SM changes (disk-backed cluster_chunk_state — RAM
+> grows O(objects), ~2 h OOM horizon at 100 k/s — and off-mutex
+> incremental snapshots) plus #261 visibility backpressure; 200 k+ needs
+> the ingress batch-quorum protocol change. Measured today: 25.6 k fresh
+> / 10.6 k at 4 M objects — the gap to budget is 65× WAIT (blocking
+> occupancy 2.6 ms/op vs ~40 µs CPU), not work.
 
 **Status overall**: default is unusable for write measurement until GH #38 (EC-4+2 fragment 16 MiB+8 byte cap) lands. Once that's fixed, this is the most useful profile for cluster-aggregate measurement on a budget.
 
