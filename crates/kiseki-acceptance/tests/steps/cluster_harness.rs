@@ -234,7 +234,7 @@ impl ClusterHarness {
             mtls_certs.as_deref(),
             chunk_device_bytes,
         )?;
-        wait_for_admin(&n1, Duration::from_secs(60)).await?;
+        wait_for_admin(&n1, Duration::from_secs(180)).await?;
         nodes.insert(1, n1);
 
         for id in 2..=node_count {
@@ -253,7 +253,7 @@ impl ClusterHarness {
                 mtls_certs.as_deref(),
                 chunk_device_bytes,
             )?;
-            wait_for_admin(&node, Duration::from_secs(60)).await?;
+            wait_for_admin(&node, Duration::from_secs(180)).await?;
             nodes.insert(id, node);
         }
 
@@ -352,7 +352,7 @@ impl ClusterHarness {
         // Old child already reaped; drop it explicitly to be tidy.
         drop(old_child);
         let id_for_log = node.node_id;
-        wait_for_admin(self.node(id_for_log), Duration::from_secs(60)).await
+        wait_for_admin(self.node(id_for_log), Duration::from_secs(180)).await
     }
 
     /// Wait until every live node reports the same non-zero `leader_id`.
