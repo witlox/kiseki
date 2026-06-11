@@ -122,21 +122,43 @@ async fn cap_is_enforced_at_listener_layer() {
         let _ = listener.run().await;
     });
 
-    // Wait until the listener is up.
+    // Wait until the listener is up — and KEEP the successful probe
+    // connection open as the first held connection. Dropping it here
+    // (the pre-2026-06-11 shape) leaks a transient +1 on the server's
+    // per-peer counter: the increment happens in the accept loop, but
+    // the decrement runs in the spawned per-connection handler only
+    // after it observes EOF. If the accept loop is starved (loaded CI
+    // runner) until all `cap` held connects are queued, it processes
+    // [probe, held1..held4] in one burst at transient counts
+    // [1,2,3,4,5] — wrongly rejecting the last held conn — and after
+    // the probe handler retires the counter to cap-1, the "extra"
+    // below is admitted at exactly cap, held open as an idle
+    // connection forever, and the poll loop exhausts its deadline.
+    // That is release run 27318887961 (10.16 s = full deadline) and
+    // run 27130713337 before it (the 2 s era). NOT an enforcement
+    // regression: at admission time only cap-1 held conns were alive,
+    // so the listener never exceeded the cap — the test's probe was
+    // silently occupying the slot it assumed held4 owned. Keeping the
+    // probe as held[0] makes the counter monotonic across the test:
+    // no decrement can occur, so the (cap+1)-th conn is over cap
+    // deterministically.
+    let mut held: Vec<TcpStream> = Vec::with_capacity(TEST_CAP as usize);
     for _ in 0..50 {
-        if TcpStream::connect(addr).await.is_ok() {
+        if let Ok(s) = TcpStream::connect(addr).await {
+            held.push(s);
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    assert_eq!(held.len(), 1, "listener did not come up within 500 ms");
 
-    // Open `cap` raw TCP connections from loopback (same source IP,
-    // distinct ephemeral ports). Hold them open so the per-peer
-    // counter stays at cap. They're plaintext-mode, so the listener
-    // accepts the TCP, spawns a handler, and reads frames; with no
-    // frames sent the handler stays alive (idle).
-    let mut held: Vec<TcpStream> = Vec::with_capacity(TEST_CAP as usize + 1);
-    for _ in 0..TEST_CAP {
+    // Open the remaining `cap - 1` raw TCP connections from loopback
+    // (same source IP, distinct ephemeral ports). Hold all of them
+    // open so the per-peer counter stays at cap. They're
+    // plaintext-mode, so the listener accepts the TCP, spawns a
+    // handler, and reads frames; with no frames sent the handler
+    // stays alive (idle).
+    for _ in 1..TEST_CAP {
         let s = TcpStream::connect(addr).await.expect("connect under cap");
         held.push(s);
     }
@@ -156,9 +178,7 @@ async fn cap_is_enforced_at_listener_layer() {
 
     // Poll for the drop instead of a one-shot deadline. The CONTRACT
     // is "the cap+1 connection gets dropped", not "dropped within 2 s
-    // on any hardware" — a hard 2 s read deadline deterministically
-    // failed on slow GitHub-hosted release runners (release.yml
-    // Preflight, run 27130713337), blocking the entire pipeline.
+    // on any hardware" — slow runners can delay the FIN wakeup.
     // 100 ms intervals up to 10 s; tokio's TcpStream::read is
     // cancel-safe, so re-issuing it after a timeout is sound.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -177,6 +197,25 @@ async fn cap_is_enforced_at_listener_layer() {
                  may be holding the connection in the accept-queue past \
                  the per-peer cap",
             ),
+        }
+    }
+
+    // Other half of the contract: every UNDER-cap connection is still
+    // alive — the listener must reject only the over-cap extra, never
+    // an admitted connection. This turns the failure mode that bit
+    // release run 27318887961 (a held conn silently rejected, the
+    // extra silently admitted) into a loud, attributable assert.
+    for (i, h) in held.iter_mut().enumerate() {
+        let mut b = [0u8; 1];
+        match tokio::time::timeout(Duration::from_millis(50), h.read(&mut b)).await {
+            Err(_still_open) => {} // no EOF within 50 ms — connection is alive. Expected.
+            Ok(Ok(0)) => panic!(
+                "under-cap held connection #{i} was dropped by the \
+                 listener — per-peer cap is rejecting connections \
+                 below the cap",
+            ),
+            Ok(Ok(n)) => panic!("under-cap held connection #{i} received {n} bytes"),
+            Ok(Err(e)) => panic!("under-cap held connection #{i} errored: {e}"),
         }
     }
 
