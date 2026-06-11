@@ -381,9 +381,11 @@ the gap analysis assumed were missing are largely already implemented**:
   (`kiseki-raft/src/config.rs:22`); it coalesces up to 300 entries into
   one AppendEntries round and pipelines replication.
 - **The hydrator already batches at commit** — one `HydrationBatch` per
-  poll (up to 1000 deltas staged, one atomic storage commit), not
-  per-delta (`hydrator.rs:304-422`). #133's ~50 deltas/s is a *per-delta
-  staging* cost, not a missing-batch — needs profiling to localise.
+  poll (window = `KISEKI_HYDRATOR_BATCH`, default 4000 post-#231; 1000
+  hard-coded before that — one atomic storage commit + one fsync per
+  window), not per-delta (`hydrator.rs`). #133's ~50 deltas/s is a
+  *per-delta staging* cost, not a missing-batch — needs profiling to
+  localise.
 - **B1 (CompositionStore HashMap → DashMap) is effectively already done**
   — the store has sharded `name_locks` + `id_locks`
   (`composition.rs:573-581`), an `RwLock` namespace map, and an LRU

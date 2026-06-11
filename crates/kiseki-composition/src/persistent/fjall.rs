@@ -737,6 +737,237 @@ mod tests {
     use super::*;
     use kiseki_common::ids::OrgId;
 
+    /// #231 STEP-0 probe: per-delta hydration-apply cost vs batch size
+    /// on REAL disk (a dir under the workspace `target/`, NOT /tmp —
+    /// /tmp is tmpfs on dev boxes and fsync there is free, which would
+    /// hide exactly the barrier this probe exists to measure).
+    ///
+    /// Decomposes one hydration tick of B modern-shape Create deltas
+    /// (payload ≈ 110 B: `comp_id` + ns + size + S3-style name +
+    /// perspective-seq) into:
+    ///
+    /// - stage: `decode_composition_create_payload` + the staged-view
+    ///   miss (one fjall point read per delta) + staging map inserts —
+    ///   the hydrator's per-delta CPU before the storage call.
+    /// - build: `encode_composition` + the 3 LWW/cascade point reads
+    ///   per name insert + `WriteBatch` fill.
+    /// - commit: fjall `WriteBatch::commit` (journal write, NO fsync).
+    /// - fsync: `PersistMode::SyncAll` — the `last_applied` durability
+    ///   barrier (load-bearing, must stay per batch).
+    ///
+    /// plus a cross-check of the real `apply_hydration_batch`
+    /// end-to-end on a second store, and the P4 ack-path residual
+    /// (`name_lookup` point read — the only fjall touch left on the
+    /// ack path post-#226).
+    ///
+    /// Run: `cargo test -p kiseki-composition --release \
+    ///       measure_hydration_apply_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "perf probe: hydration apply cost vs batch size (real-disk fsync)"]
+    #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+    fn measure_hydration_apply_cost_vs_batch_size() {
+        use std::time::Instant;
+
+        let probe_root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/probe-231");
+        let _ = std::fs::remove_dir_all(&probe_root);
+        std::fs::create_dir_all(&probe_root).unwrap();
+
+        let ns = NamespaceId(uuid::Uuid::from_u128(2));
+        let shard = ShardId(uuid::Uuid::from_u128(1));
+        let mk_seq = |i: u64| {
+            PerspectiveSeq(HybridLogicalClock {
+                physical_ms: 1_700_000_000_000 + i,
+                logical: 0,
+                node_id: NodeId(3),
+            })
+        };
+        let mk_comp = |id: CompositionId| Composition {
+            id,
+            tenant_id: OrgId(uuid::Uuid::from_u128(1)),
+            namespace_id: ns,
+            shard_id: shard,
+            chunks: vec![kiseki_common::ids::ChunkId([7u8; 32])],
+            version: 1,
+            size: 65_536,
+            has_inline_data: false,
+            content_type: None,
+            chunk_plaintext_lens: Vec::new(),
+            chunk_locations: Vec::new(),
+        };
+
+        println!();
+        println!(
+            "{:>6} {:>5} {:>10} {:>10} {:>10} {:>10} {:>11} {:>11} {:>11}",
+            "batch",
+            "round",
+            "stage/d µs",
+            "build/d µs",
+            "commit/d µs",
+            "fsync ms",
+            "fsync/d µs",
+            "total/d µs",
+            "real/d µs",
+        );
+
+        for &batch_size in &[100u64, 500, 1000, 2000, 5000] {
+            // Two stores per batch size: `split` (manual decomposition)
+            // and `real` (the production `apply_hydration_batch`).
+            let split_dir = probe_root.join(format!("split-{batch_size}"));
+            let real_dir = probe_root.join(format!("real-{batch_size}"));
+            std::fs::create_dir_all(&split_dir).unwrap();
+            std::fs::create_dir_all(&real_dir).unwrap();
+            let split = FjallStorage::open(&split_dir).unwrap();
+            let real = FjallStorage::open(&real_dir).unwrap();
+
+            for round in 0..3u64 {
+                // Fresh, modern-shape Create payloads (same shape the
+                // ingress emits post-P4: S3-style name + perspective-seq).
+                let base = u128::from(round) * u128::from(batch_size) + 1;
+                let payloads: Vec<(CompositionId, Vec<u8>)> = (0..batch_size)
+                    .map(|i| {
+                        let id = CompositionId(uuid::Uuid::from_u128(
+                            base + u128::from(i) + (u128::from(batch_size) << 64),
+                        ));
+                        let name = format!(
+                            "bench/run-2026-06-10/objects/obj-{:08}",
+                            base + u128::from(i)
+                        );
+                        (
+                            id,
+                            crate::composition::encode_composition_create_payload(
+                                id,
+                                ns,
+                                65_536,
+                                Some(&name),
+                                &[],
+                                Some(mk_seq(i)),
+                            ),
+                        )
+                    })
+                    .collect();
+
+                // ---- stage: decode + view-miss point read + map insert
+                let t = Instant::now();
+                let mut staged: std::collections::HashMap<CompositionId, Composition> =
+                    std::collections::HashMap::new();
+                let mut name_inserts: Vec<(
+                    NamespaceId,
+                    String,
+                    CompositionId,
+                    Option<PerspectiveSeq>,
+                )> = Vec::new();
+                for (id, payload) in &payloads {
+                    let (comp_id, ns_id, size, name, _lens, seq) =
+                        crate::composition::decode_composition_create_payload(payload).unwrap();
+                    // The hydrator's `Staging::view` miss = one fjall
+                    // point read per fresh Create.
+                    assert!(split.get(comp_id).unwrap().is_none());
+                    let mut comp = mk_comp(comp_id);
+                    comp.size = size;
+                    staged.insert(comp_id, comp);
+                    name_inserts.push((ns_id, name.unwrap(), *id, seq));
+                }
+                let stage = t.elapsed();
+
+                // ---- build: encode + LWW/cascade reads + WriteBatch fill
+                let t = Instant::now();
+                let mut wb = split.db.batch();
+                for comp in staged.values() {
+                    let bytes = encode_composition(comp).unwrap();
+                    wb.insert(&split.comps, comp.id.0.as_bytes().to_vec(), bytes);
+                }
+                for (ns_id, name, id, seq) in &name_inserts {
+                    let new_key = name_key(*ns_id, name);
+                    let id_bytes = id.0.as_bytes();
+                    // Same 3 point reads `apply_hydration_batch` pays.
+                    let stored = split.name_seqs.get(&new_key).unwrap();
+                    assert!(stored.is_none(), "fresh name");
+                    let _prev = split.names.get(&new_key).unwrap();
+                    let _old_rev = split.names_rev.get(id_bytes).unwrap();
+                    wb.insert(&split.names, new_key.clone(), id_bytes.to_vec());
+                    wb.insert(&split.names_rev, id_bytes.to_vec(), new_key.clone());
+                    wb.insert(
+                        &split.name_seqs,
+                        new_key,
+                        encode_name_seq(seq.unwrap()).to_vec(),
+                    );
+                }
+                wb.insert(
+                    &split.meta,
+                    meta_keys::last_applied_seq(shard),
+                    ((round + 1) * batch_size).to_le_bytes().to_vec(),
+                );
+                let build = t.elapsed();
+
+                // ---- commit: journal write, no fsync
+                let t = Instant::now();
+                wb.commit().unwrap();
+                let commit = t.elapsed();
+
+                // ---- fsync: the durability barrier
+                let t = Instant::now();
+                split.db.persist(PersistMode::SyncAll).unwrap();
+                let fsync = t.elapsed();
+
+                // ---- cross-check: the real apply_hydration_batch
+                let real_batch = HydrationBatch {
+                    shard_id: shard,
+                    puts: staged.values().cloned().collect(),
+                    removes: Vec::new(),
+                    name_inserts: name_inserts.clone(),
+                    name_removes: Vec::new(),
+                    new_last_applied_seq: SequenceNumber((round + 1) * batch_size),
+                    stuck_state: Some(None),
+                    halted: None,
+                    migrated_chunk_evictions: Vec::new(),
+                };
+                let t = Instant::now();
+                real.apply_hydration_batch(real_batch).unwrap();
+                let real_total = t.elapsed();
+
+                let per = |d: std::time::Duration| d.as_secs_f64() * 1e6 / batch_size as f64;
+                println!(
+                    "{:>6} {:>5} {:>10.2} {:>10.2} {:>10.2} {:>10.3} {:>11.2} {:>11.2} {:>11.2}",
+                    batch_size,
+                    round,
+                    per(stage),
+                    per(build),
+                    per(commit),
+                    fsync.as_secs_f64() * 1e3,
+                    per(fsync),
+                    per(stage + build + commit + fsync),
+                    per(real_total),
+                );
+            }
+        }
+
+        // ---- P4 ack-path residual: the one fjall touch left on the
+        // ack path (`create_with_name_volatile` → `name_lookup`).
+        let lookup_dir = probe_root.join("split-5000");
+        let store = FjallStorage::open(&lookup_dir).unwrap();
+        let t = std::time::Instant::now();
+        let n = 10_000u32;
+        for i in 0..n {
+            let name = format!("bench/run-2026-06-10/objects/obj-{:08}", i % 5000 + 1);
+            let _ = store.name_lookup(ns, &name).unwrap();
+        }
+        let per_lookup = t.elapsed().as_secs_f64() * 1e6 / f64::from(n);
+        println!();
+        println!("P4 ack-path residual — name_lookup point read: {per_lookup:.2} µs/op");
+
+        let payload_len = crate::composition::encode_composition_create_payload(
+            CompositionId(uuid::Uuid::from_u128(1)),
+            ns,
+            65_536,
+            Some("bench/run-2026-06-10/objects/obj-00000001"),
+            &[],
+            Some(mk_seq(0)),
+        )
+        .len();
+        println!("create payload size at this shape: {payload_len} B");
+    }
+
     fn make_comp(idx: u8) -> Composition {
         use kiseki_common::ids::ChunkId;
         use kiseki_common::ids::ShardId;

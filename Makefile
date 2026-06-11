@@ -108,7 +108,10 @@ NEXTEST_FAST_BDD   ?= KISEKI_BDD_FAST=1 KISEKI_SERVER_BIN=$(abspath $(KISEKI_SER
 # `--no-tests=warn` because nextest 0.9.x defaults to exit 4 when
 # no tests match the filter, and that's the natural state while
 # the workspace has zero `#[ignore = "slow:…"]` tests.
-NEXTEST_SLOW_UNIT_MAIN     ?= $(CARGO) nextest run --profile slow --run-ignored=only --no-tests=warn -E 'not test(measure_sm_mutex_contention)' --workspace --exclude kiseki-acceptance --exclude kiseki-chunk-cluster --locked
+# `-E 'not test(measure_)'` — `measure_*` is the manual perf-probe
+# naming convention (`#[ignore = "perf probe: …"]`); probes are run
+# by hand with --nocapture, never in a CI lane.
+NEXTEST_SLOW_UNIT_MAIN     ?= $(CARGO) nextest run --profile slow --run-ignored=only --no-tests=warn -E 'not test(measure_)' --workspace --exclude kiseki-acceptance --exclude kiseki-chunk-cluster --locked
 NEXTEST_SLOW_UNIT_TLS_PEER ?= $(CARGO) nextest run --profile slow --run-ignored=only --no-tests=warn -p kiseki-chunk-cluster --locked
 # Tier 2 — full BDD (no env var → no @smoke / @slow filtering).
 # Same `cargo test` rationale as Tier 1.

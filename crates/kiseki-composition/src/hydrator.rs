@@ -177,6 +177,39 @@ fn read_transient_retry_threshold() -> u32 {
         .unwrap_or(DEFAULT_TRANSIENT_RETRY_THRESHOLD)
 }
 
+/// Default for `KISEKI_HYDRATOR_BATCH` (#231): deltas per poll window
+/// — and therefore per atomic `apply_hydration_batch` commit, i.e.
+/// the number of deltas amortizing ONE `SyncAll` durability barrier
+/// (the barrier itself stays per batch — it is load-bearing for
+/// `last_applied_seq` correctness on restart; the lever is
+/// amortization, not removal).
+///
+/// The 2026-06-10 STEP-0 probe
+/// (`measure_hydration_apply_cost_vs_batch_size` in
+/// `persistent/fjall.rs`) measured the barrier at a constant ~5-7 ms
+/// per batch regardless of batch size on `NVMe`, with stage + build +
+/// commit all ≤ ~2 µs/delta: total per-delta apply cost is ~55 µs at
+/// 100-delta batches, ~9 µs at the old hard-coded 1000 window, and
+/// ~4.6 µs at 5000. Raising the window 1000 → 4000 roughly halves the
+/// per-delta cost during deep-backlog catch-up.
+pub const DEFAULT_HYDRATOR_BATCH: u64 = 4000;
+
+/// Upper clamp for `KISEKI_HYDRATOR_BATCH`. Bounds the single-commit
+/// latency (and the staged-batch memory) so an operator setting an
+/// absurd window can't make one `apply_hydration_batch` occupy the
+/// storage backend for hundreds of milliseconds. At the probe's
+/// ~2 µs/delta commit cost, 20 000 deltas ≈ 40 ms of commit + one
+/// fsync — the worst-case single-batch latency stays well under the
+/// 100 ms poll cadence.
+pub const MAX_HYDRATOR_BATCH: u64 = 20_000;
+
+fn read_hydrator_batch() -> u64 {
+    std::env::var("KISEKI_HYDRATOR_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map_or(DEFAULT_HYDRATOR_BATCH, |v| v.clamp(1, MAX_HYDRATOR_BATCH))
+}
+
 /// Polls the Raft delta log and applies composition-create / update /
 /// delete records to a follower's local persistent store.
 pub struct CompositionHydrator {
@@ -193,6 +226,10 @@ pub struct CompositionHydrator {
     /// acquiring the storage lock. Was node-global pre-PR-2 of #87.
     halted_cache: bool,
     transient_retry_threshold: u32,
+    /// Poll-window size (#231): deltas read — and applied in ONE
+    /// atomic backend commit + ONE fsync — per poll. From
+    /// `KISEKI_HYDRATOR_BATCH`, clamped to `[1, MAX_HYDRATOR_BATCH]`.
+    batch_window: u64,
     /// §D10 metrics surface. Optional so unit tests get no-op behavior.
     metrics: Option<Arc<CompositionMetrics>>,
 }
@@ -221,6 +258,7 @@ impl CompositionHydrator {
             last_applied_cache,
             halted_cache,
             transient_retry_threshold: read_transient_retry_threshold(),
+            batch_window: read_hydrator_batch(),
             metrics: None,
         }
     }
@@ -287,7 +325,11 @@ impl CompositionHydrator {
 
         let from = SequenceNumber(self.last_applied_cache.0.saturating_add(1));
         // Bounded batch to keep backend commit duration reasonable.
-        let to = SequenceNumber(from.0.saturating_add(999));
+        // Window size = `KISEKI_HYDRATOR_BATCH` (#231): all deltas in
+        // the window land in ONE atomic backend commit + ONE fsync, so
+        // a bigger window amortizes the constant ~5-7 ms durability
+        // barrier across more deltas during deep-backlog catch-up.
+        let to = SequenceNumber(from.0.saturating_add(self.batch_window.saturating_sub(1)));
 
         let deltas = match log
             .read_deltas(ReadDeltasRequest { shard_id, from, to })
@@ -941,10 +983,11 @@ mod tests {
     /// protocol-agnostic write blocks waiting on Raft commit ack
     /// because the leader's mutex stack is saturated.
     ///
-    /// Today the hydrator reads up to 1 000 deltas per poll
-    /// (`from..from+999`) and sleeps 100 ms between polls — a
-    /// theoretical ceiling of ~10 000 ops/sec. The observed 50 ops/sec
-    /// puts the actual catch-up rate at 200x below the theoretical
+    /// The hydrator reads up to `KISEKI_HYDRATOR_BATCH` deltas per
+    /// poll (default 4 000 post-#231; 1 000 hard-coded at the time of
+    /// the observation) and — post-#212 drain-while-busy — re-polls
+    /// immediately while applying. The observed 50 ops/sec put the
+    /// actual catch-up rate orders of magnitude below the algorithmic
     /// ceiling, which is more than a slow fsync can explain on its
     /// own.
     ///
@@ -1001,6 +1044,10 @@ mod tests {
     async fn registry_drains_multi_window_burst_without_interval_sleeps() {
         const N: u64 = 3_000; // 3 poll windows of 1 000
         std::env::set_var("KISEKI_HYDRATOR_POLL_MS", "4000");
+        // Pin the window to 1 000 — the default is 4 000 post-#231,
+        // which would fit the whole burst into one window and stop
+        // exercising the multi-window drain this test pins.
+        std::env::set_var("KISEKI_HYDRATOR_BATCH", "1000");
         let store = fresh_store_with_default_ns();
         let (log, shard_id) = fresh_log();
         let ns_id = NamespaceId(uuid::Uuid::from_u128(2));
@@ -1034,6 +1081,162 @@ mod tests {
                 started.elapsed().as_secs_f64(),
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        std::env::remove_var("KISEKI_HYDRATOR_BATCH");
+    }
+
+    /// #231 — `KISEKI_HYDRATOR_BATCH` parsing: default, explicit
+    /// value, clamp floor (0 → 1), clamp ceiling (huge →
+    /// `MAX_HYDRATOR_BATCH`), and garbage → default.
+    #[test]
+    fn hydrator_batch_env_knob_parses_and_clamps() {
+        std::env::remove_var("KISEKI_HYDRATOR_BATCH");
+        assert_eq!(read_hydrator_batch(), DEFAULT_HYDRATOR_BATCH);
+
+        std::env::set_var("KISEKI_HYDRATOR_BATCH", "250");
+        assert_eq!(read_hydrator_batch(), 250);
+
+        std::env::set_var("KISEKI_HYDRATOR_BATCH", "0");
+        assert_eq!(read_hydrator_batch(), 1, "0 must clamp to 1, not stall");
+
+        std::env::set_var("KISEKI_HYDRATOR_BATCH", "999999999");
+        assert_eq!(
+            read_hydrator_batch(),
+            MAX_HYDRATOR_BATCH,
+            "cap bounds the single-commit latency",
+        );
+
+        std::env::set_var("KISEKI_HYDRATOR_BATCH", "not-a-number");
+        assert_eq!(read_hydrator_batch(), DEFAULT_HYDRATOR_BATCH);
+
+        std::env::remove_var("KISEKI_HYDRATOR_BATCH");
+    }
+
+    /// #231 — drain-accumulation correctness: a backlog deeper than
+    /// one window drains in window-sized ATOMIC batches. After every
+    /// poll the durable `last_applied_seq` has advanced exactly with
+    /// the batch that committed (never mid-batch), and the
+    /// #87 gap-evidence/halt logic stays untriggered throughout.
+    #[tokio::test]
+    async fn hydrator_drains_backlog_in_window_sized_atomic_batches() {
+        const N: u64 = 5_000;
+        const WINDOW: u64 = 2_000;
+        std::env::set_var("KISEKI_HYDRATOR_BATCH", WINDOW.to_string());
+
+        let store = fresh_store_with_default_ns();
+        let (log, shard_id) = fresh_log();
+        let ns_id = NamespaceId(uuid::Uuid::from_u128(2));
+        for i in 0..N {
+            let comp_id = CompositionId(uuid::Uuid::from_u128(u128::from(i) + 1));
+            let payload = enc_create(comp_id, ns_id, 64);
+            append_create(&log, shard_id, payload, vec![ChunkId([0u8; 32])]).await;
+        }
+
+        let mut hydrator = CompositionHydrator::new(Arc::clone(&store), shard_id);
+        std::env::remove_var("KISEKI_HYDRATOR_BATCH");
+
+        for (expected, batch) in [(2_000u64, 2_000u64), (4_000, 2_000), (5_000, 1_000)] {
+            let applied = hydrator.poll(&log).await;
+            assert_eq!(
+                applied, batch,
+                "each poll must apply exactly one window (or the tail)",
+            );
+            // Durable last_applied advanced atomically WITH the batch.
+            let durable = store
+                .with_storage_locked(|s| s.last_applied_seq(shard_id))
+                .unwrap();
+            assert_eq!(durable.0, expected);
+            assert_eq!(hydrator.last_applied().0, expected);
+            assert!(!hydrator.halted(), "windowed drain must never trip halt");
+        }
+        // Fully drained; a further poll is a no-op.
+        assert_eq!(hydrator.poll(&log).await, 0);
+        assert_eq!(store.count().unwrap(), N);
+    }
+
+    /// #231 STEP-0/STEP-2 probe — the PRODUCTION poll path end-to-end
+    /// (`read_deltas` → stage → one atomic fjall commit + fsync per
+    /// poll) on REAL disk, swept across `KISEKI_HYDRATOR_BATCH`
+    /// window sizes. 1000 = the pre-#231 hard-coded window (before),
+    /// 4000 = the new default (after).
+    ///
+    /// Run: `cargo test -p kiseki-composition --release \
+    ///       measure_hydrator_drain_vs_window -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "perf probe: hydrator drain rate vs KISEKI_HYDRATOR_BATCH (real-disk fjall)"]
+    #[allow(clippy::cast_precision_loss)]
+    async fn measure_hydrator_drain_vs_window() {
+        const N: u64 = 10_000;
+
+        let probe_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/probe-231-hydrator");
+        let _ = std::fs::remove_dir_all(&probe_root);
+
+        println!();
+        println!(
+            "{:>7} {:>7} {:>10} {:>12} {:>12}",
+            "window", "polls", "wall ms", "per-delta µs", "deltas/s"
+        );
+        for &window in &[100u64, 500, 1000, 2000, 4000, 5000] {
+            std::env::set_var("KISEKI_HYDRATOR_BATCH", window.to_string());
+
+            let dir = probe_root.join(format!("w{window}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let storage = crate::persistent::FjallStorage::open(&dir).unwrap();
+            let store = Arc::new(CompositionStore::with_storage(Box::new(storage)));
+            store.add_namespace(crate::namespace::Namespace {
+                id: NamespaceId(uuid::Uuid::from_u128(2)),
+                tenant_id: OrgId(uuid::Uuid::from_u128(1)),
+                shard_id: ShardId(uuid::Uuid::from_u128(1)),
+                read_only: false,
+                versioning_enabled: false,
+                compliance_tags: Vec::new(),
+                tier_policy: Vec::new(),
+                size_band_pools: crate::namespace::NamespaceSizeBandPools::default(),
+            });
+            let (log, shard_id) = fresh_log();
+            let ns_id = NamespaceId(uuid::Uuid::from_u128(2));
+            // Modern-shape Create deltas: S3-style name + perspective-seq
+            // (the post-P4 ingress emission — the hydrator IS the
+            // durable materialization path for these).
+            for i in 0..N {
+                let comp_id = CompositionId(uuid::Uuid::from_u128(u128::from(i) + 1));
+                let name = format!("bench/run-2026-06-10/objects/obj-{i:08}");
+                let seq = PerspectiveSeq(kiseki_common::time::HybridLogicalClock {
+                    physical_ms: 1_700_000_000_000 + i,
+                    logical: 0,
+                    node_id: NodeId(3),
+                });
+                let payload = encode_composition_create_payload(
+                    comp_id,
+                    ns_id,
+                    65_536,
+                    Some(&name),
+                    &[],
+                    Some(seq),
+                );
+                append_create(&log, shard_id, payload, vec![ChunkId([7u8; 32])]).await;
+            }
+
+            let mut hydrator = CompositionHydrator::new(Arc::clone(&store), shard_id);
+            std::env::remove_var("KISEKI_HYDRATOR_BATCH");
+            let started = std::time::Instant::now();
+            let mut polls = 0u64;
+            let mut applied_total = 0u64;
+            while applied_total < N {
+                applied_total += hydrator.poll(&log).await;
+                polls += 1;
+                assert!(polls < N, "stuck: {applied_total}/{N} after {polls} polls");
+            }
+            let wall = started.elapsed();
+            println!(
+                "{:>7} {:>7} {:>10.1} {:>12.2} {:>12.0}",
+                window,
+                polls,
+                wall.as_secs_f64() * 1e3,
+                wall.as_secs_f64() * 1e6 / N as f64,
+                N as f64 / wall.as_secs_f64(),
+            );
         }
     }
 
