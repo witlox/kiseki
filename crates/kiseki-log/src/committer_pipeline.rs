@@ -345,9 +345,7 @@ impl<A: PipelinedIntentAppender> PipelinedCommitter<A> {
         while !self.in_flight.is_empty() {
             self.await_oldest().await;
         }
-        inflight_rounds_gauge()
-            .with_label_values(&[&self.shard_label])
-            .set(0);
+        self.export_inflight_gauge();
     }
 
     /// Drop all in-flight bookkeeping (leadership lost / supervisor
@@ -356,9 +354,7 @@ impl<A: PipelinedIntentAppender> PipelinedCommitter<A> {
     pub fn clear_in_flight(&mut self) {
         self.in_flight.clear();
         self.in_flight_seqs.clear();
-        inflight_rounds_gauge()
-            .with_label_values(&[&self.shard_label])
-            .set(0);
+        self.export_inflight_gauge();
     }
 
     /// Reap rounds that have already completed, front-first
@@ -461,11 +457,18 @@ impl<A: PipelinedIntentAppender> PipelinedCommitter<A> {
             // `committer.sink_incorporate` stays "one Raft round,
             // submit → applied", now measured overlapped.
             let timer = kiseki_tracing::hot_path::HotTimer::new("committer.sink_incorporate");
-            let ticket = self
-                .appender
-                .submit_intents(items)
-                .await
-                .map_err(|e| IntentError::Incorporate(e.to_string()))?;
+            let ticket = match self.appender.submit_intents(items).await {
+                Ok(t) => t,
+                Err(e) => {
+                    // Keep the in-flight gauge honest on the early
+                    // return — rounds submitted earlier this tick (or
+                    // left over from previous ticks) are still in
+                    // flight; without this the gauge reads a stale
+                    // value until the next tick.
+                    self.export_inflight_gauge();
+                    return Err(IntentError::Incorporate(e.to_string()));
+                }
+            };
             let seqs: Vec<PerspectiveSeq> = batch.iter().map(|i| i.perspective_seq).collect();
             for s in &seqs {
                 self.in_flight_seqs.insert(*s);
@@ -477,10 +480,15 @@ impl<A: PipelinedIntentAppender> PipelinedCommitter<A> {
             });
             submitted += batch.len();
         }
+        self.export_inflight_gauge();
+        Ok(submitted)
+    }
+
+    /// Export the current in-flight round count to the per-shard gauge.
+    fn export_inflight_gauge(&self) {
         inflight_rounds_gauge()
             .with_label_values(&[&self.shard_label])
             .set(i64::try_from(self.in_flight.len()).unwrap_or(i64::MAX));
-        Ok(submitted)
     }
 
     /// Gauge + trend bookkeeping for one tick's pending snapshot.

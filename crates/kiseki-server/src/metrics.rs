@@ -770,10 +770,24 @@ impl KisekiMetrics {
     }
 
     /// Encode all metrics as Prometheus text format.
+    ///
+    /// Merges TWO registries into one exposition (GH #230 review
+    /// blocker): this struct's custom registry, plus the process-wide
+    /// prometheus DEFAULT registry. Crates that register via the
+    /// `prometheus::register_*!` macros (kiseki-log's committer
+    /// backpressure gauges, dedup/snapshot-cap/watermark-skip counters;
+    /// kiseki-gateway's pNFS DS write-buffer metrics) land in the
+    /// default registry — without this merge they were unscrapeable.
+    /// No dedupe pass: the family names are disjoint by construction
+    /// (the custom registry's `kiseki_log_*` names — append, read,
+    /// compaction, truncate, `watermark_advance` — do not collide with
+    /// the macro-registered ones; verified by name across the
+    /// workspace).
     #[must_use]
     pub fn encode(&self) -> String {
         let encoder = TextEncoder::new();
-        let metric_families = self.registry.gather();
+        let mut metric_families = self.registry.gather();
+        metric_families.extend(prometheus::default_registry().gather());
         let mut buffer = Vec::new();
         encoder.encode(&metric_families, &mut buffer).unwrap_or(());
         String::from_utf8(buffer).unwrap_or_default()
@@ -943,6 +957,38 @@ mod tests {
         assert!(
             output.contains("kiseki_gateway_requests_total"),
             "counter vec should appear after increment"
+        );
+    }
+
+    #[test]
+    fn encode_merges_default_registry_families() {
+        // GH #230 review blocker: kiseki-log's backpressure metrics
+        // (and three pre-existing counters) register via the
+        // `prometheus::register_*!` macros into the process-wide
+        // DEFAULT registry, not KisekiMetrics' custom one. Fire a
+        // counter registered the same way and assert the merged
+        // /metrics output carries it alongside a custom-registry
+        // family.
+        let probe = prometheus::IntCounter::new(
+            "kiseki_test_default_registry_probe_total",
+            "test probe for the default-registry gather-merge",
+        )
+        .expect("metric");
+        prometheus::default_registry()
+            .register(Box::new(probe.clone()))
+            .expect("register probe into the default registry");
+        probe.inc();
+
+        let m = KisekiMetrics::new();
+        m.chunk_write_bytes.inc();
+        let output = m.encode();
+        assert!(
+            output.contains("kiseki_test_default_registry_probe_total"),
+            "default-registry family must appear in the merged /metrics output"
+        );
+        assert!(
+            output.contains("kiseki_chunk_write_bytes_total"),
+            "custom-registry families must still be present after the merge"
         );
     }
 

@@ -822,7 +822,9 @@ impl RaftShardStore {
         // The supervisor runs on EVERY node hosting the shard: it drains the
         // log only while this node is the Raft leader (running recover() once
         // on becoming leader), and self-prunes the local intent store on every
-        // node (leader or follower) against the applied max_incorporated_seq.
+        // node (leader or follower) keyed on the SM's recent_incorporated
+        // snapshot (PART 8 §T) — removing exactly the intents this replica
+        // has already applied.
         if intent_store_durable {
             self.spawn_supervisor(shard_id, &store, Arc::clone(&intent_store));
             // W12 (2026-06-02): producer-side intent-fan coalescer. Same
@@ -984,10 +986,11 @@ impl RaftShardStore {
     /// - **On losing leadership**: stop draining (idle). A deposed leader's
     ///   `client_write` is fenced by openraft anyway; we simply stop trying.
     /// - **On every node, every tick (MF-5 follower self-prune)**: prune the
-    ///   local intent store up to this node's OWN applied `max_incorporated_seq`
-    ///   (read from the replicated log). Once a seq is incorporated and
-    ///   replicated to this node, its intent copy is redundant — pruning is safe
-    ///   everywhere and bounds follower-store growth under sustained load.
+    ///   local intent store keyed on the SM's `recent_incorporated` snapshot
+    ///   (PART 8 §T) — exactly the seqs this replica has applied. Once a seq is
+    ///   incorporated and replicated to this node, its intent copy is redundant
+    ///   — pruning is safe everywhere and bounds follower-store growth under
+    ///   sustained load.
     ///
     /// `cluster_size` is the configured voter count (`self.peers.len()`, incl.
     /// self): the authoritative membership size, stable even before the shard's
