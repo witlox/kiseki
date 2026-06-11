@@ -101,22 +101,7 @@ impl<A: IntentLogAppender> IncorporationSink for RaftLogIncorporationSink<A> {
         }
         let items: Vec<IncorporateItem> = ordered
             .iter()
-            .map(|intent| IncorporateItem {
-                tenant_id_bytes: *intent.append.delta.tenant_id.0.as_bytes(),
-                operation: crate::raft::openraft_store::op_to_u8_pub(intent.append.delta.operation),
-                hashed_key: intent.append.delta.hashed_key,
-                chunk_refs: intent.append.delta.chunk_refs.iter().map(|c| c.0).collect(),
-                payload: intent.append.delta.payload.clone(),
-                has_inline_data: intent.append.delta.has_inline_data,
-                new_chunks: intent.append.new_chunks.clone(),
-                perspective_seq: intent.perspective_seq.0,
-                inline_payloads: intent
-                    .append
-                    .inline_payloads
-                    .iter()
-                    .map(|(c, b)| (c.0, b.clone()).into())
-                    .collect(),
-            })
+            .map(crate::committer_pipeline::intent_to_item)
             .collect();
         block_on_maybe_in_place(&self.handle, self.appender.append_intents(items))
             .map_err(|e| IntentError::Incorporate(e.to_string()))?;

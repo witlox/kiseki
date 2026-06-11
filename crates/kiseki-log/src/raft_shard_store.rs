@@ -1038,6 +1038,10 @@ impl RaftShardStore {
             local_node: self.node_id,
             every_ticks: watermark_advance_every_ticks(COMMITTER_INTERVAL),
         };
+        // GH #230 — pipelined drain depth. Default 2 rounds in flight
+        // per shard; `KISEKI_COMMITTER_PIPELINE_DEPTH=0` opts back into
+        // the legacy serial drain (the revert lever).
+        let pipeline_depth = crate::committer_pipeline::pipeline_depth_from_env();
         let join = std::thread::Builder::new()
             .name(format!("kiseki-committer-{}", shard_id.0))
             .spawn(move || {
@@ -1047,13 +1051,31 @@ impl RaftShardStore {
                     // because this is a dedicated std::thread, not a tokio
                     // worker (the threading contract).
                     let sink = RaftLogIncorporationSink::new(
-                        OpenRaftAppender { store: appender },
+                        OpenRaftAppender {
+                            store: Arc::clone(&appender),
+                        },
                         raft_handle.clone(),
                     );
-                    let committer = ShardCommitter::new(intent_store, sink, cluster_size, min_acks);
+                    let committer = ShardCommitter::new(
+                        Arc::clone(&intent_store),
+                        sink,
+                        cluster_size,
+                        min_acks,
+                    );
+                    // GH #230 — the pipelined drain (depth >= 1). `None`
+                    // keeps the legacy serial `drain_local` path.
+                    let pipelined = (pipeline_depth >= 1).then(|| {
+                        crate::committer_pipeline::PipelinedCommitter::new(
+                            intent_store,
+                            appender,
+                            pipeline_depth,
+                            shard_id.0.to_string(),
+                        )
+                    });
                     run_supervisor_loop(
                         shard_id,
                         committer,
+                        pipelined,
                         gatherer,
                         leadership_store,
                         prune_store,
@@ -1544,7 +1566,13 @@ async fn gather_voter_hydrator_positions(
 ///    draining (idle until re-elected).
 /// 3. **Election recovery + recovery dedup:** gather + `recover()` (filtered to
 ///    drop already-incorporated and ancient intents on the way in — see §6).
-/// 4. **Drain (leader only, after recovery succeeded):** `drain_local()`.
+/// 4. **Drain (leader only, after recovery succeeded):** the GH #230 pipelined
+///    [`crate::committer_pipeline::PipelinedCommitter::drain_tick`] — submits
+///    pending intents in `DRAIN_BATCH_CAP` rounds, keeping up to
+///    `KISEKI_COMMITTER_PIPELINE_DEPTH` (default 2) rounds in flight across
+///    the tick sleep so a round's replication/apply wait overlaps the next
+///    round's append. `KISEKI_COMMITTER_PIPELINE_DEPTH=0` opts back into the
+///    legacy serial `drain_local()`.
 /// 5. **Watermark-advance round (leader only, every
 ///    `watermark.every_ticks` ticks — P3 / I-L4):** gather every
 ///    voter's node-local `hydrator` position and propose `min` as ONE
@@ -1556,9 +1584,10 @@ async fn gather_voter_hydrator_positions(
 /// / shard retire).
 #[allow(clippy::too_many_lines)] // supervisor cohesion > arbitrary line cap
 #[allow(clippy::too_many_arguments)] // the spawn site is the only caller
-async fn run_supervisor_loop<S, G>(
+async fn run_supervisor_loop<S, G, A>(
     shard_id: ShardId,
     mut committer: ShardCommitter<S>,
+    mut pipelined: Option<crate::committer_pipeline::PipelinedCommitter<A>>,
     gatherer: G,
     leadership_store: Arc<OpenRaftLogStore>,
     prune_store: Arc<dyn IntentStore>,
@@ -1568,6 +1597,7 @@ async fn run_supervisor_loop<S, G>(
 ) where
     S: crate::intent_committer::IncorporationSink,
     G: PeerIntentGatherer,
+    A: crate::committer_pipeline::PipelinedIntentAppender,
 {
     if *shutdown.borrow() {
         return;
@@ -1629,6 +1659,12 @@ async fn run_supervisor_loop<S, G>(
             }
         } else if !is_leader && was_leader {
             tracing::info!(shard_id = %shard_id.0, "LeaderSink: lost shard leadership — parking committer");
+            // GH #230 — drop the pipelined in-flight bookkeeping: a
+            // deposed leader's submitted rounds either commit (SM gate
+            // dedups any later resubmission) or are fenced by openraft.
+            if let Some(p) = pipelined.as_mut() {
+                p.clear_in_flight();
+            }
         }
         was_leader = is_leader;
 
@@ -1717,8 +1753,16 @@ async fn run_supervisor_loop<S, G>(
             }
 
             // (2b/3) Steady-state drain — only after recovery for this term.
+            // GH #230: pipelined (submit up to `depth` rounds, leave them
+            // in flight across the tick sleep) unless
+            // KISEKI_COMMITTER_PIPELINE_DEPTH=0 opted back into the
+            // legacy serial drain.
             if recovered_this_term {
-                if let Err(e) = committer.drain_local() {
+                let drained = match pipelined.as_mut() {
+                    Some(p) => p.drain_tick().await,
+                    None => committer.drain_local(),
+                };
+                if let Err(e) = drained {
                     tracing::warn!(shard_id = %shard_id.0, error = %e, "LeaderSink: drain failed; retrying next tick");
                 }
             }

@@ -16,6 +16,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod auto_split;
+pub mod committer_pipeline;
 pub mod compaction_worker;
 pub mod delta;
 pub mod error;

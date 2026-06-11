@@ -673,6 +673,55 @@ impl OpenRaftLogStore {
         }
     }
 
+    /// GH #230 — ENQUEUE a batched `IncorporateIntents` command without
+    /// waiting for apply (the pipelined committer's submit half).
+    ///
+    /// Uses `client_write_ff` + a [`openraft::impls::ProgressResponder`]:
+    /// when this method returns, the command is in the Raft core's input
+    /// queue — two sequential calls from one task therefore append in
+    /// call order (submission order == log order). The returned future
+    /// resolves once the entry is APPLIED on this leader's state machine
+    /// (or errs on a Raft failure; the entry may still have committed —
+    /// callers retry at-least-once and the SM dedup gate makes that
+    /// exactly-once).
+    ///
+    /// # Errors
+    /// [`LogError::MaintenanceMode`] if the shard is draining;
+    /// [`LogError::Unavailable`] if the Raft core is gone.
+    pub async fn submit_intents(
+        &self,
+        items: Vec<crate::raft_store::IncorporateItem>,
+    ) -> Result<impl std::future::Future<Output = Result<(), LogError>> + Send + 'static, LogError>
+    {
+        {
+            let inner = self.state.lock().await;
+            if inner.maintenance {
+                return Err(LogError::MaintenanceMode(self.shard_id));
+            }
+        }
+        let cmd = LogCommand::IncorporateIntents { items };
+        let (responder, _commit_rx, complete_rx) = openraft::impls::ProgressResponder::new();
+        self.raft
+            .client_write_ff(cmd, Some(responder))
+            .await
+            .map_err(|_| LogError::Unavailable)?;
+        let shard_id = self.shard_id;
+        Ok(async move {
+            let result = complete_rx.await.map_err(|_| LogError::Unavailable)?;
+            let resp = result.map_err(|e| {
+                if matches!(e, openraft::error::ClientWriteError::ForwardToLeader(_)) {
+                    LogError::LeaderUnavailable(shard_id)
+                } else {
+                    LogError::Unavailable
+                }
+            })?;
+            match resp.response() {
+                LogResponse::Appended(_) => Ok(()),
+                LogResponse::Ok | LogResponse::DecrementOutcome(_) => Err(LogError::Unavailable),
+            }
+        })
+    }
+
     /// ADR-042 §4 — `append_chunk_and_delta` that surfaces
     /// `LogError::ForwardToLeader` instead of `LeaderUnavailable`.
     /// Used by [`crate::traits::LogOps::append_chunk_and_delta_with_forwarding`]
