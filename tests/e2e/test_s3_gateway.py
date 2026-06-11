@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 import requests
 
+from conftest import S3_LARGE_TIMEOUT, S3_TIMEOUT
 from helpers.cluster import ServerInfo, start_cluster, stop_cluster
 
 
@@ -17,13 +18,13 @@ def test_s3_put_and_get(kiseki_server: ServerInfo) -> None:
     data = b"hello from S3 e2e test"
 
     # PUT
-    put_resp = requests.put(f"{S3_BASE}/default/testkey", data=data, timeout=5)
+    put_resp = requests.put(f"{S3_BASE}/default/testkey", data=data, timeout=S3_TIMEOUT)
     assert put_resp.status_code == 200, f"PUT failed: {put_resp.text}"
     etag = put_resp.headers.get("etag", "").strip('"')
     assert etag, "expected ETag in response"
 
     # GET (use etag as composition ID key)
-    get_resp = requests.get(f"{S3_BASE}/default/{etag}", timeout=5)
+    get_resp = requests.get(f"{S3_BASE}/default/{etag}", timeout=S3_TIMEOUT)
     assert get_resp.status_code == 200, f"GET failed: {get_resp.text}"
     assert get_resp.content == data
 
@@ -33,10 +34,10 @@ def test_s3_head(kiseki_server: ServerInfo) -> None:
     """PUT then HEAD — verify content-length."""
     data = b"head test data 1234567890"
 
-    put_resp = requests.put(f"{S3_BASE}/default/headkey", data=data, timeout=5)
+    put_resp = requests.put(f"{S3_BASE}/default/headkey", data=data, timeout=S3_TIMEOUT)
     etag = put_resp.headers.get("etag", "").strip('"')
 
-    head_resp = requests.head(f"{S3_BASE}/default/{etag}", timeout=5)
+    head_resp = requests.head(f"{S3_BASE}/default/{etag}", timeout=S3_TIMEOUT)
     assert head_resp.status_code == 200
     assert int(head_resp.headers.get("content-length", 0)) == len(data)
 
@@ -46,7 +47,7 @@ def test_s3_get_not_found(kiseki_server: ServerInfo) -> None:
     """GET non-existent object returns 404."""
     resp = requests.get(
         f"{S3_BASE}/default/00000000-0000-0000-0000-000000000099",
-        timeout=5,
+        timeout=S3_TIMEOUT,
     )
     assert resp.status_code == 404
 
@@ -59,15 +60,17 @@ def test_s3_delete(kiseki_server: ServerInfo) -> None:
     asserted the 204 only.
     """
     key = "del/should-be-gone.bin"
-    put = requests.put(f"{S3_BASE}/default/{key}", data=b"to-be-deleted", timeout=5)
+    put = requests.put(
+        f"{S3_BASE}/default/{key}", data=b"to-be-deleted", timeout=S3_TIMEOUT
+    )
     assert put.status_code == 200, f"PUT failed: {put.status_code} {put.text[:200]}"
 
-    head_before = requests.head(f"{S3_BASE}/default/{key}", timeout=5)
+    head_before = requests.head(f"{S3_BASE}/default/{key}", timeout=S3_TIMEOUT)
     assert head_before.status_code == 200, (
         f"sanity: object must exist before DELETE; got {head_before.status_code}"
     )
 
-    delete = requests.delete(f"{S3_BASE}/default/{key}", timeout=5)
+    delete = requests.delete(f"{S3_BASE}/default/{key}", timeout=S3_TIMEOUT)
     assert delete.status_code in (200, 204), (
         f"DELETE returned {delete.status_code}; expected 200 or 204"
     )
@@ -75,12 +78,12 @@ def test_s3_delete(kiseki_server: ServerInfo) -> None:
     # Post-condition: the key must not resolve anymore. This is what
     # makes the test actually verify DELETE *semantics* rather than
     # just status-code shape.
-    get_after = requests.get(f"{S3_BASE}/default/{key}", timeout=5)
+    get_after = requests.get(f"{S3_BASE}/default/{key}", timeout=S3_TIMEOUT)
     assert get_after.status_code == 404, (
         f"DELETE did not remove the object: subsequent GET returned "
         f"{get_after.status_code} (expected 404). Body: {get_after.text[:200]}"
     )
-    head_after = requests.head(f"{S3_BASE}/default/{key}", timeout=5)
+    head_after = requests.head(f"{S3_BASE}/default/{key}", timeout=S3_TIMEOUT)
     assert head_after.status_code == 404, (
         f"DELETE did not remove the object: subsequent HEAD returned "
         f"{head_after.status_code} (expected 404)."
@@ -116,7 +119,9 @@ def test_s3_large_put_exceeds_64mib_fabric_cap() -> None:
         payload = bytes((i * 17) & 0xFF for i in range(128 * 1024 * 1024))
         s3 = f"http://{cluster.nodes[0].data_addr.split(':')[0]}:9000"
 
-        put = requests.put(f"{s3}/default/large-128m", data=payload, timeout=120)
+        put = requests.put(
+            f"{s3}/default/large-128m", data=payload, timeout=S3_LARGE_TIMEOUT
+        )
         put.raise_for_status()
         etag = put.headers.get("etag", "").strip('"')
         assert etag, "PUT must return an etag"
@@ -124,7 +129,7 @@ def test_s3_large_put_exceeds_64mib_fabric_cap() -> None:
         # GET the same bytes back. Single-stream GET of 128 MiB
         # also exercises the read-side fabric path (chunk fetch
         # from any peer when the local store cold-misses).
-        get = requests.get(f"{s3}/default/{etag}", timeout=120)
+        get = requests.get(f"{s3}/default/{etag}", timeout=S3_LARGE_TIMEOUT)
         get.raise_for_status()
         assert len(get.content) == len(payload), (
             f"GET length {len(get.content)} != PUT length {len(payload)}"

@@ -9,9 +9,15 @@ from pathlib import Path
 import grpc
 import pytest
 
-from conftest import BOOTSTRAP_SHARD_UUID, BOOTSTRAP_TENANT_UUID
+from conftest import BOOTSTRAP_SHARD_UUID, BOOTSTRAP_TENANT_UUID, GRPC_TIMEOUT
 from helpers.cluster import ServerInfo, _wait_for_ready
 from kiseki.v1 import common_pb2, log_pb2, log_pb2_grpc
+
+# Release run 27322282644: post-restart RPCs on fresh channels failed with
+# "timed out before receiving SETTINGS frame" on a loaded 2-vCPU runner.
+# Scaled deadline + wait_for_ready=True retries the handshake within the
+# budget instead of failing on the first connect attempt.
+_RPC = {"timeout": GRPC_TIMEOUT, "wait_for_ready": True}
 
 
 WORKSPACE = Path(__file__).resolve().parents[2]
@@ -42,7 +48,8 @@ def test_delta_survives_restart(kiseki_server: ServerInfo) -> None:
             hashed_key=bytes([0xDD] * 32),
             payload=payload,
             has_inline_data=True,
-        )
+        ),
+        **_RPC,
     )
     seq = resp.sequence
     assert seq >= 1
@@ -67,7 +74,8 @@ def test_delta_survives_restart(kiseki_server: ServerInfo) -> None:
         log_pb2.ReadDeltasRequest(
             shard_id=common_pb2.ShardId(value=BOOTSTRAP_SHARD_UUID),
             **{"from": seq, "to": seq},
-        )
+        ),
+        **_RPC,
     )
 
     # With persistence enabled (KISEKI_DATA_DIR=/data), the delta should survive.

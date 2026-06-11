@@ -19,6 +19,8 @@ from pathlib import Path
 import grpc
 from tenacity import retry, stop_after_delay, wait_exponential
 
+from helpers.budgets import scaled
+
 
 @dataclass
 class ServerInfo:
@@ -172,9 +174,14 @@ def _wait_for_ready(addr: str) -> None:
         channel.close()
 
 
-@retry(stop=stop_after_delay(60), wait=wait_exponential(multiplier=0.3, max=3))
+@retry(stop=stop_after_delay(scaled(60)), wait=wait_exponential(multiplier=0.3, max=3))
 def _wait_for_s3(host: str, port: int = 9000) -> None:
     """Wait until the S3 listener actually serves a real PUT.
+
+    Budgets are runner-class-scaled (helpers/budgets.py): release run
+    27322282644 hit tenacity RetryError here bringing the 3-node compose
+    up on a 2-vCPU runner — 60 s of namespace-bootstrap budget is dev-box
+    calibrated, not CI calibrated.
 
     The kiseki-server starts gRPC, S3, and NFS listeners in sequence;
     `_wait_for_ready` only blocks on gRPC. e2e tests that PUT objects
@@ -189,12 +196,12 @@ def _wait_for_s3(host: str, port: int = 9000) -> None:
     resp = requests.put(
         f"http://{host}:{port}/default/__cluster_ready_probe__",
         data=b"ready",
-        timeout=3,
+        timeout=scaled(3),
     )
     resp.raise_for_status()
 
 
-@retry(stop=stop_after_delay(60), wait=wait_exponential(multiplier=0.3, max=3))
+@retry(stop=stop_after_delay(scaled(60)), wait=wait_exponential(multiplier=0.3, max=3))
 def _wait_for_nfs(host: str, port: int = 2049) -> None:
     """Wait until the NFS listener accepts a TCP connection.
 

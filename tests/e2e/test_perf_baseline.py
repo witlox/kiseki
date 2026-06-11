@@ -30,6 +30,7 @@ from typing import Generator
 import pytest
 import requests
 
+from conftest import skip_on_ci_small
 from helpers.cluster import ClusterInfo, start_cluster, stop_cluster
 
 
@@ -569,6 +570,11 @@ def _scrape_metric_total(host: str, port: int, name: str) -> int:
 @pytest.mark.e2e
 @pytest.mark.perf
 @pytest.mark.slow
+# Release run 27322282644: docker-kill timeout on a 2-vCPU runner —
+# FUSE-daemon-in-privileged-docker plus sustained NFS load is
+# infrastructure a small CI runner can't carry. Runner-class gate only;
+# the test runs unchanged on dev boxes.
+@skip_on_ci_small("FUSE daemon in privileged docker under sustained NFS load")
 def test_fuse_create_under_sustained_nfs_load(
     perf_cluster: ClusterInfo,
     perf_client_image: str,
@@ -746,6 +752,9 @@ echo "F1_WRITE_DURATION_S=$DUR_S"
 
 @pytest.mark.e2e
 @pytest.mark.perf
+# Release run 27322282644: 180 s docker timeout on a 2-vCPU runner —
+# same FUSE-in-docker infrastructure class as the F-1 test above.
+@skip_on_ci_small("FUSE daemon in privileged docker (fio seq-write)")
 def test_perf_fuse_seq_write(
     perf_cluster: ClusterInfo,
     fuse_perf_client_image: str,

@@ -12,7 +12,7 @@ from __future__ import annotations
 import grpc
 import pytest
 
-from conftest import BOOTSTRAP_SHARD_UUID
+from conftest import BOOTSTRAP_SHARD_UUID, GRPC_TIMEOUT
 from kiseki.v1 import (
     common_pb2,
     key_pb2,
@@ -20,6 +20,14 @@ from kiseki.v1 import (
     log_pb2,
     log_pb2_grpc,
 )
+
+# Release run 27322282644: late in the suite, fresh HTTP/2 connections on
+# a loaded 2-vCPU runner failed with "timed out before receiving SETTINGS
+# frame" — the default RPC (no deadline, wait_for_ready=False) fails fast
+# on the first slow connect attempt. An explicit scaled deadline plus
+# wait_for_ready=True lets the channel retry the handshake within the
+# budget. Assertions are untouched.
+_RPC = {"timeout": GRPC_TIMEOUT, "wait_for_ready": True}
 
 
 def _make_timestamp() -> common_pb2.DeltaTimestamp:
@@ -46,8 +54,8 @@ def test_keymanager_health(grpc_channel: grpc.Channel) -> None:
     is set at all (default value satisfies `>= 1` after first boot).
     """
     stub = key_pb2_grpc.KeyManagerServiceStub(grpc_channel)
-    resp1 = stub.Health(key_pb2.KeyManagerHealthRequest())
-    resp2 = stub.Health(key_pb2.KeyManagerHealthRequest())
+    resp1 = stub.Health(key_pb2.KeyManagerHealthRequest(), **_RPC)
+    resp2 = stub.Health(key_pb2.KeyManagerHealthRequest(), **_RPC)
 
     assert resp1.healthy is True, f"server reports unhealthy: {resp1}"
     assert resp1.current_epoch.value >= 1, (
@@ -77,7 +85,7 @@ def test_shard_health(grpc_channel: grpc.Channel) -> None:
         shard_id=common_pb2.ShardId(value=BOOTSTRAP_SHARD_UUID),
     )
 
-    before = log_stub.ShardHealth(shard_req)
+    before = log_stub.ShardHealth(shard_req, **_RPC)
     assert before.info.state == 1, (
         f"shard state={before.info.state}; expected 1 (SHARD_STATE_HEALTHY)"
     )
@@ -93,13 +101,14 @@ def test_shard_health(grpc_channel: grpc.Channel) -> None:
             hashed_key=bytes(32),
             payload=b"shard-health-tip-probe",
             has_inline_data=True,
-        )
+        ),
+        **_RPC,
     )
     assert append_resp.sequence >= 1, (
         f"AppendDelta returned sequence={append_resp.sequence}; expected ≥1"
     )
 
-    after = log_stub.ShardHealth(shard_req)
+    after = log_stub.ShardHealth(shard_req, **_RPC)
     assert after.info.state == 1, "shard left HEALTHY state after a single append"
     assert after.info.tip == tip_before + 1, (
         f"tip did not advance by exactly 1: before={tip_before}, "
