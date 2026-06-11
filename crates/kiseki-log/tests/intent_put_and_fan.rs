@@ -514,3 +514,122 @@ fn committer_spawn_incorporates_intent_into_the_log() {
     n2.shutdown();
     n3.shutdown();
 }
+
+/// GH #241 / chunk-storage.feature:141 (bdd run 27316155103) — a DELETE's
+/// `DecrementChunkRefcount` racing its PUT's async Create incorporation
+/// must still converge the `cluster_chunk_state` row to refcount 0 +
+/// tombstoned.
+///
+/// The production shape this pins: an S3 PUT fast-acks once
+/// `put_intent_and_fan` reaches quorum (ADR-047); the row that the
+/// decrement targets is only created when the leader's committer
+/// supervisor incorporates the Create intent — one ~50 ms drain tick
+/// (pipelined per #230) later. The BDD scenario DELETEs ~9 ms after the
+/// PUT ack, so the decrement commits FIRST and, pre-fix, no-opped on the
+/// missing row; the create then materialized it at refcount 1 — leaked
+/// forever (the scenario's 30 s poll times out). With the parked-decrement
+/// fix the decrement waits in the SM and drains at create-apply, so this
+/// test converges in EITHER ordering of the race.
+#[test]
+#[ignore = "slow: 3-node Raft election + committer-supervisor incorporate race; flakes under CI workspace-parallel load"]
+fn delete_racing_async_create_converges_refcount_to_zero() {
+    let _env = MIN_ACKS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::env::remove_var("KISEKI_MIN_ACKS");
+    let ports = find_ports(3);
+    let peers = peers_map(&ports);
+    let addrs: Vec<String> = (0..3).map(|i| format!("127.0.0.1:{}", ports[i])).collect();
+
+    let (n1, _d1) = spawn_durable_node(1, &addrs[0], &peers);
+    let (n2, _d2) = spawn_durable_node(2, &addrs[1], &peers);
+    let (n3, _d3) = spawn_durable_node(3, &addrs[2], &peers);
+
+    n1.initialize_shard(test_shard()).expect("init membership");
+
+    // Readiness poll (the #242 pattern) — no blind sleep.
+    let rt = make_runtime();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let leader_id = loop {
+        if let Ok(info) = rt.block_on(LogOps::shard_health(&n1, test_shard())) {
+            if let Some(leader) = info.leader {
+                break leader.0;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no shard leader elected within 120s",
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let node = |id: u64| -> &RaftShardStore {
+        match id {
+            1 => &n1,
+            2 => &n2,
+            _ => &n3,
+        }
+    };
+    let leader = node(leader_id);
+
+    // 1. The PUT: quorum-durable intent carrying the new_chunks row
+    //    (chunk 0x33 via `rich_intent`). This is the fast-ack point —
+    //    the cluster_chunk_state row does NOT exist yet.
+    let chunk = ChunkId([0x33u8; 32]);
+    let intent = rich_intent(seq(10, 0, 1), Some([0xa1u8; 16]));
+    rt.block_on(leader.put_intent_and_fan(test_shard(), intent))
+        .expect("quorum intent-write should succeed");
+
+    // 2. The DELETE, immediately after the ack (the BDD scenario gap is
+    //    ~9 ms; the committer drain tick is 50 ms, so the decrement
+    //    commits before the Create incorporation with near certainty).
+    //    Retry the typed ForwardToLeader hint like the #242 forwarder.
+    let mut target = leader_id;
+    let mut tombstoned_now = false;
+    for _ in 0..10 {
+        match rt.block_on(LogOps::decrement_chunk_refcount(
+            node(target),
+            test_shard(),
+            test_tenant(),
+            chunk,
+        )) {
+            Ok(t) => {
+                tombstoned_now = t;
+                break;
+            }
+            Err(kiseki_log::error::LogError::ForwardToLeader { leader_node_id, .. }) => {
+                target = leader_node_id.0;
+            }
+            Err(e) => panic!("decrement_chunk_refcount failed: {e}"),
+        }
+    }
+    eprintln!("[repro] decrement committed (tombstoned_now={tombstoned_now})");
+
+    // 3. The invariant the BDD scenario asserts: within 30 s the row
+    //    exists with refcount 0 + tombstoned on the leader. Pre-fix the
+    //    row converges to refcount=1/!tombstoned instead (the leak).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last: Option<kiseki_log::raft::state_machine::ClusterChunkStateEntry> = None;
+    loop {
+        if let Ok(Some(entry)) = rt.block_on(LogOps::cluster_chunk_state_get(
+            node(target),
+            test_shard(),
+            test_tenant(),
+            chunk,
+        )) {
+            let done = entry.refcount == 0 && entry.tombstoned;
+            last = Some(entry);
+            if done {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "refcount did not drop to 0 within 30s — the #241 leak; last row: {last:?}",
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    n1.shutdown();
+    n2.shutdown();
+    n3.shutdown();
+}
