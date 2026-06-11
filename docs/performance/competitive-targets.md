@@ -53,18 +53,23 @@ and how fast their metadata path is.
 |---|---:|---:|---:|---:|---:|
 | **Replication shape** | EC-4+2 (1.5× write) | EC-4+2 (1.5× write) | typically R-1 + RAID (**none** on local SSD) | R-3 (3× write) | EC-4+2 + dedup (~0.75× effective) |
 | **Durability on GCP local SSD** | full (cross-node) | full (cross-node) | **none** — VM dies = data dies | full (3-way) | full (cross-DNode) |
-| **Aggregate sequential read** | 1.4 GiB/s | ~16 GB/s | 8–10 GB/s | 11–13 GB/s | 12–14 GB/s |
-| **Aggregate sequential write** | ~15 MB/s | ~5.2 GB/s | 5–8 GB/s (R-1, low durability) | ~5 GB/s (R-3) | 8–10 GB/s |
-| **Single-stream bulk read** (per client) | ~180 MB/s | ~1.8 GB/s | 2–3 GB/s | 0.8–1.5 GB/s | 2–3 GB/s |
-| **Single-stream bulk write** (per client) | ~190 MB/s | ~1.8 GB/s | 1.5–2.5 GB/s | 0.5–1.2 GB/s | 1.5–2 GB/s |
-| **Small-file 4 KB write IOPS** (aggregate) | 243 op/s | ~360 k op/s | 30–80 k (MDS-bound) | 5–20 k (MDS + OSD) | 50–150 k |
-| **Small-file 4 KB read IOPS** (aggregate) | 23 k op/s | similar order | 100–200 k | 30–80 k | 100–200 k |
-| **Small-write p99 latency** | ~180 ms | ~5 ms | ~1–3 ms | ~5–20 ms | ~0.3–1 ms with Optane; **~3–8 ms without**⁶ |
-| **Metadata create** (mkdir/create op/s) | ~30 op/s under load⁷ | ~5 k op/s | 80–150 k (single MDS) | 5–15 k | 50–100 k |
+| **Aggregate sequential read** | *stale (May: 1.4 GiB/s at under-driven concurrency)* | ~16 GB/s | 8–10 GB/s | 11–13 GB/s | 12–14 GB/s |
+| **Aggregate sequential write** | *stale (May: ~15 MB/s, pre-fix era)* | ~5.2 GB/s | 5–8 GB/s (R-1, low durability) | ~5 GB/s (R-3) | 8–10 GB/s |
+| **Single-stream bulk read** (per client) | *stale (May: ~180 MB/s)* | ~1.8 GB/s | 2–3 GB/s | 0.8–1.5 GB/s | 2–3 GB/s |
+| **Single-stream bulk write** (per client) | *stale (May: ~190 MB/s)* | ~1.8 GB/s | 1.5–2.5 GB/s | 0.5–1.2 GB/s | 1.5–2 GB/s |
+| **Small-file 4 KB write IOPS** (aggregate) | **23.7 k op/s** | ~360 k op/s | 30–80 k (MDS-bound) | 5–20 k (MDS + OSD) | 50–150 k |
+| **Small-file 4 KB read IOPS** (aggregate) | **275 k op/s** | similar order | 100–200 k | 30–80 k | 100–200 k |
+| **Small-write p99 latency** | 39 ms @ conc16 · 142 ms @ saturation (closed-loop) | ~5 ms | ~1–3 ms | ~5–20 ms | ~0.3–1 ms with Optane; **~3–8 ms without**⁶ |
+| **Metadata create** (mkdir/create op/s) | *stale (May: ~30 op/s under the since-fixed F-1 wedge)*⁷ | ~5 k op/s | 80–150 k (single MDS) | 5–15 k | 50–100 k |
 
-¹ Measured 2026-05-28 on GCP `default` (RUN 3) — see
-[`README.md`](README.md) and
-[`specs/performance/2026-05-28-gcp-matrix.md`](../../specs/performance/2026-05-28-gcp-matrix.md).
+¹ Small-file rows measured 2026-06-11 on GCP `default` (post-#256/#255
+fix validation, main `896433a`, 18-shard topology) — see GH #256 and
+[`specs/performance/`](../../specs/performance/) for the run ladder.
+Bulk + metadata rows are **stale May-2026 numbers** that predate the
+entire June write-path campaign (~25 merged perf PRs, small-file
+writes ×97 since); re-measure before quoting (one Pass-D bulk cell
+suffices — bulk does not pay the per-op quorum tax that gated the
+small-file rows).
 ² From [`targets.md`](targets.md) `default` profile — derived from
 `min(NIC, storage, CPU) ÷ replication × utilization`.
 ³ Lustre on **local NVMe with R-1** is bandwidth-optimal but has no
@@ -176,35 +181,49 @@ Reading the table top-to-bottom on the targets column:
   Lustre under MDS load, loses to VAST-with-Optane (sub-1 ms) but
   matches VAST-without-Optane.
 
-## Where kiseki is *today*
+## Where kiseki is *today* (2026-06-11)
 
-Numbers from 2026-05-28 (latest matrix, RUN 3, post-#116):
+The June campaign (~25 merged perf PRs: ADR-047 decoupled ack, fjall
+sweeps, P1–P4, the fan/committer roadmap, the #256 O(N²) overlay fix,
+#255 replication byte-budget) moved the small-file rows from
+"30–300× behind" to competitive:
 
-- **Reads at 1.4 GiB/s** vs Ceph 11–13 GB/s — **measurement gap**
-  at the cluster end. Concurrency was ×3 clients × 16-way = 18% of
-  one node's NIC per client; targets assume ≥ 8-way per client at
-  ~90% NIC. The R1 / R2 / R3 entries in
-  [`roadmap.md`](roadmap.md) name the levers: re-measure at higher
-  concurrency, profile single-stream bulk GET (the same shape as
-  the 2026-05-09 Arc-wrap fix that lifted in-process single-stream
-  8.2 → 16.4 Gbps).
-- **Writes at 15 MB/s** vs Ceph 5 GB/s — **300× behind even Ceph.**
-  This is the 41 ms stacked-wait that
-  [#126](https://github.com/witlox/kiseki/issues/126) is trying to
-  localise. The isolated openraft `client_write` round is ~1 ms; the
-  single-node full write path is 240 µs; the full multi-node path
-  is ~42 ms. The 41 ms delta is a stacked off-CPU wait whose mechanism
-  is **not yet proven** — CPU flamegraph shows idle, not hot stacks.
-  Right probe is off-CPU / tokio-console, not another flamegraph.
+- **4 KB read IOPS: 275 k aggregate, 0 errors** — **above every
+  competitor's band on this shape.** The read path delivers the
+  design promise today.
+- **4 KB write IOPS: 23.7 k aggregate** — **beats Ceph's entire band
+  for the first time**; below Lustre's floor and ~half VAST's floor.
+  Cumulative ×97 since the May matrix, ×2.4 since the June-10
+  baseline (day-normalized ×3.0 vs the 10 k calibration reference).
+- **The remaining write gap is architectural, not implementational.**
+  Per-op ack costs one intent-quorum network round (~8 ms blocking at
+  saturation, conc64 closed-loop); levers since June 10 each measured
+  ×1.3–1.4 against ×2 projections — the signature of a latency-bound
+  path. Reaching the 360 k design point (and the ~5 ms p99 goal)
+  requires changing the unit of consensus at the ingress boundary
+  (batched quorum rounds with per-op acks riding the batch) — an
+  ADR-grade design decision, tracked as the successor to the #226
+  occupancy analysis. Route-to-leader (#135) is the one remaining
+  conventional lever (naive 6-ingress spread measured **negative**
+  on the healthy binary — un-routed fan adds non-leader contention).
+- **Bulk bandwidth rows are unmeasured since May.** Everything that
+  made small writes ×97 faster should move bulk writes massively
+  (the May 15 MB/s was the since-fixed commit-pipeline era); one
+  Pass-D cell updates both rows.
+- Known availability caveat under write bursts: GETs can fail (not
+  just slow) while the hydrator digests a sustained-burst backlog
+  ([#261](https://github.com/witlox/kiseki/issues/261)).
 
 ## Honest framing for prod consumers
 
-> "Targeted to beat Ceph on writes (EC vs R-3) and match Lustre on
-> bulk reads, with VAST-style small-file IOPS via ADR-047
-> decoupled-ack. Pre-production today; measured perf is 30–300×
-> below targets, root-caused to an unlocalised stacked wait in the
-> write commit pipeline. Reads need a measurement re-run at the
-> concurrency the targets assume."
+> "Beats Ceph on small-file writes and beats everything in its class
+> on small-file reads (275 k/s aggregate, measured), with full
+> cross-node EC durability that Lustre cannot offer on cloud local
+> SSD and measured 6× dedup. Small-file write IOPS (23.7 k/s) is
+> ~half of VAST-class; closing that gap is a planned consensus-
+> batching design change, not incremental tuning. Bulk bandwidth
+> unmeasured since the write-path overhaul — re-run pending.
+> Pre-production."
 
 ## Caveats
 
