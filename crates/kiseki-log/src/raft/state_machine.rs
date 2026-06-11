@@ -368,7 +368,35 @@ pub struct ShardSmInner {
     pub(crate) dedup_window_entries: usize,
     /// Per-shard cap on `apply_ms` age (ms) before the front entry evicts.
     pub(crate) dedup_window_ms: u64,
+    /// GH #241 — decrements parked because `cluster_chunk_state` lacks the
+    /// row. ADR-047 async-ack made this ordering COMMON: an S3 PUT fast-acks
+    /// once its intent is quorum-durable, but the `cluster_chunk_state` row
+    /// is only created when the committer incorporates the Create intent
+    /// (~one `COMMITTER_INTERVAL` later). A DELETE inside that window
+    /// commits its `DecrementChunkRefcount` BEFORE the row exists; dropping
+    /// it (the pre-#241 behavior) leaked the refcount permanently — the row
+    /// then materialized at refcount 1 with nothing ever decrementing it,
+    /// so the chunk never tombstoned and GC never fired
+    /// (chunk-storage.feature:141, bdd run 27316155103).
+    ///
+    /// Parked decrements drain inside `apply_new_chunks` when the row is
+    /// created, in the same apply step — every replica applies the same
+    /// command sequence, so the map (and the drain) is deterministic
+    /// replicated state. Bounded by [`PENDING_CHUNK_DECREMENTS_CAP`]; at
+    /// the cap a new park degrades to the historical drop-with-ERROR.
+    /// Like `cluster_chunk_state` itself, this map is absent from
+    /// `ShardSnapshot` (the #220 restart-correctness gap — same fate,
+    /// tracked together).
+    pub(crate) pending_chunk_decrements: HashMap<(OrgId, ChunkId), u64>,
 }
+
+/// Upper bound on distinct parked-decrement keys (GH #241). A parked entry
+/// is ~56 bytes; the legitimate population is "DELETEs racing their PUT's
+/// create incorporation" — committer-drain-window sized, near zero at rest.
+/// Hitting the cap means a bookkeeping anomaly is parking decrements for
+/// rows that will never be created; refusing to park degrades exactly to
+/// the pre-#241 drop semantics (ERROR-logged), never worse.
+const PENDING_CHUNK_DECREMENTS_CAP: usize = 65_536;
 
 impl ShardSmInner {
     pub(crate) fn new(shard_id: ShardId, tenant_id: OrgId) -> Self {
@@ -395,6 +423,7 @@ impl ShardSmInner {
             recent_incorporated_seqs: HashSet::new(),
             dedup_window_entries: dedup_window_entries(),
             dedup_window_ms: dedup_window_ms(),
+            pending_chunk_decrements: HashMap::new(),
         }
     }
 
@@ -669,6 +698,14 @@ impl ShardSmInner {
     /// Apply Phase 16a `cluster_chunk_state` mutations: create new
     /// entries for each `NewChunkMeta`. Idempotent on re-apply
     /// (existing key keeps its current refcount + placement).
+    ///
+    /// GH #241: a freshly-created row immediately absorbs any parked
+    /// decrements (a DELETE whose `DecrementChunkRefcount` applied
+    /// before this create — the common ordering under ADR-047
+    /// async-ack). Parked count >= 1 drives the row straight to
+    /// refcount 0 + tombstoned, in this same apply step, so every
+    /// replica converges identically and the GC scrub gets its
+    /// signal.
     fn apply_new_chunks(
         &mut self,
         tenant_id_bytes: &[u8; 16],
@@ -678,15 +715,36 @@ impl ShardSmInner {
         let tenant = OrgId(uuid::Uuid::from_bytes(*tenant_id_bytes));
         for nc in new_chunks {
             let key = (tenant, ChunkId(nc.chunk_id));
-            self.cluster_chunk_state
-                .entry(key)
-                .or_insert_with(|| ClusterChunkStateEntry {
-                    refcount: 1,
+            if self.cluster_chunk_state.contains_key(&key) {
+                // Idempotent re-apply — keep current refcount +
+                // placement. No parked decrement can exist for a
+                // present key (parks only accumulate while the key
+                // is absent and drain the moment it is created).
+                continue;
+            }
+            let parked = self.pending_chunk_decrements.remove(&key).unwrap_or(0);
+            let refcount = 1u64.saturating_sub(parked);
+            let tombstoned = parked > 0;
+            if tombstoned {
+                tracing::info!(
+                    shard = %self.shard_id.0,
+                    tenant = %tenant.0,
+                    chunk_id = ?nc.chunk_id,
+                    parked,
+                    "cluster_chunk_state row created with parked decrement(s) \
+                     drained — tombstoned at birth (GH #241 delete-before-create)",
+                );
+            }
+            self.cluster_chunk_state.insert(
+                key,
+                ClusterChunkStateEntry {
+                    refcount,
                     placement: nc.placement.clone(),
-                    tombstoned: false,
+                    tombstoned,
                     created_ms: log_index,
                     original_len: nc.original_len,
-                });
+                },
+            );
         }
     }
 
@@ -987,6 +1045,39 @@ impl ShardSmInner {
                         entry.tombstoned = true;
                         tombstoned_now = true;
                     }
+                } else if self.pending_chunk_decrements.len() >= PENDING_CHUNK_DECREMENTS_CAP
+                    && !self.pending_chunk_decrements.contains_key(&key)
+                {
+                    // GH #241 overflow posture: refusing to park is
+                    // exactly the pre-#241 drop (a leak the operator
+                    // must reconcile) — never silent.
+                    tracing::error!(
+                        shard = %self.shard_id.0,
+                        tenant = %tenant.0,
+                        chunk_id = ?chunk_id,
+                        parked = self.pending_chunk_decrements.len(),
+                        "DecrementChunkRefcount on missing cluster_chunk_state row \
+                         REFUSED: pending-decrement map at cap — refcount leak \
+                         (I-C2), operator reconciliation required",
+                    );
+                } else {
+                    // GH #241: the row does not exist yet — the Create
+                    // intent that materializes it is still in the
+                    // committer's drain window (ADR-047 async-ack).
+                    // Park the decrement; `apply_new_chunks` drains it
+                    // when the row is created, in the same apply lock.
+                    // The caller sees `false` (not tombstoned YET);
+                    // the eventual tombstone is observed by the
+                    // orphan-fragment scrub, which is the reclaim
+                    // authority for this ordering.
+                    *self.pending_chunk_decrements.entry(key).or_insert(0) += 1;
+                    tracing::info!(
+                        shard = %self.shard_id.0,
+                        tenant = %tenant.0,
+                        chunk_id = ?chunk_id,
+                        "DecrementChunkRefcount precedes the chunk's create \
+                         incorporation — parked until apply_new_chunks (GH #241)",
+                    );
                 }
                 LogResponse::DecrementOutcome(tombstoned_now)
             }
@@ -1537,6 +1628,228 @@ mod tests {
             .expect("entry still present (tombstoned, not removed)");
         assert_eq!(entry.refcount, 0);
         assert!(entry.tombstoned, "refcount=0 must mark entry tombstoned");
+    }
+
+    // -----------------------------------------------------------
+    // GH #241 — DELETE racing the async Create incorporation.
+    //
+    // The chunk-storage.feature:141 shape (bdd run 27316155103):
+    // an S3 PUT fast-acks once its intent is quorum-durable
+    // (ADR-047); the `cluster_chunk_state` row only materializes
+    // when the committer incorporates the Create intent ~one
+    // 50 ms drain tick later. A DELETE inside that window commits
+    // `DecrementChunkRefcount` BEFORE the row exists. The decrement
+    // MUST NOT be dropped: it parks and drains when the create
+    // applies, leaving refcount 0 + tombstoned — the GC signal.
+    // -----------------------------------------------------------
+
+    /// RED before the #241 fix: the decrement no-opped on the missing
+    /// row and the later `IncorporateIntent` (the production async-ack
+    /// create path) materialized it at refcount 1 — leaked forever.
+    #[test]
+    fn decrement_before_async_create_parks_and_drains_on_incorporate() {
+        let mut inner = fresh_inner();
+        let tenant = org(1);
+        let chunk_id = chunk(9);
+
+        // 1. The DELETE's decrement applies first — no row yet.
+        let resp = inner.apply_command(
+            &LogCommand::DecrementChunkRefcount {
+                tenant_id_bytes: tenant,
+                chunk_id,
+            },
+            1,
+        );
+        // Not tombstoned NOW (the row doesn't exist) — the signal
+        // fires at create-apply; reclaim is the scrub's job.
+        assert!(matches!(resp, LogResponse::DecrementOutcome(false)));
+
+        // 2. The committer incorporates the PUT's Create intent.
+        let mut cmd = mk_incorporate(tenant, hlc(10, 0, 1));
+        if let LogCommand::IncorporateIntent {
+            ref mut new_chunks, ..
+        } = cmd
+        {
+            *new_chunks = vec![NewChunkMeta {
+                chunk_id,
+                placement: vec![1, 2, 3],
+                original_len: 1024,
+            }];
+        }
+        let _ = inner.apply_command_at(&cmd, 2, 1_000);
+
+        // 3. The row must converge to the deleted state, not leak at 1.
+        let key = (OrgId(uuid::Uuid::from_bytes(tenant)), ChunkId(chunk_id));
+        let entry = inner
+            .cluster_chunk_state
+            .get(&key)
+            .expect("create must still materialize the row");
+        assert_eq!(
+            entry.refcount, 0,
+            "parked decrement must drain at create-apply (GH #241 leak)"
+        );
+        assert!(
+            entry.tombstoned,
+            "refcount 0 at birth must tombstone the row so GC has its signal"
+        );
+        assert!(
+            inner.pending_chunk_decrements.is_empty(),
+            "drained park must not linger"
+        );
+    }
+
+    /// Same ordering through the synchronous `ChunkAndDelta` create
+    /// path (POSIX surfaces) — the park must drain regardless of which
+    /// create shape materializes the row.
+    #[test]
+    fn decrement_before_sync_create_drains_via_chunk_and_delta() {
+        let mut inner = fresh_inner();
+        let tenant = org(1);
+        let chunk_id = chunk(10);
+
+        let _ = inner.apply_command(
+            &LogCommand::DecrementChunkRefcount {
+                tenant_id_bytes: tenant,
+                chunk_id,
+            },
+            1,
+        );
+        let _ = inner.apply_command(
+            &LogCommand::ChunkAndDelta {
+                tenant_id_bytes: tenant,
+                operation: 0,
+                hashed_key: [0; 32],
+                chunk_refs: vec![chunk_id],
+                payload: vec![],
+                has_inline_data: false,
+                new_chunks: vec![NewChunkMeta {
+                    chunk_id,
+                    placement: vec![1, 2, 3],
+                    original_len: 0,
+                }],
+                inline_payloads: vec![],
+            },
+            2,
+        );
+
+        let key = (OrgId(uuid::Uuid::from_bytes(tenant)), ChunkId(chunk_id));
+        let entry = inner.cluster_chunk_state.get(&key).expect("row exists");
+        assert_eq!(entry.refcount, 0);
+        assert!(entry.tombstoned);
+    }
+
+    /// A parked decrement for chunk A must not bleed into chunk B's
+    /// create, and a create with NO parked decrement keeps the normal
+    /// refcount-1 birth.
+    #[test]
+    fn parked_decrement_is_keyed_per_chunk() {
+        let mut inner = fresh_inner();
+        let tenant = org(1);
+        let chunk_a = chunk(11);
+        let chunk_b = chunk(12);
+
+        let _ = inner.apply_command(
+            &LogCommand::DecrementChunkRefcount {
+                tenant_id_bytes: tenant,
+                chunk_id: chunk_a,
+            },
+            1,
+        );
+        // Create B only — A's park must stay parked.
+        let _ = inner.apply_command(
+            &LogCommand::ChunkAndDelta {
+                tenant_id_bytes: tenant,
+                operation: 0,
+                hashed_key: [0; 32],
+                chunk_refs: vec![chunk_b],
+                payload: vec![],
+                has_inline_data: false,
+                new_chunks: vec![NewChunkMeta {
+                    chunk_id: chunk_b,
+                    placement: vec![1, 2, 3],
+                    original_len: 0,
+                }],
+                inline_payloads: vec![],
+            },
+            2,
+        );
+
+        let key_b = (OrgId(uuid::Uuid::from_bytes(tenant)), ChunkId(chunk_b));
+        let entry_b = inner.cluster_chunk_state.get(&key_b).expect("B exists");
+        assert_eq!(entry_b.refcount, 1, "B is untouched by A's park");
+        assert!(!entry_b.tombstoned);
+        let key_a = (OrgId(uuid::Uuid::from_bytes(tenant)), ChunkId(chunk_a));
+        assert_eq!(
+            inner.pending_chunk_decrements.get(&key_a).copied(),
+            Some(1),
+            "A's decrement stays parked until A's create applies"
+        );
+    }
+
+    /// At the cap, a park for a NEW key is refused (degrades to the
+    /// historical drop) while an existing parked key still accumulates
+    /// — the bound is on distinct keys, deterministic across replicas.
+    #[test]
+    fn pending_decrement_park_refuses_new_keys_at_cap() {
+        let mut inner = fresh_inner();
+        let tenant = org(1);
+
+        // Fill to the cap with distinct keys (no rows exist).
+        for i in 0..PENDING_CHUNK_DECREMENTS_CAP {
+            let mut id = [0u8; 32];
+            let idx = u64::try_from(i).expect("usize fits u64");
+            id[..8].copy_from_slice(&idx.to_be_bytes());
+            id[8] = 0xA5; // disjoint from the probe keys below
+            let _ = inner.apply_command(
+                &LogCommand::DecrementChunkRefcount {
+                    tenant_id_bytes: tenant,
+                    chunk_id: id,
+                },
+                1,
+            );
+        }
+        assert_eq!(
+            inner.pending_chunk_decrements.len(),
+            PENDING_CHUNK_DECREMENTS_CAP
+        );
+
+        // A new key is refused — map does not grow.
+        let probe = chunk(0xEE);
+        let _ = inner.apply_command(
+            &LogCommand::DecrementChunkRefcount {
+                tenant_id_bytes: tenant,
+                chunk_id: probe,
+            },
+            2,
+        );
+        assert_eq!(
+            inner.pending_chunk_decrements.len(),
+            PENDING_CHUNK_DECREMENTS_CAP,
+            "cap must hold for new keys"
+        );
+        let probe_key = (OrgId(uuid::Uuid::from_bytes(tenant)), ChunkId(probe));
+        assert!(
+            !inner.pending_chunk_decrements.contains_key(&probe_key),
+            "refused park must not be recorded"
+        );
+
+        // An EXISTING parked key still accumulates at the cap.
+        let mut first = [0u8; 32];
+        first[..8].copy_from_slice(&0u64.to_be_bytes());
+        first[8] = 0xA5;
+        let _ = inner.apply_command(
+            &LogCommand::DecrementChunkRefcount {
+                tenant_id_bytes: tenant,
+                chunk_id: first,
+            },
+            3,
+        );
+        let first_key = (OrgId(uuid::Uuid::from_bytes(tenant)), ChunkId(first));
+        assert_eq!(
+            inner.pending_chunk_decrements.get(&first_key).copied(),
+            Some(2),
+            "existing key accumulates past the cap check"
+        );
     }
 
     // -----------------------------------------------------------
