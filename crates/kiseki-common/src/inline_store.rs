@@ -41,6 +41,23 @@ pub trait InlineStore: Send + Sync {
     /// Delete inline content. Returns `true` if entry existed.
     fn delete(&self, key: &[u8; 32]) -> io::Result<bool>;
 
+    /// Batched variant of [`InlineStore::delete`] — the Raft state
+    /// machine prunes EVERY inline offload entry below the GC
+    /// boundary in one watermark-advance apply (#226 100k attempt:
+    /// at 23k PUT/s that was ~100k+ entries per advance, each
+    /// previously paying its own backend commit INSIDE the apply
+    /// lock on every replica). Returns the number of entries that
+    /// existed and were removed.
+    fn delete_many(&self, keys: &[[u8; 32]]) -> io::Result<u64> {
+        let mut removed = 0;
+        for key in keys {
+            if self.delete(key)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     /// Durability barrier: force buffered writes to stable storage.
     /// The Raft state machine calls this in `build_snapshot` so no
     /// log entry can be purged (snapshot-gated) while an inline put

@@ -1080,6 +1080,21 @@ impl AuxMuxPool {
         tag: &str,
         req: &Req,
     ) -> io::Result<Resp> {
+        let outer = encode_outer_tuple(shard_id, tag, req)?;
+        self.rpc_raw(shard_id, &outer).await
+    }
+
+    /// [`Self::rpc`] with the request-id-independent outer tuple
+    /// pre-encoded by the caller (#226 100k attempt). The intent fan
+    /// retries the SAME batch payload against multiple peers
+    /// (leader-first → topup walk → rescue); encoding the outer tuple
+    /// once per flush instead of once per attempt removes a full
+    /// payload serialization + clone per peer attempt.
+    async fn rpc_raw<Resp: DeserializeOwned>(
+        &self,
+        shard_id: ShardId,
+        outer_bytes: &[u8],
+    ) -> io::Result<Resp> {
         maybe_inject_fake_rtt().await;
 
         let idx = (self.next.fetch_add(1, Ordering::Relaxed) as usize) % self.conns.len();
@@ -1109,7 +1124,10 @@ impl AuxMuxPool {
             ));
         }
 
-        let body = encode_aux_request_body(request_id, shard_id, tag, req)?;
+        let mut body = Vec::with_capacity(9 + outer_bytes.len());
+        body.push(RAFT_TRANSPORT_AUX_VERSION_V3);
+        body.extend_from_slice(&request_id.to_be_bytes());
+        body.extend_from_slice(outer_bytes);
         if body.len() > max_raft_rpc_size() {
             return Err(network_error(
                 NetworkErrorKind::Transport,
@@ -1238,6 +1256,31 @@ pub async fn rpc_call_aux<Req: Serialize, Resp: DeserializeOwned>(
 ) -> io::Result<Resp> {
     let pool = get_or_create_aux_mux_pool(addr, tls_config);
     pool.rpc(shard_id, tag, req).await
+}
+
+/// Pre-encode an aux request's request-id-independent outer tuple for
+/// [`rpc_call_aux_raw`] (#226 100k attempt). Callers that send the
+/// SAME payload to multiple peers (the intent fan's leader-first →
+/// topup → rescue walk) encode once per flush instead of once per
+/// attempt.
+pub fn encode_aux_outer_tuple<P: Serialize>(
+    shard_id: ShardId,
+    tag: &str,
+    payload: &P,
+) -> io::Result<Vec<u8>> {
+    encode_outer_tuple(shard_id, tag, payload)
+}
+
+/// [`rpc_call_aux`] with the outer tuple pre-encoded via
+/// [`encode_aux_outer_tuple`].
+pub async fn rpc_call_aux_raw<Resp: DeserializeOwned>(
+    addr: &str,
+    shard_id: ShardId,
+    tls_config: Option<&Arc<rustls::ClientConfig>>,
+    outer_bytes: &[u8],
+) -> io::Result<Resp> {
+    let pool = get_or_create_aux_mux_pool(addr, tls_config);
+    pool.rpc_raw(shard_id, outer_bytes).await
 }
 
 fn to_rpc_error<C: RaftTypeConfig>(e: io::Error) -> RPCError<C> {
