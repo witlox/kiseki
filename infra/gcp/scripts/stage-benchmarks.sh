@@ -65,9 +65,13 @@ echo "=== Verifying tarball structure ==="
 # Quick sanity: the tarball MUST contain the bench driver + perf-common.sh
 # at the top level. If a future refactor moves them, this script
 # fails loudly rather than uploading a broken artifact.
+# List once into a variable: `tar tzf | grep -q` under pipefail
+# intermittently fails with 141 when grep exits early and tar takes
+# SIGPIPE — a false "missing entry" on a perfectly good tarball.
+listing=$(tar tzf "$OUT_TAR")
 required=(./bench ./perf-common.sh)
 for f in "${required[@]}"; do
-  if ! tar tzf "$OUT_TAR" | grep -q "^${f}\$"; then
+  if ! grep -q "^${f}\$" <<<"$listing"; then
     echo "ERROR: tarball missing required entry: $f" >&2
     exit 1
   fi
