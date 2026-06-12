@@ -45,9 +45,14 @@
 - [Performance Tuning](operations/performance.md)
 - [Performance Benchmarks](performance/README.md)
 - [Performance Targets](performance/targets.md)
+- [Competitive Targets — kiseki vs the field](performance/competitive-targets.md)
+- [Performance Roadmap](performance/roadmap.md)
 - [Optimization Backlog](performance/optimization-backlog.md)
+- [Perf Capacity Planning](performance/capacity-planning.md)
+- [Manual Perf-Phase Runbook](performance/manual-phase-runbook.md)
 - [Durability & Data-Loss Windows](operations/durability.md)
 - [Capacity Planning](operations/capacity.md)
+- [ADR-049 Migration Runbook](operations/adr-049-migration-runbook.md)
 
 # API Reference
 
