@@ -398,9 +398,74 @@ const VALUE_VERSION: u8 = 1;
 /// On-disk format version persisted in `meta["format_version"]`. The
 /// F-4 forward-compat guard: opening a store written by a newer,
 /// incompatible binary fails loudly rather than silently mis-reading.
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
-const KS_INTENTS: &str = "intents";
+/// Meta record: BE-u64 list of live intent-epoch numbers (#267 item 0).
+const META_EPOCHS_KEY: &[u8] = b"epochs";
+/// Meta record: encoded seq-key bound — entries with key strictly
+/// below it are incorporated (reopen skips them; #267 item 0).
+const META_WM_KEY: &[u8] = b"incorporated_below";
+
+/// Inserts per intent epoch before rotation
+/// (`KISEKI_INTENT_EPOCH_ROTATE`, default 8192). Small epochs keep the
+/// active keyspace's LSM permanently shallow; sealed epochs are
+/// DROPPED whole once fully incorporated — zero tombstones, zero
+/// compaction of dead intents (GH #266: tombstone-churn write stalls
+/// were the measured 35 ms → 1 s ack-path wall).
+fn epoch_rotate_from_env() -> u64 {
+    std::env::var("KISEKI_INTENT_EPOCH_ROTATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &u64| *n >= 1)
+        .unwrap_or(8192)
+}
+
+fn epoch_ks_name(no: u64) -> String {
+    format!("intents-{no}")
+}
+
+fn encode_epoch_list(nos: &[u64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(nos.len() * 8);
+    for n in nos {
+        out.extend_from_slice(&n.to_be_bytes());
+    }
+    out
+}
+
+fn decode_epoch_list(bytes: &[u8]) -> Result<Vec<u64>, IntentError> {
+    if bytes.len() % 8 != 0 {
+        return Err(IntentError::Codec("epoch list length".to_string()));
+    }
+    Ok(bytes
+        .chunks_exact(8)
+        .map(|c| u64::from_be_bytes(c.try_into().expect("chunk is 8 bytes")))
+        .collect())
+}
+
+/// Rotating intent-epoch state (#267 item 0). All mutation happens
+/// under `StoreCore::mutations`; this inner mutex only guards the
+/// handle swap so the commit path can clone the active handle cheaply.
+struct EpochSet {
+    active_no: u64,
+    active: Keyspace,
+    /// Inserts into the ACTIVE epoch since it was created.
+    active_inserts: u64,
+    /// Sealed (rotated-out) epochs still holding live intents.
+    sealed: Vec<(u64, Keyspace)>,
+    /// Live (pending, not yet incorporated) intent count per epoch.
+    live: HashMap<u64, u64>,
+    rotate_threshold: u64,
+    /// Cached copy of the durable `incorporated_below` watermark
+    /// (empty = unset). The COMMIT path consults it: a batch whose
+    /// minimum seq-key falls BELOW the watermark (late lower seq from
+    /// another ingress's HLC, or an election-recovery restore) must
+    /// LOWER the durable watermark in the same atomic batch, or the
+    /// acked intent would be silently skipped on reopen (adversary
+    /// finding 1 — acked-write loss with no crash required).
+    /// Watermark regression only ever resurrects MORE on reopen,
+    /// which the ADR-047 replay contract absorbs.
+    wm: Vec<u8>,
+}
 const KS_IDEM: &str = "idem";
 const KS_META: &str = "meta";
 const META_FORMAT_VERSION_KEY: &[u8] = b"format_version";
@@ -584,10 +649,12 @@ fn take_array16(cur: &mut &[u8]) -> Result<[u8; 16], IntentError> {
 /// `open()` rebuilds from fjall.
 #[derive(Default)]
 struct PendingIndex {
-    /// Seq → intent, `BTreeMap` so iteration is ascending (matches
-    /// `pending()`'s contract: ascending perspective-seq) and `range(..=k)`
-    /// drives `prune`'s cutoff walk.
-    by_seq: BTreeMap<PerspectiveSeq, WriteIntent>,
+    /// Seq → (intent, epoch-number it durably lives in). `BTreeMap` so
+    /// iteration is ascending (matches `pending()`'s contract) and
+    /// `range(..=k)` drives `prune`'s cutoff walk. The epoch tag drives
+    /// the per-epoch live counters that trigger whole-keyspace drops
+    /// (#267 item 0).
+    by_seq: BTreeMap<PerspectiveSeq, (WriteIntent, u64)>,
     /// Idempotency key → its current seq, for ADR-047 §5 / O3 dedup
     /// without touching the durable `idem` keyspace.
     by_idem: HashMap<IdempotencyKey, PerspectiveSeq>,
@@ -698,8 +765,14 @@ fn commit_thread_loop(core: &StoreCore, rx: &mut mpsc::Receiver<CommitJob>) {
 /// closes the submission queue and the thread drains + exits.
 struct StoreCore {
     db: Database,
-    intents_ks: Keyspace,
+    /// Rotating intent epochs (#267 item 0) — replaces the single
+    /// `intents` keyspace whose ingest-then-delete churn caused the
+    /// GH #266 fjall write stalls.
+    epochs: Mutex<EpochSet>,
     idem_ks: Keyspace,
+    /// Meta keyspace: format version, epoch list, incorporated
+    /// watermark (#267 item 0).
+    meta_ks: Keyspace,
     /// Per-write fsync vs buffered durability. Defaults to `true`
     /// (POSIX-immediate) so a freshly-opened store is durable until the
     /// runtime explicitly relaxes it for the group-commit perf path.
@@ -773,6 +846,16 @@ impl StoreCore {
             for group in groups {
                 let mut outcomes = Vec::with_capacity(group.len());
                 for r in group {
+                    // Same-seq re-put (election-recovery `restore_into`
+                    // onto a store already holding the seq): treat as
+                    // the documented overwrite-in-place — no second
+                    // durable row, no live-counter bump, no epoch-tag
+                    // rewrite (adversary finding 2: the double insert
+                    // pinned BOTH epochs undroppable).
+                    if idx.by_seq.contains_key(&r.seq) {
+                        outcomes.push(PutOutcome::Recorded);
+                        continue;
+                    }
                     if let Some(key) = r.idem {
                         if let Some(&existing) = idx.by_idem.get(&key).or_else(|| claimed.get(&key))
                         {
@@ -792,31 +875,149 @@ impl StoreCore {
         }
 
         // Pass 2: ONE batch carrying every Recorded intent + dedup
-        // pointer across every group. fjall commits the whole batch
-        // atomically — a crash never leaves a dedup pointer without
-        // its intent (or vice-versa).
+        // pointer across every group, into the ACTIVE epoch keyspace
+        // (#267 item 0). fjall commits the whole batch atomically — a
+        // crash never leaves a dedup pointer without its intent (or
+        // vice-versa).
+        let (active_ks, active_no, wm_lowered) = {
+            let ep = self.epochs.lock().lock_or_die("intent_store.fjall.epochs");
+            let min_key = to_record
+                .iter()
+                .map(|r| r.seq_key.as_slice())
+                .min()
+                .expect("to_record is non-empty");
+            let lowered = if !ep.wm.is_empty() && min_key < ep.wm.as_slice() {
+                Some(min_key.to_vec())
+            } else {
+                None
+            };
+            (ep.active.clone(), ep.active_no, lowered)
+        };
         let mut batch = self.batch_for_write();
         for r in &to_record {
-            batch.insert(&self.intents_ks, r.seq_key.to_vec(), r.value.clone());
+            batch.insert(&active_ks, r.seq_key.to_vec(), r.value.clone());
             if let Some(key) = r.idem {
                 batch.insert(&self.idem_ks, key.to_vec(), r.seq_key.to_vec());
             }
+        }
+        if let Some(ref new_wm) = wm_lowered {
+            // Adversary finding 1: a below-watermark intent rides in
+            // the SAME atomic batch as the watermark regression, so
+            // reopen can never skip an acked record.
+            batch.insert(&self.meta_ks, META_WM_KEY.to_vec(), new_wm.clone());
         }
         batch.commit()?;
         self.commits.fetch_add(1, Ordering::Relaxed);
 
         // Pass 3: durable commit landed — update the mirror once.
-        let mut idx = self
-            .pending_index
-            .lock()
-            .lock_or_die("intent_store.fjall.pending_index");
-        for r in to_record {
-            if let Some(key) = r.idem {
-                idx.by_idem.insert(key, r.seq);
+        {
+            let mut idx = self
+                .pending_index
+                .lock()
+                .lock_or_die("intent_store.fjall.pending_index");
+            let n = to_record.len() as u64;
+            for r in to_record {
+                if let Some(key) = r.idem {
+                    idx.by_idem.insert(key, r.seq);
+                }
+                idx.by_seq.insert(r.seq, (r.intent, active_no));
             }
-            idx.by_seq.insert(r.seq, r.intent);
+            let mut ep = self.epochs.lock().lock_or_die("intent_store.fjall.epochs");
+            *ep.live.entry(active_no).or_insert(0) += n;
+            ep.active_inserts += n;
+            if let Some(new_wm) = wm_lowered {
+                ep.wm = new_wm;
+            }
+        }
+        // Rotation failure must not fail an already-durable ack
+        // (adversary finding 4b): log and retry on the next commit.
+        if let Err(e) = self.maybe_rotate_epoch() {
+            tracing::warn!(error = %e, "intent epoch rotation failed; retrying next commit");
         }
         Ok(per_group)
+    }
+
+    /// Seal the active epoch and open the next when the insert
+    /// threshold is reached (#267 item 0). Caller MUST hold the
+    /// `mutations` mutex. The durable epoch list commits BEFORE the
+    /// swap so a crash never strands intents in an unlisted keyspace.
+    fn maybe_rotate_epoch(&self) -> Result<(), IntentError> {
+        let (rotate, next_no) = {
+            let ep = self.epochs.lock().lock_or_die("intent_store.fjall.epochs");
+            (ep.active_inserts >= ep.rotate_threshold, ep.active_no + 1)
+        };
+        if !rotate {
+            return Ok(());
+        }
+        let next_ks = self
+            .db
+            .keyspace(&epoch_ks_name(next_no), KeyspaceCreateOptions::default)?;
+        let list: Vec<u64> = {
+            let ep = self.epochs.lock().lock_or_die("intent_store.fjall.epochs");
+            let mut l: Vec<u64> = ep.sealed.iter().map(|(n, _)| *n).collect();
+            l.push(ep.active_no);
+            l.push(next_no);
+            l
+        };
+        let mut batch = self.batch_for_write();
+        batch.insert(
+            &self.meta_ks,
+            META_EPOCHS_KEY.to_vec(),
+            encode_epoch_list(&list),
+        );
+        batch.commit()?;
+        let mut ep = self.epochs.lock().lock_or_die("intent_store.fjall.epochs");
+        let old_no = ep.active_no;
+        let old_ks = std::mem::replace(&mut ep.active, next_ks);
+        ep.sealed.push((old_no, old_ks));
+        ep.active_no = next_no;
+        ep.active_inserts = 0;
+        Ok(())
+    }
+
+    /// Drop fully-incorporated sealed epochs (#267 item 0) and persist
+    /// the shrunk epoch list. Caller MUST hold `mutations`. Whole-
+    /// keyspace deletion is the ONLY space-reclamation path for intent
+    /// records — no per-record tombstones exist anywhere.
+    fn gc_epochs_locked(&self) -> Result<(), IntentError> {
+        let dead: Vec<(u64, Keyspace)> = {
+            let mut ep = self.epochs.lock().lock_or_die("intent_store.fjall.epochs");
+            let drained: Vec<(u64, Keyspace)> = std::mem::take(&mut ep.sealed);
+            let mut dead = Vec::new();
+            let mut keep = Vec::new();
+            for (no, ks) in drained {
+                if ep.live.get(&no).copied().unwrap_or(0) == 0 {
+                    dead.push((no, ks));
+                } else {
+                    keep.push((no, ks));
+                }
+            }
+            ep.sealed = keep;
+            for (no, _) in &dead {
+                ep.live.remove(no);
+            }
+            dead
+        };
+        if dead.is_empty() {
+            return Ok(());
+        }
+        for (_, ks) in &dead {
+            self.db.delete_keyspace(ks.clone())?;
+        }
+        let list: Vec<u64> = {
+            let ep = self.epochs.lock().lock_or_die("intent_store.fjall.epochs");
+            let mut l: Vec<u64> = ep.sealed.iter().map(|(n, _)| *n).collect();
+            l.push(ep.active_no);
+            l
+        };
+        let mut batch = self.batch_for_write();
+        batch.insert(
+            &self.meta_ks,
+            META_EPOCHS_KEY.to_vec(),
+            encode_epoch_list(&list),
+        );
+        batch.commit()?;
+        Ok(())
     }
 }
 
@@ -882,8 +1083,17 @@ impl FjallIntentStore {
     /// [`IntentError::Codec`] if the persisted `format_version` is not
     /// [`FORMAT_VERSION`].
     pub fn open(path: &Path) -> Result<Self, IntentError> {
+        Self::open_with_rotate(path, epoch_rotate_from_env())
+    }
+
+    /// [`Self::open`] with an explicit epoch-rotation threshold —
+    /// tests use tiny thresholds to exercise rotation + drop.
+    ///
+    /// # Errors
+    /// As [`Self::open`].
+    #[allow(clippy::too_many_lines)]
+    pub fn open_with_rotate(path: &Path, rotate_threshold: u64) -> Result<Self, IntentError> {
         let db = Database::builder(path).open()?;
-        let intents_ks = db.keyspace(KS_INTENTS, KeyspaceCreateOptions::default)?;
         let idem_ks = db.keyspace(KS_IDEM, KeyspaceCreateOptions::default)?;
         let meta_ks = db.keyspace(KS_META, KeyspaceCreateOptions::default)?;
 
@@ -910,38 +1120,97 @@ impl FjallIntentStore {
             batch.commit()?;
         }
 
-        // W11 (2026-06-02): rebuild the in-memory mirror from the durable
-        // intents keyspace. ONE LSM scan amortised over the lifetime of
-        // the store; subsequent reads (`pending`, `next_pending_seq`,
-        // `pending_len`, dedup) are pure memory ops.
-        let mut by_seq: BTreeMap<PerspectiveSeq, WriteIntent> = BTreeMap::new();
+        // #267 item 0: enumerate the durable epoch list (fresh store →
+        // [0]) and the incorporated watermark, then rebuild the mirror
+        // from every live epoch, SKIPPING already-incorporated entries
+        // (key strictly below the watermark — durably present only
+        // because reclamation is whole-epoch drop, never per-record
+        // tombstones). An entry the watermark cannot cover (out-of-
+        // order retire before a crash) re-delivers and dedups
+        // downstream, per the ADR-047 idempotent-replay contract.
+        let epoch_nos: Vec<u64> = if let Some(v) = meta_ks.get(META_EPOCHS_KEY)? {
+            decode_epoch_list(v.as_ref())?
+        } else {
+            let mut batch = db.batch().durability(Some(PersistMode::SyncAll));
+            batch.insert(&meta_ks, META_EPOCHS_KEY.to_vec(), encode_epoch_list(&[0]));
+            batch.commit()?;
+            vec![0]
+        };
+        let wm: Option<Vec<u8>> = meta_ks.get(META_WM_KEY)?.map(|v| v.as_ref().to_vec());
+        let active_no = epoch_nos.iter().copied().max().unwrap_or(0);
+        let mut by_seq: BTreeMap<PerspectiveSeq, (WriteIntent, u64)> = BTreeMap::new();
         let mut by_idem: HashMap<IdempotencyKey, PerspectiveSeq> = HashMap::new();
-        for entry in intents_ks.iter() {
-            let (k, v) = entry.into_inner()?;
-            let seq = decode_seq_key(k.as_ref())?;
-            let decoded = decode_value(v.as_ref())?;
-            if let Some(idem) = decoded.idempotency_key {
-                by_idem.insert(idem, seq);
+        let mut live: HashMap<u64, u64> = HashMap::new();
+        let mut sealed: Vec<(u64, Keyspace)> = Vec::new();
+        let mut active: Option<Keyspace> = None;
+        let mut active_inserts = 0u64;
+        for no in &epoch_nos {
+            let ks = db.keyspace(&epoch_ks_name(*no), KeyspaceCreateOptions::default)?;
+            let mut kept = 0u64;
+            let mut total = 0u64;
+            for entry in ks.iter() {
+                let (k, v) = entry.into_inner()?;
+                total += 1;
+                if let Some(ref w) = wm {
+                    if k.as_ref() < w.as_slice() {
+                        continue; // incorporated pre-crash; epoch drop pending
+                    }
+                }
+                let seq = decode_seq_key(k.as_ref())?;
+                let decoded = decode_value(v.as_ref())?;
+                if let Some(idem) = decoded.idempotency_key {
+                    by_idem.insert(idem, seq);
+                }
+                by_seq.insert(
+                    seq,
+                    (
+                        WriteIntent {
+                            perspective_seq: seq,
+                            idempotency_key: decoded.idempotency_key,
+                            append: decoded.append,
+                        },
+                        *no,
+                    ),
+                );
+                kept += 1;
             }
-            by_seq.insert(
-                seq,
-                WriteIntent {
-                    perspective_seq: seq,
-                    idempotency_key: decoded.idempotency_key,
-                    append: decoded.append,
-                },
-            );
+            live.insert(*no, kept);
+            if *no == active_no {
+                active_inserts = total;
+                active = Some(ks);
+            } else {
+                sealed.push((*no, ks));
+            }
         }
+        let active =
+            active.ok_or_else(|| IntentError::Codec("no active intent epoch".to_string()))?;
 
         let core = Arc::new(StoreCore {
             db,
-            intents_ks,
+            epochs: Mutex::new(EpochSet {
+                active_no,
+                active,
+                active_inserts,
+                sealed,
+                live,
+                rotate_threshold,
+                wm: wm.clone().unwrap_or_default(),
+            }),
             idem_ks,
+            meta_ks,
             sync_per_write: AtomicBool::new(true),
             mutations: Mutex::new(()),
             pending_index: Mutex::new(PendingIndex { by_seq, by_idem }),
             commits: AtomicU64::new(0),
         });
+        // Reclaim epochs fully incorporated before the last shutdown.
+        {
+            let _guard = core
+                .mutations
+                .lock()
+                .lock_or_die("intent_store.fjall.mutations");
+            core.gc_epochs_locked()?;
+        }
 
         // GH #228 — the dedicated commit thread. One per store (= one
         // per shard); both hot call sites (the producer coalescer's
@@ -959,6 +1228,107 @@ impl FjallIntentStore {
             commit_tx: Some(commit_tx),
             commit_thread: Some(commit_thread),
         })
+    }
+
+    /// #267 item 0 — the shared retire core for `prune` / `remove_seq`
+    /// / `remove_seqs`. NO per-record intent deletes: the durable
+    /// commit carries only the released idem pointers plus the
+    /// advanced incorporated watermark; intent bytes are reclaimed
+    /// exclusively by whole-epoch drops. Caller MUST hold `mutations`.
+    fn retire_locked(
+        &self,
+        work: &[(PerspectiveSeq, Option<IdempotencyKey>, u64)],
+    ) -> Result<(), IntentError> {
+        if work.is_empty() {
+            return Ok(());
+        }
+        // Mirror first (under the index lock) so the new watermark is
+        // derived from the post-removal lowest pending seq. Track
+        // which idem pointers the mirror actually released — a key
+        // re-claimed by a NEWER seq keeps its durable pointer.
+        let mut released_idems: Vec<IdempotencyKey> = Vec::new();
+        // Adversary finding 3: a duplicate seq in one call must not
+        // double-decrement — count an epoch only when the mirror
+        // ACTUALLY removed the entry, taking the tag from the removed
+        // value (self-defending against any caller).
+        let mut removed_epochs: Vec<u64> = Vec::new();
+        let wm: Vec<u8> = {
+            let mut idx = self
+                .core
+                .pending_index
+                .lock()
+                .lock_or_die("intent_store.fjall.pending_index");
+            for (seq, idem, _) in work {
+                if let Some((_, ep)) = idx.by_seq.remove(seq) {
+                    removed_epochs.push(ep);
+                } else {
+                    continue;
+                }
+                if let Some(k) = idem {
+                    if idx.by_idem.get(k).copied() == Some(*seq) {
+                        idx.by_idem.remove(k);
+                        released_idems.push(*k);
+                    }
+                }
+            }
+            if let Some(lowest) = idx.by_seq.keys().next() {
+                // Everything strictly below the lowest survivor is
+                // incorporated (committer removals are prefix-
+                // dominant; an out-of-order survivor correctly HOLDS
+                // the watermark back).
+                encode_seq_key(*lowest).to_vec()
+            } else {
+                // Index empty: everything up to and including the max
+                // retired seq is incorporated — extend its key one
+                // byte so the strictly-below comparison covers it.
+                let max_seq = work
+                    .iter()
+                    .map(|(s, _, _)| *s)
+                    .max()
+                    .expect("work is non-empty");
+                let mut k = encode_seq_key(max_seq).to_vec();
+                k.push(0);
+                k
+            }
+        };
+        // Monotonic ON THE RETIRE PATH ONLY: the watermark never moves
+        // backward here (an empty-index retire after out-of-order
+        // history would otherwise resurrect more than necessary). The
+        // COMMIT path may lower it (finding 1). Cache, not a meta read.
+        let wm = {
+            let ep = self
+                .core
+                .epochs
+                .lock()
+                .lock_or_die("intent_store.fjall.epochs");
+            if !ep.wm.is_empty() && ep.wm.as_slice() >= wm.as_slice() {
+                ep.wm.clone()
+            } else {
+                wm
+            }
+        };
+        let mut batch = self.core.batch_for_write();
+        for k in &released_idems {
+            batch.remove(&self.core.idem_ks, k.to_vec());
+        }
+        batch.insert(&self.core.meta_ks, META_WM_KEY.to_vec(), wm.clone());
+        batch.commit()?;
+
+        // Live counters (actual removals only) + cache + reclamation.
+        {
+            let mut ep = self
+                .core
+                .epochs
+                .lock()
+                .lock_or_die("intent_store.fjall.epochs");
+            for epoch_no in &removed_epochs {
+                if let Some(c) = ep.live.get_mut(epoch_no) {
+                    *c = c.saturating_sub(1);
+                }
+            }
+            ep.wm = wm;
+        }
+        self.core.gc_epochs_locked()
     }
 
     /// Toggle inline-fsync vs buffered durability. Defaults to `true`.
@@ -1083,7 +1453,7 @@ impl IntentStore for FjallIntentStore {
             .pending_index
             .lock()
             .lock_or_die("intent_store.fjall.pending_index");
-        Ok(idx.by_seq.values().cloned().collect())
+        Ok(idx.by_seq.values().map(|(i, _)| i.clone()).collect())
     }
 
     fn next_pending_seq(&self) -> Result<Option<PerspectiveSeq>, IntentError> {
@@ -1104,10 +1474,10 @@ impl IntentStore for FjallIntentStore {
             .mutations
             .lock()
             .lock_or_die("intent_store.fjall.mutations");
-        // W11: walk the in-memory mirror's `..=up_to` range to identify
-        // the intents to drop + their idem keys. Avoids the fjall LSM
-        // scan over the durable keyspace.
-        let work: Vec<(PerspectiveSeq, Option<IdempotencyKey>)> = {
+        // W11: walk the in-memory mirror's `..=up_to` range. #267
+        // item 0: routes through the retire core — no per-record
+        // intent deletes; reclamation is whole-epoch drop.
+        let work: Vec<(PerspectiveSeq, Option<IdempotencyKey>, u64)> = {
             let idx = self
                 .core
                 .pending_index
@@ -1115,37 +1485,10 @@ impl IntentStore for FjallIntentStore {
                 .lock_or_die("intent_store.fjall.pending_index");
             idx.by_seq
                 .range(..=up_to)
-                .map(|(s, intent)| (*s, intent.idempotency_key))
+                .map(|(s, (intent, ep))| (*s, intent.idempotency_key, *ep))
                 .collect()
         };
-        if work.is_empty() {
-            return Ok(());
-        }
-        // Drop the intent rows and dedup pointers in one batch so a crash
-        // mid-prune never leaves a pointer without its intent.
-        let mut batch = self.core.batch_for_write();
-        for (seq, idem) in &work {
-            let seq_key = encode_seq_key(*seq);
-            batch.remove(&self.core.intents_ks, seq_key.to_vec());
-            if let Some(k) = idem {
-                batch.remove(&self.core.idem_ks, k.to_vec());
-            }
-        }
-        batch.commit()?;
-
-        // Durable commit succeeded — bring the mirror into line.
-        let mut idx = self
-            .core
-            .pending_index
-            .lock()
-            .lock_or_die("intent_store.fjall.pending_index");
-        for (seq, idem) in &work {
-            idx.by_seq.remove(seq);
-            if let Some(k) = idem {
-                idx.by_idem.remove(k);
-            }
-        }
-        Ok(())
+        self.retire_locked(&work)
     }
 
     fn remove_seq(&self, seq: PerspectiveSeq) -> Result<(), IntentError> {
@@ -1157,47 +1500,19 @@ impl IntentStore for FjallIntentStore {
             .lock()
             .lock_or_die("intent_store.fjall.mutations");
         // W11: look up via the in-memory mirror. Absent → no-op without
-        // touching fjall (was the bulk of the 70 % CPU hit pre-W11).
-        let idem = {
+        // touching fjall. #267 item 0: routes through the retire core.
+        let work: Vec<(PerspectiveSeq, Option<IdempotencyKey>, u64)> = {
             let idx = self
                 .core
                 .pending_index
                 .lock()
                 .lock_or_die("intent_store.fjall.pending_index");
             match idx.by_seq.get(&seq) {
-                Some(intent) => intent.idempotency_key,
+                Some((intent, ep)) => vec![(seq, intent.idempotency_key, *ep)],
                 None => return Ok(()),
             }
         };
-        let seq_key = encode_seq_key(seq);
-        let mut batch = self.core.batch_for_write();
-        batch.remove(&self.core.intents_ks, seq_key.to_vec());
-        if let Some(k) = idem {
-            // Only drop the dedup pointer if it still points at THIS seq.
-            // The mirror's invariant (an idem-pointed seq is always live)
-            // means in the common case the pointer matches; we still
-            // re-check fjall so the durable state stays consistent if a
-            // future change relaxes the mirror's coupling.
-            if let Some(pointer) = self.core.idem_ks.get(k)? {
-                if pointer.as_ref() == seq_key.as_slice() {
-                    batch.remove(&self.core.idem_ks, k.to_vec());
-                }
-            }
-        }
-        batch.commit()?;
-
-        let mut idx = self
-            .core
-            .pending_index
-            .lock()
-            .lock_or_die("intent_store.fjall.pending_index");
-        idx.by_seq.remove(&seq);
-        if let Some(k) = idem {
-            if idx.by_idem.get(&k).copied() == Some(seq) {
-                idx.by_idem.remove(&k);
-            }
-        }
-        Ok(())
+        self.retire_locked(&work)
     }
 
     fn remove_seqs(&self, seqs: &[PerspectiveSeq]) -> Result<(), IntentError> {
@@ -1215,9 +1530,10 @@ impl IntentStore for FjallIntentStore {
             .lock()
             .lock_or_die("intent_store.fjall.mutations");
 
-        // W11: filter against the mirror — present seqs go to the batch,
-        // absent seqs are skipped at zero LSM cost.
-        let work: Vec<(PerspectiveSeq, Option<IdempotencyKey>)> = {
+        // W11: filter against the mirror — present seqs proceed, absent
+        // seqs are skipped at zero LSM cost. #267 item 0: routes
+        // through the retire core.
+        let work: Vec<(PerspectiveSeq, Option<IdempotencyKey>, u64)> = {
             let idx = self
                 .core
                 .pending_index
@@ -1227,42 +1543,11 @@ impl IntentStore for FjallIntentStore {
                 .filter_map(|&seq| {
                     idx.by_seq
                         .get(&seq)
-                        .map(|intent| (seq, intent.idempotency_key))
+                        .map(|(intent, ep)| (seq, intent.idempotency_key, *ep))
                 })
                 .collect()
         };
-        if work.is_empty() {
-            return Ok(());
-        }
-
-        let mut batch = self.core.batch_for_write();
-        for (seq, idem) in &work {
-            let seq_key = encode_seq_key(*seq);
-            batch.remove(&self.core.intents_ks, seq_key.to_vec());
-            if let Some(k) = idem {
-                if let Some(pointer) = self.core.idem_ks.get(*k)? {
-                    if pointer.as_ref() == seq_key.as_slice() {
-                        batch.remove(&self.core.idem_ks, k.to_vec());
-                    }
-                }
-            }
-        }
-        batch.commit()?;
-
-        let mut idx = self
-            .core
-            .pending_index
-            .lock()
-            .lock_or_die("intent_store.fjall.pending_index");
-        for (seq, idem) in &work {
-            idx.by_seq.remove(seq);
-            if let Some(k) = idem {
-                if idx.by_idem.get(k).copied() == Some(*seq) {
-                    idx.by_idem.remove(k);
-                }
-            }
-        }
-        Ok(())
+        self.retire_locked(&work)
     }
 
     fn pending_len(&self) -> Result<usize, IntentError> {
@@ -1793,6 +2078,159 @@ mod tests {
     /// W11 (2026-06-02): the in-memory mirror MUST be rebuilt from the
     /// durable keyspace on reopen, including the idem dedup pointer.
     #[test]
+    fn late_lower_seq_survives_reopen_below_watermark() {
+        // Adversary finding 1 (Critical): a put with a seq BELOW the
+        // durable watermark (multi-ingress HLC reorder / election
+        // restore) must lower the watermark atomically with the
+        // insert — otherwise the acked intent is silently skipped on
+        // reopen. Fails on the pre-fix build.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intents");
+        let store = FjallIntentStore::open(&path).unwrap();
+        let s1 = seq(1, 0, 1);
+        let s2 = seq(1, 1, 1);
+        store.put(intent(s2, None)).unwrap();
+        store.remove_seq(s2).unwrap(); // index empty → wm past s2
+        store.put(intent(s1, None)).unwrap(); // LOWER than the wm
+        drop(store);
+        let store = FjallIntentStore::open(&path).unwrap();
+        assert_eq!(
+            store.next_pending_seq().unwrap(),
+            Some(s1),
+            "acked below-watermark intent must survive reopen"
+        );
+        // Lowering the watermark also resurrects the already-retired
+        // s2 (its record outlives retire until the epoch drops) — the
+        // safe direction: resurrection re-incorporates idempotently,
+        // skipping never does.
+        assert_eq!(store.pending_len().unwrap(), 2);
+    }
+
+    #[test]
+    fn duplicate_seqs_in_one_remove_call_do_not_double_decrement() {
+        // Adversary finding 3: remove_seqs(&[s, s]) double-decremented
+        // the epoch's live counter, dropping a sealed epoch that still
+        // held an acked intent.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intents");
+        let store = FjallIntentStore::open_with_rotate(&path, 2).unwrap();
+        let s1 = seq(1, 0, 1);
+        let s2 = seq(1, 1, 1);
+        store.put(intent(s1, None)).unwrap();
+        store.put(intent(s2, None)).unwrap(); // seals epoch 0 = {s1, s2}
+        store.put(intent(seq(1, 2, 1), None)).unwrap(); // epoch 1 active
+        store.remove_seqs(&[s1, s1]).unwrap();
+        // s2 must still be durable: epoch 0 must NOT have dropped.
+        drop(store);
+        let store = FjallIntentStore::open_with_rotate(&path, 2).unwrap();
+        let p = store.pending().unwrap();
+        assert!(
+            p.iter().any(|i| i.perspective_seq == s2),
+            "epoch holding a live intent was dropped after duplicate retire"
+        );
+    }
+
+    #[test]
+    fn same_seq_reput_keeps_epochs_droppable() {
+        // Adversary finding 2: election-recovery restore re-puts an
+        // existing seq; the overwrite must not double-insert or corrupt
+        // live counters — full retire must still drop every epoch.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intents");
+        let store = FjallIntentStore::open_with_rotate(&path, 2).unwrap();
+        let s1 = seq(1, 0, 1);
+        let s2 = seq(1, 1, 1);
+        store.put(intent(s1, None)).unwrap();
+        store.put(intent(s2, None)).unwrap(); // epoch 0 sealed
+        store.put(intent(s1, None)).unwrap(); // restore-style re-put
+        assert_eq!(store.pending_len().unwrap(), 2);
+        store.remove_seqs(&[s1, s2]).unwrap();
+        assert_eq!(store.pending_len().unwrap(), 0);
+        drop(store);
+        let store = FjallIntentStore::open_with_rotate(&path, 2).unwrap();
+        assert_eq!(
+            store.pending_len().unwrap(),
+            0,
+            "re-put row resurrected — overwrite contract violated"
+        );
+    }
+
+    #[test]
+    fn keyed_out_of_order_retiree_resurrects_with_dedup() {
+        // Pins the resurrection semantics for KEYED intents: the
+        // retired-out-of-order intent comes back on reopen and its
+        // idem dedup works again (Duplicate against the resurrected
+        // seq), per the ADR-047 replay contract.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intents");
+        let key = [9u8; 16];
+        let s1 = seq(1, 0, 1);
+        let s2 = seq(1, 1, 1);
+        {
+            let store = FjallIntentStore::open(&path).unwrap();
+            store.put(intent(s1, None)).unwrap();
+            store.put(intent(s2, Some(key))).unwrap();
+            store.remove_seq(s2).unwrap(); // out of order: s1 survives
+        }
+        let store = FjallIntentStore::open(&path).unwrap();
+        assert_eq!(store.pending_len().unwrap(), 2, "keyed retiree resurrects");
+        assert!(matches!(
+            store.put(intent(seq(2, 0, 1), Some(key))).unwrap(),
+            PutOutcome::Duplicate(s) if s == s2
+        ));
+    }
+
+    #[test]
+    fn epoch_rotation_drops_fully_incorporated_keyspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intents");
+        let store = FjallIntentStore::open_with_rotate(&path, 4).unwrap();
+        // 10 intents at threshold 4 → epochs 0..2 sealed along the way.
+        let seqs: Vec<PerspectiveSeq> = (0..10u32).map(|i| seq(1, i, 1)).collect();
+        for &sq in &seqs {
+            store.put(intent(sq, None)).unwrap();
+        }
+        assert_eq!(store.pending_len().unwrap(), 10);
+        // Retire the first 8 (prefix order — the committer shape):
+        // epochs 0 and 1 (4 intents each) become fully incorporated
+        // and must be DROPPED; their data must stay invisible.
+        store.remove_seqs(&seqs[..8]).unwrap();
+        assert_eq!(store.pending_len().unwrap(), 2);
+        // Reopen: only the surviving tail comes back (watermark +
+        // dropped epochs); nothing resurrects.
+        drop(store);
+        let store = FjallIntentStore::open_with_rotate(&path, 4).unwrap();
+        assert_eq!(store.pending_len().unwrap(), 2);
+        let p = store.pending().unwrap();
+        assert_eq!(p[0].perspective_seq, seqs[8]);
+        assert_eq!(p[1].perspective_seq, seqs[9]);
+        // Retire the rest; reopen is empty.
+        store.remove_seqs(&seqs[8..]).unwrap();
+        drop(store);
+        let store = FjallIntentStore::open_with_rotate(&path, 4).unwrap();
+        assert_eq!(store.pending_len().unwrap(), 0);
+    }
+
+    #[test]
+    fn epoch_watermark_skips_incorporated_on_reopen_without_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("intents");
+        let store = FjallIntentStore::open(&path).unwrap();
+        let s1 = seq(1, 0, 1);
+        let s2 = seq(1, 1, 1);
+        store.put(intent(s1, None)).unwrap();
+        store.put(intent(s2, None)).unwrap();
+        // Prefix retire: watermark advances past s1 even though the
+        // active epoch (holding both records durably) is never
+        // dropped — reopen must NOT resurrect s1.
+        store.remove_seq(s1).unwrap();
+        drop(store);
+        let store = FjallIntentStore::open(&path).unwrap();
+        assert_eq!(store.pending_len().unwrap(), 1);
+        assert_eq!(store.next_pending_seq().unwrap(), Some(s2));
+    }
+
+    #[test]
     fn fjall_pending_index_rebuilds_from_disk_on_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("intents");
@@ -1815,17 +2253,30 @@ mod tests {
             ));
         }
 
-        // Reopen: index rebuild scans fjall; pending(), pending_len(),
-        // next_pending_seq(), and the idem dedup all reflect the durable
-        // state.
+        // Reopen: index rebuild scans the epoch keyspaces. #267 item 0
+        // CONTRACT CHANGE: s2 was retired OUT OF ORDER (s1 < s2 still
+        // pending), so the incorporated watermark could not advance
+        // past it — s2 RESURRECTS on reopen and will re-incorporate
+        // idempotently downstream (ADR-047 replay contract). The
+        // durable idem state still reflects exactly what was released.
         let store = FjallIntentStore::open(&path).unwrap();
         let s1 = seq(1, 0, 1);
+        let s2 = seq(1, 1, 1);
         let key = [7u8; 16];
-        assert_eq!(store.pending_len().unwrap(), 1, "reopen rebuilds the count");
+        assert_eq!(
+            store.pending_len().unwrap(),
+            2,
+            "out-of-order retiree resurrects on reopen (epoch-store contract)"
+        );
         let p = store.pending().unwrap();
-        assert_eq!(p.len(), 1);
+        assert_eq!(p.len(), 2);
         assert_eq!(p[0].perspective_seq, s1);
+        assert_eq!(p[1].perspective_seq, s2);
         assert_eq!(store.next_pending_seq().unwrap(), Some(s1));
+        // Re-retire the resurrected tail so the rest of the test sees
+        // the same world as before the reopen.
+        store.remove_seq(s2).unwrap();
+        assert_eq!(store.pending_len().unwrap(), 1);
         // Dedup pointer survived the reopen via the durable idem keyspace
         // (which the index rebuilt from).
         assert!(matches!(
