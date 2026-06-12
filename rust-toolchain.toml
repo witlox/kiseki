@@ -1,4 +1,8 @@
 [toolchain]
-channel = "stable"
+# Pinned 2026-06-12: today's stable rollout breaks rcgen 0.14.8 (E0119
+# coherence conflict via time's format_description projections — no
+# patched rcgen exists yet). 1.96.0 is the verified-green toolchain.
+# Un-pin when rcgen/time ship fixes (tracked in the repo issues).
+channel = "1.96.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
