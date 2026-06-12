@@ -16,6 +16,8 @@ yanked = "deny"
 ignore = [
     "RUSTSEC-2024-0384", # `instant` unmaintained — transitive via openraft
     "RUSTSEC-2025-0020", # pyo3 PyString buffer overflow — not used in kiseki (transitive)
+    "RUSTSEC-2026-0176", # pyo3 BoundList/TupleIterator nth OOB — python bindings only, not on any kiseki data path
+    "RUSTSEC-2026-0177", # pyo3 new_closure missing Sync bound — python bindings only, not on any kiseki data path
     "RUSTSEC-2025-0134", # rustls-pemfile unmaintained — awaiting upstream migration
     "RUSTSEC-2026-0104", # x509-parser CRL parsing panic — mitigated by input validation
 ]
