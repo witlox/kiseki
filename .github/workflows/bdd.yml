@@ -51,8 +51,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.96.0" # pinned: new stable breaks rcgen 0.14.8 (E0119) — un-pin via #273
       - name: Install protoc
         uses: ./.github/actions/install-deps
       - uses: Swatinem/rust-cache@v2
@@ -75,8 +73,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.96.0" # pinned: new stable breaks rcgen 0.14.8 (E0119) — un-pin via #273
       - name: Install protoc
         uses: ./.github/actions/install-deps
       - uses: Swatinem/rust-cache@v2

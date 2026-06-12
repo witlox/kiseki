@@ -30,7 +30,14 @@ rm -f Cargo.toml.bak
 sed -i.bak "s/version = \"${BASE_VERSION}\\.0\"/version = \"${FULL_VERSION}\"/g" Cargo.toml
 rm -f Cargo.toml.bak
 
-# Regenerate Cargo.lock
-cargo generate-lockfile --quiet
+# Sync the lockfile's workspace-member versions ONLY. Never use
+# `cargo generate-lockfile` here: it re-resolves every third-party
+# dependency to the newest compatible version, silently discarding
+# the committed pins. That is how the 2026-06-12 release broke —
+# time 0.3.48 (published that day) re-entered the lock and hit the
+# rcgen 0.14.8 E0119 coherence conflict, despite every CI step
+# passing --locked. `cargo update --workspace` touches only the
+# path-dependency (workspace member) entries.
+cargo update --workspace --quiet
 
 echo "Version set to ${FULL_VERSION}"
