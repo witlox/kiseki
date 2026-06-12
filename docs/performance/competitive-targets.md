@@ -57,8 +57,9 @@ and how fast their metadata path is.
 | **Aggregate sequential write** | *stale (May: ~15 MB/s, pre-fix era)* | ~5.2 GB/s | 5–8 GB/s (R-1, low durability) | ~5 GB/s (R-3) | 8–10 GB/s |
 | **Single-stream bulk read** (per client) | *stale (May: ~180 MB/s)* | ~1.8 GB/s | 2–3 GB/s | 0.8–1.5 GB/s | 2–3 GB/s |
 | **Single-stream bulk write** (per client) | *stale (May: ~190 MB/s)* | ~1.8 GB/s | 1.5–2.5 GB/s | 0.5–1.2 GB/s | 1.5–2 GB/s |
-| **Small-file 4 KB write IOPS** (aggregate) | **23.7 k op/s** | ~360 k op/s | 30–80 k (MDS-bound) | 5–20 k (MDS + OSD) | 50–150 k |
-| **Small-file 4 KB read IOPS** (aggregate) | **275 k op/s** | similar order | 100–200 k | 30–80 k | 100–200 k |
+| **Small-file 4 KB write IOPS** (aggregate, fresh) | **27.9 k op/s** | ~~360 k~~ audited: 100–200 k conditional | 30–80 k (MDS-bound) | 5–20 k (MDS + OSD) | 50–150 k |
+| **Small-file 4 KB write IOPS** (sustained at 3.8 M objects) | **15.1 k op/s** (was 10.6 k pre-#269) | flat-at-fresh is the target | — | — | — |
+| **Small-file 4 KB read IOPS** (aggregate, settled) | **275 k op/s** | similar order | 100–200 k | 30–80 k | 100–200 k |
 | **Small-write p99 latency** | 39 ms @ conc16 · 142 ms @ saturation (closed-loop) | ~5 ms | ~1–3 ms | ~5–20 ms | ~0.3–1 ms with Optane; **~3–8 ms without**⁶ |
 | **Metadata create** (mkdir/create op/s) | *stale (May: ~30 op/s under the since-fixed F-1 wedge)*⁷ | ~5 k op/s | 80–150 k (single MDS) | 5–15 k | 50–100 k |
 
@@ -263,3 +264,40 @@ When re-measuring kiseki on the `default` profile, update the
 For other GCP profiles (`compact`, `transport`), add a sibling
 section below or a separate table — the methodology in
 [`targets.md`](targets.md) section "Methodology" applies uniformly.
+
+## Where kiseki ACTUALLY outperforms today (2026-06-12, measured)
+
+1. **Small-file reads: above every competitor's band.** 275 k op/s
+   aggregate 4 KB GETs (settled data) vs Lustre/VAST 100–200 k and
+   Ceph 30–80 k on this hardware class. How: content-addressed inline
+   tier + decrypt cache + the ADR-042 TCP-framed path — no MDS hop,
+   no per-read consensus.
+2. **Small-file writes vs Ceph: 1.4–5×.** 27.9 k fresh / 15.1 k
+   sustained vs Ceph's 5–20 k band. How: ADR-047 decoupled ack
+   (quorum-intent, batch-amortized fan) instead of per-op 3-way
+   commit.
+3. **Durability on cloud local SSD vs Lustre: categorical.** Cross-
+   node EC/replication survives VM loss; Lustre on local SSD does
+   not.
+4. **Dedup: 6.03× measured** (2026-05-28) vs VAST's claimed 2–5×.
+
+## Known failure modes & limits (2026-06-12, measured)
+
+- **Write amplification ~15–35× is the throughput governor**: every
+  4 KiB PUT lands ~6+ durable copies cluster-wide (3 replicas ×
+  intent journal/raft log/small store/composition + WALs) before LSM
+  compaction re-writes; sustained load saturates the storage device
+  and queues every journal commit (the with-volume decay). Survivors
+  per the #226/#267 audits: fjall KV-separation; reducing required
+  copies. The intent store's share was fixed (#269: epoch-partitioned,
+  +42% sustained confirmed); the rest is open.
+- **Read availability collapses under sustained cloud-rate ingest at
+  volume (#261)**: GETs fail (not just slow) while millions of writes
+  of apply backlog drain; reads on settled data are clean (68 k op/s
+  local at 1 M objects). Error class capture pending (needs cloud-rate
+  arrival). Release-gating for mixed sustained workloads.
+- **Replication catch-up frame cap (#255): FIXED** — byte-budgeted
+  batches + env escape hatches + restart-under-volume BDD guard.
+- Local dev boxes are device-bound: single consumer NVMe saturates at
+  ~1/15th of the logical write rate; absolute local numbers are not
+  comparable to cluster hardware.
