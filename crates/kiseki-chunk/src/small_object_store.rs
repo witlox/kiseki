@@ -151,19 +151,18 @@ impl SmallObjectStore {
     /// # Errors
     /// Returns the underlying `io::Error` on commit failure.
     pub fn put(&self, chunk_id: &ChunkId, data: &[u8]) -> io::Result<bool> {
-        // Read-then-write under the same fjall snapshot: a concurrent
-        // writer with the same chunk_id would either land before
-        // (so we see Some, return false) or after (so we land Ok,
-        // increment approx_len). Both branches are correctness-safe
-        // even if approx_len drifts by one — it's advisory.
-        let existed = self
-            .objects
-            .get(chunk_id.0.as_slice())
-            .map_err(|e| io::Error::other(e.to_string()))?
-            .is_some();
-        if existed {
-            return Ok(false);
-        }
+        // BLIND WRITE (#267 wall-1 lever 1, GH #226 audit): the
+        // pre-insert existence get was a point read against an LSM
+        // that deepens with every object — 1-2 such reads per inline
+        // PUT at SM apply were a measured component of the residual
+        // with-volume write decay. The read protected only (a) an
+        // ADVISORY counter (`approx_len` — now drifts upward on
+        // dedup-heavy workloads, documented) and (b) skipping a
+        // byte-identical overwrite (ADR-044 convergent encryption:
+        // same plaintext → same chunk_id AND same envelope bytes, so
+        // the overwrite is value-stable). No production caller
+        // consumes the newness bool (verified: all `let _ =` /
+        // Err-only).
         let mut batch = self.db.batch().durability(Some(self.batch_durability()));
         batch.insert(&self.objects, chunk_id.0.to_vec(), data.to_vec());
         batch
@@ -185,36 +184,26 @@ impl SmallObjectStore {
     /// # Errors
     /// Returns the underlying `io::Error` on read or commit failure.
     pub fn put_many(&self, items: &[(&[u8; 32], &[u8])]) -> io::Result<u64> {
-        let mut batch = self.db.batch().durability(Some(self.batch_durability()));
-        let mut new_count: u64 = 0;
-        // Dedup within the batch too: the existence check below reads
-        // committed state, so a key repeated in `items` (same content
-        // → same content-addressed chunk_id) would otherwise double-
-        // insert and drift `approx_len`.
-        let mut staged: std::collections::HashSet<&[u8; 32]> = std::collections::HashSet::new();
-        for (key, data) in items {
-            if !staged.insert(key) {
-                continue;
-            }
-            let existed = self
-                .objects
-                .get(key.as_slice())
-                .map_err(|e| io::Error::other(e.to_string()))?
-                .is_some();
-            if existed {
-                continue;
-            }
-            batch.insert(&self.objects, key.to_vec(), data.to_vec());
-            new_count += 1;
-        }
-        if new_count == 0 {
+        // BLIND WRITE (#267 wall-1 lever 1) — see [`Self::put`]. This
+        // is the SM-apply hot path: every replica paid one LSM point
+        // read PER INLINE PAYLOAD here, inside the apply mutex.
+        // In-batch duplicate keys are harmless (same content-addressed
+        // key → identical bytes; fjall last-write-wins in the batch).
+        // `approx_len` counts all items (advisory; drifts upward on
+        // dedup hits).
+        if items.is_empty() {
             return Ok(0);
         }
+        let mut batch = self.db.batch().durability(Some(self.batch_durability()));
+        for (key, data) in items {
+            batch.insert(&self.objects, key.to_vec(), data.to_vec());
+        }
+        let n = items.len() as u64;
         batch
             .commit()
             .map_err(|e| io::Error::other(e.to_string()))?;
-        self.approx_len.fetch_add(new_count, Ordering::Relaxed);
-        Ok(new_count)
+        self.approx_len.fetch_add(n, Ordering::Relaxed);
+        Ok(n)
     }
 
     /// Retrieve inline content for a chunk.
@@ -264,28 +253,28 @@ impl SmallObjectStore {
     /// # Errors
     /// Returns the underlying `io::Error` on read or commit failure.
     pub fn delete_many(&self, keys: &[[u8; 32]]) -> io::Result<u64> {
-        let mut batch = self.db.batch().durability(Some(self.batch_durability()));
-        let mut removed: u64 = 0;
-        for key in keys {
-            let existed = self
-                .objects
-                .get(key.as_slice())
-                .map_err(|e| io::Error::other(e.to_string()))?
-                .is_some();
-            if !existed {
-                continue;
-            }
-            batch.remove(&self.objects, key.to_vec());
-            removed += 1;
-        }
-        if removed == 0 {
+        // BLIND DELETE (#267 wall-1 lever 1): the per-key existence
+        // gets ran INSIDE the SM apply lock on every watermark
+        // advance (~100k keys at rate) against the deepening LSM.
+        // Prune keys embed the delta sequence, so callers only pass
+        // keys that were offloaded — a remove on an absent key (rare
+        // crash-replay case) is one harmless tombstone. `approx_len`
+        // is advisory; saturating drift accepted.
+        if keys.is_empty() {
             return Ok(0);
         }
+        let mut batch = self.db.batch().durability(Some(self.batch_durability()));
+        for key in keys {
+            batch.remove(&self.objects, key.to_vec());
+        }
+        let n = keys.len() as u64;
         batch
             .commit()
             .map_err(|e| io::Error::other(e.to_string()))?;
-        self.approx_len.fetch_sub(removed, Ordering::Relaxed);
-        Ok(removed)
+        let cur = self.approx_len.load(Ordering::Relaxed);
+        self.approx_len
+            .store(cur.saturating_sub(n), Ordering::Relaxed);
+        Ok(n)
     }
 
     /// Check if a chunk exists in the inline store.
@@ -397,12 +386,18 @@ mod tests {
 
     #[test]
     fn dedup_returns_false() {
+        // Blind-write contract (#267 lever 1): a re-put of identical
+        // content (the only possible duplicate under content
+        // addressing + ADR-044 convergent encryption) overwrites
+        // value-stably and reports `true`; the content stays
+        // readable and identical. `approx_len` drift is advisory.
         let dir = tempfile::tempdir().unwrap();
         let store = open_at(&dir, "test-dedup");
 
         let id = test_chunk_id(0x02);
         assert!(store.put(&id, b"data").unwrap());
-        assert!(!store.put(&id, b"data").unwrap()); // dedup
+        assert!(store.put(&id, b"data").unwrap()); // blind overwrite
+        assert_eq!(store.get(&id).unwrap().as_deref(), Some(&b"data"[..]));
     }
 
     #[test]
@@ -505,7 +500,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = open_at(&dir, "test-put-many");
 
-        // Pre-existing entry: must be skipped (dedup).
+        // Pre-existing entry: blind-overwritten value-stably.
         store.put(&test_chunk_id(0x20), b"existing").unwrap();
 
         let k_existing = [0x20u8; 32];
@@ -519,8 +514,11 @@ mod tests {
             (&k_new_a, b"a"),
         ];
         let new_count = store.put_many(&items).unwrap();
-        assert_eq!(new_count, 2);
-        assert_eq!(store.len().unwrap(), 3);
+        // Blind-write contract (#267 lever 1): every item is written
+        // (value-stable overwrites for the dup and the in-batch
+        // repeat) and counted; `approx_len` drifts upward (advisory).
+        assert_eq!(new_count, 4);
+        assert_eq!(store.len().unwrap(), 5);
         assert_eq!(
             store.get(&test_chunk_id(0x21)).unwrap(),
             Some(b"a".to_vec())
@@ -533,13 +531,21 @@ mod tests {
 
     #[test]
     fn put_many_all_dups_commits_nothing() {
+        // Blind-write contract (#267 lever 1): duplicates are
+        // overwritten value-stably and counted; content remains
+        // identical and readable. The advisory `approx_len` drifts
+        // upward — pinned here so the drift is a documented choice.
         let dir = tempfile::tempdir().unwrap();
         let store = open_at(&dir, "test-put-many-dups");
         store.put(&test_chunk_id(0x30), b"x").unwrap();
         let k = [0x30u8; 32];
         let items: Vec<(&[u8; 32], &[u8])> = vec![(&k, b"x")];
-        assert_eq!(store.put_many(&items).unwrap(), 0);
-        assert_eq!(store.len().unwrap(), 1);
+        assert_eq!(store.put_many(&items).unwrap(), 1);
+        assert_eq!(
+            store.get(&test_chunk_id(0x30)).unwrap().as_deref(),
+            Some(&b"x"[..])
+        );
+        assert_eq!(store.len().unwrap(), 2); // advisory drift, documented
     }
 
     #[test]
