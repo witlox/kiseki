@@ -45,7 +45,7 @@ libc = { workspace = true }
 # can be driven from a tokio task via its own reactor inside
 # `UringFileBackedDevice`. Gated behind the `io_uring` feature so
 # non-Linux builds and the default Tier-1 unit suite stay unaffected.
-io-uring = { version = "0.6", optional = true }
+io-uring = { version = "0.7", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
