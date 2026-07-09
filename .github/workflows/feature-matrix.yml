@@ -33,8 +33,6 @@ on:
       - "**/build.rs"
       - ".cargo/**"
       - ".github/workflows/feature-matrix.yml"
-  schedule:
-    - cron: "0 5 * * *" # Daily 05:00 UTC (one hour before the weekly release run)
   workflow_dispatch:
   workflow_call:
 

@@ -10,11 +10,6 @@ on:
       - "*.md"
       - "infra/**"
   workflow_dispatch:
-  schedule:
-    # Nightly at 03:00 UTC. Catches drift in slow-marked unit tests
-    # and the @slow / @integration BDD scenarios that the Tier 1
-    # smoke filter skips.
-    - cron: "0 3 * * *"
 
 concurrency:
   group: slow-${{ github.ref }}
