@@ -26,7 +26,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
@@ -88,7 +88,7 @@ jobs:
     needs: preflight
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protoc
         uses: ./.github/actions/install-deps
@@ -132,7 +132,7 @@ jobs:
           dnf install -y --allowerasing gcc gcc-c++ openssl-devel pkgconf-pkg-config \
             perl-IPC-Cmd git curl unzip tar gzip make findutils cmake
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Mark workspace safe for git
@@ -205,7 +205,7 @@ jobs:
             fuse3-devel \
             clang clang-devel
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Mark workspace safe for git
@@ -272,7 +272,7 @@ jobs:
     permissions:
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
@@ -327,7 +327,7 @@ jobs:
       # keyed off the CI=true env GitHub Actions already sets.
       E2E_RUNNER_CLASS: ci-small
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install protoc
         uses: ./.github/actions/install-deps
@@ -438,7 +438,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           pattern: kiseki-*
