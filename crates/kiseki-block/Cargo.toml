@@ -53,7 +53,7 @@ tempfile = "3"
 # perf gate in `benches/backend_compare.rs` (GH #39). Pinned to 0.5
 # (current stable line) and built without its plotters dep to keep
 # the bench compile cheap on dev boxes.
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "backend_compare"
